@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics><meta name="design_doc_mode" content="canvas"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"><style>
+body{margin:0;background:#0d0d0d;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+a{color:#4daafc;text-decoration:none}a:hover{color:#7cc2ff}
+.dv-turn{padding:40px 44px 32px;border-bottom:1px solid rgba(255,255,255,.07);scroll-margin-top:16px}
+.dv-thd{display:flex;align-items:baseline;gap:10px;margin:0 0 22px}
+.dv-tid{font:600 10px "JetBrains Mono",ui-monospace,monospace;padding:3px 7px;background:#e8e8e8;color:#111;border-radius:4px;text-decoration:none}
+.dv-tname{font:600 13px/1.2 system-ui,sans-serif;color:#e8e8e8}
+.dv-opts{display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start}
+.dv-opt{flex:none;display:flex;flex-direction:column;gap:9px;scroll-margin-top:16px}
+.dv-oid{font:600 10.5px "JetBrains Mono",ui-monospace,monospace;padding:3px 7px;background:rgba(255,255,255,.11);color:#e8e8e8;border-radius:5px;text-decoration:none}
+.dv-olabel{display:flex;align-items:baseline;gap:8px;font:400 11.5px/1.3 system-ui,sans-serif;color:rgba(255,255,255,.5)}
+.dv-card{max-width:100%;background:#1f1f1f;border:1px solid rgba(255,255,255,.1);border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.45);overflow:hidden}
+.dv-opt:target .dv-oid{background:#0078d4;color:#fff}
+.dv-next{margin:26px 0 0;font:12px/1.6 system-ui,sans-serif;color:rgba(255,255,255,.42)}
+</style></helmet>
+
+<section class="dv-turn" id="t1">
+<div class="dv-thd"><a class="dv-tid" href="#t1">1</a><span class="dv-tname">Wide exploration — GitLab + Copilot review assistant for VS Code</span></div>
+
+<div class="dv-opts">
+
+<!-- 1a sidebar -->
+<div class="dv-opt" id="1a">
+<div class="dv-olabel"><a class="dv-oid" href="#1a">1a</a>Sidebar view — MR tree with review items nested under files</div>
+<div class="dv-card" style="width:360px">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;background:#181818;border-bottom:1px solid #2b2b2b">
+    <span style="font:600 11px/1 system-ui;letter-spacing:.08em;color:#cccccc;text-transform:uppercase">GitLab: Review</span>
+    <span style="display:flex;gap:11px;color:#9d9d9d;font:400 13px/1 'JetBrains Mono',monospace">⟳ ⋯</span>
+  </div>
+  <div style="background:#181818;padding:10px 12px;border-bottom:1px solid #2b2b2b;display:flex;flex-direction:column;gap:7px">
+    <div style="display:flex;align-items:center;gap:7px">
+      <span style="width:16px;height:16px;border-radius:3px;background:#fc6d26;display:grid;place-items:center;font:700 9px/1 system-ui;color:#fff">!</span>
+      <span style="font:600 12.5px/1.3 system-ui;color:#e8e8e8">!2841 · Refactor token refresh</span>
+    </div>
+    <div style="display:flex;gap:6px;font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d">
+      <span style="padding:2px 6px;background:#252525;border-radius:3px">feat/auth-refresh</span>
+      <span style="padding:2px 6px;background:#252525;border-radius:3px;color:#3fb950">+284</span>
+      <span style="padding:2px 6px;background:#252525;border-radius:3px;color:#f85149">−91</span>
+    </div>
+  </div>
+  <div style="padding:10px 12px;background:#181818;border-bottom:1px solid #2b2b2b;display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;align-items:center;justify-content:space-between;font:400 11px/1 system-ui;color:#9d9d9d">
+      <span>Agent · <span style="color:#a371f7">HVE Core / PR Review</span></span><span>12 items</span>
+    </div>
+    <div style="height:4px;border-radius:2px;background:#2b2b2b;overflow:hidden;display:flex">
+      <span style="width:33%;background:#3fb950"></span><span style="width:17%;background:#f85149"></span><span style="width:8%;background:#6e7681"></span>
+    </div>
+    <div style="display:flex;gap:12px;font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d">
+      <span style="color:#3fb950">4 accepted</span><span style="color:#f85149">2 rejected</span><span>1 skipped</span><span style="margin-left:auto;color:#cccccc">5 left</span>
+    </div>
+  </div>
+  <div style="padding:6px 0;font:400 12.5px/1 system-ui;color:#cccccc">
+    <div style="display:flex;align-items:center;gap:6px;padding:5px 12px;color:#9d9d9d;font-size:11.5px">▾ <span style="font-family:'JetBrains Mono',monospace">src/auth/token.ts</span> <span style="margin-left:auto;color:#6e7681">4</span></div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px;background:#04395e;border-left:2px solid #0078d4">
+      <span style="width:7px;height:7px;border-radius:50%;background:#f85149;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Refresh token logged in error path</span>
+      <span style="font:500 9.5px/1 'JetBrains Mono',monospace;color:#f85149;border:1px solid #f8514955;padding:2px 4px;border-radius:3px">SEC</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px">
+      <span style="width:7px;height:7px;border-radius:50%;background:#d29922;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Race on concurrent refresh calls</span>
+      <span style="font:500 9.5px/1 'JetBrains Mono',monospace;color:#9d9d9d">88%</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px;color:#6e7681;text-decoration:line-through">
+      <span style="width:7px;height:7px;border-radius:50%;background:#3fb950;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Prefer AbortController over flag</span>
+      <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#3fb950">✓</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px">
+      <span style="width:7px;height:7px;border-radius:50%;background:#6e7681;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Nit: extract magic number 300</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;padding:5px 12px;color:#9d9d9d;font-size:11.5px">▾ <span style="font-family:'JetBrains Mono',monospace">src/api/client.ts</span> <span style="margin-left:auto;color:#6e7681">3</span></div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px">
+      <span style="width:7px;height:7px;border-radius:50%;background:#d29922;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Retry loop lacks backoff ceiling</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px 6px 28px">
+      <span style="width:7px;height:7px;border-radius:50%;background:#4a9eff;flex:none"></span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Missing test for 401 → refresh path</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;padding:5px 12px;color:#9d9d9d;font-size:11.5px">▸ <span style="font-family:'JetBrains Mono',monospace">src/ui/session.tsx</span> <span style="margin-left:auto;color:#6e7681">5</span></div>
+  </div>
+  <div style="padding:10px 12px;border-top:1px solid #2b2b2b;background:#181818;display:flex;gap:8px">
+    <button style="flex:1;background:#0078d4;color:#fff;border:none;border-radius:4px;padding:7px 10px;font:500 12px/1 system-ui;cursor:pointer" style-hover="background:#1a86e0">Open review tab</button>
+    <button style="background:#2b2b2b;color:#cccccc;border:1px solid #3c3c3c;border-radius:4px;padding:7px 10px;font:500 12px/1 system-ui;cursor:pointer" style-hover="background:#383838">Summary</button>
+  </div>
+</div>
+</div>
+
+<!-- 1b split triage -->
+<div class="dv-opt" id="1b">
+<div class="dv-olabel"><a class="dv-oid" href="#1b">1b</a>Full editor tab — list + detail triage, live (click rows, accept/reject)</div>
+<div class="dv-card" style="width:1180px">
+  <div style="display:flex;align-items:center;gap:0;background:#181818;border-bottom:1px solid #2b2b2b">
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:#1f1f1f;border-top:1px solid #0078d4;font:400 12.5px/1 system-ui;color:#e8e8e8">
+      <span style="color:#fc6d26">◈</span> AI Review · !2841 <span style="color:#6e7681;margin-left:6px">✕</span>
+    </div>
+    <div style="padding:8px 14px;font:400 12.5px/1 system-ui;color:#8b8b8b">token.ts</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid #2b2b2b">
+    <span style="font:600 13px/1 system-ui;color:#e8e8e8">Refactor token refresh</span>
+    <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#9d9d9d">!2841 · gitlab.com/hve/core</span>
+    <span style="margin-left:auto;display:flex;gap:6px;font:500 10.5px/1 'JetBrains Mono',monospace">
+      <span style="padding:4px 7px;border-radius:3px;background:#f8514922;color:#f85149">2 blocker</span>
+      <span style="padding:4px 7px;border-radius:3px;background:#d2992222;color:#d29922">4 major</span>
+      <span style="padding:4px 7px;border-radius:3px;background:#4a9eff22;color:#4a9eff">6 minor</span>
+    </span>
+  </div>
+  <div style="display:grid;grid-template-columns:330px 1fr;min-height:520px">
+    <div style="border-right:1px solid #2b2b2b;background:#181818;display:flex;flex-direction:column">
+      <div style="display:flex;gap:6px;padding:9px 12px;border-bottom:1px solid #2b2b2b">
+        <span style="padding:3px 8px;border-radius:11px;background:#0078d4;color:#fff;font:500 10.5px/1.5 system-ui">All 12</span>
+        <span style="padding:3px 8px;border-radius:11px;background:#252525;color:#9d9d9d;font:500 10.5px/1.5 system-ui">Open 5</span>
+        <span style="padding:3px 8px;border-radius:11px;background:#252525;color:#9d9d9d;font:500 10.5px/1.5 system-ui">Security 3</span>
+      </div>
+      <div style="flex:1;overflow:hidden">
+        <sc-for list="{{ items }}" as="it" hint-placeholder-count="5">
+          <div onClick="{{ it.select }}" style="{{ it.rowStyle }}">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span style="{{ it.dotStyle }}"></span>
+              <span style="{{ it.titleStyle }}">{{ it.title }}</span>
+              <span style="font:500 9.5px/1 'JetBrains Mono',monospace;color:#6e7681">{{ it.confidence }}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding-left:14px;font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">
+              <span>{{ it.loc }}</span><span style="{{ it.tagStyle }}">{{ it.category }}</span>
+              <span style="{{ it.stateStyle }}">{{ it.stateLabel }}</span>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="padding:10px 12px;border-top:1px solid #2b2b2b;display:flex;flex-direction:column;gap:8px">
+        <div style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d">{{ progressLabel }}</div>
+        <div style="height:4px;border-radius:2px;background:#2b2b2b;overflow:hidden"><span style="{{ progressStyle }}"></span></div>
+        <button onClick="{{ resetAll }}" style="background:#2b2b2b;border:1px solid #3c3c3c;color:#cccccc;border-radius:4px;padding:6px;font:500 11px/1 system-ui;cursor:pointer" style-hover="background:#383838">Reset triage</button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column">
+      <div style="padding:16px 20px 12px;border-bottom:1px solid #2b2b2b;display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;align-items:center;gap:9px">
+          <span style="{{ current.chipStyle }}">{{ current.severity }}</span>
+          <span style="font:600 15px/1.3 system-ui;color:#e8e8e8">{{ current.title }}</span>
+        </div>
+        <div style="display:flex;gap:14px;font:400 11px/1 'JetBrains Mono',monospace;color:#9d9d9d">
+          <span>{{ current.loc }}</span><span>{{ current.category }}</span><span>confidence {{ current.confidence }}</span><span style="color:#a371f7">HVE Core / PR Review</span>
+        </div>
+      </div>
+      <div style="flex:1;padding:16px 20px;display:flex;flex-direction:column;gap:14px">
+        <p style="margin:0;font:400 13px/1.6 system-ui;color:#cccccc;max-width:64ch;text-wrap:pretty">{{ current.body }}</p>
+        <div style="border:1px solid #2b2b2b;border-radius:6px;overflow:hidden;background:#141414">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 10px;background:#181818;border-bottom:1px solid #2b2b2b;font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d">
+            <span>{{ current.loc }}</span><span style="color:#4daafc;cursor:pointer">Open in editor</span>
+          </div>
+          <pre style="margin:0;padding:10px 12px;font:400 12px/1.7 'JetBrains Mono',monospace;color:#cccccc;overflow:auto">{{ current.code }}</pre>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#0078d4;color:#fff">Explain the risk</span>
+          <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#0078d4;color:#fff">Show me a fix</span>
+          <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#0078d4;color:#fff">Find similar in repo</span>
+          <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#0078d4;color:#fff">Why flagged?</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;border:1px solid #3c3c3c;border-radius:6px;padding:8px 10px;background:#181818">
+          <span style="color:#a371f7;font:400 12px/1 'JetBrains Mono',monospace">▸</span>
+          <span style="flex:1;font:400 12.5px/1 system-ui;color:#6e7681">Ask the agent about this item…</span>
+          <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#6e7681">⌘↩</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;padding:12px 20px;border-top:1px solid #2b2b2b;background:#181818">
+        <button onClick="{{ accept }}" style="background:#238636;border:none;color:#fff;border-radius:4px;padding:8px 14px;font:600 12px/1 system-ui;cursor:pointer" style-hover="background:#2ea043">Accept <span style="opacity:.7;font-weight:400">A</span></button>
+        <button onClick="{{ reject }}" style="background:#2b2b2b;border:1px solid #f8514966;color:#f85149;border-radius:4px;padding:8px 14px;font:600 12px/1 system-ui;cursor:pointer" style-hover="background:#f8514922">Reject <span style="opacity:.7;font-weight:400">R</span></button>
+        <button onClick="{{ skip }}" style="background:#2b2b2b;border:1px solid #3c3c3c;color:#cccccc;border-radius:4px;padding:8px 14px;font:600 12px/1 system-ui;cursor:pointer" style-hover="background:#383838">Skip <span style="opacity:.7;font-weight:400">S</span></button>
+        <span style="margin-left:auto;font:400 11px/1 'JetBrains Mono',monospace;color:#6e7681">{{ progressLabel }}</span>
+        <button style="{{ submitStyle }}">Generate summary →</button>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- 1c focused queue -->
+<div class="dv-opt" id="1c">
+<div class="dv-olabel"><a class="dv-oid" href="#1c">1c</a>Focused queue — one item at a time, keyboard-first, deck of cards</div>
+<div class="dv-card" style="width:700px">
+  <div style="padding:10px 16px;background:#181818;border-bottom:1px solid #2b2b2b;display:flex;align-items:center;gap:10px">
+    <span style="font:600 11px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#9d9d9d">Review queue</span>
+    <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#6e7681">!2841</span>
+    <span style="margin-left:auto;display:flex;gap:3px">
+      <sc-for list="{{ pips }}" as="p" hint-placeholder-count="6"><span style="{{ p.style }}"></span></sc-for>
+    </span>
+  </div>
+  <div style="position:relative;padding:22px 20px 20px;background:#1f1f1f">
+    <div style="position:absolute;left:34px;right:34px;top:12px;height:14px;border-radius:8px 8px 0 0;background:#252525;border:1px solid #2b2b2b;border-bottom:none"></div>
+    <div style="position:relative;background:#242424;border:1px solid #3c3c3c;border-radius:8px;padding:18px 20px;display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="{{ q.chipStyle }}">{{ q.severity }}</span>
+        <span style="font:400 10.5px/1 'JetBrains Mono',monospace;padding:3px 7px;border-radius:3px;background:#2b2b2b;color:#9d9d9d">{{ q.category }}</span>
+        <span style="margin-left:auto;font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">{{ q.counter }}</span>
+      </div>
+      <div style="font:600 17px/1.35 system-ui;color:#f0f0f0;text-wrap:pretty">{{ q.title }}</div>
+      <div style="font:400 11px/1 'JetBrains Mono',monospace;color:#9d9d9d">{{ q.loc }}</div>
+      <pre style="margin:0;background:#141414;border:1px solid #2b2b2b;border-radius:6px;padding:12px;font:400 12px/1.75 'JetBrains Mono',monospace;color:#cccccc;overflow:auto">{{ q.code }}</pre>
+      <p style="margin:0;font:400 13px/1.6 system-ui;color:#bdbdbd;text-wrap:pretty">{{ q.body }}</p>
+      <div style="display:flex;gap:7px;flex-wrap:wrap">
+        <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#a371f7">Explain</span>
+        <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#a371f7">Show fix</span>
+        <span style="padding:5px 10px;border:1px solid #3c3c3c;border-radius:14px;font:400 11.5px/1.3 system-ui;color:#cccccc;cursor:pointer" style-hover="border-color:#a371f7">Similar</span>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 20px;background:#181818;border-top:1px solid #2b2b2b">
+    <button onClick="{{ qReject }}" style="flex:1;background:#2b2b2b;border:1px solid #f8514955;color:#f85149;border-radius:5px;padding:10px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:#f8514922">← Reject</button>
+    <button onClick="{{ qSkip }}" style="background:#2b2b2b;border:1px solid #3c3c3c;color:#9d9d9d;border-radius:5px;padding:10px 16px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:#383838">↓ Skip</button>
+    <button onClick="{{ qAccept }}" style="flex:1;background:#238636;border:none;color:#fff;border-radius:5px;padding:10px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:#2ea043">Accept →</button>
+  </div>
+</div>
+</div>
+
+<!-- 1d inline diff -->
+<div class="dv-opt" id="1d">
+<div class="dv-olabel"><a class="dv-oid" href="#1d">1d</a>Inline in the diff — review item as a peek widget anchored to its lines</div>
+<div class="dv-card" style="width:820px">
+  <div style="display:flex;background:#181818;border-bottom:1px solid #2b2b2b;font:400 12.5px/1 system-ui">
+    <div style="padding:8px 14px;background:#1f1f1f;border-top:1px solid #0078d4;color:#e8e8e8">token.ts <span style="color:#6e7681;margin-left:6px">✕</span></div>
+  </div>
+  <div style="padding:8px 0;font:400 12.5px/1.85 'JetBrains Mono',monospace;color:#cccccc">
+    <div style="display:flex"><span style="width:52px;text-align:right;padding-right:16px;color:#5a5a5a">61</span><span>  <span style="color:#569cd6">async</span> <span style="color:#dcdcaa">refresh</span>() {</span></div>
+    <div style="display:flex;background:#1b3a24"><span style="width:52px;text-align:right;padding-right:16px;color:#5a5a5a">62</span><span style="color:#3fb950">+   <span style="color:#569cd6">const</span> res = <span style="color:#569cd6">await</span> <span style="color:#dcdcaa">post</span>(<span style="color:#ce9178">'/oauth/token'</span>, { token: <span style="color:#9cdcfe">this</span>.refreshToken })</span></div>
+    <div style="display:flex;background:#3a1e1e;border-left:2px solid #f85149"><span style="width:50px;text-align:right;padding-right:16px;color:#5a5a5a">63</span><span style="color:#3fb950">+   <span style="color:#569cd6">if</span> (!res.ok) <span style="color:#dcdcaa">logger.error</span>(<span style="color:#ce9178">`refresh failed &#36;&#123;<span style="color:#9cdcfe">this</span>.refreshToken&#125;`</span>)</span></div>
+    <div style="margin:6px 34px 6px 52px;border:1px solid #3c3c3c;border-left:3px solid #f85149;border-radius:6px;background:#242424;font-family:system-ui">
+      <div style="display:flex;align-items:center;gap:9px;padding:9px 12px;border-bottom:1px solid #2b2b2b">
+        <span style="font:600 9.5px/1 'JetBrains Mono',monospace;letter-spacing:.06em;padding:3px 6px;border-radius:3px;background:#f8514922;color:#f85149">BLOCKER</span>
+        <span style="font:600 12.5px/1 system-ui;color:#e8e8e8">Refresh token logged in error path</span>
+        <span style="margin-left:auto;font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">96% · 3 of 12</span>
+      </div>
+      <div style="padding:10px 12px;display:flex;flex-direction:column;gap:10px">
+        <p style="margin:0;font:400 12.5px/1.6 system-ui;color:#bdbdbd;text-wrap:pretty">Secret material reaches the log sink. Redact or log only the token id — this is a compliance finding, not a style preference.</p>
+        <div style="border-radius:5px;overflow:hidden;border:1px solid #2b2b2b">
+          <div style="padding:4px 10px;background:#181818;font:400 10px/1.6 'JetBrains Mono',monospace;color:#9d9d9d">Suggested change</div>
+          <div style="background:#3a1e1e;padding:3px 10px;font:400 11.5px/1.7 'JetBrains Mono',monospace;color:#f0a5a2">− logger.error(`refresh failed &#36;&#123;this.refreshToken&#125;`)</div>
+          <div style="background:#1b3a24;padding:3px 10px;font:400 11.5px/1.7 'JetBrains Mono',monospace;color:#8ddaa0">+ logger.error('refresh failed', { tokenId: this.tokenId })</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:7px">
+          <button style="background:#238636;border:none;color:#fff;border-radius:4px;padding:6px 12px;font:600 11.5px/1 system-ui;cursor:pointer" style-hover="background:#2ea043">Accept &amp; apply</button>
+          <button style="background:#2b2b2b;border:1px solid #3c3c3c;color:#cccccc;border-radius:4px;padding:6px 12px;font:600 11.5px/1 system-ui;cursor:pointer" style-hover="background:#383838">Accept, comment only</button>
+          <button style="background:transparent;border:1px solid #3c3c3c;color:#9d9d9d;border-radius:4px;padding:6px 12px;font:600 11.5px/1 system-ui;cursor:pointer" style-hover="color:#f85149">Reject</button>
+          <span style="margin-left:auto;font:400 11px/1 system-ui;color:#4daafc;cursor:pointer">Ask agent ⌘↩</span>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex"><span style="width:52px;text-align:right;padding-right:16px;color:#5a5a5a">64</span><span>    <span style="color:#569cd6">return</span> res.data</span></div>
+    <div style="display:flex"><span style="width:52px;text-align:right;padding-right:16px;color:#5a5a5a">65</span><span>  }</span></div>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px;padding:5px 14px;background:#0078d4;font:400 11.5px/1.6 system-ui;color:#fff">
+    <span>◈ !2841</span><span>✓ 4 &nbsp;✕ 2 &nbsp;⤼ 1 &nbsp;· 5 left</span><span style="margin-left:auto">HVE Core / PR Review</span>
+  </div>
+</div>
+</div>
+
+<!-- 1e dashboard -->
+<div class="dv-opt" id="1e">
+<div class="dv-olabel"><a class="dv-oid" href="#1e">1e</a>Team dashboard — MRs, issues and pipelines in one editor tab</div>
+<div class="dv-card" style="width:1180px">
+  <div style="display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid #2b2b2b;background:#181818">
+    <span style="font:600 13px/1 system-ui;color:#e8e8e8">hve / core</span>
+    <span style="display:flex;gap:4px;background:#252525;border-radius:5px;padding:3px">
+      <span style="padding:4px 10px;border-radius:3px;background:#0078d4;color:#fff;font:500 11.5px/1.3 system-ui">Team</span>
+      <span style="padding:4px 10px;font:500 11.5px/1.3 system-ui;color:#9d9d9d">Mine</span>
+      <span style="padding:4px 10px;font:500 11.5px/1.3 system-ui;color:#9d9d9d">Reviewing</span>
+    </span>
+    <span style="margin-left:auto;display:flex;gap:8px;font:400 11px/1 'JetBrains Mono',monospace;color:#9d9d9d">
+      <span style="padding:5px 9px;border:1px solid #3c3c3c;border-radius:4px">⟳ 2m ago</span>
+      <span style="padding:5px 9px;border:1px solid #3c3c3c;border-radius:4px">Filters</span>
+    </span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#2b2b2b;border-bottom:1px solid #2b2b2b">
+    <div style="background:#1f1f1f;padding:14px 18px;display:flex;flex-direction:column;gap:6px"><span style="font:400 11px/1 system-ui;color:#9d9d9d">Open MRs</span><span style="font:600 26px/1 'JetBrains Mono',monospace;color:#e8e8e8">17</span><span style="font:400 11px/1 system-ui;color:#d29922">6 awaiting your review</span></div>
+    <div style="background:#1f1f1f;padding:14px 18px;display:flex;flex-direction:column;gap:6px"><span style="font:400 11px/1 system-ui;color:#9d9d9d">AI review coverage</span><span style="font:600 26px/1 'JetBrains Mono',monospace;color:#3fb950">12/17</span><span style="font:400 11px/1 system-ui;color:#9d9d9d">5 not yet analyzed</span></div>
+    <div style="background:#1f1f1f;padding:14px 18px;display:flex;flex-direction:column;gap:6px"><span style="font:400 11px/1 system-ui;color:#9d9d9d">Pipelines failing</span><span style="font:600 26px/1 'JetBrains Mono',monospace;color:#f85149">3</span><span style="font:400 11px/1 system-ui;color:#9d9d9d">of 41 today</span></div>
+    <div style="background:#1f1f1f;padding:14px 18px;display:flex;flex-direction:column;gap:6px"><span style="font:400 11px/1 system-ui;color:#9d9d9d">Issues in progress</span><span style="font:600 26px/1 'JetBrains Mono',monospace;color:#e8e8e8">24</span><span style="font:400 11px/1 system-ui;color:#9d9d9d">4 blocked</span></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1.6fr 1fr">
+    <div style="border-right:1px solid #2b2b2b">
+      <div style="display:grid;grid-template-columns:1fr 130px 96px 110px;gap:12px;padding:8px 18px;border-bottom:1px solid #2b2b2b;font:500 10px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6e7681">
+        <span>Merge request</span><span>AI review</span><span>Pipeline</span><span>Updated</span>
+      </div>
+      <sc-for list="{{ mrs }}" as="m" hint-placeholder-count="6">
+        <div style="display:grid;grid-template-columns:1fr 130px 96px 110px;gap:12px;padding:11px 18px;border-bottom:1px solid #232323;align-items:center" style-hover="background:#252525">
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:0">
+            <span style="font:500 12.5px/1.3 system-ui;color:#e8e8e8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ m.title }}</span>
+            <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">{{ m.meta }}</span>
+          </div>
+          <span style="{{ m.reviewStyle }}">{{ m.review }}</span>
+          <span style="{{ m.pipeStyle }}">{{ m.pipe }}</span>
+          <span style="font:400 11px/1 'JetBrains Mono',monospace;color:#6e7681">{{ m.updated }}</span>
+        </div>
+      </sc-for>
+    </div>
+    <div style="display:flex;flex-direction:column">
+      <div style="padding:11px 18px;border-bottom:1px solid #2b2b2b;font:500 10px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6e7681">Activity</div>
+      <div style="padding:6px 0">
+        <div style="display:flex;gap:10px;padding:10px 18px;border-bottom:1px solid #232323"><span style="color:#f85149;font:400 13px/1 monospace">✕</span><div style="display:flex;flex-direction:column;gap:3px"><span style="font:400 12px/1.4 system-ui;color:#cccccc">Pipeline #90412 failed on <span style="color:#e8e8e8">!2839</span></span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">e2e:chrome · 4m ago</span></div></div>
+        <div style="display:flex;gap:10px;padding:10px 18px;border-bottom:1px solid #232323"><span style="color:#a371f7;font:400 13px/1 monospace">◈</span><div style="display:flex;flex-direction:column;gap:3px"><span style="font:400 12px/1.4 system-ui;color:#cccccc">Agent finished 12 items on <span style="color:#e8e8e8">!2841</span></span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">HVE Core / PR Review · 11m ago</span></div></div>
+        <div style="display:flex;gap:10px;padding:10px 18px;border-bottom:1px solid #232323"><span style="color:#4daafc;font:400 13px/1 monospace">💬</span><div style="display:flex;flex-direction:column;gap:3px"><span style="font:400 12px/1.4 system-ui;color:#cccccc"><span style="color:#e8e8e8">@rina</span> replied to your comment on <span style="color:#e8e8e8">!2837</span></span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">22m ago</span></div></div>
+        <div style="display:flex;gap:10px;padding:10px 18px;border-bottom:1px solid #232323"><span style="color:#3fb950;font:400 13px/1 monospace">✓</span><div style="display:flex;flex-direction:column;gap:3px"><span style="font:400 12px/1.4 system-ui;color:#cccccc"><span style="color:#e8e8e8">!2834</span> merged by <span style="color:#e8e8e8">@dmitri</span></span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">1h ago</span></div></div>
+        <div style="display:flex;gap:10px;padding:10px 18px"><span style="color:#d29922;font:400 13px/1 monospace">⚑</span><div style="display:flex;flex-direction:column;gap:3px"><span style="font:400 12px/1.4 system-ui;color:#cccccc"><span style="color:#e8e8e8">#1180</span> blocked — waiting on infra</span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#6e7681">2h ago</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- 1f summary -->
+<div class="dv-opt" id="1f">
+<div class="dv-olabel"><a class="dv-oid" href="#1f">1f</a>Summary &amp; submit — what actually lands on the MR</div>
+<div class="dv-card" style="width:620px">
+  <div style="padding:14px 18px;border-bottom:1px solid #2b2b2b;display:flex;align-items:center;gap:10px">
+    <span style="font:600 13.5px/1 system-ui;color:#e8e8e8">Submit review to GitLab</span>
+    <span style="margin-left:auto;font:400 11px/1 'JetBrains Mono',monospace;color:#6e7681">!2841 · 12 items triaged</span>
+  </div>
+  <div style="padding:16px 18px;display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;gap:8px">
+      <span style="flex:1;padding:9px;border-radius:5px;background:#238636;color:#fff;text-align:center;font:600 12px/1 system-ui">7 accepted</span>
+      <span style="flex:1;padding:9px;border-radius:5px;background:#2b2b2b;border:1px solid #f8514955;color:#f85149;text-align:center;font:600 12px/1 system-ui">3 rejected</span>
+      <span style="flex:1;padding:9px;border-radius:5px;background:#2b2b2b;border:1px solid #3c3c3c;color:#9d9d9d;text-align:center;font:600 12px/1 system-ui">2 skipped</span>
+    </div>
+    <div style="border:1px solid #2b2b2b;border-radius:6px;background:#181818">
+      <div style="padding:8px 12px;border-bottom:1px solid #2b2b2b;font:500 10px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6e7681">Summary comment · editable</div>
+      <div style="padding:12px;font:400 12.5px/1.65 system-ui;color:#cccccc;text-wrap:pretty">
+        <strong style="color:#e8e8e8">Reviewed with HVE Core / PR Review.</strong> Two blockers: the refresh token reaches the log sink in <code style="font-family:'JetBrains Mono',monospace;color:#4daafc">token.ts:63</code>, and concurrent refreshes can double-issue. Both need a fix before merge. Five smaller items are posted inline; three agent findings were dismissed as false positives (rationale attached to each).
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <div style="font:500 10px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6e7681">Line comments to post (7)</div>
+      <div style="display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid #2b2b2b;border-radius:5px"><span style="color:#3fb950">☑</span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d;width:120px">token.ts:63</span><span style="flex:1;font:400 12px/1.3 system-ui;color:#cccccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Refresh token logged in error path</span><span style="font:400 10px/1 'JetBrains Mono',monospace;color:#a371f7">+suggestion</span></div>
+      <div style="display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid #2b2b2b;border-radius:5px"><span style="color:#3fb950">☑</span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d;width:120px">token.ts:88</span><span style="flex:1;font:400 12px/1.3 system-ui;color:#cccccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Race on concurrent refresh calls</span></div>
+      <div style="display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid #2b2b2b;border-radius:5px"><span style="color:#3fb950">☑</span><span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:#9d9d9d;width:120px">client.ts:41</span><span style="flex:1;font:400 12px/1.3 system-ui;color:#cccccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Retry loop lacks backoff ceiling</span><span style="font:400 10px/1 'JetBrains Mono',monospace;color:#a371f7">+suggestion</span></div>
+      <div style="font:400 11px/1 system-ui;color:#6e7681;padding-left:2px">+ 4 more</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;font:400 11.5px/1 system-ui;color:#9d9d9d">
+      <span>☑ Post as single review thread</span><span>☐ Request changes</span>
+    </div>
+  </div>
+  <div style="display:flex;gap:9px;padding:12px 18px;border-top:1px solid #2b2b2b;background:#181818">
+    <button style="background:#fc6d26;border:none;color:#fff;border-radius:4px;padding:9px 16px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:#ff8144">Submit to GitLab</button>
+    <button style="background:#2b2b2b;border:1px solid #3c3c3c;color:#cccccc;border-radius:4px;padding:9px 16px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:#383838">Copy as markdown</button>
+    <span style="margin-left:auto;align-self:center;font:400 11px/1 'JetBrains Mono',monospace;color:#6e7681">posts as @you</span>
+  </div>
+</div>
+</div>
+
+<!-- 1g agent config -->
+<div class="dv-opt" id="1g">
+<div class="dv-olabel"><a class="dv-oid" href="#1g">1g</a>Agent picker &amp; review criteria — Copilot agents from the workspace</div>
+<div class="dv-card" style="width:560px">
+  <div style="padding:13px 16px;border-bottom:1px solid #2b2b2b;font:600 13px/1 system-ui;color:#e8e8e8">Review agent</div>
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+    <div style="display:flex;align-items:flex-start;gap:11px;padding:12px;border:1px solid #0078d4;border-radius:6px;background:#04395e33">
+      <span style="width:16px;height:16px;border-radius:50%;border:2px solid #0078d4;background:#0078d4;box-shadow:inset 0 0 0 3px #1f1f1f;flex:none;margin-top:1px"></span>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <span style="font:600 12.5px/1 system-ui;color:#e8e8e8">HVE Core · PR Review</span>
+        <span style="font:400 11.5px/1.5 system-ui;color:#9d9d9d">Deep-dive agent. Full-repo context, security &amp; concurrency emphasis. ~90s per MR.</span>
+      </div>
+      <span style="margin-left:auto;font:400 9.5px/1 'JetBrains Mono',monospace;color:#a371f7;border:1px solid #a371f755;padding:3px 5px;border-radius:3px">copilot</span>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:11px;padding:12px;border:1px solid #2b2b2b;border-radius:6px">
+      <span style="width:16px;height:16px;border-radius:50%;border:2px solid #4a4a4a;flex:none;margin-top:1px"></span>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <span style="font:600 12.5px/1 system-ui;color:#cccccc">Fast Diff Review</span>
+        <span style="font:400 11.5px/1.5 system-ui;color:#9d9d9d">Diff-only pass, no repo indexing. ~15s.</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:11px;padding:12px;border:1px solid #2b2b2b;border-radius:6px">
+      <span style="width:16px;height:16px;border-radius:50%;border:2px solid #4a4a4a;flex:none;margin-top:1px"></span>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <span style="font:600 12.5px/1 system-ui;color:#cccccc">team-frontend.agent.md</span>
+        <span style="font:400 11.5px/1.5 system-ui;color:#9d9d9d">Workspace agent from <span style="font-family:'JetBrains Mono',monospace">.github/agents/</span></span>
+      </div>
+    </div>
+  </div>
+  <div style="padding:13px 16px;border-top:1px solid #2b2b2b;border-bottom:1px solid #2b2b2b;font:600 13px/1 system-ui;color:#e8e8e8">Criteria</div>
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:13px">
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <span style="font:400 11.5px/1 system-ui;color:#9d9d9d">Report items at or above</span>
+      <div style="display:flex;gap:6px">
+        <span style="flex:1;text-align:center;padding:7px;border-radius:4px;background:#2b2b2b;color:#6e7681;font:500 11px/1 'JetBrains Mono',monospace">nit</span>
+        <span style="flex:1;text-align:center;padding:7px;border-radius:4px;background:#0078d4;color:#fff;font:500 11px/1 'JetBrains Mono',monospace">minor</span>
+        <span style="flex:1;text-align:center;padding:7px;border-radius:4px;background:#2b2b2b;color:#9d9d9d;font:500 11px/1 'JetBrains Mono',monospace">major</span>
+        <span style="flex:1;text-align:center;padding:7px;border-radius:4px;background:#2b2b2b;color:#9d9d9d;font:500 11px/1 'JetBrains Mono',monospace">blocker</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <span style="font:400 11.5px/1 system-ui;color:#9d9d9d">Categories</span>
+      <div style="display:flex;gap:7px;flex-wrap:wrap">
+        <span style="padding:5px 10px;border-radius:14px;background:#f8514922;color:#f85149;font:500 11px/1.3 system-ui">Security ✓</span>
+        <span style="padding:5px 10px;border-radius:14px;background:#d2992222;color:#d29922;font:500 11px/1.3 system-ui">Performance ✓</span>
+        <span style="padding:5px 10px;border-radius:14px;background:#4a9eff22;color:#4a9eff;font:500 11px/1.3 system-ui">Tests ✓</span>
+        <span style="padding:5px 10px;border-radius:14px;border:1px solid #3c3c3c;color:#6e7681;font:500 11px/1.3 system-ui">Style</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <span style="font:400 11.5px/1 system-ui;color:#9d9d9d">Minimum confidence · <span style="font-family:'JetBrains Mono',monospace;color:#cccccc">70%</span></span>
+      <div style="height:4px;border-radius:2px;background:#2b2b2b;position:relative"><span style="position:absolute;left:0;top:0;bottom:0;width:70%;background:#0078d4;border-radius:2px"></span><span style="position:absolute;left:70%;top:-4px;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:#e8e8e8"></span></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <span style="font:400 11.5px/1 system-ui;color:#9d9d9d">Extra instructions</span>
+      <div style="border:1px solid #3c3c3c;border-radius:5px;background:#181818;padding:9px 11px;font:400 12px/1.6 'JetBrains Mono',monospace;color:#cccccc;text-wrap:pretty">Terse. No praise. Cite the rule or CVE class. Ignore formatting — Prettier owns it.</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- 1h notifications -->
+<div class="dv-opt" id="1h">
+<div class="dv-olabel"><a class="dv-oid" href="#1h">1h</a>Notifications — toast, status bar, and a digest that doesn't interrupt</div>
+<div class="dv-card" style="width:520px;background:#141414">
+  <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+    <div style="border:1px solid #3c3c3c;border-radius:6px;background:#252525;box-shadow:0 6px 20px rgba(0,0,0,.5);overflow:hidden">
+      <div style="display:flex;align-items:center;gap:9px;padding:10px 12px">
+        <span style="color:#a371f7;font:400 13px/1 monospace">◈</span>
+        <span style="font:500 12.5px/1.3 system-ui;color:#e8e8e8">Review ready · 12 items on !2841</span>
+        <span style="margin-left:auto;color:#6e7681;font:400 12px/1 system-ui">✕</span>
+      </div>
+      <div style="padding:0 12px 11px 33px;display:flex;flex-direction:column;gap:9px">
+        <span style="font:400 11.5px/1.5 system-ui;color:#9d9d9d">2 blockers · 4 major · 6 minor. Agent: HVE Core / PR Review.</span>
+        <div style="display:flex;gap:7px"><span style="padding:5px 11px;border-radius:4px;background:#0078d4;color:#fff;font:500 11.5px/1 system-ui">Start triage</span><span style="padding:5px 11px;border-radius:4px;border:1px solid #3c3c3c;color:#cccccc;font:500 11.5px/1 system-ui">Later</span></div>
+      </div>
+    </div>
+    <div style="border:1px solid #3c3c3c;border-radius:6px;background:#252525;box-shadow:0 6px 20px rgba(0,0,0,.5);padding:10px 12px;display:flex;align-items:center;gap:9px">
+      <span style="color:#4daafc;font:400 13px/1 monospace">💬</span>
+      <span style="font:400 12.5px/1.4 system-ui;color:#cccccc"><span style="color:#e8e8e8;font-weight:500">@rina</span> replied on !2837 — “can we keep the flag for now?”</span>
+    </div>
+    <div style="border:1px solid #3c3c3c;border-radius:6px;background:#252525;box-shadow:0 6px 20px rgba(0,0,0,.5);padding:10px 12px;display:flex;align-items:center;gap:9px">
+      <span style="color:#f85149;font:400 13px/1 monospace">✕</span>
+      <span style="font:400 12.5px/1.4 system-ui;color:#cccccc">Pipeline #90412 failed · <span style="color:#4daafc">e2e:chrome</span></span>
+      <span style="margin-left:auto;font:400 11px/1 system-ui;color:#4daafc">Logs</span>
+    </div>
+    <div style="border:1px dashed #3c3c3c;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px">
+      <span style="font:500 10px/1 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#6e7681">Quiet mode · hourly digest</span>
+      <span style="font:400 12px/1.55 system-ui;color:#9d9d9d;text-wrap:pretty">Only blockers and direct mentions interrupt. Everything else collects in the sidebar badge and lands in one digest.</span>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px;padding:5px 14px;background:#0078d4;font:400 11.5px/1.6 system-ui;color:#fff">
+    <span>⎇ feat/auth-refresh</span><span>◈ !2841 · 5 left</span><span>✕ 1</span><span style="margin-left:auto">🔔 3</span>
+  </div>
+</div>
+</div>
+
+</div>
+<p class="dv-next">Try next: “build <a class="dv-oid" href="#1b">1b</a> out as a full clickable flow, triage → summary → submit” · “merge <a class="dv-oid" href="#1c">1c</a>’s queue into <a class="dv-oid" href="#1a">1a</a>’s sidebar” · “more directions for the dashboard <a class="dv-oid" href="#1e">1e</a>”</p>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:900}}">
+const SEV = {
+  blocker: {color:'#f85149', bg:'#f8514922'},
+  major:   {color:'#d29922', bg:'#d2992222'},
+  minor:   {color:'#4a9eff', bg:'#4a9eff22'},
+  nit:     {color:'#8b8b8b', bg:'#8b8b8b22'}
+};
+const DATA = [
+  {id:1, sev:'blocker', title:'Refresh token logged in error path', loc:'src/auth/token.ts:63', cat:'security', conf:'96%',
+   code:"if (!res.ok) logger.error(`refresh failed ${this.refreshToken}`)",
+   body:'Secret material reaches the log sink. Redact or log only the token id — this is a compliance finding, not a style preference. Downstream log shipping is not scrubbed.'},
+  {id:2, sev:'blocker', title:'Race on concurrent refresh calls', loc:'src/auth/token.ts:88', cat:'concurrency', conf:'88%',
+   code:"if (this.refreshing) return this.pending\nthis.refreshing = true",
+   body:'Two callers can pass the guard before it is set, issuing two refreshes and invalidating the first token. Store the in-flight promise and return it, or take a mutex.'},
+  {id:3, sev:'major', title:'Retry loop lacks backoff ceiling', loc:'src/api/client.ts:41', cat:'performance', conf:'81%',
+   code:"while (attempt < max) { await sleep(2 ** attempt * 100) }",
+   body:'Exponential delay is uncapped; at attempt 12 that is a 6-minute sleep holding the request slot. Cap at ~30s and add jitter.'},
+  {id:4, sev:'minor', title:'Missing test for 401 → refresh path', loc:'test/auth.spec.ts', cat:'tests', conf:'74%',
+   code:"describe('token', () => { /* happy path only */ })",
+   body:'The new interceptor branch is untested. A single case asserting one refresh and one replay would cover both blockers above.'},
+  {id:5, sev:'nit', title:'Extract magic number 300', loc:'src/auth/token.ts:112', cat:'style', conf:'62%',
+   code:"const skew = 300",
+   body:'Name it CLOCK_SKEW_SECONDS. Low value; safe to dismiss.'}
+];
+const STATE_META = {
+  accepted: {label:'accepted', color:'#3fb950'},
+  rejected: {label:'rejected', color:'#f85149'},
+  skipped:  {label:'skipped',  color:'#6e7681'}
+};
+const MRS = [
+  {title:'Refactor token refresh', meta:'!2841 · @you · feat/auth-refresh', review:'5 left', rs:'open', pipe:'passed', updated:'11m'},
+  {title:'Add pipeline retry backoff', meta:'!2839 · @rina · fix/backoff', review:'not run', rs:'none', pipe:'failed', updated:'4m'},
+  {title:'Session UI polish pass', meta:'!2838 · @dmitri · ui/session', review:'clean', rs:'clean', pipe:'passed', updated:'38m'},
+  {title:'Drop legacy /v1 endpoints', meta:'!2836 · @kai · chore/v1-sunset', review:'2 blockers', rs:'block', pipe:'running', updated:'1h'},
+  {title:'Cache warm on cold start', meta:'!2833 · @rina · perf/cache-warm', review:'submitted', rs:'done', pipe:'passed', updated:'3h'},
+  {title:'Bump gitlab-ci runner image', meta:'!2830 · @you · chore/runner', review:'not run', rs:'none', pipe:'passed', updated:'5h'}
+];
+const RS_STYLE = {
+  open:  'font:500 11px/1 "JetBrains Mono",monospace;color:#d29922;padding:4px 8px;border-radius:3px;background:#d2992222;justify-self:start',
+  none:  'font:500 11px/1 "JetBrains Mono",monospace;color:#6e7681;padding:4px 8px;border-radius:3px;background:#2b2b2b;justify-self:start',
+  clean: 'font:500 11px/1 "JetBrains Mono",monospace;color:#3fb950;padding:4px 8px;border-radius:3px;background:#3fb95022;justify-self:start',
+  block: 'font:500 11px/1 "JetBrains Mono",monospace;color:#f85149;padding:4px 8px;border-radius:3px;background:#f8514922;justify-self:start',
+  done:  'font:500 11px/1 "JetBrains Mono",monospace;color:#a371f7;padding:4px 8px;border-radius:3px;background:#a371f722;justify-self:start'
+};
+const PIPE_COLOR = {passed:'#3fb950', failed:'#f85149', running:'#4a9eff'};
+
+class Component extends DCLogic {
+  state = { sel: 0, decisions: {}, qIdx: 0, qDecisions: {} };
+
+  decide(id, verdict) {
+    this.setState(s => {
+      const decisions = Object.assign({}, s.decisions, {[id]: verdict});
+      const next = DATA.findIndex((d, i) => i > s.sel && !decisions[d.id]);
+      return { decisions, sel: next === -1 ? s.sel : next };
+    });
+  }
+  qDecide(verdict) {
+    this.setState(s => ({
+      qDecisions: Object.assign({}, s.qDecisions, {[DATA[s.qIdx].id]: verdict}),
+      qIdx: (s.qIdx + 1) % DATA.length
+    }));
+  }
+
+  renderVals() {
+    const { sel, decisions, qIdx, qDecisions } = this.state;
+    const cur = DATA[sel];
+    const done = Object.keys(decisions).length;
+
+    const items = DATA.map((d, i) => {
+      const st = decisions[d.id];
+      const active = i === sel;
+      const m = st ? STATE_META[st] : null;
+      return {
+        title: d.title, loc: d.loc, category: d.cat, confidence: d.conf,
+        select: () => this.setState({sel: i}),
+        rowStyle: 'display:flex;flex-direction:column;gap:4px;padding:9px 12px;cursor:pointer;border-left:2px solid ' +
+          (active ? '#0078d4' : 'transparent') + ';background:' + (active ? '#04395e' : 'transparent'),
+        dotStyle: 'width:7px;height:7px;border-radius:50%;flex:none;background:' + SEV[d.sev].color,
+        titleStyle: 'flex:1;font:500 12.5px/1.3 system-ui;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:' +
+          (st ? '#6e7681' : '#e8e8e8') + (st && st !== 'skipped' ? ';text-decoration:line-through' : ''),
+        tagStyle: 'padding:2px 5px;border-radius:3px;background:#2b2b2b;color:#9d9d9d',
+        stateStyle: 'margin-left:auto;color:' + (m ? m.color : 'transparent'),
+        stateLabel: m ? m.label : ''
+      };
+    });
+
+    const q = DATA[qIdx];
+    const pips = DATA.map((d, i) => ({
+      style: 'width:16px;height:4px;border-radius:2px;background:' +
+        (qDecisions[d.id] ? STATE_META[qDecisions[d.id]].color : (i === qIdx ? '#e8e8e8' : '#3c3c3c'))
+    }));
+
+    const chip = sev => 'font:600 9.5px/1 "JetBrains Mono",monospace;letter-spacing:.06em;padding:4px 7px;border-radius:3px;text-transform:uppercase;color:' +
+      SEV[sev].color + ';background:' + SEV[sev].bg;
+
+    return {
+      items,
+      current: Object.assign({}, cur, {chipStyle: chip(cur.sev), severity: cur.sev, confidence: cur.conf, category: cur.cat}),
+      accept: () => this.decide(cur.id, 'accepted'),
+      reject: () => this.decide(cur.id, 'rejected'),
+      skip:   () => this.decide(cur.id, 'skipped'),
+      resetAll: () => this.setState({decisions: {}, sel: 0}),
+      progressLabel: done + ' of ' + DATA.length + ' triaged',
+      progressStyle: 'display:block;height:100%;border-radius:2px;background:#0078d4;width:' + Math.round(done / DATA.length * 100) + '%',
+      submitStyle: 'border:none;border-radius:4px;padding:8px 14px;font:600 12px/1 system-ui;cursor:pointer;' +
+        (done === DATA.length ? 'background:#fc6d26;color:#fff' : 'background:#2b2b2b;color:#6e7681'),
+      q: Object.assign({}, q, {
+        chipStyle: chip(q.sev), severity: q.sev, category: q.cat,
+        counter: (qIdx + 1) + ' / ' + DATA.length
+      }),
+      pips,
+      qAccept: () => this.qDecide('accepted'),
+      qReject: () => this.qDecide('rejected'),
+      qSkip:   () => this.qDecide('skipped'),
+      mrs: MRS.map(m => Object.assign({}, m, {
+        reviewStyle: RS_STYLE[m.rs],
+        pipeStyle: 'font:500 11px/1 "JetBrains Mono",monospace;color:' + PIPE_COLOR[m.pipe]
+      }))
+    };
+  }
+}
+</script>
+</body>
+</html>

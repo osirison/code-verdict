@@ -1,0 +1,78 @@
+# Code Verdict — naming, commands, and UI strings
+
+## The name
+
+**Marketplace / package name:** `Code Verdict`
+**Spoken and in-product name:** `Verdict`
+**Publisher-qualified id:** `<publisher>.code-verdict`
+
+Why the split: "Verdict" alone competes in search with legal apps and generic tooling, so the long
+name carries discovery. Inside the editor the user already knows which extension they're in, so the
+short name carries the chrome — it stays terse in a 36px tab and a 26px status bar.
+
+Rules:
+
+- Never "CodeVerdict" (one word) or "code verdict" (lowercase) in user-facing copy.
+- Never "Code Verdict:" as a command prefix — too long in the palette. Always `Verdict:`.
+- The agent is never called Verdict. Verdict is the plugin; the reviewer is the Copilot agent the
+  user selected (e.g. `HVE Core / PR Review`). Keep that attribution visible — it's what makes the
+  findings trustworthy.
+- The tagline used in the marketplace listing and step 1 of onboarding:
+  *Judge the AI's review, then ship it to GitLab.*
+
+## Command palette
+
+All commands use the `Verdict:` prefix, sentence case after the colon, verb first.
+
+| Command title | Command id | Notes |
+| --- | --- | --- |
+| Verdict: Run review | `codeVerdict.runReview` | Runs the selected agent on the active MR |
+| Verdict: Open dashboard | `codeVerdict.openDashboard` | Pod dashboard in an editor tab |
+| Verdict: Open review | `codeVerdict.openReview` | Triage tab for the active MR |
+| Verdict: Next item | `codeVerdict.nextItem` | Queue and diff modes |
+| Verdict: Previous item | `codeVerdict.prevItem` | |
+| Verdict: Accept item | `codeVerdict.acceptItem` | `A` when the review tab has focus |
+| Verdict: Accept item and apply fix | `codeVerdict.acceptItemApplyFix` | Only when the agent proposed a diff |
+| Verdict: Reject item | `codeVerdict.rejectItem` | `R` |
+| Verdict: Skip item | `codeVerdict.skipItem` | `S` |
+| Verdict: Ask agent about this item | `codeVerdict.askAgent` | `⌘↩` / `Ctrl+Enter` |
+| Verdict: Generate summary | `codeVerdict.generateSummary` | Enabled once every item is triaged |
+| Verdict: Submit review to GitLab | `codeVerdict.submitReview` | |
+| Verdict: Select review agent | `codeVerdict.selectAgent` | Lists Copilot workspace agents |
+| Verdict: Edit review criteria | `codeVerdict.editCriteria` | Severity floor, categories, confidence |
+| Verdict: New pod | `codeVerdict.newPod` | |
+| Verdict: Switch pod | `codeVerdict.switchPod` | Quick pick |
+| Verdict: Add project to pod | `codeVerdict.addProject` | Accepts URL, project id, or group id |
+| Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
+| Verdict: Sign in to GitLab | `codeVerdict.signIn` | |
+
+Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
+elsewhere. Nothing is bound by default outside that context.
+
+## Settings namespace
+
+`codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.severityFloor`,
+`codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
+`codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.pods`.
+
+The access token is never a setting — it lives in the VS Code secret store.
+
+## UI strings as shipped
+
+- Activity bar tooltip: `Verdict`
+- Sidebar view title: `VERDICT`
+- Sidebar nav row: `Pod dashboard`
+- Editor tabs: `Verdict: Dashboard` · `Verdict: Setup` · `Verdict: Run review · !2841` ·
+  `Verdict: Review · !2841`
+- Status bar: `◈ Verdict: !2841 · 5 left`, or `◈ Verdict: no active review`
+- Onboarding step 1 heading: `Welcome to Code Verdict`
+- Notification titles stay MR-first, not brand-first: `Review ready · 8 items on !2841`
+  (the source is already obvious from the icon)
+
+## Category vocabulary
+
+Review criteria categories, in the order they appear in the UI: Security, Concurrency,
+Error handling, Performance, Craftsmanship, API contract, Tests, Docs & comments, Style.
+Severity floor uses `nit / minor / major / blocker`. Triage verdicts are always
+`Accepted / Rejected / Skipped` — capitalised, never "approved" or "dismissed", so the words match
+the buttons, the summary, and the docs.

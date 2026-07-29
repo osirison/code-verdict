@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics><meta name="design_doc_mode" content="canvas"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"><script src="./image-slot.js"></script><style>
+:root{--bg:#1f1f1f;--bg2:#181818;--bg3:#252525;--card:#242424;--row:#232323;--line:#2b2b2b;--line2:#3c3c3c;--line3:#4a4a4a;--hover:#383838;--code:#141414;--fg-max:#f0f0f0;--fg-hi:#e8e8e8;--fg:#cccccc;--fg-dim:#9d9d9d;--fg-dimmer:#6e7681;--link:#4daafc;--accent:#0078d4;--accent-h:#1a86e0;--sel:#04395e;--brand:#fc6d26;--agent:#a371f7;--ok:#3fb950;--ok-strong:#238636;--sev-blocker:#f85149;--sev-major:#d29922;--sev-minor:#4a9eff}
+body{margin:0;background:#0d0d0d;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--link);text-decoration:none}a:hover{color:#7cc2ff}
+*{box-sizing:border-box}
+image-slot{--slot-bg:#1a1a1a}
+</style></helmet>
+
+<div style="display:flex;flex-direction:column;gap:52px;padding:44px 48px">
+
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:baseline;gap:10px">
+      <span style="font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:4px;background:var(--fg-hi);color:#111">A</span>
+      <span style="font:600 13px/1.2 system-ui;color:var(--fg-hi)">Walkthrough — the Get Started card VS Code opens after install</span>
+    </div>
+
+    <div style="width:1120px;background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.5)">
+      <div style="display:flex;align-items:center;gap:10px;height:36px;padding:0 14px;background:var(--bg2);border-bottom:1px solid var(--line)">
+        <span style="font:400 12.5px/1 system-ui;color:var(--fg-hi);padding:9px 14px;background:var(--bg);border-top:1px solid var(--accent)">Get Started · Code Verdict</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;min-height:508px">
+        <div style="padding:26px 28px;display:flex;flex-direction:column;gap:22px;border-right:1px solid var(--line)">
+          <div style="display:flex;align-items:center;gap:13px">
+            <span style="width:44px;height:44px;border-radius:10px;background:#111;border:1px solid var(--line2);display:grid;place-items:center;flex:none">
+              <span style="display:flex;align-items:center;gap:1px;font:700 17px/1 'JetBrains Mono',monospace"><span style="color:var(--fg-dimmer)">[</span><span style="color:var(--brand)">✓</span><span style="color:var(--fg-dimmer)">]</span></span>
+            </span>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <span style="font:600 17px/1.2 system-ui;color:var(--fg-max)">Code Verdict</span>
+              <span style="font:400 12px/1.4 system-ui;color:var(--fg-dim)">Judge the AI’s review, then ship it to GitLab.</span>
+            </div>
+          </div>
+
+          <div style="height:5px;border-radius:3px;background:var(--line);overflow:hidden"><span style="{{ wtBarStyle }}"></span></div>
+
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <sc-for list="{{ steps }}" as="s" hint-placeholder-count="4">
+              <div onClick="{{ s.click }}" style="{{ s.wrapStyle }}">
+                <div style="display:flex;align-items:center;gap:11px">
+                  <span style="{{ s.tickStyle }}">{{ s.tick }}</span>
+                  <span style="{{ s.titleStyle }}">{{ s.title }}</span>
+                  <span style="{{ s.timeStyle }}">{{ s.time }}</span>
+                </div>
+                <sc-if value="{{ s.open }}" hint-placeholder-val="{{ true }}">
+                  <div style="display:flex;flex-direction:column;gap:11px;padding:2px 0 4px 30px">
+                    <span style="font:400 12.5px/1.65 system-ui;color:var(--fg-dim);text-wrap:pretty">{{ s.body }}</span>
+                    <div style="display:flex;align-items:center;gap:9px">
+                      <button onClick="{{ s.done }}" style="background:var(--accent);border:none;color:#fff;border-radius:4px;padding:8px 13px;font:600 11.5px/1 system-ui;cursor:pointer" style-hover="background:var(--accent-h)">{{ s.action }}</button>
+                      <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">{{ s.command }}</span>
+                    </div>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="margin-top:auto;display:flex;align-items:center;gap:12px;font:400 11.5px/1 system-ui;color:var(--fg-dimmer)">
+            <span>{{ wtProgress }}</span>
+            <span onClick="{{ wtReset }}" style="color:var(--link);cursor:pointer">Reset</span>
+            <span style="margin-left:auto">☐ Show this after each update</span>
+          </div>
+        </div>
+
+        <div style="padding:26px 28px;display:flex;flex-direction:column;gap:14px;background:var(--bg2)">
+          <div style="position:relative;flex:1;min-height:300px;border:1px solid var(--line);border-radius:8px;overflow:hidden">
+            <image-slot id="{{ mediaSlotId }}" shape="rect" src="{{ mediaSrc }}" placeholder="Screenshot for the selected step"></image-slot>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <span style="font:600 12.5px/1.3 system-ui;color:var(--fg-hi)">{{ mediaTitle }}</span>
+            <span style="font:400 12px/1.6 system-ui;color:var(--fg-dim);text-wrap:pretty">{{ mediaCaption }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:baseline;gap:10px">
+      <span style="font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:4px;background:var(--fg-hi);color:#111">B</span>
+      <span style="font:600 13px/1.2 system-ui;color:var(--fg-hi)">Marketplace listing — hero, README body, screenshots</span>
+    </div>
+
+    <div style="width:1120px;background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.5)">
+      <div style="display:flex;gap:22px;padding:26px 28px;border-bottom:1px solid var(--line)">
+        <span style="width:112px;height:112px;border-radius:20px;background:#111;border:1px solid var(--line2);display:grid;place-items:center;flex:none">
+          <span style="display:flex;align-items:center;gap:2px;font:700 44px/1 'JetBrains Mono',monospace"><span style="color:var(--fg-dimmer)">[</span><span style="color:var(--brand)">✓</span><span style="color:var(--fg-dimmer)">]</span></span>
+        </span>
+        <div style="display:flex;flex-direction:column;gap:10px;min-width:0">
+          <div style="display:flex;align-items:baseline;gap:11px">
+            <span style="font:600 24px/1.15 system-ui;color:var(--fg-max)">Code Verdict</span>
+            <span style="font:400 12px/1 'JetBrains Mono',monospace;color:var(--fg-dim)">v0.4.1</span>
+          </div>
+          <span style="font:400 14px/1.5 system-ui;color:var(--fg);max-width:62ch;text-wrap:pretty">Judge the AI’s review, then ship it to GitLab. Run a Copilot review agent on a merge request, decide every finding, and post the ones that matter.</span>
+          <div style="display:flex;gap:16px;font:400 11.5px/1 'JetBrains Mono',monospace;color:var(--fg-dim)">
+            <span>hve-tools</span><span>GitLab · Copilot · Code review</span><span>MIT</span>
+          </div>
+          <div style="display:flex;gap:9px;padding-top:2px">
+            <button style="background:var(--accent);border:none;color:#fff;border-radius:4px;padding:9px 18px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:var(--accent-h)">Install</button>
+            <button style="background:var(--line);border:1px solid var(--line2);color:var(--fg);border-radius:4px;padding:9px 14px;font:600 12.5px/1 system-ui;cursor:pointer" style-hover="background:var(--hover)">Repository</button>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:0;padding:0 28px;border-bottom:1px solid var(--line)">
+        <sc-for list="{{ listingTabs }}" as="t" hint-placeholder-count="3"><span onClick="{{ t.click }}" style="{{ t.style }}">{{ t.label }}</span></sc-for>
+      </div>
+
+      <sc-if value="{{ tabDetails }}" hint-placeholder-val="{{ true }}">
+        <div style="padding:26px 28px;display:flex;flex-direction:column;gap:26px">
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <span style="font:600 18px/1.3 system-ui;color:var(--fg-max)">An AI review is a pile of comments. A review is a decision.</span>
+            <span style="font:400 13.5px/1.7 system-ui;color:var(--fg);max-width:78ch;text-wrap:pretty">Point a Copilot agent — your own, or one from your workspace like <code style="font-family:'JetBrains Mono',monospace;color:var(--agent)">HVE Core / PR Review</code> — at a GitLab merge request. Verdict collects its findings as reviewable items with severity, category and confidence. You work through them one at a time, deep-diving with the agent where it matters, and mark each <span style="color:var(--ok)">Accepted</span>, <span style="color:var(--sev-blocker)">Rejected</span> or <span style="color:var(--fg-dim)">Skipped</span>. Then Verdict writes the review: inline comments with applyable suggestions for what you accepted, a summary in your words, and nothing at all for what you threw out.</span>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
+            <sc-for list="{{ valueProps }}" as="v" hint-placeholder-count="3">
+              <div style="border:1px solid var(--line);border-radius:6px;padding:15px;display:flex;flex-direction:column;gap:7px">
+                <span style="{{ v.iconStyle }}">{{ v.icon }}</span>
+                <span style="font:600 13px/1.3 system-ui;color:var(--fg-hi)">{{ v.title }}</span>
+                <span style="font:400 12px/1.6 system-ui;color:var(--fg-dim);text-wrap:pretty">{{ v.body }}</span>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <span style="font:500 10px/1 system-ui;letter-spacing:.09em;text-transform:uppercase;color:var(--fg-dimmer)">Screenshots</span>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="position:relative;height:216px;border:1px solid var(--line);border-radius:6px;overflow:hidden"><image-slot id="cv-shot-triage" shape="rect" src="assets/shot-triage.png" placeholder="Triage — split view with an item open"></image-slot></div>
+                <span style="font:400 11.5px/1.5 system-ui;color:var(--fg-dim)">Every finding carries severity, category and the agent’s confidence. Accept, reject or skip — the keyboard is enough.</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="position:relative;height:216px;border:1px solid var(--line);border-radius:6px;overflow:hidden"><image-slot id="cv-shot-diff" shape="rect" src="assets/shot-diff.png" placeholder="In-diff peek widget with a suggested change"></image-slot></div>
+                <span style="font:400 11.5px/1.5 system-ui;color:var(--fg-dim)">Review in the diff, where the code is. Accept &amp; apply turns the agent’s fix into a GitLab suggestion.</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="position:relative;height:216px;border:1px solid var(--line);border-radius:6px;overflow:hidden"><image-slot id="cv-shot-dashboard" shape="rect" src="assets/shot-dashboard.png" placeholder="Pod dashboard — MRs, issues, pipelines"></image-slot></div>
+                <span style="font:400 11.5px/1.5 system-ui;color:var(--fg-dim)">Pods group the projects you watch together. One dashboard answers whose turn it is.</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="position:relative;height:216px;border:1px solid var(--line);border-radius:6px;overflow:hidden"><image-slot id="cv-shot-tuning" shape="rect" src="assets/shot-tuning.png" placeholder="Agent tuning — accept rate by category"></image-slot></div>
+                <span style="font:400 11.5px/1.5 system-ui;color:var(--fg-dim)">Your verdicts score the agent. Categories you never accept get turned off — with one click.</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <span style="font:500 10px/1 system-ui;letter-spacing:.09em;text-transform:uppercase;color:var(--fg-dimmer)">Requirements</span>
+            <sc-for list="{{ requirements }}" as="r" hint-placeholder-count="3">
+              <div style="display:flex;gap:10px;font:400 12.5px/1.6 system-ui;color:var(--fg-dim)">
+                <span style="color:var(--fg-dimmer);flex:none">·</span><span style="text-wrap:pretty">{{ r }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ tabContrib }}" hint-placeholder-val="{{ false }}">
+        <div style="padding:24px 28px;display:flex;flex-direction:column;gap:10px">
+          <span style="font:500 10px/1 system-ui;letter-spacing:.09em;text-transform:uppercase;color:var(--fg-dimmer)">Commands</span>
+          <sc-for list="{{ commandRows }}" as="c" hint-placeholder-count="8">
+            <div style="display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:14px;padding:8px 0;border-bottom:1px solid var(--row)">
+              <span style="font:400 12.5px/1.3 system-ui;color:var(--fg)">{{ c.title }}</span>
+              <span style="font:400 11.5px/1.3 'JetBrains Mono',monospace;color:var(--fg-dimmer)">{{ c.id }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ tabChangelog }}" hint-placeholder-val="{{ false }}">
+        <div style="padding:24px 28px;display:flex;flex-direction:column;gap:16px">
+          <sc-for list="{{ changelog }}" as="c" hint-placeholder-count="3">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <div style="display:flex;align-items:baseline;gap:10px">
+                <span style="font:600 13px/1 'JetBrains Mono',monospace;color:var(--fg-hi)">{{ c.version }}</span>
+                <span style="font:400 11px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">{{ c.date }}</span>
+              </div>
+              <sc-for list="{{ c.lines }}" as="l" hint-placeholder-count="3">
+                <span style="font:400 12.5px/1.6 system-ui;color:var(--fg-dim);padding-left:2px">— {{ l }}</span>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:baseline;gap:10px">
+      <span style="font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:4px;background:var(--fg-hi);color:#111">C</span>
+      <span style="font:600 13px/1.2 system-ui;color:var(--fg-hi)">Icon — a bracketed check: a verdict rendered in code</span>
+    </div>
+
+    <div style="width:1120px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:26px 28px;display:flex;flex-direction:column;gap:24px">
+      <div style="display:flex;align-items:flex-end;gap:30px;flex-wrap:wrap">
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:128px;height:128px;border-radius:24px;background:#111;border:1px solid var(--line2);display:grid;place-items:center">
+            <span style="display:flex;align-items:center;gap:3px;font:700 50px/1 'JetBrains Mono',monospace"><span style="color:var(--fg-dimmer)">[</span><span style="color:var(--brand)">✓</span><span style="color:var(--fg-dimmer)">]</span></span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">128 · marketplace</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:64px;height:64px;border-radius:13px;background:#111;border:1px solid var(--line2);display:grid;place-items:center">
+            <span style="display:flex;align-items:center;gap:2px;font:700 25px/1 'JetBrains Mono',monospace"><span style="color:var(--fg-dimmer)">[</span><span style="color:var(--brand)">✓</span><span style="color:var(--fg-dimmer)">]</span></span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">64</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:32px;height:32px;border-radius:7px;background:#111;border:1px solid var(--line2);display:grid;place-items:center">
+            <span style="display:flex;align-items:center;gap:1px;font:700 13px/1 'JetBrains Mono',monospace"><span style="color:var(--fg-dimmer)">[</span><span style="color:var(--brand)">✓</span><span style="color:var(--fg-dimmer)">]</span></span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">32</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:24px;height:24px;border-radius:5px;background:var(--brand);display:grid;place-items:center">
+            <span style="font:700 13px/1 'JetBrains Mono',monospace;color:#fff">✓</span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">24 · activity bar</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:64px;height:64px;border-radius:13px;background:#f3f3f3;border:1px solid #cecece;display:grid;place-items:center">
+            <span style="display:flex;align-items:center;gap:2px;font:700 25px/1 'JetBrains Mono',monospace"><span style="color:#8b8b8b">[</span><span style="color:#b8341d">✓</span><span style="color:#8b8b8b">]</span></span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">light theme</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;align-items:center">
+          <span style="width:64px;height:64px;border-radius:13px;background:#111;border:1px solid var(--line2);display:grid;place-items:center">
+            <span style="display:flex;align-items:center;gap:2px;font:700 25px/1 'JetBrains Mono',monospace;color:var(--fg-hi)">[✓]</span>
+          </span>
+          <span style="font:400 10.5px/1 'JetBrains Mono',monospace;color:var(--fg-dimmer)">monochrome</span>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:26px;flex-wrap:wrap">
+        <span style="font:400 12.5px/1.7 system-ui;color:var(--fg-dim);max-width:56ch;text-wrap:pretty">The mark is typographic, not illustrative: square brackets — the punctuation of code — closing around a check. It reads as approval *inside* source, which is the whole product. At 24px the brackets drop away and the check goes solid on brand orange, so the activity bar stays legible.</span>
+        <span style="font:400 12.5px/1.7 system-ui;color:var(--fg-dim);max-width:46ch;text-wrap:pretty">Ship as SVG with the glyph converted to outlines (no font dependency), plus 128px PNG for the marketplace. One-colour variant for docs and the light-theme tile darkens the accent to <code style="font-family:'JetBrains Mono',monospace">#b8341d</code> for contrast.</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1220,&quot;height&quot;:1900}}">
+const STEPS = [
+  {key:'connect', title:'Connect GitLab', time:'1 min', action:'Sign in to GitLab', command:'codeVerdict.signIn',
+   body:'Paste a personal access token with api scope. It goes into the VS Code secret store — never into settings.json, never into a dotfile you might commit.',
+   media:'assets/wt-connect.png', mediaTitle:'Step 1 · Connect', mediaCaption:'Instance URL and token, with a connection test that tells you which account and scopes you got.'},
+  {key:'pod', title:'Create a pod', time:'2 min', action:'New pod', command:'codeVerdict.newPod',
+   body:'A pod is the set of projects you watch together. Paste a project URL, a project id, or a group id — a group expands so you pick which of its projects join.',
+   media:'assets/wt-projects.png', mediaTitle:'Step 2 · Add projects', mediaCaption:'One field takes a URL, a project id or a group id; the detection line tells you what it resolved to before you commit.'},
+  {key:'run', title:'Run your first review', time:'2 min', action:'Run review', command:'codeVerdict.runReview',
+   body:'Pick any Copilot agent in your workspace and set the criteria — severity floor, categories, confidence. The agent reads the diff; you decide what ships.',
+   media:'assets/wt-triage.png', mediaTitle:'Step 3 · Triage', mediaCaption:'Findings arrive with severity, category and confidence. Accept, reject or skip each one, then Verdict writes the review.'},
+  {key:'keys', title:'Learn four keys', time:'30 sec', action:'Show shortcuts', command:'codeVerdict.showShortcuts',
+   body:'A accepts, R rejects, S skips, ? shows the rest. Triage of a twelve-item review takes about as long as reading it.',
+   media:'assets/wt-keys.png', mediaTitle:'Step 4 · Keyboard', mediaCaption:'The queue mode is built for the keyboard — the mouse is optional from the first item to submit.'}
+];
+const VALUE_PROPS = [
+  {icon:'◈', color:'var(--agent)', title:'Your agent, your rules',
+   body:'Any Copilot agent in the workspace. Criteria are yours: severity floor, nine categories including Craftsmanship, a confidence floor, and free-text instructions.'},
+  {icon:'⌘', color:'var(--accent)', title:'Triage, not reading',
+   body:'One item at a time with the code in front of you. Ask the agent to explain, propose a fix, or find the same mistake elsewhere — then decide.'},
+  {icon:'◍', color:'var(--brand)', title:'Ends in GitLab',
+   body:'Inline comments with applyable suggestions, a summary in your voice, and a thread tracker that tells you who owes whom a reply.'}
+];
+const REQUIREMENTS = [
+  'VS Code 1.90 or later, with GitHub Copilot and at least one review agent available.',
+  'A GitLab personal access token with api scope — gitlab.com or self-managed 16.x and later.',
+  'Reviews run against merge-request diffs; no repository contents are uploaded beyond what the agent requests.'
+];
+const COMMANDS = [
+  {title:'Verdict: Run review', id:'codeVerdict.runReview'},
+  {title:'Verdict: Open dashboard', id:'codeVerdict.openDashboard'},
+  {title:'Verdict: Open review', id:'codeVerdict.openReview'},
+  {title:'Verdict: Accept item', id:'codeVerdict.acceptItem'},
+  {title:'Verdict: Accept item and apply fix', id:'codeVerdict.acceptItemApplyFix'},
+  {title:'Verdict: Reject item', id:'codeVerdict.rejectItem'},
+  {title:'Verdict: Skip item', id:'codeVerdict.skipItem'},
+  {title:'Verdict: Ask agent about this item', id:'codeVerdict.askAgent'},
+  {title:'Verdict: Generate summary', id:'codeVerdict.generateSummary'},
+  {title:'Verdict: Submit review to GitLab', id:'codeVerdict.submitReview'},
+  {title:'Verdict: Select review agent', id:'codeVerdict.selectAgent'},
+  {title:'Verdict: New pod', id:'codeVerdict.newPod'},
+  {title:'Verdict: Switch pod', id:'codeVerdict.switchPod'},
+  {title:'Verdict: Add project to pod', id:'codeVerdict.addProject'}
+];
+const CHANGELOG = [
+  {version:'0.4.1', date:'2026-07-24', lines:['Posted reviews now list every merge request you reviewed in the pod.','Thread status survives a force-push: stale anchors are flagged instead of silently dropped.']},
+  {version:'0.4.0', date:'2026-07-11', lines:['Agent tuning: accept rate by category and confidence, with one-click criteria changes.','Craftsmanship, Concurrency, Error handling and API contract added as review categories.','Quiet hours and per-event notification modes.']},
+  {version:'0.3.2', date:'2026-06-28', lines:['Partial results are usable when an agent times out mid-run.','Submit failures keep the draft — the 401 path no longer loses your triage.']}
+];
+
+class Component extends DCLogic {
+  state = {step:0, done:{}, tab:0};
+  renderVals(){
+    const s = this.state;
+    const cur = STEPS[s.step];
+    const doneCount = Object.keys(s.done).filter(k => s.done[k]).length;
+    return {
+      steps: STEPS.map((st, i) => {
+        const open = i === s.step;
+        const isDone = !!s.done[st.key];
+        return {
+          title:st.title, body:st.body, action:st.action, command:st.command, time:st.time, open,
+          click:() => this.setState({step:i}),
+          done:(e) => {
+            if (e && e.stopPropagation) e.stopPropagation();
+            this.setState(prev => ({done: Object.assign({}, prev.done, {[st.key]:true}), step: Math.min(STEPS.length - 1, i + 1)}));
+          },
+          wrapStyle:'display:flex;flex-direction:column;gap:9px;padding:11px 13px;border-radius:6px;cursor:pointer;background:' + (open ? 'var(--bg3)' : 'transparent'),
+          tick: isDone ? '✓' : String(i + 1),
+          tickStyle:'width:20px;height:20px;border-radius:50%;display:grid;place-items:center;flex:none;font:600 10.5px/1 "JetBrains Mono",monospace;' +
+            (isDone ? 'background:var(--ok-strong);color:#fff' : open ? 'background:var(--accent);color:#fff' : 'border:1px solid var(--line2);color:var(--fg-dimmer)'),
+          titleStyle:'flex:1;font:' + (open ? '600' : '500') + ' 13px/1.3 system-ui;color:' + (isDone && !open ? 'var(--fg-dimmer)' : 'var(--fg-hi)'),
+          timeStyle:'font:400 10.5px/1 "JetBrains Mono",monospace;color:var(--fg-dimmer)'
+        };
+      }),
+      wtBarStyle:'display:block;height:100%;border-radius:3px;background:var(--ok);transition:width .25s ease;width:' + Math.round(doneCount / STEPS.length * 100) + '%',
+      wtProgress: doneCount + ' of ' + STEPS.length + ' done',
+      wtReset:() => this.setState({done:{}, step:0}),
+      mediaTitle: cur.mediaTitle, mediaCaption: cur.mediaCaption, mediaSrc: cur.media, mediaSlotId: 'cv-wt-' + cur.key,
+      listingTabs: ['Details','Feature Contributions','Changelog'].map((label, i) => ({
+        label, click:() => this.setState({tab:i}),
+        style:'padding:12px 15px;cursor:pointer;font:500 12.5px/1 system-ui;border-bottom:2px solid ' + (s.tab === i ? 'var(--accent)' : 'transparent') + ';color:' + (s.tab === i ? 'var(--fg-hi)' : 'var(--fg-dim)')
+      })),
+      tabDetails: s.tab === 0, tabContrib: s.tab === 1, tabChangelog: s.tab === 2,
+      valueProps: VALUE_PROPS.map(v => ({
+        title:v.title, body:v.body, icon:v.icon,
+        iconStyle:'font:400 15px/1 "JetBrains Mono",monospace;color:' + v.color
+      })),
+      requirements: REQUIREMENTS,
+      commandRows: COMMANDS,
+      changelog: CHANGELOG
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,402 @@
+{
+  "_comment": "Code Verdict — reference payloads for the shapes in 'Code Verdict — developer handoff.md'. Trimmed to the fields the extension reads. Build against these; they match the prototype's demo data.",
+  "agentReviewResponse": {
+    "_comment": "What a Copilot review agent must return for MR !2841. The extension validates this shape and rejects items missing file/line/severity/category/confidence. `candidates` are findings the agent produced that fell below the pod criteria — they are NOT shown as items, but they power the 'no findings above your criteria' screen.",
+    "schemaVersion": "1",
+    "agentId": "hve-core.pr-review",
+    "agentLabel": "HVE Core · PR Review",
+    "headSha": "4f19c2a7b1d3e9f0c5a8b2d4e6f7a9c1b3d5e7f9",
+    "criteria": {
+      "severityFloor": "minor",
+      "minConfidence": 70,
+      "categories": [
+        "security",
+        "concurrency",
+        "errorHandling",
+        "performance",
+        "craftsmanship",
+        "tests"
+      ],
+      "extraInstructions": "Terse. No praise. Cite the rule or CVE class. Ignore formatting — Prettier owns it."
+    },
+    "stats": {
+      "filesRead": 9,
+      "linesAdded": 284,
+      "linesRemoved": 91,
+      "durationMs": 87400
+    },
+    "items": [
+      {
+        "id": "itm_01H9Z4",
+        "file": "src/auth/token.ts",
+        "line": 63,
+        "endLine": 63,
+        "severity": "blocker",
+        "category": "security",
+        "confidence": 96,
+        "rule": "secrets/no-credential-logging",
+        "reference": "CWE-532",
+        "title": "Refresh token logged in error path",
+        "body": "Secret material reaches the log sink. Log shipping is not scrubbed, so the token lands in retained storage. Redact, or log only the token id.",
+        "code": "if (!res.ok) logger.error(`refresh failed ${this.refreshToken}`)",
+        "suggestion": {
+          "old": "logger.error(`refresh failed ${this.refreshToken}`)",
+          "new": "logger.error('refresh failed', { tokenId: this.tokenId })"
+        },
+        "answers": {
+          "explain": "The logger writes to stdout, which the runner ships to a 90-day retained index. A leaked refresh token is a full account takeover until rotation.",
+          "fix": "Log the opaque token id, never the token. The suggestion is line-accurate for GitLab.",
+          "similar": "Two other sites log raw credentials: src/api/client.ts:118 and src/ui/session.tsx:44.",
+          "why": "Matched rule secrets/no-credential-logging plus taint flow from this.refreshToken to a sink."
+        }
+      },
+      {
+        "id": "itm_01H9Z5",
+        "file": "src/auth/token.ts",
+        "line": 88,
+        "endLine": 89,
+        "severity": "blocker",
+        "category": "concurrency",
+        "confidence": 88,
+        "title": "Race on concurrent refresh calls",
+        "body": "Two callers can clear the guard before it is set, issuing two refreshes and invalidating the first token. Store the in-flight promise and return it.",
+        "code": "if (this.refreshing) return this.pending\nthis.refreshing = true",
+        "suggestion": {
+          "old": "if (this.refreshing) return this.pending",
+          "new": "if (this.pending) return this.pending"
+        },
+        "answers": {
+          "explain": "The guard is read and written in separate microtasks; both callers see false. Under a 401 storm every request refreshes.",
+          "fix": "Assign this.pending before the first await and return it for subsequent callers.",
+          "similar": "Same shape in src/api/client.ts:64.",
+          "why": "Interleaving detected across two await points on shared mutable state."
+        }
+      },
+      {
+        "id": "itm_01H9Z6",
+        "file": "test/auth.spec.ts",
+        "line": 12,
+        "severity": "minor",
+        "category": "tests",
+        "confidence": 74,
+        "title": "Missing test for 401 → refresh path",
+        "body": "The new interceptor branch is untested. One case asserting a single refresh and one replay would cover both blockers above.",
+        "code": "describe('token', () => { /* happy path only */ })",
+        "answers": {
+          "explain": "Coverage on token.ts dropped from 91% to 68% in this MR; the new branch is the gap.",
+          "fix": "Add a case that queues two parallel 401s and asserts exactly one POST /oauth/token.",
+          "similar": "test/api.spec.ts:88 has a mock harness you can copy.",
+          "why": "New conditional branches with no corresponding assertions in the diff."
+        }
+      }
+    ],
+    "candidates": [
+      {
+        "severity": "nit",
+        "category": "style",
+        "confidence": 62,
+        "reason": "belowSeverityFloor",
+        "count": 4
+      },
+      {
+        "severity": "minor",
+        "category": "concurrency",
+        "confidence": 51,
+        "reason": "belowConfidence",
+        "count": 19
+      }
+    ]
+  },
+  "gitlabMergeRequest": {
+    "_comment": "GET /projects/:id/merge_requests?scope=all&state=opened — fields the dashboard uses. diff_refs is what staleness detection compares against ReviewItem anchors.",
+    "id": 284101,
+    "iid": 2841,
+    "project_id": 9101,
+    "title": "Refactor token refresh",
+    "state": "opened",
+    "source_branch": "feat/auth-refresh",
+    "target_branch": "main",
+    "author": {
+      "username": "you",
+      "name": "You"
+    },
+    "reviewers": [
+      {
+        "username": "rina"
+      }
+    ],
+    "web_url": "https://gitlab.com/hve/platform/core/-/merge_requests/2841",
+    "updated_at": "2026-07-28T09:41:12.000Z",
+    "sha": "4f19c2a7b1d3e9f0c5a8b2d4e6f7a9c1b3d5e7f9",
+    "diff_refs": {
+      "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      "head_sha": "4f19c2a7b1d3e9f0c5a8b2d4e6f7a9c1b3d5e7f9",
+      "start_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+    },
+    "changes_count": "9",
+    "head_pipeline": {
+      "id": 90412,
+      "status": "success",
+      "web_url": "https://gitlab.com/hve/platform/core/-/pipelines/90412"
+    },
+    "blocking_discussions_resolved": false,
+    "detailed_merge_status": "not_approved"
+  },
+  "postDiscussionRequest": {
+    "_comment": "POST /projects/:id/merge_requests/:iid/discussions for one ACCEPTED item. `position` must carry the same diff_refs the agent read — if head_sha moved, re-anchor first or the API 400s. The ```suggestion block is what makes GitLab render an Apply button.",
+    "body": "**Refresh token logged in error path** · blocker · security · CWE-532\n\nSecret material reaches the log sink. Log shipping is not scrubbed, so the token lands in retained storage. Redact, or log only the token id.\n\n```suggestion:-0+0\nlogger.error('refresh failed', { tokenId: this.tokenId })\n```\n\n<sub>Flagged by HVE Core · PR Review (96% confidence), accepted by @you via Code Verdict.</sub>",
+    "position": {
+      "position_type": "text",
+      "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      "start_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      "head_sha": "4f19c2a7b1d3e9f0c5a8b2d4e6f7a9c1b3d5e7f9",
+      "old_path": "src/auth/token.ts",
+      "new_path": "src/auth/token.ts",
+      "new_line": 63
+    }
+  },
+  "postSummaryRequest": {
+    "_comment": "POST /projects/:id/merge_requests/:iid/notes — the summary comment, generated from the accepted set and edited by the user, with the optional final note appended. Sent after the per-line discussions succeed.",
+    "body": "**Reviewed with HVE Core / PR Review.** 2 blockers: refresh token logged in error path (token.ts:63); race on concurrent refresh calls (token.ts:88). Needs a fix before merge. 5 smaller items posted inline. 3 findings dismissed as false positives.\n\n---\n\nBoth blockers must be fixed before merge. The minor items can land in a follow-up MR — open an issue and link it here."
+  },
+  "discussionsResponse": {
+    "_comment": "GET /projects/:id/merge_requests/:iid/discussions — polled to derive thread status. Mapping: no notes after yours → awaiting; last note not yours → replied; resolved:true → resolved; position:null on a text discussion → stale (anchor dropped by a force-push).",
+    "discussions": [
+      {
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "individual_note": false,
+        "notes": [
+          {
+            "id": 771001,
+            "author": {
+              "username": "you"
+            },
+            "body": "**Refresh token logged in error path** · blocker · security · CWE-532 …",
+            "created_at": "2026-07-28T09:52:00.000Z",
+            "resolvable": true,
+            "resolved": false,
+            "position": {
+              "new_path": "src/auth/token.ts",
+              "new_line": 63,
+              "position_type": "text"
+            }
+          },
+          {
+            "id": 771044,
+            "author": {
+              "username": "kai"
+            },
+            "body": "The shipper scrubs secrets in prod, doesn't it? I'd rather keep the full token for local debugging.",
+            "created_at": "2026-07-28T11:58:00.000Z",
+            "resolvable": true,
+            "resolved": false
+          }
+        ],
+        "_derivedStatus": "replied"
+      },
+      {
+        "id": "b1946ac92492d2347c6235b4d2611184",
+        "individual_note": false,
+        "notes": [
+          {
+            "id": 771002,
+            "author": {
+              "username": "you"
+            },
+            "body": "Store the in-flight promise and return it for subsequent callers.",
+            "created_at": "2026-07-28T09:52:01.000Z",
+            "resolvable": true,
+            "resolved": true,
+            "resolved_by": {
+              "username": "kai"
+            },
+            "resolved_at": "2026-07-28T12:31:00.000Z"
+          }
+        ],
+        "_derivedStatus": "resolved",
+        "_closedBy": "fixed in 4f19c2 · @kai"
+      },
+      {
+        "id": "c3fcd3d76192e4007dfb496cca67e13b",
+        "individual_note": false,
+        "notes": [
+          {
+            "id": 771006,
+            "author": {
+              "username": "you"
+            },
+            "body": "Gate the debug banner on NODE_ENV, not a query param.",
+            "created_at": "2026-07-28T09:52:05.000Z",
+            "resolvable": true,
+            "resolved": false,
+            "position": null
+          }
+        ],
+        "_derivedStatus": "stale",
+        "_note": "position went null after a force-push — offer re-post at the new line rather than silently dropping the finding."
+      }
+    ]
+  },
+  "errorResponses": {
+    "_comment": "The five failure branches in the handoff doc, as the extension sees them.",
+    "tokenExpired": {
+      "status": 401,
+      "body": {
+        "message": "401 Unauthorized"
+      },
+      "uiBranch": "submitFailure — keep the draft, offer Reconnect / Retry"
+    },
+    "staleAnchor": {
+      "status": 400,
+      "body": {
+        "message": "400 (Bad request) \"Note position is invalid\""
+      },
+      "uiBranch": "staleAnchors — re-anchor to HEAD or re-run the agent"
+    },
+    "rateLimited": {
+      "status": 429,
+      "headers": {
+        "RateLimit-Remaining": "0",
+        "Retry-After": "38"
+      },
+      "uiBranch": "agentFailure card — retry after the given delay"
+    },
+    "agentTimeout": {
+      "source": "copilot",
+      "code": "request_timeout",
+      "afterMs": 90000,
+      "partialItems": 4,
+      "requestId": "4f19c2",
+      "uiBranch": "agentFailure — Use partial findings / Retry / switch agent"
+    },
+    "insufficientScope": {
+      "status": 403,
+      "body": {
+        "message": "403 Forbidden — insufficient_scope"
+      },
+      "uiBranch": "onboarding step 1 — token lacks api scope"
+    }
+  },
+  "changeset": {
+    "_comment": "A detected changeset: MRs across projects that ship together. Detection runs over the pod's open MRs; a detected group is a suggestion until the user opens it.",
+    "id": "cs_01H9ZK",
+    "podId": "pod_platform",
+    "name": "Key rotation, end to end",
+    "detection": "trailer",
+    "detectionDetail": "Part-of: #1180 in every description",
+    "linkedIssue": "#1180",
+    "mrs": [
+      {
+        "projectId": "9102",
+        "iid": "812",
+        "project": "hve/platform/auth-service"
+      },
+      {
+        "projectId": "9101",
+        "iid": "2841",
+        "project": "hve/platform/core"
+      },
+      {
+        "projectId": "9103",
+        "iid": "381",
+        "project": "hve/platform/api-gateway"
+      },
+      {
+        "projectId": "9210",
+        "iid": "1509",
+        "project": "hve/web/console"
+      }
+    ],
+    "mergeOrder": [
+      {
+        "iid": "812",
+        "projectId": "9102",
+        "reason": "declares the new TTL and key ids the others read"
+      },
+      {
+        "iid": "2841",
+        "projectId": "9101",
+        "reason": "consumes the schema; must land before the gateway"
+      },
+      {
+        "iid": "381",
+        "projectId": "9103",
+        "reason": "renames the response field"
+      },
+      {
+        "iid": "1509",
+        "projectId": "9210",
+        "reason": "reads the renamed field — merge last or the banner breaks"
+      }
+    ]
+  },
+  "crossRepoItem": {
+    "_comment": "A finding that cannot be produced by a single-repo review. Requires the agent to receive every member diff in one request. `spans` names each side and its role; `mrIid` is where the comment gets posted.",
+    "id": "itm_01HA01",
+    "cross": true,
+    "projectId": "9103",
+    "mrIid": "381",
+    "file": "src/routes/session.ts",
+    "line": 88,
+    "severity": "blocker",
+    "category": "apiContract",
+    "confidence": 94,
+    "title": "Response field renamed in the gateway but still read in the console",
+    "body": "The gateway renames the field in !381 while the console still reads session.expiry in !1509. Both merge green on their own and the session banner breaks the moment they are both live.",
+    "code": "return { expires_at: session.expiresAt }   // was: expiry",
+    "spans": [
+      {
+        "projectId": "9103",
+        "location": "src/routes/session.ts:88",
+        "role": "renames the field"
+      },
+      {
+        "projectId": "9210",
+        "location": "src/api/session.ts:41",
+        "role": "still reads the old name"
+      }
+    ],
+    "suggestion": {
+      "old": "const expiry = res.data.expiry",
+      "new": "const expiry = res.data.expires_at"
+    },
+    "answers": {
+      "explain": "Neither repo can see the break. The gateway contract test asserts the new name; the console test mocks the old one, so both suites pass.",
+      "fix": "Land the console rename in !1509 before the gateway merges, or ship expires_at alongside expiry for one release.",
+      "similar": "The same pair diverged on token_id in March — see !2201.",
+      "why": "Field renamed on one side of a boundary that another MR in this changeset reads."
+    }
+  },
+  "changesetSubmitPlan": {
+    "_comment": "What one changeset triage pass posts. Each accepted item goes to the MR named by mrIid; the summary goes to every member, cross-linked to the issue. On partial failure, retry only the MRs that did not take their comments.",
+    "perMrComments": [
+      {
+        "projectId": "9102",
+        "iid": "812",
+        "count": 2
+      },
+      {
+        "projectId": "9101",
+        "iid": "2841",
+        "count": 3
+      },
+      {
+        "projectId": "9103",
+        "iid": "381",
+        "count": 2
+      },
+      {
+        "projectId": "9210",
+        "iid": "1509",
+        "count": 1
+      }
+    ],
+    "summaryPostedTo": [
+      "812",
+      "2841",
+      "381",
+      "1509"
+    ],
+    "summaryFooter": "Part of changeset “Key rotation, end to end” (#1180) — reviewed together across 4 repositories with HVE Core / PR Review."
+  }
+}
