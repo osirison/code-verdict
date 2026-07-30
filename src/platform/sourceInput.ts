@@ -32,7 +32,13 @@ export function parseSourceInput(raw: string): SourceInputShape {
     } catch {
       return { shape: 'invalid' };
     }
-    let path = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, '');
+    let path: string;
+    try {
+      // User-entered input: malformed percent-encoding must not throw.
+      path = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, '');
+    } catch {
+      return { shape: 'invalid' };
+    }
     if (path === '') return { shape: 'invalid' };
 
     if (path.startsWith('groups/')) {

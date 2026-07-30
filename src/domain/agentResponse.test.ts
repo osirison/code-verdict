@@ -54,6 +54,22 @@ describe('parseAgentReviewResponse', () => {
     expect(rejected.map((r) => r.index)).toEqual([1, 2, 3, 4]);
   });
 
+  it('drops candidate buckets with unknown reasons and non-finite stats', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [],
+      candidates: [
+        { severity: 'nit', category: 'style', confidence: 60, reason: 'belowSeverityFloor', count: 4 },
+        { severity: 'nit', category: 'style', confidence: 60, reason: 'vibesOff', count: 2 },
+      ],
+      stats: { filesRead: '9', linesAdded: Infinity, linesRemoved: 91, durationMs: null },
+    });
+    expect(response.candidates).toHaveLength(1);
+    expect(response.candidates[0]?.reason).toBe('belowSeverityFloor');
+    expect(response.stats).toEqual({ filesRead: 0, linesAdded: 0, linesRemoved: 91, durationMs: 0 });
+  });
+
   it('rejects a response without headSha outright', () => {
     expect(() =>
       parseAgentReviewResponse({ schemaVersion: '1', items: [] }),

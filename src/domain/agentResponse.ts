@@ -52,6 +52,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 const SEVERITIES = new Set<string>(SEVERITY_ORDER);
 const CATEGORIES = new Set<string>(ALL_CATEGORIES);
+const CANDIDATE_REASONS = new Set<string>(['belowSeverityFloor', 'belowConfidence', 'categoryOff']);
 
 function itemRejection(raw: Record<string, unknown>): string | null {
   if (typeof raw.file !== 'string' || raw.file === '') return 'missing file';
@@ -149,6 +150,7 @@ export function parseAgentReviewResponse(rawInput: unknown): {
           CATEGORIES.has(c.category) &&
           typeof c.confidence === 'number' &&
           typeof c.reason === 'string' &&
+          CANDIDATE_REASONS.has(c.reason) &&
           typeof c.count === 'number';
         return ok
           ? [
@@ -164,12 +166,13 @@ export function parseAgentReviewResponse(rawInput: unknown): {
       })
     : [];
 
+  const finite = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
   const stats = isRecord(raw.stats)
     ? {
-        filesRead: Number(raw.stats.filesRead ?? 0),
-        linesAdded: Number(raw.stats.linesAdded ?? 0),
-        linesRemoved: Number(raw.stats.linesRemoved ?? 0),
-        durationMs: Number(raw.stats.durationMs ?? 0),
+        filesRead: finite(raw.stats.filesRead),
+        linesAdded: finite(raw.stats.linesAdded),
+        linesRemoved: finite(raw.stats.linesRemoved),
+        durationMs: finite(raw.stats.durationMs),
       }
     : undefined;
 
