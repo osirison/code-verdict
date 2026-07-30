@@ -11,7 +11,7 @@ interface PackageJson {
 }
 
 const pkg = JSON.parse(
-  readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
+  readFileSync(join(process.cwd(), 'package.json'), 'utf8'),
 ) as PackageJson;
 
 describe('package.json contributions', () => {
