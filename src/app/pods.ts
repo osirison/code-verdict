@@ -12,7 +12,9 @@ export class PodStore {
   constructor(private readonly store: KeyValueStore) {}
 
   list(): Pod[] {
-    return this.store.get<Pod[]>(PODS_KEY) ?? [];
+    // Copy: Memento may hand back its cached array, and callers must not
+    // mutate shared state behind its back.
+    return [...(this.store.get<Pod[]>(PODS_KEY) ?? [])];
   }
 
   get(id: string): Pod | undefined {
@@ -32,9 +34,8 @@ export class PodStore {
   async upsert(pod: Pod): Promise<void> {
     const pods = this.list();
     const index = pods.findIndex((p) => p.id === pod.id);
-    if (index >= 0) pods[index] = pod;
-    else pods.push(pod);
-    await this.store.update(PODS_KEY, pods);
+    const next = index >= 0 ? pods.map((p) => (p.id === pod.id ? pod : p)) : [...pods, pod];
+    await this.store.update(PODS_KEY, next);
   }
 
   async setActive(id: string): Promise<void> {

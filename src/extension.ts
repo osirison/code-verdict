@@ -32,7 +32,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const bootstrapFromDebugBypass = async (): Promise<void> => {
-    const bypass = getDebugAuthBypass();
+    const bypass = getDebugAuthBypass(context.extensionMode);
     if (!bypass) {
       void vscode.window.showWarningMessage('Verdict: the debug auth bypass is not enabled.');
       return;
@@ -51,7 +51,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const signIn = async (): Promise<void> => {
-    const bypass = getDebugAuthBypass();
+    const bypass = getDebugAuthBypass(context.extensionMode);
     const options = getSignInOptions(Boolean(bypass));
     const selected = await vscode.window.showQuickPick(options, {
       placeHolder: 'Choose how to continue',
@@ -130,9 +130,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
-  // onboarding entirely and land on a populated dashboard.
-  if (getDebugAuthBypass()) {
-    await bootstrapFromDebugBypass();
+  // onboarding entirely and land on a populated dashboard. Fire and
+  // forget — activation must not block on network I/O.
+  if (getDebugAuthBypass(context.extensionMode)) {
+    void bootstrapFromDebugBypass();
   }
 }
 

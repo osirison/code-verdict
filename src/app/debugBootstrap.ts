@@ -27,23 +27,25 @@ export async function runDebugBootstrap(
 ): Promise<Pod> {
   await secrets.store(tokenSecretKey(bypass.instanceUrl), bypass.token);
 
-  const existing = podStore.findByInstance('gitlab', bypass.instanceUrl);
-  if (existing) {
-    await podStore.setActive(existing.id);
-    return existing;
-  }
-
   const provider = getProvider('gitlab');
   const connection = provider.connect({
     instanceUrl: bypass.instanceUrl,
     token: bypass.token,
   });
 
+  // Always verify connectivity — a reused pod against a dead emulator must
+  // fail loudly here, not toast "connected" and break on the first query.
   const status = await connection.testConnection();
   if (!status.ok) {
     throw new Error(
       `Debug bootstrap could not connect to ${bypass.instanceUrl}: ${status.error?.message ?? 'unknown error'}. Is the emulator running (npm run emulator)?`,
     );
+  }
+
+  const existing = podStore.findByInstance('gitlab', bypass.instanceUrl);
+  if (existing) {
+    await podStore.setActive(existing.id);
+    return existing;
   }
 
   const sources: PodSource[] = [];

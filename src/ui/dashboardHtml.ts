@@ -50,6 +50,19 @@ export interface DashboardViewState {
   pipelines: DashboardPipelineRow[];
 }
 
+/** Script-free page for error / no-pod states, with the same strict CSP. */
+export function renderFallbackHtml(messageHtml: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';">
+<title>Verdict: Dashboard</title>
+</head>
+<body>${messageHtml}</body>
+</html>`;
+}
+
 /** The webview → extension message contract. */
 export type DashboardMessage =
   | { type: 'refresh' }

@@ -20,9 +20,12 @@ export function getDebugAuthBypass(
   const explicitInstanceUrl = env.CODE_VERDICT_DEBUG_INSTANCE_URL?.trim();
   const explicitToken = env.CODE_VERDICT_DEBUG_TOKEN?.trim();
 
-  // The bypass requires the explicit opt-in flag — NODE_ENV=development
-  // alone must never silently redirect connections to the emulator.
-  if (mode === 1 || overrideEnabled) {
+  // Both gates are required: the explicit env opt-in AND an Extension
+  // Development Host. 2 = vscode.ExtensionMode.Development (this module
+  // stays vscode-free); a packaged install (Production = 1) must never
+  // pick the bypass up from an inherited environment.
+  const inDevelopmentHost = mode === 2;
+  if (inDevelopmentHost && overrideEnabled) {
     return {
       enabled: true,
       instanceUrl: explicitInstanceUrl ?? DEFAULT_DEBUG_INSTANCE_URL,

@@ -7,7 +7,7 @@ import type { PodData } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import { getProvider } from '../platform/registry';
 import type { DashboardMessage, DashboardViewState } from './dashboardHtml';
-import { escapeHtml, renderDashboardHtml } from './dashboardHtml';
+import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboardHtml';
 
 function formatAge(iso: string, now: number): string {
   const ms = now - Date.parse(iso);
@@ -54,7 +54,10 @@ function toViewState(data: PodData, now: number): DashboardViewState {
       milestone: wi.milestone ?? '—',
       age: formatAge(wi.updatedAt, now),
     })),
-    pipelines: data.ciRuns.slice(0, 3).map((run) => ({
+    pipelines: [...data.ciRuns]
+      .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+      .slice(0, 3)
+      .map((run) => ({
       id: run.id,
       status: run.status,
       ref: run.ref ?? '',
@@ -87,12 +90,16 @@ export class DashboardPanel {
     await DashboardPanel.current?.refresh();
   }
 
+  private disposed = false;
+  private refreshSeq = 0;
+
   private constructor(
     private readonly panel: vscode.WebviewPanel,
     private readonly podStore: PodStore,
     private readonly secrets: SecretStore,
   ) {
     panel.onDidDispose(() => {
+      this.disposed = true;
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
     panel.webview.onDidReceiveMessage((message: DashboardMessage) => {
@@ -110,19 +117,33 @@ export class DashboardPanel {
   }
 
   async refresh(): Promise<void> {
+    // Guard both races: writes after the panel is disposed throw, and a
+    // slow older fetch must never repaint over a newer one (e.g. after a
+    // pod switch — the screen would contradict the active pod).
+    const seq = ++this.refreshSeq;
+    const canRender = (): boolean => !this.disposed && seq === this.refreshSeq;
+
     const pod = this.podStore.activePod;
     if (!pod) {
-      this.panel.webview.html = '<p>No pod configured. Run "Verdict: Sign in to GitLab" first.</p>';
+      if (canRender()) {
+        this.panel.webview.html = renderFallbackHtml(
+          '<p>No pod configured. Run "Verdict: Sign in to GitLab" first.</p>',
+        );
+      }
       return;
     }
     try {
       const connection = await connectionForPod(pod, this.secrets);
       const data = await fetchPodData(connection, pod, Date.now());
+      if (!canRender()) return;
       const nonce = crypto.randomBytes(16).toString('hex');
       this.panel.webview.html = renderDashboardHtml(toViewState(data, Date.now()), nonce);
     } catch (e) {
+      if (!canRender()) return;
       const message = escapeHtml(e instanceof Error ? e.message : String(e));
-      this.panel.webview.html = `<p>Could not load the pod: ${message}</p><p>Is the emulator running? (<code>npm run emulator</code>)</p>`;
+      this.panel.webview.html = renderFallbackHtml(
+        `<p>Could not load the pod: ${message}</p><p>Is the emulator running? (<code>npm run emulator</code>)</p>`,
+      );
     }
   }
 }

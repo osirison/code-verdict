@@ -32,15 +32,18 @@ export class VerdictSidebarProvider implements vscode.TreeDataProvider<NavRow> {
 
   getChildren(): NavRow[] {
     const pod = this.podStore.activePod;
-    const rows: NavRow[] = [];
-    if (pod) {
-      rows.push({
+    // No pod → empty tree, which is what lets the contributed viewsWelcome
+    // ("Sign in to GitLab") render. Nav rows appear once connected, per
+    // the spec's onboarding sidebar behaviour.
+    if (!pod) return [];
+    const rows: NavRow[] = [
+      {
         label: pod.name,
         icon: 'organization',
         description: `${repoIdsOf(pod).length} projects`,
         command: COMMANDS.switchPod,
-      });
-    }
+      },
+    ];
     rows.push(
       { label: 'Pod dashboard', icon: 'dashboard', command: COMMANDS.openDashboard },
       { label: 'Posted reviews', icon: 'comment-discussion', command: COMMANDS.openReview },
