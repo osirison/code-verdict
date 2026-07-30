@@ -11,6 +11,14 @@ export interface Criteria {
 
 export const SEVERITY_ORDER: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
 
+/** Spec defaults: minor floor, 70% confidence, the six default categories. */
+export const DEFAULT_CRITERIA: Criteria = {
+  severityFloor: 'minor',
+  categories: ['security', 'concurrency', 'errorHandling', 'performance', 'craftsmanship', 'tests'],
+  minConfidence: 70,
+  extraInstructions: '',
+};
+
 export function severityAtLeast(severity: Severity, floor: Severity): boolean {
   return SEVERITY_ORDER.indexOf(severity) >= SEVERITY_ORDER.indexOf(floor);
 }
