@@ -1,0 +1,12 @@
+.github/**
+.gitignore
+.vscodeignore
+docs/**
+spec/**
+src/**
+node_modules/**
+eslint.config.mjs
+tsconfig.json
+vitest.config.ts
+**/*.map
+**/*.test.ts

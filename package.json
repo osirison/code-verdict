@@ -1,0 +1,157 @@
+{
+  "name": "code-verdict",
+  "displayName": "Code Verdict",
+  "description": "Judge the AI's review, then ship it to GitLab.",
+  "version": "0.0.1",
+  "publisher": "osirison",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/osirison/code-verdict.git"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "codeVerdict.runReview", "title": "Verdict: Run review" },
+      { "command": "codeVerdict.openDashboard", "title": "Verdict: Open dashboard" },
+      { "command": "codeVerdict.openReview", "title": "Verdict: Open review" },
+      { "command": "codeVerdict.nextItem", "title": "Verdict: Next item" },
+      { "command": "codeVerdict.prevItem", "title": "Verdict: Previous item" },
+      { "command": "codeVerdict.acceptItem", "title": "Verdict: Accept item" },
+      { "command": "codeVerdict.acceptItemApplyFix", "title": "Verdict: Accept item and apply fix" },
+      { "command": "codeVerdict.rejectItem", "title": "Verdict: Reject item" },
+      { "command": "codeVerdict.skipItem", "title": "Verdict: Skip item" },
+      { "command": "codeVerdict.askAgent", "title": "Verdict: Ask agent about this item" },
+      { "command": "codeVerdict.generateSummary", "title": "Verdict: Generate summary" },
+      { "command": "codeVerdict.submitReview", "title": "Verdict: Submit review to GitLab" },
+      { "command": "codeVerdict.selectAgent", "title": "Verdict: Select review agent" },
+      { "command": "codeVerdict.editCriteria", "title": "Verdict: Edit review criteria" },
+      { "command": "codeVerdict.newPod", "title": "Verdict: New pod" },
+      { "command": "codeVerdict.switchPod", "title": "Verdict: Switch pod" },
+      { "command": "codeVerdict.addProject", "title": "Verdict: Add project to pod" },
+      { "command": "codeVerdict.refresh", "title": "Verdict: Refresh" },
+      { "command": "codeVerdict.signIn", "title": "Verdict: Sign in to GitLab" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "verdict",
+          "title": "Verdict",
+          "icon": "media/verdict.svg"
+        }
+      ]
+    },
+    "views": {
+      "verdict": [
+        {
+          "id": "codeVerdict.sidebar",
+          "name": "Verdict"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "codeVerdict.sidebar",
+        "contents": "Judge the AI's review, then ship it to GitLab.\n[Sign in to GitLab](command:codeVerdict.signIn)"
+      }
+    ],
+    "configuration": {
+      "title": "Code Verdict",
+      "properties": {
+        "codeVerdict.instanceUrl": {
+          "type": "string",
+          "default": "https://gitlab.com",
+          "description": "Base URL of the GitLab instance. The access token is never a setting — it lives in the VS Code secret store."
+        },
+        "codeVerdict.agent": {
+          "type": "string",
+          "default": "",
+          "description": "Id of the Copilot workspace agent used for reviews."
+        },
+        "codeVerdict.severityFloor": {
+          "type": "string",
+          "enum": ["nit", "minor", "major", "blocker"],
+          "default": "minor",
+          "description": "Report findings at or above this severity."
+        },
+        "codeVerdict.categories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["security", "concurrency", "errorHandling", "performance", "craftsmanship", "apiContract", "tests", "docs", "style"]
+          },
+          "default": ["security", "concurrency", "errorHandling", "performance", "craftsmanship", "tests"],
+          "description": "Review categories the agent looks for."
+        },
+        "codeVerdict.minConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 70,
+          "description": "Minimum agent confidence for a finding to be reported."
+        },
+        "codeVerdict.extraInstructions": {
+          "type": "string",
+          "default": "",
+          "description": "Free-text instructions appended to every review request."
+        },
+        "codeVerdict.autoAdvance": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a verdict, advance to the next undecided item."
+        },
+        "codeVerdict.agentVoice": {
+          "type": "string",
+          "enum": ["terse", "explanatory", "blunt"],
+          "default": "terse",
+          "description": "Voice of the generated summary comment."
+        },
+        "codeVerdict.notifications.quietMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Quiet hours: demote everything except blockers and direct mentions."
+        },
+        "codeVerdict.changesets.trailer": {
+          "type": "string",
+          "default": "Part-of:",
+          "description": "Commit-message / MR-description trailer used to detect changesets. Branch-name matching is the fallback."
+        },
+        "codeVerdict.pods": {
+          "type": "array",
+          "default": [],
+          "description": "Pods (named sets of watched projects). Managed by the extension; edit through the UI."
+        }
+      }
+    },
+    "keybindings": [
+      { "command": "codeVerdict.acceptItem", "key": "a", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.rejectItem", "key": "r", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.skipItem", "key": "s", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.nextItem", "key": "j", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.prevItem", "key": "k", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.askAgent", "key": "ctrl+enter", "mac": "cmd+enter", "when": "verdict.reviewFocus" }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --sourcemap",
+    "watch": "npm run build -- --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "~1.96.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.19.0",
+    "vitest": "^3.0.0"
+  }
+}
