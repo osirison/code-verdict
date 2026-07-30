@@ -91,7 +91,7 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
   },
 ];
 
-const TOKEN_TS_DIFF = `@@ -58,12 +58,14 @@ export class TokenStore {
+const TOKEN_TS_DIFF = `@@ -60,6 +60,6 @@ export class TokenStore {
    async refresh(): Promise<void> {
      const res = await this.client.post('/oauth/token', this.grant)
      if (!res.ok) {
@@ -99,7 +99,7 @@ const TOKEN_TS_DIFF = `@@ -58,12 +58,14 @@ export class TokenStore {
 +      logger.error(\`refresh failed \${this.refreshToken}\`)
        throw new RefreshError(res.status)
      }
-@@ -84,8 +86,9 @@ export class TokenStore {
+@@ -86,2 +86,3 @@ export class TokenStore {
 -    if (this.refreshing) return this.pending
 -    this.refreshing = true
 +    if (this.refreshing) return this.pending
@@ -116,7 +116,7 @@ export const DIFFS: ChangeRequestDiff[] = [
       {
         oldPath: 'test/auth.spec.ts',
         newPath: 'test/auth.spec.ts',
-        diff: `@@ -10,4 +10,6 @@\n describe('token', () => { /* happy path only */ })\n`,
+        diff: `@@ -10,1 +10,2 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n`,
       },
     ],
     anchorRefs: DIFF_REFS,

@@ -1,7 +1,11 @@
 .github/**
 .gitignore
+.vscode/**
 .vscodeignore
+dist/emulator.cjs
+dist/emulator.cjs.map
 docs/**
+emulator/**
 spec/**
 src/**
 node_modules/**
