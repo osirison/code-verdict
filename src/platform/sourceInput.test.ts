@@ -43,4 +43,8 @@ describe('parseSourceInput (handoff §4)', () => {
     expect(parseSourceInput('what is this')).toEqual({ shape: 'invalid' });
     expect(parseSourceInput('https://')).toEqual({ shape: 'invalid' });
   });
+
+  it('survives malformed percent-encoding instead of throwing', () => {
+    expect(parseSourceInput('https://gitlab.com/hve/%E0%A4%A')).toEqual({ shape: 'invalid' });
+  });
 });
