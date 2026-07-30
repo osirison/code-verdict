@@ -7,7 +7,13 @@
       "request": "launch",
       "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
-      "preLaunchTask": "build"
+      "preLaunchTask": "build",
+      "env": {
+        "NODE_ENV": "development",
+        "VERDICT_DEBUG_AUTH_BYPASS": "1",
+        "CODE_VERDICT_DEBUG_INSTANCE_URL": "http://127.0.0.1:8971",
+        "CODE_VERDICT_DEBUG_TOKEN": "glpat-emulator"
+      }
     },
     {
       "name": "Run Extension + GitLab emulator",
@@ -15,7 +21,13 @@
       "request": "launch",
       "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
-      "preLaunchTask": "build-and-emulator"
+      "preLaunchTask": "build-and-emulator",
+      "env": {
+        "NODE_ENV": "development",
+        "VERDICT_DEBUG_AUTH_BYPASS": "1",
+        "CODE_VERDICT_DEBUG_INSTANCE_URL": "http://127.0.0.1:8971",
+        "CODE_VERDICT_DEBUG_TOKEN": "glpat-emulator"
+      }
     }
   ]
 }

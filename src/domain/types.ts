@@ -47,6 +47,10 @@ export interface Pod {
   /** Per pod, not per change request. */
   criteria: Criteria;
   agentId: string;
+  /** Repository snapshot (id/path/name) taken when sources were resolved. */
+  repos?: Array<{ id: string; path: string; name: string }>;
+  /** Signed-in username at connection time — drives "waiting on you". */
+  username?: string;
 }
 
 export interface ReviewItem {
