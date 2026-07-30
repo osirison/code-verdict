@@ -23,7 +23,10 @@ export function mapGitLabError(status: number, message: string, headers?: Header
     return new ScmError('notFound', message || '404 Not Found', { status });
   }
   if (status === 429) {
-    const retryAfter = Number(headers?.get('Retry-After'));
+    // Number(null) === 0 — an absent header must map to undefined, not an
+    // immediate-retry delay of 0.
+    const raw = headers?.get('Retry-After');
+    const retryAfter = raw == null || raw.trim() === '' ? NaN : Number(raw);
     return new ScmError('rateLimited', message || '429 Too Many Requests', {
       status,
       retryAfterSeconds: Number.isFinite(retryAfter) ? retryAfter : undefined,

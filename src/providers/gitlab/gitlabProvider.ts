@@ -24,8 +24,7 @@ import type {
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
-import type { ScmError } from '../../platform/errors';
-import { isScmError, toScmError } from '../../platform/errors';
+import { ScmError, isScmError, toScmError } from '../../platform/errors';
 import { parseSourceInput } from '../../platform/sourceInput';
 import type { FetchLike } from './http';
 import { GitLabHttp, encodeRepoId } from './http';
@@ -45,6 +44,7 @@ import {
   toChangeRequest,
   toChangeRequestDiff,
   toCiRun,
+  toCiStatus,
   toRepoGroup,
   toRepository,
   toReviewThread,
@@ -54,10 +54,9 @@ import {
 const CAPABILITIES: ProviderCapabilities = {
   suggestions: true,
   approvals: true,
-  // GitLab has no REST endpoint equivalent to GitHub's REQUEST_CHANGES
-  // review event; the summary comment carries the ask instead. The UI hides
-  // the toggle off this flag.
-  requestChanges: false,
+  // REST has no equivalent, but the GraphQL mutation
+  // mergeRequestUpdateReviewerState(state: REQUESTED_CHANGES) does it.
+  requestChanges: true,
   threadResolution: true,
   groupHierarchy: true,
   // Batched review would use the draft-notes API — not in v1.
@@ -176,6 +175,7 @@ export class GitLabConnection implements Connection {
     // One group-level query fills the chooser's open-MR counts — never one
     // request per project.
     const counts = new Map<string, number>();
+    let countsKnown = true;
     try {
       const mrs = await this.http.getAll<{ project_id: number }>(
         `/groups/${encodeRepoId(groupId)}/merge_requests`,
@@ -186,11 +186,13 @@ export class GitLabConnection implements Connection {
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     } catch {
-      // Counts are decoration; the chooser works without them.
+      // Counts are decoration; the chooser works without them — but a
+      // failed query must read as unknown, not as a confident zero.
+      countsKnown = false;
     }
     return projects.map((p) => ({
       ...toRepository(p),
-      openChangeRequestCount: counts.get(String(p.id)) ?? 0,
+      openChangeRequestCount: countsKnown ? (counts.get(String(p.id)) ?? 0) : undefined,
     }));
   }
 
@@ -200,14 +202,45 @@ export class GitLabConnection implements Connection {
 
   async listOpenChangeRequests(repoIds: readonly string[]): Promise<ChangeRequest[]> {
     const perRepo = await Promise.all(
-      repoIds.map((repoId) =>
-        this.http.getAll<GlMergeRequest>(`/projects/${encodeRepoId(repoId)}/merge_requests`, {
-          state: 'opened',
-          scope: 'all',
-        }),
-      ),
+      repoIds.map(async (repoId) => {
+        const mrs = await this.http.getAll<GlMergeRequest>(
+          `/projects/${encodeRepoId(repoId)}/merge_requests`,
+          { state: 'opened', scope: 'all' },
+        );
+        if (mrs.length === 0) return [];
+        // The list endpoint omits head_pipeline (single-MR only), so CI
+        // status is joined from one per-project pipelines query by SHA —
+        // still never one request per MR.
+        const bySha = new Map<string, GlPipelineRef>();
+        try {
+          const pipelines = await this.http.get<GlPipelineRef[]>(
+            `/projects/${encodeRepoId(repoId)}/pipelines`,
+            { per_page: 100 },
+          );
+          // Newest first — keep the first (latest) pipeline per SHA.
+          for (const p of pipelines) {
+            if (p.sha && !bySha.has(p.sha)) bySha.set(p.sha, p);
+          }
+        } catch {
+          // CI status stays unknown; the rest of the row is unaffected.
+        }
+        return mrs.map((mr) => {
+          const cr = toChangeRequest(mr);
+          if (!cr.ci) {
+            const pipeline = bySha.get(cr.headSha);
+            if (pipeline) {
+              cr.ci = {
+                runId: String(pipeline.id),
+                status: toCiStatus(pipeline.status),
+                webUrl: pipeline.web_url,
+              };
+            }
+          }
+          return cr;
+        });
+      }),
     );
-    return perRepo.flat().map(toChangeRequest);
+    return perRepo.flat();
   }
 
   async listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]> {
@@ -286,7 +319,35 @@ export class GitLabConnection implements Connection {
         result.approvalError = toScmError(e);
       }
     }
+
+    if (submission.requestChanges && allOk && result.summaryError === undefined) {
+      try {
+        await this.requestChanges(ref);
+        result.requestChangesApplied = true;
+      } catch (e) {
+        result.requestChangesError = toScmError(e);
+      }
+    }
     return result;
+  }
+
+  /** No REST surface for this — GraphQL is the sanctioned equivalent. */
+  private async requestChanges(ref: ChangeRequestRef): Promise<void> {
+    const repo = await this.getRepository(ref.repoId);
+    const data = await this.http.graphql<{
+      mergeRequestUpdateReviewerState: { errors: string[] } | null;
+    }>(
+      `mutation($projectPath: ID!, $iid: String!) {
+        mergeRequestUpdateReviewerState(
+          input: { projectPath: $projectPath, iid: $iid, state: REQUESTED_CHANGES }
+        ) { errors }
+      }`,
+      { projectPath: repo.path, iid: ref.number },
+    );
+    const errors = data.mergeRequestUpdateReviewerState?.errors ?? [];
+    if (errors.length > 0) {
+      throw new ScmError('unknown', `Request changes failed: ${errors.join('; ')}`);
+    }
   }
 
   async listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]> {

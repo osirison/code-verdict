@@ -22,6 +22,11 @@ describe('mapGitLabError (errorResponses fixtures)', () => {
   it('does not treat other 400s as stale anchors', () => {
     expect(mapGitLabError(400, 'something else entirely').kind).toBe('unknown');
   });
+
+  it('leaves retryAfterSeconds undefined when the header is absent or empty', () => {
+    expect(mapGitLabError(429, '', { get: () => null }).retryAfterSeconds).toBeUndefined();
+    expect(mapGitLabError(429, '', { get: () => '' }).retryAfterSeconds).toBeUndefined();
+  });
 });
 
 describe('outbound payloads reproduce the postDiscussionRequest fixture', () => {
@@ -52,6 +57,16 @@ describe('outbound payloads reproduce the postDiscussionRequest fixture', () => 
       refs: mr.diff_refs,
     });
     expect(position).toEqual(reference.position);
+  });
+
+  it('extends the suggestion span for multi-line anchors', () => {
+    const body = buildCommentBody({
+      key: 'itm_01H9Z5',
+      body: 'Race on concurrent refresh calls.',
+      suggestion: { old: 'if (this.refreshing) return this.pending', new: 'if (this.pending) return this.pending' },
+      anchor: { filePath: 'src/auth/token.ts', line: 88, endLine: 89, refs: {} },
+    });
+    expect(body).toContain('```suggestion:-0+1\n');
   });
 
   it('rejects anchors that do not carry GitLab diff_refs', () => {
@@ -92,8 +107,42 @@ describe('pagination', () => {
   });
 });
 
+describe('CI status join', () => {
+  it('fills ChangeRequest.ci from the per-project pipelines query, not the list payload', async () => {
+    // The fake's list route strips head_pipeline (as real GitLab does), so a
+    // populated ci proves the SHA join against /pipelines.
+    const conn = createGitLabProvider(makeFakeGitLabFetch()).connect({
+      instanceUrl: 'https://gitlab.example',
+      token: 'glpat-test',
+    });
+    const [cr] = await conn.listOpenChangeRequests(['9101']);
+    expect(cr?.ci).toEqual({
+      runId: '90412',
+      status: 'success',
+      webUrl: 'https://gitlab.example/hve/platform/core/-/pipelines/90412',
+    });
+  });
+});
+
 describe('submitReview against the fake instance', () => {
   const CONFIG = { instanceUrl: 'https://gitlab.example', token: 'glpat-test' };
+
+  it('requests changes through the GraphQL reviewer-state mutation', async () => {
+    const conn = createGitLabProvider(makeFakeGitLabFetch()).connect(CONFIG);
+    const refs = (fixtures.gitlabMergeRequest as { diff_refs: unknown }).diff_refs;
+    const result = await conn.submitReview(
+      { repoId: '9101', number: '2841' },
+      {
+        comments: [{ key: 'a', body: 'x', anchor: { filePath: 'src/auth/token.ts', line: 63, refs } }],
+        summary: 'Summary.',
+        requestChanges: true,
+      },
+    );
+    expect(result.comments[0]?.ok).toBe(true);
+    expect(result.summaryPosted).toBe(true);
+    expect(result.requestChangesApplied).toBe(true);
+    expect(result.approvalApplied).toBeUndefined();
+  });
 
   it('aborts the remaining batch after an auth failure instead of hammering', async () => {
     let calls = 0;

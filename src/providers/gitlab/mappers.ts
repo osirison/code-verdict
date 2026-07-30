@@ -46,6 +46,7 @@ export interface GlPipelineRef {
   status: string;
   web_url?: string;
   ref?: string;
+  sha?: string;
   created_at?: string;
 }
 
@@ -278,7 +279,11 @@ export function toReviewThread(d: GlDiscussion, crRef: ChangeRequestRef): Review
 export function buildCommentBody(draft: ReviewCommentDraft): string {
   const parts = [draft.body];
   if (draft.suggestion) {
-    parts.push(`\`\`\`suggestion:-0+0\n${draft.suggestion.new}\n\`\`\``);
+    // A multi-line anchor extends the replacement span below the anchored
+    // line; single-line anchors keep the spec's `-0+0` form.
+    const { line, endLine } = draft.anchor;
+    const span = endLine !== undefined && endLine > line ? endLine - line : 0;
+    parts.push(`\`\`\`suggestion:-0+${span}\n${draft.suggestion.new}\n\`\`\``);
   }
   if (draft.footer) parts.push(draft.footer);
   return parts.join('\n\n');

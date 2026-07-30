@@ -46,6 +46,9 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
     const page = Number(parsed.searchParams.get('page') ?? '1');
     const route = `${method} ${path}`;
 
+    if (route === 'POST /api/graphql') {
+      return json(200, { data: { mergeRequestUpdateReviewerState: { errors: [] } } });
+    }
     if (route === 'GET /api/v4/user') return json(200, { username: 'you', name: 'You' });
     if (route === 'GET /api/v4/personal_access_tokens/self') {
       return json(200, { scopes: ['api'], expires_at: '2026-09-10' });
@@ -96,7 +99,27 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
     if (route === `POST ${mrBase}/notes`) return json(201, { id: 2 });
     if (route === `POST ${mrBase}/approve`) return json(201, {});
 
-    if (route === 'GET /api/v4/projects/9101/merge_requests') return json(200, [mr]);
+    // The real list endpoint omits head_pipeline / changes_count / diff_refs
+    // (single-MR-only fields) — serve the honest list shape so the provider
+    // cannot silently depend on them.
+    if (route === 'GET /api/v4/projects/9101/merge_requests') {
+      const listShaped = { ...mr };
+      delete listShaped.head_pipeline;
+      delete listShaped.changes_count;
+      delete listShaped.diff_refs;
+      return json(200, [listShaped]);
+    }
+    if (route === 'GET /api/v4/projects/9101/pipelines') {
+      return json(200, [
+        {
+          id: 90412,
+          status: 'success',
+          sha: diffRefs.head_sha,
+          ref: 'feat/auth-refresh',
+          web_url: 'https://gitlab.example/hve/platform/core/-/pipelines/90412',
+        },
+      ]);
+    }
     if (method === 'GET' && /^\/api\/v4\/projects\/[^/]+\/merge_requests$/.test(path)) {
       return json(200, []);
     }

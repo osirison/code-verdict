@@ -52,7 +52,9 @@ export class GitLabHttp {
       if (qs !== '') url += `?${qs}`;
     }
 
-    const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token };
+    // Bearer works for both personal access tokens and OAuth tokens;
+    // PRIVATE-TOKEN would reject the OAuth case.
+    const headers: Record<string, string> = { Authorization: `Bearer ${this.token}` };
     let body: string | undefined;
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -103,20 +105,56 @@ export class GitLabHttp {
   put<T>(path: string, body?: unknown, query?: Query): Promise<T> {
     return this.request<T>('PUT', path, { body, query });
   }
+
+  /**
+   * GraphQL endpoint (`/api/graphql`, outside the v4 prefix) — used where
+   * REST has no equivalent (e.g. requesting changes on a merge request).
+   * GraphQL-level errors are thrown as ScmError('unknown').
+   */
+  async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    let res: FetchResponseLike;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/graphql`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (e) {
+      throw new ScmError('network', `Network error reaching ${this.baseUrl}`, { cause: e });
+    }
+    if (!res.ok) {
+      throw mapGitLabError(res.status, await readErrorMessage(res), res.headers);
+    }
+    const payload = (await res.json()) as { data?: T; errors?: Array<{ message?: string }> };
+    if (payload.errors && payload.errors.length > 0) {
+      throw new ScmError('unknown', payload.errors.map((e) => e.message ?? 'GraphQL error').join('; '));
+    }
+    if (payload.data === undefined) {
+      throw new ScmError('unknown', 'GraphQL response carried no data');
+    }
+    return payload.data;
+  }
 }
 
 async function readErrorMessage(res: FetchResponseLike): Promise<string> {
+  // Read the body exactly once — with real fetch, a failed json() consumes
+  // the stream and a text() fallback would throw "Body is unusable".
+  let raw: string;
   try {
-    const parsed = (await res.json()) as { message?: unknown; error?: unknown };
+    raw = await res.text();
+  } catch {
+    return '';
+  }
+  try {
+    const parsed = JSON.parse(raw) as { message?: unknown; error?: unknown };
     if (typeof parsed.message === 'string') return parsed.message;
     if (typeof parsed.error === 'string') return parsed.error;
     return JSON.stringify(parsed);
   } catch {
-    try {
-      return await res.text();
-    } catch {
-      return '';
-    }
+    return raw;
   }
 }
 
