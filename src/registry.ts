@@ -4,8 +4,12 @@
  */
 import { registerProvider, listProviders } from './platform/registry';
 import { fixtureProvider } from './providers/fixture/fixtureProvider';
+import { gitlabProvider } from './providers/gitlab/gitlabProvider';
 
 export function registerBuiltInProviders(): void {
-  if (listProviders().some((p) => p.id === fixtureProvider.id)) return;
-  registerProvider(fixtureProvider);
+  for (const provider of [gitlabProvider, fixtureProvider]) {
+    if (!listProviders().some((p) => p.id === provider.id)) {
+      registerProvider(provider);
+    }
+  }
 }
