@@ -1,7 +1,9 @@
 .github/**
 .gitignore
+.vscode/**
 .vscodeignore
 docs/**
+emulator/**
 spec/**
 src/**
 node_modules/**

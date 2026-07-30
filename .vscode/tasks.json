@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent" }
+    },
+    {
+      "label": "emulator",
+      "type": "shell",
+      "command": "npm run emulator",
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": {
+        "pattern": { "regexp": "^ERROR: (.*)$", "message": 1 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "GitLab emulator starting",
+          "endsPattern": "GitLab emulator listening on"
+        }
+      }
+    },
+    {
+      "label": "build-and-emulator",
+      "dependsOn": ["build", "emulator"],
+      "dependsOrder": "sequence"
+    }
+  ]
+}

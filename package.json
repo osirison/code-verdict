@@ -142,8 +142,9 @@
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --sourcemap",
     "watch": "npm run build -- --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src",
-    "test": "vitest run"
+    "lint": "eslint src emulator",
+    "test": "vitest run",
+    "emulator": "esbuild emulator/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/emulator.cjs --log-level=warning && node dist/emulator.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
