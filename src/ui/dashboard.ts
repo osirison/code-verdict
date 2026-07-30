@@ -63,12 +63,10 @@ export class DashboardPanel {
           );
           break;
         case 'openCr':
-          if (message.submitted) {
-            void vscode.commands.executeCommand(COMMANDS.openReview);
+          if (this.deps.openCr) {
+            this.deps.openCr({ repoId: message.repoId, number: message.number }, message.submitted);
           } else {
-            void vscode.window.showInformationMessage(
-              `Verdict: running a review on ${message.number} arrives with issue #9 (agent integration).`,
-            );
+            void vscode.commands.executeCommand(COMMANDS.openReview);
           }
           break;
       }

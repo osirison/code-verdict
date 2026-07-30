@@ -2,24 +2,52 @@ import * as vscode from 'vscode';
 import { ALL_COMMAND_IDS, COMMANDS } from './commands';
 import { runDebugBootstrap } from './app/debugBootstrap';
 import { PodStore } from './app/pods';
+import { ReviewHistory } from './app/reviewHistory';
 import { tokenSecretKey } from './app/storage';
 import { getDebugAuthBypass } from './debugAuth';
 import { getProvider } from './platform/registry';
 import { registerBuiltInProviders } from './registry';
 import { getSignInOptions } from './signInFlow';
 import { DashboardPanel } from './ui/dashboard';
+import type { DashboardDeps } from './ui/dashboardState';
+import { ReviewFlowPanel } from './ui/reviewFlow';
 import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
   const podStore = new PodStore(context.globalState);
   const secrets = context.secrets;
+  const reviewHistory = new ReviewHistory(context.globalState);
 
   const sidebar = new VerdictSidebarProvider(podStore);
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('codeVerdict.sidebar', sidebar),
     createStatusBarItem(),
   );
+
+  const flowDeps = {
+    podStore,
+    secrets,
+    workspaceState: context.workspaceState,
+    globalState: context.globalState,
+    onSubmitted: () => {
+      sidebar.refresh();
+      void DashboardPanel.refreshIfOpen();
+    },
+  };
+
+  const dashboardDeps: DashboardDeps = {
+    submittedRefs: () => reviewHistory.submittedRefs(),
+    openCr: (ref, submitted) => {
+      if (submitted) {
+        void vscode.window.showInformationMessage(
+          'Verdict: posted-review tracking arrives with issue #12.',
+        );
+        return;
+      }
+      void ReviewFlowPanel.open(flowDeps, ref);
+    },
+  };
 
   const openDashboard = async (): Promise<void> => {
     if (!podStore.activePod) {
@@ -28,7 +56,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return;
     }
-    await DashboardPanel.show(podStore, secrets);
+    await DashboardPanel.show(podStore, secrets, dashboardDeps);
   };
 
   const bootstrapFromDebugBypass = async (): Promise<void> => {
@@ -122,6 +150,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const handler =
       handlers[id] ??
       (() => {
+        // Review-tab commands (A/R/S, J/K, generate, submit …) route to the
+        // active review panel first.
+        if (ReviewFlowPanel.handleCommand(id)) return;
         void vscode.window.showInformationMessage(
           `Verdict: "${id}" is not implemented yet — the extension is under construction.`,
         );
