@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ReviewThread, ThreadNote } from '../platform/types';
 import { deriveThreadStatus, isWaitingOnYou } from './threadStatus';
-import { loadSpecFixtures } from './fixtures.test-helper';
+import { loadSpecFixtures } from '../testing/specFixtures';
 
 interface RawNote {
   id: number;

@@ -124,6 +124,8 @@ export interface ReviewCommentDraft {
   body: string;
   anchor: DiffAnchor;
   suggestion?: { old: string; new: string };
+  /** Attribution line rendered after the suggestion block. */
+  footer?: string;
 }
 
 export interface ReviewSubmission {

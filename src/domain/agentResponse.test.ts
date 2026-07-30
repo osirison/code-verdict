@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AgentResponseError, parseAgentReviewResponse } from './agentResponse';
-import { loadSpecFixtures } from './fixtures.test-helper';
+import { loadSpecFixtures } from '../testing/specFixtures';
 
 const fixtures = loadSpecFixtures();
 const reference = fixtures.agentReviewResponse as Record<string, unknown>;
