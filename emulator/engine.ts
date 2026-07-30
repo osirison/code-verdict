@@ -48,12 +48,13 @@ export class GitLabEmulator {
   private discussionPosts = 0;
 
   constructor(
-    opts: { seed?: number; scenario?: ScenarioName; baseUrl?: string } = {},
+    opts: { seed?: number; scenario?: ScenarioName; baseUrl?: string; now?: string } = {},
   ) {
     this.world = generateWorld(
       opts.seed ?? 1,
       opts.scenario ?? 'happy',
       opts.baseUrl ?? 'https://gitlab.emulator.local',
+      opts.now,
     );
   }
 
@@ -62,6 +63,7 @@ export class GitLabEmulator {
       seed ?? this.world.seed,
       scenario ?? this.world.scenario,
       this.world.baseUrl,
+      this.world.now,
     );
     this.discussionPosts = 0;
   }
@@ -142,7 +144,9 @@ export class GitLabEmulator {
       return json(200, { username: w.you.username, name: w.you.name });
     }
     if (method === 'GET' && rawPath === '/api/v4/personal_access_tokens/self') {
-      const expires = new Date();
+      // Anchored to the world's time base, not the wall clock — same seed,
+      // same response.
+      const expires = new Date(w.now);
       expires.setUTCDate(expires.getUTCDate() + 42);
       return json(200, {
         scopes: this.tokenScopes(),

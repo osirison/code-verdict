@@ -35,6 +35,9 @@ const emulator = new GitLabEmulator({
   seed,
   scenario,
   baseUrl: `http://127.0.0.1:${port}`,
+  // The live server anchors the world to the wall clock so ages read
+  // realistically while debugging; tests use the fixed default epoch.
+  now: new Date().toISOString(),
 });
 
 const server = http.createServer((req, res) => {

@@ -19,13 +19,25 @@ function post(em: GitLabEmulator, url: string, body?: unknown, headers: Record<s
 }
 
 describe('world generation', () => {
-  it('is deterministic per seed', () => {
+  it('is deterministic per seed — including timestamps and token expiry', () => {
     const a = new GitLabEmulator({ seed: 7 });
     const b = new GitLabEmulator({ seed: 7 });
     const c = new GitLabEmulator({ seed: 8 });
     const shas = (em: GitLabEmulator) => em.world.mergeRequests.map((m) => m.head_sha);
     expect(shas(a)).toEqual(shas(b));
     expect(shas(a)).not.toEqual(shas(c));
+
+    const stamps = (em: GitLabEmulator) => em.world.mergeRequests.map((m) => m.updated_at);
+    expect(stamps(a)).toEqual(stamps(b));
+    expect(get(a, '/api/v4/personal_access_tokens/self').body).toEqual(
+      get(b, '/api/v4/personal_access_tokens/self').body,
+    );
+
+    // The live server anchors to the wall clock instead — same content,
+    // shifted timestamps.
+    const fresh = new GitLabEmulator({ seed: 7, now: '2027-01-01T09:00:00.000Z' });
+    expect(shas(fresh)).toEqual(shas(a));
+    expect(stamps(fresh)).not.toEqual(stamps(a));
   });
 
   it('covers the spec surfaces: flagship MR, changeset trailer, every thread status, empty projects', () => {

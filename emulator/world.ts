@@ -144,10 +144,15 @@ export interface FailureInjection {
   discussionPostFailStatus?: number;
 }
 
+/** Default time anchor: fixed, so the default world is fully deterministic. */
+export const EMULATOR_EPOCH = '2026-07-30T09:00:00.000Z';
+
 export interface World {
   seed: number;
   scenario: ScenarioName;
   baseUrl: string;
+  /** All generated timestamps are relative to this anchor. */
+  now: string;
   users: EmUser[];
   you: EmUser;
   groups: EmGroup[];
@@ -187,8 +192,8 @@ const ISSUE_TITLES = [
 const BRANCH_WORDS = ['fix', 'feat', 'chore', 'perf'];
 const FILE_STEMS = ['api/client', 'auth/session', 'jobs/digest', 'ui/banner', 'core/retry', 'db/audit'];
 
-function isoDaysAgo(days: number, hour = 9): string {
-  const d = new Date();
+function isoDaysAgoFrom(anchor: string, days: number, hour = 9): string {
+  const d = new Date(anchor);
   d.setUTCDate(d.getUTCDate() - days);
   d.setUTCHours(hour, 12, 0, 0);
   return d.toISOString();
@@ -228,8 +233,14 @@ const TOKEN_TS_DIFF = [
   '',
 ].join('\n');
 
-export function generateWorld(seed: number, scenario: ScenarioName, baseUrl: string): World {
+export function generateWorld(
+  seed: number,
+  scenario: ScenarioName,
+  baseUrl: string,
+  nowIso: string = EMULATOR_EPOCH,
+): World {
   const rng = new Prng(seed);
+  const isoDaysAgo = (days: number, hour = 9): string => isoDaysAgoFrom(nowIso, days, hour);
 
   const you: EmUser = { username: 'you', name: 'You' };
   const users: EmUser[] = [
@@ -262,6 +273,7 @@ export function generateWorld(seed: number, scenario: ScenarioName, baseUrl: str
     seed,
     scenario,
     baseUrl,
+    now: nowIso,
     users,
     you,
     groups,
