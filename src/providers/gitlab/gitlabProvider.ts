@@ -169,17 +169,17 @@ export class GitLabConnection implements Connection {
   }
 
   async listGroupRepositories(groupId: string): Promise<Repository[]> {
-    const projects = await this.http.get<GlProject[]>(
+    const projects = await this.http.getAll<GlProject>(
       `/groups/${encodeRepoId(groupId)}/projects`,
-      { per_page: 100, include_subgroups: true, archived: false },
+      { include_subgroups: true, archived: false },
     );
     // One group-level query fills the chooser's open-MR counts — never one
     // request per project.
     const counts = new Map<string, number>();
     try {
-      const mrs = await this.http.get<Array<{ project_id: number }>>(
+      const mrs = await this.http.getAll<{ project_id: number }>(
         `/groups/${encodeRepoId(groupId)}/merge_requests`,
-        { state: 'opened', per_page: 100, scope: 'all' },
+        { state: 'opened', scope: 'all' },
       );
       for (const mr of mrs) {
         const key = String(mr.project_id);
@@ -201,9 +201,8 @@ export class GitLabConnection implements Connection {
   async listOpenChangeRequests(repoIds: readonly string[]): Promise<ChangeRequest[]> {
     const perRepo = await Promise.all(
       repoIds.map((repoId) =>
-        this.http.get<GlMergeRequest[]>(`/projects/${encodeRepoId(repoId)}/merge_requests`, {
+        this.http.getAll<GlMergeRequest>(`/projects/${encodeRepoId(repoId)}/merge_requests`, {
           state: 'opened',
-          per_page: 100,
           scope: 'all',
         }),
       ),
@@ -214,9 +213,8 @@ export class GitLabConnection implements Connection {
   async listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]> {
     const perRepo = await Promise.all(
       repoIds.map((repoId) =>
-        this.http.get<GlIssue[]>(`/projects/${encodeRepoId(repoId)}/issues`, {
+        this.http.getAll<GlIssue>(`/projects/${encodeRepoId(repoId)}/issues`, {
           state: 'opened',
-          per_page: 50,
           scope: 'all',
         }),
       ),
@@ -292,9 +290,7 @@ export class GitLabConnection implements Connection {
   }
 
   async listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]> {
-    const discussions = await this.http.get<GlDiscussion[]>(`${this.mrPath(ref)}/discussions`, {
-      per_page: 100,
-    });
+    const discussions = await this.http.getAll<GlDiscussion>(`${this.mrPath(ref)}/discussions`);
     return discussions
       .filter((d) => !d.individual_note)
       .map((d) => toReviewThread(d, ref));

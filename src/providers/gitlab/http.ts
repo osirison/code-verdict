@@ -34,6 +34,14 @@ export class GitLabHttp {
     path: string,
     opts: { query?: Query; body?: unknown } = {},
   ): Promise<T> {
+    return (await this.requestWithHeaders<T>(method, path, opts)).data;
+  }
+
+  private async requestWithHeaders<T>(
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    path: string,
+    opts: { query?: Query; body?: unknown } = {},
+  ): Promise<{ data: T; headers: { get(name: string): string | null } }> {
     let url = `${this.baseUrl}/api/v4${path}`;
     if (opts.query) {
       const params = new URLSearchParams();
@@ -61,12 +69,31 @@ export class GitLabHttp {
     if (!res.ok) {
       throw mapGitLabError(res.status, await readErrorMessage(res), res.headers);
     }
-    if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
+    if (res.status === 204) return { data: undefined as T, headers: res.headers };
+    return { data: (await res.json()) as T, headers: res.headers };
   }
 
   get<T>(path: string, query?: Query): Promise<T> {
     return this.request<T>('GET', path, { query });
+  }
+
+  /**
+   * GET every page of a list endpoint, following `x-next-page`. Bounded by
+   * `maxPages` so one pathological group cannot hammer the instance.
+   */
+  async getAll<T>(path: string, query?: Query, maxPages = 10): Promise<T[]> {
+    const all: T[] = [];
+    let page = 1;
+    for (;;) {
+      const { data, headers } = await this.requestWithHeaders<T[]>('GET', path, {
+        query: { per_page: 100, ...query, page },
+      });
+      all.push(...data);
+      const next = Number(headers.get('x-next-page'));
+      if (!Number.isInteger(next) || next <= page || next > maxPages) break;
+      page = next;
+    }
+    return all;
   }
 
   post<T>(path: string, body?: unknown): Promise<T> {

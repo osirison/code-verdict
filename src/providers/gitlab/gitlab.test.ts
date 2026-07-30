@@ -79,6 +79,19 @@ describe('toReviewThread', () => {
   });
 });
 
+describe('pagination', () => {
+  it('follows x-next-page so large groups are not silently truncated', async () => {
+    const conn = createGitLabProvider(makeFakeGitLabFetch()).connect({
+      instanceUrl: 'https://gitlab.example',
+      token: 'glpat-test',
+    });
+    const repos = await conn.listGroupRepositories('4821');
+    expect(repos.map((r) => r.id)).toEqual(['9101', '9102', '9103', '9104', '9105']);
+    expect(repos.find((r) => r.id === '9101')?.openChangeRequestCount).toBe(1);
+    expect(repos.find((r) => r.id === '9104')?.openChangeRequestCount).toBe(0);
+  });
+});
+
 describe('submitReview against the fake instance', () => {
   const CONFIG = { instanceUrl: 'https://gitlab.example', token: 'glpat-test' };
 

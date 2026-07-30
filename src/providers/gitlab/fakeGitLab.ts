@@ -41,7 +41,9 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
 
   return async (url, init = {}) => {
     const method = init.method ?? 'GET';
-    const path = new URL(url).pathname;
+    const parsed = new URL(url);
+    const path = parsed.pathname;
+    const page = Number(parsed.searchParams.get('page') ?? '1');
     const route = `${method} ${path}`;
 
     if (route === 'GET /api/v4/user') return json(200, { username: 'you', name: 'You' });
@@ -50,7 +52,12 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
     }
 
     if (route === 'GET /api/v4/groups/4821') return json(200, GROUP);
-    if (route === 'GET /api/v4/groups/4821/projects') return json(200, PROJECTS);
+    // Served in two pages to exercise x-next-page pagination.
+    if (route === 'GET /api/v4/groups/4821/projects') {
+      return page === 1
+        ? json(200, PROJECTS.slice(0, 3), { 'x-next-page': '2' })
+        : json(200, PROJECTS.slice(3));
+    }
     if (route === 'GET /api/v4/groups/4821/merge_requests') {
       return json(200, [{ project_id: 9101 }]);
     }
