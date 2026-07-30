@@ -99,6 +99,50 @@ describe('REST fidelity', () => {
     expect((res.body as { id: number }).id).toBe(9101);
   });
 
+  it('answers 404 for undecodable percent-sequences instead of throwing', () => {
+    const em = new GitLabEmulator();
+    expect(get(em, '/api/v4/projects/%zz').status).toBe(404);
+  });
+
+  it('generates only internally consistent unified diff hunks', () => {
+    for (const seed of [1, 2, 7, 42]) {
+      const em = new GitLabEmulator({ seed });
+      for (const mr of em.world.mergeRequests) {
+        for (const file of mr.files) {
+          const lines = file.diff.split('\n');
+          let hunk: { header: string; old: number; new: number; oldN: number; newN: number } | null =
+            null;
+          const check = () => {
+            if (!hunk) return;
+            expect(hunk.old, `${file.new_path} ${hunk.header} old count`).toBe(hunk.oldN);
+            expect(hunk.new, `${file.new_path} ${hunk.header} new count`).toBe(hunk.newN);
+          };
+          for (const line of lines) {
+            const header = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+            if (header) {
+              check();
+              hunk = {
+                header: line,
+                old: 0,
+                new: 0,
+                oldN: header[2] === undefined ? 1 : Number(header[2]),
+                newN: header[4] === undefined ? 1 : Number(header[4]),
+              };
+            } else if (hunk && line !== '') {
+              if (line.startsWith('-')) hunk.old += 1;
+              else if (line.startsWith('+')) hunk.new += 1;
+              else {
+                hunk.old += 1;
+                hunk.new += 1;
+              }
+            }
+          }
+          check();
+        }
+      }
+    }
+  });
+
   it('serves the honest list shape and the rich single shape', () => {
     const em = new GitLabEmulator();
     const list = get(em, '/api/v4/projects/9101/merge_requests?state=opened&per_page=100');
@@ -139,6 +183,27 @@ describe('REST fidelity', () => {
     expect(ok.status).toBe(201);
     const listed = get(em, '/api/v4/projects/9101/merge_requests/2841/discussions?per_page=100');
     expect((listed.body as unknown[]).length).toBe(1);
+  });
+
+  it('rejects positions that do not land on a diff line, like real GitLab', () => {
+    const em = new GitLabEmulator();
+    const mr = em.world.mergeRequests.find((m) => m.iid === 2841);
+    const at = (newPath: string, line: number) =>
+      post(em, '/api/v4/projects/9101/merge_requests/2841/discussions', {
+        body: 'x',
+        position: {
+          position_type: 'text',
+          base_sha: mr?.base_sha,
+          start_sha: mr?.start_sha,
+          head_sha: mr?.head_sha,
+          old_path: newPath,
+          new_path: newPath,
+          new_line: line,
+        },
+      });
+    expect(at('does/not/exist.ts', 1).status).toBe(400);
+    expect(at('src/auth/token.ts', 5000).status).toBe(400);
+    expect(at('src/auth/token.ts', 88).status).toBe(201);
   });
 });
 

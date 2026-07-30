@@ -203,7 +203,9 @@ function makeDiff(rng: Prng, stem: string): string {
   const start = rng.int(8, 120);
   const name = stem.split('/')[1] ?? 'value';
   return [
-    `@@ -${start},7 +${start},9 @@ export function ${name}() {`,
+    // Header counts match the body (2 old / 5 new lines) — the extension
+    // will grow a hunk parser, and it must never meet an inconsistent hunk.
+    `@@ -${start},2 +${start},5 @@ export function ${name}() {`,
     `   const options = normalize(input)`,
     `-  return run(options)`,
     `+  if (!options.valid) {`,
@@ -214,9 +216,13 @@ function makeDiff(rng: Prng, stem: string): string {
   ].join('\n');
 }
 
-/** The flagship diff mirrors the spec fixture anchors (token.ts:63 and :88). */
+/**
+ * The flagship diff mirrors the spec fixture anchors: the logged token is
+ * new line 63 and the in-flight-promise fix ends at new line 88. Hunk
+ * headers are line-accurate against their bodies.
+ */
 const TOKEN_TS_DIFF = [
-  '@@ -58,12 +58,14 @@ export class TokenStore {',
+  '@@ -60,6 +60,6 @@ export class TokenStore {',
   '   async refresh(): Promise<void> {',
   "     const res = await this.client.post('/oauth/token', this.grant)",
   '     if (!res.ok) {',
@@ -224,12 +230,36 @@ const TOKEN_TS_DIFF = [
   '+      logger.error(`refresh failed ${this.refreshToken}`)',
   '       throw new RefreshError(res.status)',
   '     }',
-  '@@ -84,8 +86,9 @@ export class TokenStore {',
+  '@@ -86,2 +86,3 @@ export class TokenStore {',
   '-    if (this.refreshing) return this.pending',
   '-    this.refreshing = true',
   '+    if (this.refreshing) return this.pending',
   '+    this.refreshing = true',
   '+    this.pending = this.doRefresh()',
+  '',
+].join('\n');
+
+/**
+ * The reviewed MR's diff: hunks deliberately cover new lines 14, 31 and 52
+ * — the anchors of the seeded !2833 threads and the contract-suite posts.
+ */
+const BANNER_TS_DIFF = [
+  '@@ -13,3 +13,4 @@ export function renderBanner() {',
+  '   const flags = readFlags()',
+  "-  const text = params.get('banner')",
+  '+  if (!isProd()) return null',
+  "+  const text = sanitize(params.get('banner'))",
+  '   return show(text)',
+  '@@ -29,3 +30,3 @@ export function renderBanner() {',
+  '   const theme = flags.theme',
+  '-  banner.style = theme',
+  '+  banner.style = resolveTheme(theme)',
+  '   mount(banner)',
+  '@@ -50,3 +51,3 @@ export function renderBanner() {',
+  '   if (!session) return',
+  "-  track('banner_shown')",
+  "+  track('banner_shown', { sessionId: session.id })",
+  '   return banner',
   '',
 ].join('\n');
 
@@ -353,7 +383,7 @@ export function generateWorld(
       {
         old_path: 'test/auth.spec.ts',
         new_path: 'test/auth.spec.ts',
-        diff: "@@ -10,4 +10,6 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n",
+        diff: "@@ -10,1 +10,2 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n",
       },
       ...FILE_STEMS.slice(0, 3).map((stem) => ({
         old_path: `src/${stem}.ts`,
@@ -420,7 +450,7 @@ export function generateWorld(
     start_sha: submittedBase,
     head_sha: submittedHead,
     files: [
-      { old_path: 'src/ui/banner.ts', new_path: 'src/ui/banner.ts', diff: makeDiff(rng, 'ui/banner') },
+      { old_path: 'src/ui/banner.ts', new_path: 'src/ui/banner.ts', diff: BANNER_TS_DIFF },
     ],
   });
   addPipeline(9101, submittedHead, 'fix/debug-banner', 'success', 1);

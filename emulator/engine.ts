@@ -138,7 +138,15 @@ export class GitLabEmulator {
     body?: string,
   ): EmResponse {
     const w = this.world;
-    const dec = (s: string | undefined): string => decodeURIComponent(s ?? '');
+    // Invalid percent-sequences must not throw — a typo'd curl would
+    // otherwise kill the whole server. Undecodable ids fail lookup → 404.
+    const dec = (s: string | undefined): string => {
+      try {
+        return decodeURIComponent(s ?? '');
+      } catch {
+        return s ?? '';
+      }
+    };
 
     if (method === 'GET' && rawPath === '/api/v4/user') {
       return json(200, { username: w.you.username, name: w.you.name });
@@ -340,6 +348,12 @@ export class GitLabEmulator {
       // The branch moved since these refs were read — GitLab's exact branch.
       return message(400, '400 (Bad request) "Note position is invalid"');
     }
+    if (!this.positionResolves(mr, position)) {
+      // Real GitLab also rejects positions that do not land on a line of
+      // the MR diff — the anchor-computation bug class spec §14 warns about
+      // must fail here too, not only in production.
+      return message(400, '400 (Bad request) "Note position is invalid"');
+    }
 
     const discussion: EmDiscussion = {
       id: `em${(++w.counters.discussion).toString().padStart(4, '0')}${mr.head_sha.slice(0, 24)}`,
@@ -514,6 +528,31 @@ export class GitLabEmulator {
     return this.world.groups.find(
       (g) => String(g.id) === idOrPath || g.full_path === idOrPath,
     );
+  }
+
+  /** Does the position land on a line the MR diff actually contains? */
+  private positionResolves(mr: EmMergeRequest, position: EmPosition): boolean {
+    const file = mr.files.find(
+      (f) => f.new_path === position.new_path || f.old_path === position.old_path,
+    );
+    if (!file) return false;
+    const hunks = [...file.diff.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)].map(
+      (m) => ({
+        oldStart: Number(m[1]),
+        oldCount: m[2] === undefined ? 1 : Number(m[2]),
+        newStart: Number(m[3]),
+        newCount: m[4] === undefined ? 1 : Number(m[4]),
+      }),
+    );
+    const newLine = position.new_line;
+    if (typeof newLine === 'number') {
+      return hunks.some((h) => newLine >= h.newStart && newLine < h.newStart + h.newCount);
+    }
+    const oldLine = position.old_line;
+    if (typeof oldLine === 'number') {
+      return hunks.some((h) => oldLine >= h.oldStart && oldLine < h.oldStart + h.oldCount);
+    }
+    return false;
   }
 
   private findDiscussion(mr: EmMergeRequest, id: string): EmDiscussion | undefined {

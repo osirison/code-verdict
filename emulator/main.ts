@@ -40,6 +40,8 @@ const emulator = new GitLabEmulator({
   now: new Date().toISOString(),
 });
 
+const JSON_HEADERS = { 'content-type': 'application/json' };
+
 const server = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -48,12 +50,21 @@ const server = http.createServer((req, res) => {
     for (const [key, value] of Object.entries(req.headers)) {
       if (typeof value === 'string') headers[key] = value;
     }
-    const result = emulator.handle({
-      method: req.method ?? 'GET',
-      url: req.url ?? '/',
-      headers,
-      body: chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : undefined,
-    });
+    let result;
+    try {
+      result = emulator.handle({
+        method: req.method ?? 'GET',
+        url: req.url ?? '/',
+        headers,
+        body: chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : undefined,
+      });
+    } catch (e) {
+      // One bad request must never take the server down mid-debug.
+      console.error(`${req.method} ${req.url} -> 500`, e);
+      res.writeHead(500, JSON_HEADERS);
+      res.end(JSON.stringify({ message: '500 emulator internal error', error: String(e) }));
+      return;
+    }
     console.log(`${req.method} ${req.url} -> ${result.status}`);
     res.writeHead(result.status, result.headers);
     res.end(JSON.stringify(result.body));

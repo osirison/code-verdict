@@ -76,12 +76,12 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
           {
             old_path: 'src/auth/token.ts',
             new_path: 'src/auth/token.ts',
-            diff: '@@ -60,7 +60,7 @@\n-      logger.error(\'refresh failed\')\n+      logger.error(`refresh failed ${this.refreshToken}`)\n',
+            diff: '@@ -63,1 +63,1 @@\n-      logger.error(\'refresh failed\')\n+      logger.error(`refresh failed ${this.refreshToken}`)\n',
           },
           {
             old_path: 'test/auth.spec.ts',
             new_path: 'test/auth.spec.ts',
-            diff: "@@ -10,4 +10,6 @@\n describe('token', () => { /* happy path only */ })\n",
+            diff: "@@ -10,1 +10,2 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n",
           },
         ],
       });
