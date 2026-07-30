@@ -1,0 +1,251 @@
+/**
+ * The Verdict webview design system — the spec's design tokens
+ * (`spec/README.md` §Design tokens) as CSS.
+ *
+ * Two rules from the spec, honoured here once for every screen:
+ * - Surfaces, lines and text come from VS Code THEME VARIABLES with the
+ *   prototype's Dark+ hexes as fallbacks — in Dark+ the resolution is
+ *   pixel-identical to the POC, in other themes the theme wins.
+ * - Product identity colors (brand, agent, severities, ok/accept) are
+ *   controlled literals with the spec's contrast-corrected light-theme
+ *   overrides (`body.vscode-light`) — they are design constants, not
+ *   theme-derivable.
+ *
+ * Type: UI text uses the system stack via --vscode-font-family; code, ids,
+ * paths, counts and metadata use the user's editor font (JetBrains Mono in
+ * the POC) via --vscode-editor-font-family.
+ */
+
+export const VERDICT_TOKENS_CSS = `
+:root {
+  /* Surfaces */
+  --bg: var(--vscode-editor-background, #1f1f1f);
+  --bg2: var(--vscode-sideBar-background, #181818);
+  --bg3: var(--vscode-editorWidget-background, #252525);
+  --card: var(--vscode-editorHoverWidget-background, #242424);
+  --code: var(--vscode-textCodeBlock-background, #141414);
+  --row: #232323;
+  /* Lines */
+  --line: var(--vscode-widget-border, #2b2b2b);
+  --line2: #3c3c3c;
+  --line3: #4a4a4a;
+  --hover: var(--vscode-list-hoverBackground, #383838);
+  /* Text */
+  --fg-max: #f0f0f0;
+  --fg-hi: #e8e8e8;
+  --fg: var(--vscode-foreground, #cccccc);
+  --fg2: #bdbdbd;
+  --fg-dim: #9d9d9d;
+  --fg-dim2: #8b8b8b;
+  --fg-dimmer: #6e7681;
+  --gutter: #5a5a5a;
+  --link: var(--vscode-textLink-foreground, #4daafc);
+  /* Accents */
+  --accent: var(--vscode-button-background, #0078d4);
+  --accent-h: var(--vscode-button-hoverBackground, #1a86e0);
+  --accent-fg: var(--vscode-button-foreground, #ffffff);
+  --sel: var(--vscode-list-activeSelectionBackground, #04395e);
+  --sel-soft: #04395e33;
+  --brand: #fc6d26;
+  --brand-h: #ff8144;
+  --agent: #a371f7;
+  --agent-t: #a371f722;
+  --agent-b: #a371f755;
+  --agent-f: #a371f70f;
+  /* Semantic */
+  --sev-blocker: #f85149;
+  --sev-blocker-t: #f8514922;
+  --sev-blocker-b: #f8514966;
+  --sev-major: #d29922;
+  --sev-major-t: #d2992222;
+  --sev-minor: #4a9eff;
+  --sev-minor-t: #4a9eff22;
+  --nit-t: #8b8b8b22;
+  --ok: #3fb950;
+  --ok-t: #3fb95022;
+  --ok-strong: #238636;
+  --ok-strong-h: #2ea043;
+  --ok-strong-t: #23863622;
+  --add-bg: #1b3a24;
+  --add-fg: #8ddaa0;
+  --del-bg: #3a1e1e;
+  --del-fg: #f0a5a2;
+  /* Type */
+  --font-ui: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
+  --font-mono: var(--vscode-editor-font-family, "JetBrains Mono", monospace);
+}
+/* Spec light-theme overrides: contrast-corrected, not derived. */
+body.vscode-light {
+  --row: #ececec;
+  --line2: #cecece;
+  --line3: #b8b8b8;
+  --fg-max: #111111;
+  --fg-hi: #1f1f1f;
+  --fg2: #4a4a4a;
+  --fg-dim: #616161;
+  --fg-dim2: #595959;
+  --fg-dimmer: #595959;
+  --gutter: #a8a8a8;
+  --sel-soft: #cce4f755;
+  --brand: #b8341d;
+  --brand-h: #d14526;
+  --agent: #6b3fc7;
+  --agent-t: #6b3fc71f;
+  --agent-b: #6b3fc766;
+  --agent-f: #6b3fc70d;
+  --sev-blocker: #b3252b;
+  --sev-blocker-t: #b3252b1f;
+  --sev-blocker-b: #b3252b66;
+  --sev-major: #8a6100;
+  --sev-major-t: #8a61001f;
+  --sev-minor: #0b62c4;
+  --sev-minor-t: #0b62c41f;
+  --nit-t: #59595922;
+  --ok: #116329;
+  --ok-t: #1163291f;
+  --ok-strong: #116329;
+  --ok-strong-h: #1a7f37;
+  --ok-strong-t: #1163291f;
+  --add-bg: #e6ffec;
+  --add-fg: #116329;
+  --del-bg: #ffebe9;
+  --del-fg: #a40e26;
+}
+`;
+
+export const VERDICT_BASE_CSS = `
+* { box-sizing: border-box; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  padding: 0;
+}
+a { color: var(--link); text-decoration: none; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+/* The only two animations, both deliberate (spec: tool, not showcase). */
+@keyframes tin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.mono { font-family: var(--font-mono); }
+.dim { color: var(--fg-dim); }
+.dimmer { color: var(--fg-dimmer); }
+.ok { color: var(--ok); }
+.bad { color: var(--sev-blocker); }
+.warn { color: var(--sev-major); }
+.info { color: var(--sev-minor); }
+.run { color: var(--sev-minor); }
+.agent-fg { color: var(--agent); }
+
+/* 10px/500 uppercase tracked section label */
+.section-label {
+  font-size: 10px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: .09em; color: var(--fg-dimmer);
+}
+
+/* Buttons: 4-5px radius, hover lightens one step */
+.btn {
+  font-family: var(--font-ui); font-size: 12px; cursor: pointer;
+  border-radius: 5px; padding: 6px 14px; border: 1px solid transparent;
+  background: var(--line); color: var(--fg-hi); border-color: var(--line2);
+}
+.btn:hover { background: var(--hover); }
+.btn-accent { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.btn-accent:hover { background: var(--accent-h); }
+.btn-brand { background: var(--brand); color: #fff; border-color: transparent; }
+.btn-brand:hover { background: var(--brand-h); }
+.btn-ok { background: var(--ok-strong); color: #fff; border-color: transparent; }
+.btn-ok:hover { background: var(--ok-strong-h); }
+.btn-danger { background: var(--line); color: var(--sev-blocker); border-color: var(--sev-blocker); }
+.btn-danger:hover { background: var(--sev-blocker-t); }
+.btn[disabled], .btn-inert { background: var(--line); color: var(--fg-dimmer); border-color: transparent; cursor: default; }
+
+/* Capsule chips (presets, filters): 6px/11px padding, 14px radius */
+.chip {
+  display: inline-block; font-size: 11px; color: var(--fg-dim);
+  padding: 6px 11px; border-radius: 14px; border: 1px solid var(--line2);
+  background: none; cursor: pointer; font-family: var(--font-ui);
+}
+.chip:hover { border-color: var(--accent); }
+.chip.active { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+
+/* Small state pills: 5px/8px padding, 3px radius */
+.pill {
+  display: inline-block; font-family: var(--font-mono); font-size: 11px;
+  padding: 5px 8px; border-radius: 3px; color: var(--fg-dimmer);
+  background: var(--nit-t);
+}
+.pill-warn { color: var(--sev-major); background: var(--sev-major-t); }
+.pill-bad { color: var(--sev-blocker); background: var(--sev-blocker-t); }
+.pill-ok { color: var(--ok); background: var(--ok-t); }
+.pill-agent { color: var(--agent); background: var(--agent-t); }
+.pill-info { color: var(--sev-minor); background: var(--sev-minor-t); }
+
+/* Severity chips: 9.5px/600 uppercase, .07em tracking, 5px/7px padding */
+.sev {
+  display: inline-block; font-family: var(--font-mono); font-size: 9.5px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
+  padding: 5px 7px; border-radius: 3px;
+}
+.sev-blocker { color: var(--sev-blocker); background: var(--sev-blocker-t); }
+.sev-major { color: var(--sev-major); background: var(--sev-major-t); }
+.sev-minor { color: var(--sev-minor); background: var(--sev-minor-t); }
+.sev-nit { color: var(--fg-dim2); background: var(--nit-t); }
+
+/* Cards: 1px line border, 6px radius */
+.card { border: 1px solid var(--line); border-radius: 6px; background: var(--card); }
+
+/* Inputs: 1px line2, 5px radius, bg2, 9px/11px padding */
+.input {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--fg-hi);
+  background: var(--bg2); border: 1px solid var(--line2); border-radius: 5px;
+  padding: 9px 11px; outline: none; width: 100%;
+}
+.input:focus { border-color: var(--accent); }
+
+/* Segmented control container */
+.seg { display: inline-flex; background: var(--bg3); border-radius: 5px; padding: 2px; gap: 2px; }
+.seg button {
+  border: none; background: none; color: var(--fg-dim); font-size: 11px;
+  font-family: var(--font-mono); padding: 4px 10px; border-radius: 4px; cursor: pointer;
+}
+.seg button.active { background: var(--accent); color: var(--accent-fg); }
+
+/* Key caps for the keyboard overlay / hints */
+.kbd {
+  display: inline-block; min-width: 20px; text-align: center;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+  background: var(--bg2); border: 1px solid var(--line2); border-radius: 4px;
+  padding: 2px 6px; color: var(--fg2);
+}
+`;
+
+/** Full webview document with the strict CSP and the design system inlined. */
+export function renderPage(opts: {
+  title: string;
+  nonce: string;
+  css: string;
+  body: string;
+  script?: string;
+}): string {
+  const script = opts.script
+    ? `<script nonce="${opts.nonce}">${opts.script}</script>`
+    : '';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${opts.nonce}'; script-src 'nonce-${opts.nonce}';">
+<style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.css}</style>
+<title>${opts.title}</title>
+</head>
+<body>
+${opts.body}
+${script}
+</body>
+</html>`;
+}

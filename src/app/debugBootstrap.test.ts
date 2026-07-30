@@ -8,8 +8,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { GitLabEmulator } from '../../emulator/engine';
 import { registerBuiltInProviders } from '../registry';
 import { renderDashboardHtml } from '../ui/dashboardHtml';
+import { toViewState } from '../ui/dashboardState';
 import { connectionForPod } from './connections';
-import { deriveStats, fetchPodData, repoIdsOf, repoLabel } from './podQuery';
+import { fetchPodData, repoIdsOf, repoLabel } from './podQuery';
 import { PodStore } from './pods';
 import type { KeyValueStore, SecretStore } from './storage';
 import { runDebugBootstrap } from './debugBootstrap';
@@ -105,32 +106,10 @@ describe('debug bootstrap against a live emulator', () => {
     expect(flagship?.ci?.status).toBe('success');
     expect(repoLabel(pod, flagship?.ref.repoId ?? '')).toBe('core');
 
-    const html = renderDashboardHtml(
-      {
-        podName: pod.name,
-        meta: 'meta',
-        stats: deriveStats(data),
-        fetchedAgo: 'now',
-        projects: [],
-        rows: data.changeRequests.map((cr) => ({
-          repoId: cr.ref.repoId,
-          number: cr.ref.number,
-          refLabel: `!${cr.ref.number}`,
-          title: cr.title,
-          author: cr.author.username,
-          branch: cr.sourceBranch,
-          project: repoLabel(pod, cr.ref.repoId),
-          aiState: 'not run',
-          ciStatus: cr.ci?.status,
-          age: '1h',
-        })),
-        issues: [],
-        pipelines: [],
-      },
-      'testnonce',
-    );
+    const html = renderDashboardHtml(toViewState(data, Date.now(), new Set()), 'testnonce');
     expect(html).toContain('Refactor token refresh');
     expect(html).toContain('feat/auth-refresh');
     expect(html).toContain('Projects in pod');
+    expect(html).toContain('Waiting on you ·');
   });
 });
