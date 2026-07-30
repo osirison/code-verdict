@@ -76,9 +76,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
     if (!token) return;
 
-    await secrets.store(tokenSecretKey(instanceUrl), token);
     const status = await getProvider('gitlab').connect({ instanceUrl, token }).testConnection();
     if (status.ok) {
+      // Persist only credentials that actually work — a failed token must
+      // not linger in the secret store for other flows to reuse.
+      await secrets.store(tokenSecretKey(instanceUrl), token);
       const scope = status.scopes?.join(', ') ?? 'unknown scope';
       void vscode.window.showInformationMessage(
         `Verdict: connected as @${status.username} · ${scope}. Pods and projects arrive with the onboarding wizard (issue #7).`,

@@ -50,6 +50,11 @@ export interface DashboardViewState {
   pipelines: DashboardPipelineRow[];
 }
 
+/** The webview → extension message contract. */
+export type DashboardMessage =
+  | { type: 'refresh' }
+  | { type: 'openCr'; repoId: string; number: string };
+
 export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -129,11 +134,13 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     )
     .join('');
 
+  // Text labels for now — Codicons (with the font shipped into the webview)
+  // arrive with the issue #8 fidelity pass. No raw Unicode glyphs.
   const pipelineRows = state.pipelines
     .map(
       (p) => `
       <div class="pipeline">
-        <span class="mono ${CI_CLASS[p.status]}">${p.status === 'failed' ? '✕' : p.status === 'success' ? '✓' : '◔'}</span>
+        <span class="mono ${CI_CLASS[p.status]}">${CI_LABEL[p.status]}</span>
         <span class="mono">#${e(p.id)}</span>
         <span class="dim mono">${e(p.ref)}</span>
         <span class="dim mono">${e(p.project)}</span>
@@ -205,6 +212,8 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
   .row { border-bottom: 1px solid var(--line); }
   .mr-row { cursor: pointer; }
   .mr-row:hover, .mr-row:focus { background: var(--hover); outline: none; }
+  /* .row's display:grid would defeat the hidden attribute otherwise. */
+  .mr-row[hidden] { display: none; }
   .title { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .meta { color: var(--dim); margin-top: 2px; font-size: 10.5px; }
   .pill { border: 1px solid var(--line); border-radius: 3px; padding: 2px 8px; font-size: 11px; color: var(--dim); font-family: var(--mono); }
@@ -219,7 +228,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     <h1>${e(state.podName)}</h1>
     <span class="dim">${e(state.meta)}</span>
     <span class="spacer"></span>
-    <span class="dim mono">⟳ ${e(state.fetchedAgo)}</span>
+    <span class="dim mono">updated ${e(state.fetchedAgo)}</span>
     <button class="refresh" id="refresh">Refresh</button>
   </header>
   ${body}
@@ -232,7 +241,8 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
         chip.classList.add('active');
         const project = chip.dataset.project;
         for (const row of document.querySelectorAll('.mr-row')) {
-          row.style.display = project === '*' || row.dataset.project === project ? '' : 'none';
+          // CSP nonces do not cover style attributes — toggle hidden instead.
+          row.hidden = !(project === '*' || row.dataset.project === project);
         }
       });
     }

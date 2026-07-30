@@ -20,7 +20,9 @@ export function getDebugAuthBypass(
   const explicitInstanceUrl = env.CODE_VERDICT_DEBUG_INSTANCE_URL?.trim();
   const explicitToken = env.CODE_VERDICT_DEBUG_TOKEN?.trim();
 
-  if (mode === 1 || overrideEnabled || env.NODE_ENV === 'development') {
+  // The bypass requires the explicit opt-in flag — NODE_ENV=development
+  // alone must never silently redirect connections to the emulator.
+  if (mode === 1 || overrideEnabled) {
     return {
       enabled: true,
       instanceUrl: explicitInstanceUrl ?? DEFAULT_DEBUG_INSTANCE_URL,

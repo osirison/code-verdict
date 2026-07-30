@@ -6,8 +6,8 @@ import { deriveStats, fetchPodData, repoIdsOf, repoLabel } from '../app/podQuery
 import type { PodData } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import { getProvider } from '../platform/registry';
-import type { DashboardViewState } from './dashboardHtml';
-import { renderDashboardHtml } from './dashboardHtml';
+import type { DashboardMessage, DashboardViewState } from './dashboardHtml';
+import { escapeHtml, renderDashboardHtml } from './dashboardHtml';
 
 function formatAge(iso: string, now: number): string {
   const ms = now - Date.parse(iso);
@@ -95,13 +95,16 @@ export class DashboardPanel {
     panel.onDidDispose(() => {
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: { type?: string; number?: string }) => {
-      if (message.type === 'refresh') {
-        void this.refresh();
-      } else if (message.type === 'openCr') {
-        void vscode.window.showInformationMessage(
-          `Verdict: running a review on ${message.number ?? 'this change'} arrives with issue #9 (agent integration).`,
-        );
+    panel.webview.onDidReceiveMessage((message: DashboardMessage) => {
+      switch (message.type) {
+        case 'refresh':
+          void this.refresh();
+          break;
+        case 'openCr':
+          void vscode.window.showInformationMessage(
+            `Verdict: running a review on ${message.number} arrives with issue #9 (agent integration).`,
+          );
+          break;
       }
     });
   }
@@ -118,7 +121,7 @@ export class DashboardPanel {
       const nonce = crypto.randomBytes(16).toString('hex');
       this.panel.webview.html = renderDashboardHtml(toViewState(data, Date.now()), nonce);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+      const message = escapeHtml(e instanceof Error ? e.message : String(e));
       this.panel.webview.html = `<p>Could not load the pod: ${message}</p><p>Is the emulator running? (<code>npm run emulator</code>)</p>`;
     }
   }
