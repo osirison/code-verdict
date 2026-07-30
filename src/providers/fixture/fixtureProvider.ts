@@ -187,8 +187,11 @@ export class FixtureConnection implements Connection {
     if (submission.summary !== undefined && allCommentsOk) {
       result.summaryPosted = true;
     }
-    if ((submission.approve || submission.requestChanges) && allCommentsOk) {
+    if (submission.approve && allCommentsOk) {
       result.approvalApplied = true;
+    }
+    if (submission.requestChanges && allCommentsOk) {
+      result.requestChangesApplied = true;
     }
     return result;
   }

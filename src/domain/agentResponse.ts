@@ -63,7 +63,14 @@ function itemRejection(raw: Record<string, unknown>): string | null {
   if (typeof raw.category !== 'string' || !CATEGORIES.has(raw.category)) {
     return `invalid category: ${String(raw.category)}`;
   }
-  if (typeof raw.confidence !== 'number' || raw.confidence < 0 || raw.confidence > 100) {
+  if (
+    typeof raw.confidence !== 'number' ||
+    !Number.isFinite(raw.confidence) ||
+    raw.confidence < 0 ||
+    raw.confidence > 100
+  ) {
+    // NaN compares false to everything, so it must be caught explicitly —
+    // otherwise it also slips past the minConfidence gate downstream.
     return `invalid confidence: ${String(raw.confidence)}`;
   }
   return null;

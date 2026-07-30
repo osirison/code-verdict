@@ -48,10 +48,11 @@ describe('parseAgentReviewResponse', () => {
         { file: 'b.ts', line: 3, severity: 'catastrophic', category: 'tests', confidence: 80 },
         { file: 'c.ts', line: 4, severity: 'minor', category: 'vibes', confidence: 80 },
         { file: 'd.ts', line: 5, severity: 'minor', category: 'tests', confidence: 180 },
+        { file: 'e.ts', line: 6, severity: 'minor', category: 'tests', confidence: NaN },
       ],
     });
     expect(response.items).toHaveLength(1);
-    expect(rejected.map((r) => r.index)).toEqual([1, 2, 3, 4]);
+    expect(rejected.map((r) => r.index)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it('drops candidate buckets with unknown reasons and non-finite stats', () => {

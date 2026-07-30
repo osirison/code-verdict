@@ -156,6 +156,8 @@ export interface SubmitResult {
   summaryError?: ScmError;
   approvalApplied?: boolean;
   approvalError?: ScmError;
+  /** Distinct from approval — requesting changes is its opposite. */
+  requestChangesApplied?: boolean;
 }
 
 export interface ThreadNote {
