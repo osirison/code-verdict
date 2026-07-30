@@ -224,6 +224,14 @@ a { color: var(--link); text-decoration: none; }
 }
 `;
 
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 /** Full webview document with the strict CSP and the design system inlined. */
 export function renderPage(opts: {
   title: string;
@@ -241,7 +249,7 @@ export function renderPage(opts: {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${opts.nonce}'; script-src 'nonce-${opts.nonce}';">
 <style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.css}</style>
-<title>${opts.title}</title>
+<title>${escapeHtml(opts.title)}</title>
 </head>
 <body>
 ${opts.body}

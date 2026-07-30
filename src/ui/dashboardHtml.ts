@@ -3,11 +3,13 @@
  * Layout, spacing, type scale and copy follow the POC exactly; colors are
  * the design-system tokens (theme variables with Dark+ fallbacks).
  *
- * Glyph note: the POC's few Unicode glyphs (◈ ✕ ✓ ⚑ ▼ ⟳) are kept inside
+ * Glyph note: the POC's few Unicode glyphs (◈ ✕ ✓ ⚑ ◔ ▼ ⟳) are kept inside
  * webviews as designed — native chrome (sidebar, status bar) uses Codicons.
  */
 import type { CiStatus } from '../platform/types';
-import { renderPage } from './theme';
+import { escapeHtml, renderPage } from './theme';
+
+export { escapeHtml };
 
 export type RowScope = 'you' | 'them' | 'none';
 
@@ -73,14 +75,6 @@ export type DashboardMessage =
   | { type: 'switchPod' }
   | { type: 'addProjects' }
   | { type: 'filters' };
-
-export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 /** Script-free page for error / no-pod states, with the same strict CSP. */
 export function renderFallbackHtml(messageHtml: string): string {
@@ -342,6 +336,15 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       btn.classList.add('active');
       scopeSel = btn.dataset.scope;
       applyFilters();
+      // If the selected project has no rows under the new scope, fall back
+      // to All projects instead of leaving the table blank.
+      const activeChip = document.querySelector('.chip[data-project="' + projectSel + '"]');
+      if (projectSel !== '*' && activeChip?.hidden) {
+        projectSel = '*';
+        document.querySelectorAll('.chip[data-project]').forEach((c) => c.classList.remove('active'));
+        document.querySelector('.chip[data-project="*"]')?.classList.add('active');
+        applyFilters();
+      }
     });
     for (const chip of document.querySelectorAll('.chip[data-project]')) {
       chip.addEventListener('click', () => {
