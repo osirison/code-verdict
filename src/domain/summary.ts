@@ -19,10 +19,13 @@ export function composeSummary(review: Review, agentLabel: string, voice: AgentV
 
   if (voice === 'blunt') {
     const parts = [
-      blockers.length > 0 ? `${blockers.length} blockers. Fix before merge.` : 'No blockers.',
+      blockers.length > 0
+        ? `${blockers.length} ${plural(blockers.length, 'blocker')}. Fix before merge.`
+        : 'No blockers.',
     ];
-    if (smaller > 0) parts.push(`${smaller} inline comments.`);
-    if (rejected.length > 0) parts.push(`${rejected.length} false positives binned.`);
+    if (smaller > 0) parts.push(`${smaller} inline ${plural(smaller, 'comment')}.`);
+    if (rejected.length > 0)
+      parts.push(`${rejected.length} ${plural(rejected.length, 'false positive')} binned.`);
     return parts.join(' ');
   }
 

@@ -34,7 +34,8 @@ describe('composeSummary (spec §7 composition)', () => {
     const review = reviewWithVerdicts();
     expect(composeSummary(review, 'A', 'explanatory')).toContain('carries the reasoning');
     const blunt = composeSummary(review, 'A', 'blunt');
-    expect(blunt).toContain('1 blockers. Fix before merge.');
+    expect(blunt).toContain('1 blocker. Fix before merge.');
+    expect(blunt).toContain('1 inline comment.');
     expect(blunt.length).toBeLessThan(90);
   });
 

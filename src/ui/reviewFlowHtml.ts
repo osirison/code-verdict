@@ -39,7 +39,7 @@ export interface FlowViewState {
   // running
   runSteps: string[];
   runStep: number;
-  runError?: { message: string; requestId: string; partialCount: number };
+  runError?: { message: string; requestId: string; partialCount: number; code: string };
   // triage
   mode: 'split' | 'queue';
   items: TriageItemView[];
@@ -362,7 +362,7 @@ function renderRunning(s: FlowViewState): string {
           <button class="btn" id="retry-run">Retry</button>
           <button class="btn" id="switch-agent">Switch agent</button>
         </div>
-        <div class="fail-meta">copilot.request.timeout · 90000ms · request id ${e(s.runError.requestId)}</div>
+        <div class="fail-meta">${e(s.runError.code)} · request id ${e(s.runError.requestId)}</div>
       </div>
     </div>`;
   }

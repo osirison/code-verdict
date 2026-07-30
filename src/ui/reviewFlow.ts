@@ -16,7 +16,7 @@ import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import { diffStats } from '../domain/diffHunks';
+import { addedLines, diffStats } from '../domain/diffHunks';
 import { composeSummary } from '../domain/summary';
 import type { AgentVoice } from '../domain/summary';
 import {
@@ -91,7 +91,7 @@ export class ReviewFlowPanel {
   private selectedId?: string;
   private runSteps: string[] = [];
   private runStep = 0;
-  private runError?: { message: string; requestId: string; partialCount: number };
+  private runError?: { message: string; requestId: string; partialCount: number; code: string };
   private runToken = 0;
   private summaryText = '';
   private finalNote = '';
@@ -223,7 +223,12 @@ export class ReviewFlowPanel {
     } catch (e) {
       if (this.disposed || token !== this.runToken) return;
       const err = e instanceof AgentRunError ? e : new AgentRunError(String(e), '------', false);
-      this.runError = { message: err.message, requestId: err.requestId, partialCount: 0 };
+      this.runError = {
+        message: err.message,
+        requestId: err.requestId,
+        partialCount: 0,
+        code: err.timedOut ? 'copilot.request.timeout · 90000ms' : 'copilot.request.error',
+      };
       this.render();
     }
   }
@@ -361,16 +366,34 @@ export class ReviewFlowPanel {
             ),
         );
         return;
-      case 'reanchor':
-        // The refs the submit uses are refetched; items keep their lines.
-        if (this.diff) {
-          const connection = await this.connection();
-          this.diff = await connection.getChangeRequestDiff(this.ref);
-          if (this.review) this.review = { ...this.review, headSha: this.diff.headSha };
-          this.staleHead = undefined;
-          await this.persistDraft();
+      case 'reanchor': {
+        // Refetch the diff and recompute each item's line from where its
+        // flagged code now sits (spec §6: re-anchor = recompute line
+        // numbers from the new diff).
+        const connection = await this.connection();
+        this.diff = await connection.getChangeRequestDiff(this.ref);
+        if (this.review && this.diff) {
+          const diff = this.diff;
+          let moved = 0;
+          const items = this.review.items.map((item) => {
+            const file = diff.files.find((f) => f.newPath === item.file);
+            if (!file) return item;
+            const match = addedLines(file.diff).find((a) => a.text.trim() === item.code.trim());
+            if (!match || match.line === item.line) return item;
+            moved += 1;
+            return { ...item, line: match.line };
+          });
+          this.review = { ...this.review, items, headSha: diff.headSha };
+          if (moved > 0) {
+            void vscode.window.showInformationMessage(
+              `Verdict: re-anchored ${moved} ${moved === 1 ? 'finding' : 'findings'} to the new HEAD.`,
+            );
+          }
         }
+        this.staleHead = undefined;
+        await this.persistDraft();
         break;
+      }
       case 'rerun':
         void this.run();
         return;
