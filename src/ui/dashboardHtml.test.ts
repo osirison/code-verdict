@@ -36,19 +36,31 @@ const state: DashboardViewState = {
   pipelines: [{ id: '90412', status: 'success', job: 'feat/auth-refresh', age: '2h' }],
 };
 
-describe('design tokens (spec §Design tokens)', () => {
-  it('carries the Dark+ resolutions as fallbacks on theme variables', () => {
-    expect(VERDICT_TOKENS_CSS).toContain('var(--vscode-editor-background, #1f1f1f)');
-    expect(VERDICT_TOKENS_CSS).toContain('var(--vscode-sideBar-background, #181818)');
-    for (const hex of ['#fc6d26', '#a371f7', '#f85149', '#d29922', '#4a9eff', '#3fb950', '#238636', '#0078d4']) {
-      expect(VERDICT_TOKENS_CSS).toContain(hex);
+describe('design tokens (POC :root block, verbatim)', () => {
+  it('carries the exact POC dark palette', () => {
+    const dark = VERDICT_TOKENS_CSS.slice(0, VERDICT_TOKENS_CSS.indexOf('body.vscode-light'));
+    for (const decl of [
+      '--bg: #1f1f1f', '--bg2: #181818', '--bg3: #252525', '--card: #242424', '--code: #141414',
+      '--row: #232323', '--line: #2b2b2b', '--line2: #3c3c3c', '--hover: #383838',
+      '--fg-hi: #e8e8e8', '--fg-dimmer: #6e7681', '--accent: #0078d4', '--sel: #04395e',
+      '--brand: #fc6d26', '--agent: #a371f7', '--sev-blocker: #f85149', '--sev-major: #d29922',
+      '--sev-minor: #4a9eff', '--ok: #3fb950', '--ok-strong: #238636', '--add-bg: #1b3a24',
+      '--del-bg: #3a1e1e',
+    ]) {
+      expect(dark).toContain(decl);
     }
+    // JetBrains Mono leads the mono stack, like the POC.
+    expect(dark).toContain('--font-mono: "JetBrains Mono"');
   });
 
-  it('carries the contrast-corrected light overrides under body.vscode-light', () => {
+  it('carries the exact POC light theme under body.vscode-light', () => {
     const light = VERDICT_TOKENS_CSS.slice(VERDICT_TOKENS_CSS.indexOf('body.vscode-light'));
-    for (const hex of ['#b3252b', '#8a6100', '#0b62c4', '#116329', '#6b3fc7', '#b8341d', '#595959']) {
-      expect(light).toContain(hex);
+    for (const decl of [
+      '--bg: #ffffff', '--bg2: #f3f3f3', '--bg3: #e8e8e8', '--card: #fafafa', '--hover: #dcdcdc',
+      '--sev-blocker: #b3252b', '--sev-major: #8a6100', '--sev-minor: #0b62c4', '--ok: #116329',
+      '--agent: #6b3fc7', '--brand: #b8341d', '--sel: #cce4f7', '--link: #0066bf',
+    ]) {
+      expect(light).toContain(decl);
     }
   });
 });
