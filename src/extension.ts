@@ -9,6 +9,7 @@ import { getProvider } from './platform/registry';
 import { registerBuiltInProviders } from './registry';
 import { getSignInOptions } from './signInFlow';
 import { DashboardPanel } from './ui/dashboard';
+import { PostedReviewsPanel } from './ui/postedReviews';
 import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
 import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
@@ -36,13 +37,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   };
 
+  const postedDeps = {
+    podStore,
+    secrets,
+    globalState: context.globalState,
+    openReviewFlow: (ref: { repoId: string; number: string }) =>
+      void ReviewFlowPanel.open(flowDeps, ref),
+  };
+
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     openCr: (ref, submitted) => {
       if (submitted) {
-        void vscode.window.showInformationMessage(
-          'Verdict: posted-review tracking arrives with issue #12.',
-        );
+        void PostedReviewsPanel.show(postedDeps);
         return;
       }
       void ReviewFlowPanel.open(flowDeps, ref);
@@ -138,6 +145,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const handlers: Partial<Record<string, () => Promise<void> | void>> = {
     [COMMANDS.openDashboard]: openDashboard,
+    [COMMANDS.openReview]: async () => {
+      await PostedReviewsPanel.show(postedDeps);
+    },
     [COMMANDS.refresh]: async () => {
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();

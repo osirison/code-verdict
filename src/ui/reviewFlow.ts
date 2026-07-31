@@ -506,9 +506,7 @@ export class ReviewFlowPanel {
         void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
         return;
       case 'trackReplies':
-        void vscode.window.showInformationMessage(
-          'Verdict: posted-review tracking arrives with issue #12.',
-        );
+        void vscode.commands.executeCommand('codeVerdict.openReview');
         return;
       case 'help':
         void vscode.window.showInformationMessage(
@@ -589,6 +587,9 @@ export class ReviewFlowPanel {
         submittedAt: new Date().toISOString(),
         counts,
         threads,
+        items: this.review.items
+          .filter((i) => this.review?.verdicts[i.id]?.verdict === 'accepted')
+          .map((i) => ({ id: i.id, title: i.title, severity: i.severity, file: i.file, line: i.line })),
         requestedChanges: result.requestChangesApplied === true,
       });
       await this.deps.workspaceState.update(this.draftKey(), undefined);

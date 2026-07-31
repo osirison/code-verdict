@@ -4,7 +4,16 @@
  * (issue #12) and agent tuning (issue #13) next.
  */
 import type { VerdictCounts } from '../domain/reviewState';
+import type { Severity } from '../domain/types';
 import type { KeyValueStore } from './storage';
+
+export interface SubmittedItemSnapshot {
+  id: string;
+  title: string;
+  severity: Severity;
+  file: string;
+  line: number;
+}
 
 export interface SubmittedReview {
   repoId: string;
@@ -16,6 +25,8 @@ export interface SubmittedReview {
   counts: VerdictCounts;
   /** itemId → discussion/thread id, for reply polling. */
   threads: Record<string, string>;
+  /** Accepted-item snapshot — posted-review rows need titles/severities offline. */
+  items?: SubmittedItemSnapshot[];
   requestedChanges: boolean;
 }
 
