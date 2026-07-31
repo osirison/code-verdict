@@ -19,6 +19,8 @@ export function formatAge(iso: string, now: number): string {
 export interface DashboardDeps {
   /** CR refs (repoId!number) with a submitted review — fills the AI pill. */
   submittedRefs?: () => ReadonlySet<string>;
+  /** Row click: submitted rows open Posted reviews, others Run review (§2). */
+  openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
 }
 
 export function toViewState(
