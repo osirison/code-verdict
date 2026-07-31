@@ -74,6 +74,14 @@ export class ReviewFlowPanel {
     await ReviewFlowPanel.current.load(ref);
   }
 
+  /** "Verdict: Open review" — the triage tab for the active MR (naming doc). */
+  static revealIfOpen(): boolean {
+    const panel = ReviewFlowPanel.current;
+    if (!panel || panel.disposed) return false;
+    panel.panel.reveal();
+    return true;
+  }
+
   static handleCommand(command: string): boolean {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed) return false;
@@ -506,9 +514,10 @@ export class ReviewFlowPanel {
         void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
         return;
       case 'trackReplies':
-        void vscode.window.showInformationMessage(
-          'Verdict: posted-review tracking arrives with issue #12.',
-        );
+        void vscode.commands.executeCommand('codeVerdict.internal.postedReviews', {
+          repoId: this.ref.repoId,
+          number: this.ref.number,
+        });
         return;
       case 'help':
         void vscode.window.showInformationMessage(
@@ -589,6 +598,9 @@ export class ReviewFlowPanel {
         submittedAt: new Date().toISOString(),
         counts,
         threads,
+        items: this.review.items
+          .filter((i) => this.review?.verdicts[i.id]?.verdict === 'accepted')
+          .map((i) => ({ id: i.id, title: i.title, severity: i.severity, file: i.file, line: i.line })),
         requestedChanges: result.requestChangesApplied === true,
       });
       await this.deps.workspaceState.update(this.draftKey(), undefined);

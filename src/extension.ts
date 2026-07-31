@@ -9,6 +9,7 @@ import { getProvider } from './platform/registry';
 import { registerBuiltInProviders } from './registry';
 import { getSignInOptions } from './signInFlow';
 import { DashboardPanel } from './ui/dashboard';
+import { PostedReviewsPanel } from './ui/postedReviews';
 import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
 import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
@@ -36,13 +37,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   };
 
+  const postedDeps = {
+    podStore,
+    secrets,
+    globalState: context.globalState,
+    openReviewFlow: (ref: { repoId: string; number: string }) =>
+      void ReviewFlowPanel.open(flowDeps, ref),
+  };
+
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     openCr: (ref, submitted) => {
       if (submitted) {
-        void vscode.window.showInformationMessage(
-          'Verdict: posted-review tracking arrives with issue #12.',
-        );
+        void PostedReviewsPanel.show(postedDeps, ref);
         return;
       }
       void ReviewFlowPanel.open(flowDeps, ref);
@@ -138,6 +145,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const handlers: Partial<Record<string, () => Promise<void> | void>> = {
     [COMMANDS.openDashboard]: openDashboard,
+    [COMMANDS.openReview]: () => {
+      // Naming doc: "Verdict: Open review" is the triage tab for the
+      // active MR — Posted reviews has its own (internal) entry point.
+      if (!ReviewFlowPanel.revealIfOpen()) {
+        void vscode.window.showInformationMessage(
+          'Verdict: no active review — open a merge request from the dashboard first.',
+        );
+      }
+    },
     [COMMANDS.refresh]: async () => {
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();
@@ -159,6 +175,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     context.subscriptions.push(vscode.commands.registerCommand(id, handler));
   }
+
+  // Not in the palette (the naming doc's 19 commands reserve openReview
+  // for triage) — the sidebar row, dashboard rows and "Track replies"
+  // reach Posted reviews through this internal id.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'codeVerdict.internal.postedReviews',
+      (focusRef?: { repoId: string; number: string }) =>
+        void PostedReviewsPanel.show(postedDeps, focusRef),
+    ),
+  );
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and

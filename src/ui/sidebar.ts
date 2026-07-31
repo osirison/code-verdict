@@ -46,7 +46,7 @@ export class VerdictSidebarProvider implements vscode.TreeDataProvider<NavRow> {
     ];
     rows.push(
       { label: 'Pod dashboard', icon: 'dashboard', command: COMMANDS.openDashboard },
-      { label: 'Posted reviews', icon: 'comment-discussion', command: COMMANDS.openReview },
+      { label: 'Posted reviews', icon: 'comment-discussion', command: 'codeVerdict.internal.postedReviews' },
       { label: 'Agent tuning', icon: 'graph', command: COMMANDS.selectAgent },
       { label: 'Settings', icon: 'gear', command: COMMANDS.editCriteria },
     );
