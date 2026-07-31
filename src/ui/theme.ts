@@ -1,50 +1,48 @@
 /**
- * The Verdict webview design system — the spec's design tokens
- * (`spec/README.md` §Design tokens) as CSS.
+ * The Verdict webview design system — the POC's design tokens
+ * (`spec/prototypes/GitLab AI Review - Prototype.dc.html` :root block)
+ * verbatim, so every screen resolves pixel-identical to the prototype.
  *
- * Two rules from the spec, honoured here once for every screen:
- * - Surfaces, lines and text come from VS Code THEME VARIABLES with the
- *   prototype's Dark+ hexes as fallbacks — in Dark+ the resolution is
- *   pixel-identical to the POC, in other themes the theme wins.
- * - Product identity colors (brand, agent, severities, ok/accept) are
- *   controlled literals with the spec's contrast-corrected light-theme
- *   overrides (`body.vscode-light`) — they are design constants, not
- *   theme-derivable.
+ * Product decision (overriding the README's theme-variable rule): the POC
+ * palette is canonical. Light/dark still follows VS Code's mode via the
+ * body class — `body.vscode-light` carries the POC's own light theme, and
+ * high-contrast falls back to the dark set. Revisit theme-variable
+ * adaptation only if product asks for it.
  *
- * Type: UI text uses the system stack via --vscode-font-family; code, ids,
- * paths, counts and metadata use the user's editor font (JetBrains Mono in
- * the POC) via --vscode-editor-font-family.
+ * Type: UI text uses the system stack; code, ids, paths, counts and
+ * metadata use JetBrains Mono like the POC, falling back to the user's
+ * editor font when it is not installed (no font is bundled).
  */
 
 export const VERDICT_TOKENS_CSS = `
 :root {
-  /* Surfaces */
-  --bg: var(--vscode-editor-background, #1f1f1f);
-  --bg2: var(--vscode-sideBar-background, #181818);
-  --bg3: var(--vscode-editorWidget-background, #252525);
-  --card: var(--vscode-editorHoverWidget-background, #242424);
-  --code: var(--vscode-textCodeBlock-background, #141414);
+  /* Surfaces — POC dark set, verbatim */
+  --bg: #1f1f1f;
+  --bg2: #181818;
+  --bg3: #252525;
+  --card: #242424;
+  --code: #141414;
   --row: #232323;
   /* Lines */
-  --line: var(--vscode-widget-border, #2b2b2b);
+  --line: #2b2b2b;
   --line2: #3c3c3c;
   --line3: #4a4a4a;
-  --hover: var(--vscode-list-hoverBackground, #383838);
+  --hover: #383838;
   /* Text */
   --fg-max: #f0f0f0;
   --fg-hi: #e8e8e8;
-  --fg: var(--vscode-foreground, #cccccc);
+  --fg: #cccccc;
   --fg2: #bdbdbd;
   --fg-dim: #9d9d9d;
   --fg-dim2: #8b8b8b;
   --fg-dimmer: #6e7681;
   --gutter: #5a5a5a;
-  --link: var(--vscode-textLink-foreground, #4daafc);
+  --link: #4daafc;
   /* Accents */
-  --accent: var(--vscode-button-background, #0078d4);
-  --accent-h: var(--vscode-button-hoverBackground, #1a86e0);
-  --accent-fg: var(--vscode-button-foreground, #ffffff);
-  --sel: var(--vscode-list-activeSelectionBackground, #04395e);
+  --accent: #0078d4;
+  --accent-h: #1a86e0;
+  --accent-fg: #ffffff;
+  --sel: #04395e;
   --sel-soft: #04395e33;
   --brand: #fc6d26;
   --brand-h: #ff8144;
@@ -71,21 +69,31 @@ export const VERDICT_TOKENS_CSS = `
   --del-bg: #3a1e1e;
   --del-fg: #f0a5a2;
   /* Type */
-  --font-ui: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
-  --font-mono: var(--vscode-editor-font-family, "JetBrains Mono", monospace);
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
 }
-/* Spec light-theme overrides: contrast-corrected, not derived. */
+/* POC light theme, verbatim ([data-theme="light"] in the prototype). */
 body.vscode-light {
+  --bg: #ffffff;
+  --bg2: #f3f3f3;
+  --bg3: #e8e8e8;
+  --card: #fafafa;
+  --code: #f8f8f8;
   --row: #ececec;
+  --line: #e0e0e0;
   --line2: #cecece;
   --line3: #b8b8b8;
+  --hover: #dcdcdc;
   --fg-max: #111111;
   --fg-hi: #1f1f1f;
+  --fg: #3b3b3b;
   --fg2: #4a4a4a;
   --fg-dim: #616161;
   --fg-dim2: #595959;
   --fg-dimmer: #595959;
   --gutter: #a8a8a8;
+  --link: #0066bf;
+  --sel: #cce4f7;
   --sel-soft: #cce4f755;
   --brand: #b8341d;
   --brand-h: #d14526;
