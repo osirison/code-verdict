@@ -49,7 +49,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     submittedRefs: () => reviewHistory.submittedRefs(),
     openCr: (ref, submitted) => {
       if (submitted) {
-        void PostedReviewsPanel.show(postedDeps);
+        void PostedReviewsPanel.show(postedDeps, ref);
         return;
       }
       void ReviewFlowPanel.open(flowDeps, ref);
@@ -145,8 +145,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const handlers: Partial<Record<string, () => Promise<void> | void>> = {
     [COMMANDS.openDashboard]: openDashboard,
-    [COMMANDS.openReview]: async () => {
-      await PostedReviewsPanel.show(postedDeps);
+    [COMMANDS.openReview]: () => {
+      // Naming doc: "Verdict: Open review" is the triage tab for the
+      // active MR — Posted reviews has its own (internal) entry point.
+      if (!ReviewFlowPanel.revealIfOpen()) {
+        void vscode.window.showInformationMessage(
+          'Verdict: no active review — open a merge request from the dashboard first.',
+        );
+      }
     },
     [COMMANDS.refresh]: async () => {
       sidebar.refresh();
@@ -169,6 +175,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     context.subscriptions.push(vscode.commands.registerCommand(id, handler));
   }
+
+  // Not in the palette (the naming doc's 19 commands reserve openReview
+  // for triage) — the sidebar row, dashboard rows and "Track replies"
+  // reach Posted reviews through this internal id.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'codeVerdict.internal.postedReviews',
+      (focusRef?: { repoId: string; number: string }) =>
+        void PostedReviewsPanel.show(postedDeps, focusRef),
+    ),
+  );
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and

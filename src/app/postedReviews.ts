@@ -38,7 +38,14 @@ export function crKey(repoId: string, crNumber: string): string {
   return `${repoId}!${crNumber}`;
 }
 
-/** Local-only thread flags, keyed `<crRef>:<threadId>` (handoff §8). */
+/**
+ * Local-only thread flags, keyed `<crRef>` → set of thread ids. Thread ids
+ * are what the platform returned when this review posted its comments and
+ * map 1:1 to item ids through the history entry — equivalent to the
+ * handoff's `<crRef>:<itemId>` keying, and directly comparable against the
+ * ids reply-polling returns. A provider with unstable thread ids would
+ * need a translation layer here (none of the current ones do).
+ */
 export class ThreadFlags {
   private static readonly KEY = 'codeVerdict.threadFlags';
 
@@ -93,9 +100,15 @@ export function toThreadView(
       .slice(1)
       .filter((n) => n.author.username !== you)
       .map((n) => ({ author: n.author.username, body: n.body, at: n.createdAt })),
-    closedBy: resolvedNote?.resolvedBy
-      ? `resolved by @${resolvedNote.resolvedBy.username}`
-      : undefined,
+    // The POC shows "fixed in <sha> · @user"; the fixing commit is not
+    // derivable from discussions alone, so the closed line names the
+    // resolver (conceded threads say so explicitly).
+    closedBy:
+      status === 'conceded'
+        ? 'conceded — they were right'
+        : resolvedNote?.resolvedBy
+          ? `resolved by @${resolvedNote.resolvedBy.username}`
+          : undefined,
   };
 }
 
@@ -108,7 +121,12 @@ export async function buildPostedReview(
   const ref = { repoId: entry.repoId, number: entry.crNumber };
   const ourThreadIds = new Set(Object.values(entry.threads));
   const threads = (await connection.listThreads(ref))
-    .filter((t) => ourThreadIds.size === 0 || ourThreadIds.has(t.id))
+    // Only threads this review posted. Legacy entries without thread ids
+    // fall back to "threads you started" — never the whole MR's
+    // discussions, which would include other reviewers' threads.
+    .filter((t) =>
+      ourThreadIds.size > 0 ? ourThreadIds.has(t.id) : t.notes[0]?.author.username === you,
+    )
     .map((t) => toThreadView(t, entry, you, conceded));
 
   const counts = { you: 0, author: 0, closed: 0 };

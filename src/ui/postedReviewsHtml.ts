@@ -3,6 +3,7 @@
  * replies across every review submitted in the pod.
  */
 import type { PostedReviewView, PostedThreadView } from '../app/postedReviews';
+import { formatAge } from './dashboardState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
 import { escapeHtml as e, renderPage } from './theme';
@@ -17,6 +18,7 @@ export interface PostedRow {
 
 export interface PostedViewState {
   podName: string;
+  now: number;
   waitingOnYouTotal: number;
   rows: PostedRow[];
   selectedIndex: number;
@@ -59,7 +61,8 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .rev-row.selected { background: var(--sel); }
 .rev-title { font-size: 12.5px; font-weight: 500; color: var(--fg-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rev-ref { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); margin-top: 2px; }
-.breakdown { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); }
+.breakdown { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; }
+.rev-project { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .badge { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: 3px; }
 .badge-you { color: var(--sev-minor); background: var(--sev-minor-t); }
 .badge-none { color: var(--fg-dimmer); background: var(--nit-t); }
@@ -98,14 +101,14 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .empty { text-align: center; padding: 70px 20px; color: var(--fg-dim); font-size: 12.5px; }
 `;
 
-function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined): string {
+function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number): string {
   const chip = STATUS_CHIP[t.status];
   const open = t.status !== 'resolved' && t.status !== 'conceded';
   return `<div class="th-row" data-thread="${e(t.threadId)}">
     <div class="th-head" data-toggle="${e(t.threadId)}">
-      ${t.severity ? `<span class="sev sev-${t.severity}">${t.severity}</span>` : ''}
+      ${t.severity ? `<span class="sev sev-${e(t.severity)}">${e(t.severity)}</span>` : ''}
       <span class="th-title">${e(t.title)}</span>
-      ${t.file ? `<span class="th-loc">${e(t.file)}${t.line !== undefined ? `:${t.line}` : ''}</span>` : ''}
+      ${t.file ? `<span class="th-loc">${e(t.file)}${t.line !== undefined ? `:${e(String(t.line))}` : ''}</span>` : ''}
       <span class="pill ${chip.cls}">${e(chip.label)}</span>
     </div>
     ${
@@ -114,7 +117,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
       <div class="entry entry-you"><div class="entry-label">you · posted comment</div>${e(t.yourBody)}</div>
       ${t.replies
         .map(
-          (r) => `<div class="entry entry-author"><div class="entry-label">@${e(r.author)} · ${e(r.at.slice(0, 10))}</div>${e(r.body)}</div>`,
+          (r) => `<div class="entry entry-author"><div class="entry-label">@${e(r.author)} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
         )
         .join('')}
       ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — GitLab dropped the anchor.</div>` : ''}
@@ -146,20 +149,20 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       <span class="on-you">${state.waitingOnYouTotal} on you</span>
       <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
     </header>
-    <div class="thead"><div>Merge request</div><div>Threads</div><div>Status</div><div>Age</div></div>
+    <div class="thead"><div>Merge request</div><div>Threads</div><div>Project</div><div>Age</div></div>
     ${state.rows
       .map(
         (row, index) => `<div class="rev-row ${index === state.selectedIndex ? 'selected' : ''}" data-index="${index}">
         <div>
-          <div class="rev-title">${e(row.title)}</div>
-          <div class="rev-ref">${e(row.refLabel)} · ${e(row.project)}</div>
+          <div class="rev-title">${e(row.refLabel)} · ${e(row.title)}</div>
+          <div class="breakdown">${row.view.counts.you} you · ${row.view.counts.author} author · ${row.view.counts.closed} closed</div>
         </div>
-        <div class="breakdown">${row.view.counts.you} you · ${row.view.counts.author} author · ${row.view.counts.closed} closed</div>
         <div>${
           row.view.counts.you > 0
             ? `<span class="badge badge-you">${row.view.counts.you} waiting on you</span>`
             : `<span class="badge badge-none">nothing on you</span>`
         }</div>
+        <div class="rev-project">${e(row.project)}</div>
         <div class="cell-age">${e(row.age)}</div>
       </div>`,
       )
@@ -173,13 +176,13 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       </div>
       <div class="grow"></div>
       <div class="sel-count you"><b>${selected.view.counts.you}</b>waiting on you</div>
-      <div class="sel-count author"><b>${selected.view.counts.author}</b>waiting on author</div>
+      <div class="sel-count author"><b>${selected.view.counts.author}</b>waiting on the author</div>
       <div class="sel-count closed"><b>${selected.view.counts.closed}</b>closed</div>
       <button class="btn" id="rerun">Re-run agent on the fix</button>
     </div>
     <div class="threads">
       ${selected.view.threads
-        .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId]))
+        .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId], state.now))
         .join('')}
     </div>`
         : ''

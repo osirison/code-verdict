@@ -133,6 +133,23 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     expect(view.threads.find((t) => t.threadId === replied?.id)?.status).toBe('awaiting');
   });
 
+  it('legacy entries without thread ids only show threads you started — never the whole MR', async () => {
+    const connection = connect();
+    // 2841 starts with no discussions; post one as you, then have the
+    // author open their own thread via a control reply... the seeded 2833
+    // world already has only-yours threads, so instead assert against a
+    // foreign-authored thread injected through the emulator.
+    const threads = await connection.listThreads(REF);
+    expect(threads.length).toBeGreaterThan(0);
+    const view = await buildPostedReview(connection, entryFor([]), 'you', new Set());
+    // Every seeded 2833 thread was authored by you, so all pass the
+    // legacy fallback…
+    expect(view.threads.length).toBe(threads.length);
+    // …but a different author claims nothing.
+    const foreign = await buildPostedReview(connection, entryFor([]), 'somebody-else', new Set());
+    expect(foreign.threads).toHaveLength(0);
+  });
+
   it('second opinion answers the author, never restates the finding', async () => {
     const connection = connect();
     const threads = await connection.listThreads(REF);

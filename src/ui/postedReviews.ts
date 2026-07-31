@@ -27,8 +27,12 @@ export interface PostedReviewsDeps {
 export class PostedReviewsPanel {
   private static current: PostedReviewsPanel | undefined;
 
-  static async show(deps: PostedReviewsDeps): Promise<void> {
+  static async show(
+    deps: PostedReviewsDeps,
+    focusRef?: { repoId: string; number: string },
+  ): Promise<void> {
     if (PostedReviewsPanel.current && !PostedReviewsPanel.current.disposed) {
+      PostedReviewsPanel.current.focusRef = focusRef;
       PostedReviewsPanel.current.panel.reveal();
       await PostedReviewsPanel.current.refresh();
       return;
@@ -40,11 +44,18 @@ export class PostedReviewsPanel {
       { enableScripts: true },
     );
     PostedReviewsPanel.current = new PostedReviewsPanel(panel, deps);
+    PostedReviewsPanel.current.focusRef = focusRef;
     await PostedReviewsPanel.current.refresh();
+  }
+
+  static async refreshIfOpen(): Promise<void> {
+    await PostedReviewsPanel.current?.refresh();
   }
 
   private disposed = false;
   private refreshSeq = 0;
+  private focusRef?: { repoId: string; number: string };
+  private pod?: ReturnType<PodStore['list']>[number];
   private rows: PostedRow[] = [];
   private selectedIndex = 0;
   private expandedThreadId?: string;
@@ -66,7 +77,9 @@ export class PostedReviewsPanel {
   }
 
   private async onMessage(m: PostedMessage): Promise<void> {
-    const pod = this.deps.podStore.activePod;
+    // The pod captured at refresh time — never pair a freshly-switched
+    // pod's connection with rows fetched for the previous one.
+    const pod = this.pod;
     if (!pod) return;
     const view = this.selectedView();
     try {
@@ -99,16 +112,17 @@ export class PostedReviewsPanel {
         }
         case 'concede': {
           if (!view) return;
-          // Local flag + resolved in GitLab (handoff §8).
-          await new ThreadFlags(this.deps.globalState).concede(
-            crKey(view.repoId, view.crNumber),
-            m.threadId,
-          );
+          // Resolve on the platform FIRST — the local flag only lands once
+          // the resolution stuck, so a failure leaves no phantom concede.
           const connection = await connectionForPod(pod, this.deps.secrets);
           await connection.resolveThread(
             { repoId: view.repoId, number: view.crNumber },
             m.threadId,
             true,
+          );
+          await new ThreadFlags(this.deps.globalState).concede(
+            crKey(view.repoId, view.crNumber),
+            m.threadId,
           );
           await this.refresh();
           return;
@@ -193,7 +207,16 @@ export class PostedReviewsPanel {
         }),
       );
       if (!canRender()) return;
+      this.pod = pod;
       this.rows = rows;
+      if (this.focusRef) {
+        const wanted = this.focusRef;
+        const index = rows.findIndex(
+          (r) => r.view.repoId === wanted.repoId && r.view.crNumber === wanted.number,
+        );
+        if (index >= 0) this.selectedIndex = index;
+        this.focusRef = undefined;
+      }
       if (this.selectedIndex >= rows.length) this.selectedIndex = 0;
       this.render();
     } catch (e) {
@@ -209,7 +232,8 @@ export class PostedReviewsPanel {
     const nonce = crypto.randomBytes(16).toString('hex');
     this.panel.webview.html = renderPostedReviewsHtml(
       {
-        podName: this.deps.podStore.activePod?.name ?? '',
+        podName: this.pod?.name ?? this.deps.podStore.activePod?.name ?? '',
+        now: Date.now(),
         waitingOnYouTotal: this.rows.reduce((n, r) => n + r.view.counts.you, 0),
         rows: this.rows,
         selectedIndex: this.selectedIndex,

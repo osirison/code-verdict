@@ -74,6 +74,14 @@ export class ReviewFlowPanel {
     await ReviewFlowPanel.current.load(ref);
   }
 
+  /** "Verdict: Open review" — the triage tab for the active MR (naming doc). */
+  static revealIfOpen(): boolean {
+    const panel = ReviewFlowPanel.current;
+    if (!panel || panel.disposed) return false;
+    panel.panel.reveal();
+    return true;
+  }
+
   static handleCommand(command: string): boolean {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed) return false;
@@ -506,7 +514,10 @@ export class ReviewFlowPanel {
         void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
         return;
       case 'trackReplies':
-        void vscode.commands.executeCommand('codeVerdict.openReview');
+        void vscode.commands.executeCommand('codeVerdict.internal.postedReviews', {
+          repoId: this.ref.repoId,
+          number: this.ref.number,
+        });
         return;
       case 'help':
         void vscode.window.showInformationMessage(
