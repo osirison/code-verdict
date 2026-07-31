@@ -128,8 +128,14 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
     // Deterministic per file: which anchors get findings, and which template.
     const seed = hash(`${diff.headSha}:${file.newPath}`);
     const take = Math.min(anchors.length, 1 + (seed % 2));
+    const used = new Set<number>();
     for (let i = 0; i < take; i++) {
-      const anchor = anchors[(seed + i * 7) % anchors.length];
+      // Distinct anchors per file — step patterns can collide when the
+      // anchor count divides the stride.
+      let index = (seed + i * 7) % anchors.length;
+      while (used.has(index)) index = (index + 1) % anchors.length;
+      used.add(index);
+      const anchor = anchors[index];
       if (!anchor) continue;
       const template = TEMPLATES[(seed + i) % TEMPLATES.length] as Template;
       // Unsigned shift — a signed one goes negative for high hashes and
@@ -158,8 +164,11 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
       } else {
         const key = `${reason}:${item.severity}:${item.category}`;
         const bucket = rejectedBuckets.get(key);
-        if (bucket) bucket.count += 1;
-        else
+        if (bucket) {
+          bucket.count += 1;
+          // The clean screen reads this as "highest scored N%".
+          bucket.confidence = Math.max(bucket.confidence, item.confidence);
+        } else
           rejectedBuckets.set(key, {
             severity: item.severity,
             category: item.category,

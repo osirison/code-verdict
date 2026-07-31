@@ -41,6 +41,9 @@ interface SessionDraft {
   threads: Record<string, Array<{ label: string; text: string }>>;
   summaryText: string;
   finalNote: string;
+  /** Partial-failure ledger — must survive reloads so a retry never re-posts what already landed (spec §7). */
+  failedKeys?: string[];
+  summaryPosted?: boolean;
 }
 
 export interface ReviewFlowDeps {
@@ -55,9 +58,10 @@ export class ReviewFlowPanel {
   private static current: ReviewFlowPanel | undefined;
 
   static async open(deps: ReviewFlowDeps, ref: ChangeRequestRef): Promise<void> {
-    if (ReviewFlowPanel.current && !ReviewFlowPanel.current.disposed) {
-      await ReviewFlowPanel.current.load(ref);
-      ReviewFlowPanel.current.panel.reveal();
+    const existing = ReviewFlowPanel.current;
+    if (existing && !existing.disposed) {
+      await existing.load(ref);
+      if (!existing.disposed) existing.panel.reveal();
       return;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -136,10 +140,36 @@ export class ReviewFlowPanel {
     return `codeVerdict.draft.${this.ref.repoId}!${this.ref.number}`;
   }
 
+  private loadSeq = 0;
+
   private async load(ref: ChangeRequestRef): Promise<void> {
+    const loadToken = ++this.loadSeq;
+    // Cancel any in-flight run for the previous MR — its completion must
+    // never land findings under this ref's review or draft key.
+    this.runToken += 1;
+    this.runSteps = [];
+    this.runStep = 0;
+    this.runError = undefined;
+    // Full per-MR reset: nothing (verdicts, threads, summary text, the
+    // partial-failure ledger) may leak from one MR into another.
     this.ref = ref;
+    this.review = undefined;
+    this.response = undefined;
+    this.threads = {};
+    this.selectedId = undefined;
+    this.summaryText = '';
+    this.finalNote = '';
+    this.submitError = undefined;
+    this.failedKeys = undefined;
+    this.summaryPosted = false;
+    this.threadsAccum = {};
+    this.doneSentence = '';
+    this.staleHead = undefined;
+    this.agentOpen = false;
+
     const connection = await this.connection();
     const crs = await connection.listOpenChangeRequests([ref.repoId]);
+    if (this.disposed || loadToken !== this.loadSeq) return;
     const cr = crs.find((c) => c.ref.number === ref.number);
     if (!cr) {
       void vscode.window.showWarningMessage(`Verdict: ${ref.number} is no longer open.`);
@@ -149,18 +179,22 @@ export class ReviewFlowPanel {
     this.cr = cr;
     this.diff = await connection.getChangeRequestDiff(ref);
     this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await discoverLmAgents())];
+    if (this.disposed || loadToken !== this.loadSeq) return;
     const pod = this.pod();
     if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
       this.agentId = pod.agentId;
     }
 
-    // A surviving draft re-enters triage (spec: drafts lose no work).
+    // A surviving draft re-enters triage (spec: drafts lose no work),
+    // including the partial-failure ledger.
     const draft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
     if (draft && draft.review.headSha) {
       this.review = draft.review;
       this.threads = draft.threads;
       this.summaryText = draft.summaryText;
       this.finalNote = draft.finalNote;
+      this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
+      this.summaryPosted = draft.summaryPosted ?? false;
       this.screen = 'triage';
       this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
       this.staleHead = draft.review.headSha === cr.headSha ? undefined : cr.headSha;
@@ -177,6 +211,8 @@ export class ReviewFlowPanel {
       threads: this.threads,
       summaryText: this.summaryText,
       finalNote: this.finalNote,
+      failedKeys: this.failedKeys ? [...this.failedKeys] : undefined,
+      summaryPosted: this.summaryPosted || undefined,
     } satisfies SessionDraft);
   }
 
@@ -207,14 +243,15 @@ export class ReviewFlowPanel {
       return;
     }
 
+    const lmStats = diffStats(this.diff.files.map((f) => f.diff));
     this.runSteps = [
       'Resolving agent from Copilot workspace…',
-      `Indexing ${this.diff.files.length} changed files…`,
-      'Waiting for the agent…',
+      `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
+      'Cross-referencing module history…',
       'Scoring findings against project criteria…',
-      'Done',
+      'Items ready',
     ];
-    this.runStep = 1;
+    this.runStep = 2;
     this.render();
     try {
       const response = await runLmAgent(this.agentId, this.diff, pod.criteria);
@@ -237,6 +274,9 @@ export class ReviewFlowPanel {
     const pod = this.pod();
     this.response = response;
     if (response.items.length === 0) {
+      // The superseded draft must not resurrect a dead review on next open.
+      void this.deps.workspaceState.update(this.draftKey(), undefined);
+      this.review = undefined;
       this.screen = 'clean';
       this.render();
       return;
@@ -249,6 +289,11 @@ export class ReviewFlowPanel {
       response,
     });
     this.threads = {};
+    // A fresh run supersedes any previous submit attempt's ledger.
+    this.submitError = undefined;
+    this.failedKeys = undefined;
+    this.summaryPosted = false;
+    this.threadsAccum = {};
     this.selectedId = this.review.items[0]?.id;
     this.staleHead = undefined;
     this.screen = 'triage';
@@ -297,6 +342,11 @@ export class ReviewFlowPanel {
         break;
       case 'retryRun':
         void this.run();
+        return;
+      case 'openTuning':
+        void vscode.window.showInformationMessage(
+          'Verdict: the agent scorecard arrives with issue #13.',
+        );
         return;
       case 'usePartial':
         // The demo agent never produces partials; the lm path reports 0
@@ -483,8 +533,13 @@ export class ReviewFlowPanel {
 
   // ---- submit ---------------------------------------------------------------------
 
+  private threadsAccum: Record<string, string> = {};
+
   private async submit(): Promise<void> {
     if (!this.review || !this.diff) return;
+    // Palette-invoked submits must obey the same gate as the button: a
+    // fully-triaged review, from the summary screen.
+    if (this.screen !== 'summary' || !allDecided(this.review)) return;
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
     const you = pod.username ?? 'you';
@@ -504,21 +559,27 @@ export class ReviewFlowPanel {
       );
 
       const failed = result.comments.filter((c) => !c.ok);
+      for (const outcome of result.comments) {
+        if (outcome.threadId) this.threadsAccum[outcome.key] = outcome.threadId;
+      }
       if (result.summaryPosted) this.summaryPosted = true;
-      if (failed.length > 0 || (!this.summaryPosted && drafts.length >= 0 && result.summaryError)) {
+      if (failed.length > 0 || (!this.summaryPosted && result.summaryError)) {
         this.failedKeys = new Set(failed.map((c) => c.key));
         const first = failed[0]?.error ?? result.summaryError;
         this.submitError = first?.message ?? 'submit failed';
         this.screen = 'summary';
+        // The ledger must survive a reload — a later retry may only post
+        // the remainder (spec §7).
+        await this.persistDraft();
         this.render();
         return;
       }
 
       const counts = verdictCounts(this.review);
-      const threads: Record<string, string> = {};
       for (const outcome of result.comments) {
-        if (outcome.threadId) threads[outcome.key] = outcome.threadId;
+        if (outcome.threadId) this.threadsAccum[outcome.key] = outcome.threadId;
       }
+      const threads = { ...this.threadsAccum };
       await new ReviewHistory(this.deps.globalState).add({
         repoId: this.ref.repoId,
         crNumber: this.ref.number,
@@ -534,7 +595,7 @@ export class ReviewFlowPanel {
       this.submitError = undefined;
       this.failedKeys = undefined;
       this.doneSentence = [
-        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${this.postThread ? ' as one review thread' : ''}${result.requestChangesApplied ? ', changes requested' : ''}.`,
+        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${this.postThread && provider.capabilities.batchedReview ? ' as one review thread' : ''}${result.requestChangesApplied ? ', changes requested' : ''}.`,
         counts.rejected > 0 ? `${counts.rejected} dismissed findings stayed local.` : '',
       ]
         .filter(Boolean)
@@ -600,8 +661,18 @@ export class ReviewFlowPanel {
     const counts = this.review
       ? verdictCounts(this.review)
       : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
+    const history = new ReviewHistory(this.deps.globalState).list().filter((r) => r.podId === pod.id);
+    const produced = history.reduce(
+      (n, r) => n + r.counts.accepted + r.counts.rejected + r.counts.skipped,
+      0,
+    );
+    const acceptRate =
+      produced > 0
+        ? Math.round((history.reduce((n, r) => n + r.counts.accepted, 0) / produced) * 100)
+        : undefined;
     const state: FlowViewState = {
       screen: this.screen,
+      acceptRate,
       header: {
         refLabel: this.refLabel(),
         projectPath: pod.repos?.find((r) => r.id === this.ref.repoId)?.path ?? this.ref.repoId,
@@ -633,6 +704,7 @@ export class ReviewFlowPanel {
       requestChanges: this.requestChanges,
       supportsRequestChanges: getProvider(pod.providerId).capabilities.requestChanges,
       submitError: this.submitError,
+      username: pod.username ?? 'you',
       doneSentence: this.doneSentence,
       crWebUrl: this.cr.webUrl,
     };

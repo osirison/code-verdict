@@ -36,6 +36,8 @@ export interface FlowViewState {
   agentId: string;
   agentOpen: boolean;
   criteria: Criteria;
+  /** "56% accepted in this pod" — undefined hides the tuning link. */
+  acceptRate?: number;
   // running
   runSteps: string[];
   runStep: number;
@@ -56,6 +58,7 @@ export interface FlowViewState {
   requestChanges: boolean;
   supportsRequestChanges: boolean;
   submitError?: string;
+  username: string;
   // done
   doneSentence: string;
   crWebUrl: string;
@@ -97,6 +100,7 @@ export type FlowMessage =
   | { type: 'backToDashboard' }
   | { type: 'openMr' }
   | { type: 'trackReplies' }
+  | { type: 'openTuning' }
   | { type: 'help' };
 
 export const SEVERITIES: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
@@ -239,6 +243,7 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 textarea.summary { width: 100%; min-height: 96px; border: none; background: var(--card); color: var(--fg); font-size: 12.5px; line-height: 1.7; padding: 12px 14px; resize: vertical; outline: none; font-family: var(--font-ui); }
 .comment-row { display: grid; grid-template-columns: 20px 148px minmax(0,1fr) 90px; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--row); font-size: 12px; align-items: center; }
 .comment-loc { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); }
+.comment-title { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sugg-mark { color: var(--agent); font-family: var(--font-mono); font-size: 10.5px; text-align: right; }
 .rejected-row { color: var(--fg-dimmer); font-size: 12px; padding: 7px 14px; border-bottom: 1px solid var(--row); }
 .empty-comments { border: 1px dashed var(--line2); border-radius: 6px; padding: 18px; text-align: center; font-size: 12px; color: var(--fg-dimmer); }
@@ -278,7 +283,7 @@ function renderRunReview(s: FlowViewState): string {
     ${subline(s.header)}
     <div>
       <h1>Run an AI review</h1>
-      <p class="lede">Agents come from your Copilot workspace. Criteria are saved per pod and follow every run.</p>
+      <p class="lede">Agents come from your Copilot workspace. Criteria are saved per project and follow every run.</p>
     </div>
     <div class="agent-select">
       <button class="agent-row" id="agent-toggle">
@@ -305,7 +310,7 @@ function renderRunReview(s: FlowViewState): string {
       </div>`
           : ''
       }
-      <div class="agent-sub">${e(agent?.description ?? '')}</div>
+      <div class="agent-sub">${e(agent?.description ?? '')}${s.acceptRate !== undefined ? `<a href="#" id="tuning-link">${s.acceptRate}% accepted in this pod →</a>` : ''}</div>
     </div>
     <div class="crit-grid">
       <div>
@@ -360,7 +365,7 @@ function renderRunning(s: FlowViewState): string {
         <div class="actions-row">
           ${s.runError.partialCount > 0 ? `<button class="btn btn-accent" id="use-partial">Use ${s.runError.partialCount} partial findings</button>` : ''}
           <button class="btn" id="retry-run">Retry</button>
-          <button class="btn" id="switch-agent">Switch agent</button>
+          <button class="btn" id="switch-agent">Switch to Fast Diff Review</button>
         </div>
         <div class="fail-meta">${e(s.runError.code)} · request id ${e(s.runError.requestId)}</div>
       </div>
@@ -396,7 +401,7 @@ function triageHeader(s: FlowViewState): string {
   return `<div class="tri-head">
     <div>
       <div class="tri-title">${e(s.header.title)}</div>
-      <div class="tri-meta">${e(s.header.branch)} · ${e(s.header.projectPath)}</div>
+      <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}</div>
     </div>
     <div class="tallies">${tallies}</div>
     <div class="seg mode" id="mode">
@@ -408,19 +413,19 @@ function triageHeader(s: FlowViewState): string {
   ${
     s.stale
       ? `<div class="stale">⚠ <div class="grow"><b>New commits on ${e(s.header.branch)} while you were reviewing</b>
-         ${s.stale.affected} findings may no longer sit on the lines the agent read.</div>
+         ${s.stale.affected} findings — including any you accepted — may no longer sit on the lines the agent read.</div>
          <button class="btn btn-accent" id="reanchor">Re-anchor to HEAD</button>
          <button class="btn" id="rerun">Re-run agent</button></div>`
       : ''
   }`;
 }
 
-function itemDetail(view: TriageItemView, agentLabel: string, position: string): string {
+function itemDetail(view: TriageItemView, agentLabel: string): string {
   const item = view.item;
   return `
     <div>${sevChip(item.severity)}</div>
     <div class="detail-title">${e(item.title)}</div>
-    <div class="detail-meta">${e(item.file)}:${item.line} · ${e(item.category)} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span> · ${position}</div>
+    <div class="detail-meta">${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span></div>
     <p class="prose">${e(item.body)}</p>
     <div class="code-card">
       <div class="code-head"><span>${e(item.file)}:${item.line}</span><a href="#" id="open-editor" data-file="${e(item.file)}" data-line="${item.line}">Open in editor</a></div>
@@ -455,12 +460,11 @@ function itemDetail(view: TriageItemView, agentLabel: string, position: string):
 
 function renderTriageSplit(s: FlowViewState, agentLabel: string): string {
   const selected = s.items.find((v) => v.item.id === s.selectedId) ?? s.items[0];
-  const index = selected ? s.items.findIndex((v) => v.item.id === selected.item.id) + 1 : 0;
   const decided = s.items.length - s.counts.undecided;
   const all = s.counts.undecided === 0;
   return `${triageHeader(s)}
   <div class="detail" data-item="${e(selected?.item.id ?? '')}">
-    ${selected ? itemDetail(selected, agentLabel, `${index} of ${s.items.length}`) : '<p class="prose">No review items.</p>'}
+    ${selected ? itemDetail(selected, agentLabel) : '<p class="prose">No review items.</p>'}
   </div>
   <div class="action-bar">
     <button class="btn btn-ok" id="accept">Accept<span class="key">A</span></button>
@@ -504,6 +508,8 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
         <p class="prose">${e(selected.item.body)}</p>
         <div class="presets">
           <button class="chip preset" data-preset="explain">Explain the risk</button>
+          <button class="chip preset" data-preset="fix">Show me a fix</button>
+          <button class="chip preset" data-preset="similar">Find similar in repo</button>
           <button class="chip preset" data-preset="why">Why flagged?</button>
         </div>
         ${selected.thread
@@ -586,18 +592,6 @@ function renderSummary(s: FlowViewState): string {
       <div class="tally tally-rej"><b>${s.counts.rejected}</b>rejected</div>
       <div class="tally tally-skip"><b>${s.counts.skipped}</b>skipped</div>
     </div>
-    ${
-      s.submitError
-        ? `<div class="submit-fail">
-        <div class="fail-title">GitLab rejected the request · ${e(s.submitError)}</div>
-        <div class="lede">Nothing is lost — the summary, the ${s.counts.accepted} line comments and your final note are still here.</div>
-        <div class="actions-row">
-          <button class="btn btn-accent" id="reconnect">Reconnect GitLab</button>
-          <button class="btn" id="retry-submit">Retry submit</button>
-        </div>
-      </div>`
-        : ''
-    }
     <div class="card">
       <div class="sum-card-head"><span>Summary comment · editable</span><a href="#" id="regenerate">Regenerate</a></div>
       <textarea class="summary" id="summary-text">${e(s.summaryText)}</textarea>
@@ -612,7 +606,7 @@ function renderSummary(s: FlowViewState): string {
                 (v) => `<div class="comment-row">
           <span>☑</span>
           <span class="comment-loc">${e(v.item.file.split('/').pop() ?? v.item.file)}:${v.item.line}</span>
-          <span class="row-title">${e(v.item.title)}</span>
+          <span class="comment-title">${e(v.item.title)}</span>
           <span class="sugg-mark">${v.applyFix && v.item.suggestion ? '+suggestion' : ''}</span>
         </div>`,
               )
@@ -645,11 +639,23 @@ function renderSummary(s: FlowViewState): string {
           : ''
       }
     </div>
+    ${
+      s.submitError
+        ? `<div class="submit-fail">
+        <div class="fail-title">GitLab rejected the request · ${e(s.submitError)}</div>
+        <div class="lede">Nothing is lost — the summary, the ${s.counts.accepted} line comments and your final note are still here.</div>
+        <div class="actions-row">
+          <button class="btn btn-accent" id="reconnect">Reconnect GitLab</button>
+          <button class="btn" id="retry-submit">Retry submit</button>
+        </div>
+      </div>`
+        : ''
+    }
     <div class="actions-row">
       <button class="btn btn-brand" id="submit">Submit to GitLab</button>
       <button class="btn" id="copy-md">Copy as markdown</button>
       <button class="btn" id="back-triage">Back to triage</button>
-      <span class="posts-as">posts as @you</span>
+      <span class="posts-as">posts as @${e(s.username)}</span>
     </div>
   </div>`;
 }
@@ -710,11 +716,12 @@ document.getElementById('opt-thread')?.addEventListener('change', () => post({ t
 document.getElementById('opt-changes')?.addEventListener('change', () => post({ type: 'toggleOption', option: 'requestChanges' }));
 on('submit', 'submit'); on('retry-submit', 'retrySubmit'); on('reconnect', 'reconnect'); on('back-triage', 'backToTriage'); on('copy-md', 'copyMarkdown');
 on('approve', 'approve'); on('lower-bar', 'lowerBar'); on('back-dash', 'backToDashboard');
-on('track-replies', 'trackReplies'); on('open-mr', 'openMr');
+on('track-replies', 'trackReplies'); on('open-mr', 'openMr'); on('tuning-link', 'openTuning');
 
 // Keyboard (spec §12 Triage group) — active while the review tab has focus.
 document.addEventListener('keydown', (ev) => {
   if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // never hijack Cmd/Ctrl chords
   const map = { a: () => verdict('accepted', !ev.shiftKey ? true : false), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); }, '?': () => post({ type: 'help' }) };
   const jump = { '1': 'blocker', '2': 'major', '3': 'minor', '4': 'nit' };
   const key = ev.key.toLowerCase();

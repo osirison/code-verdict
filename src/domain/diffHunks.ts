@@ -43,6 +43,9 @@ export function parseHunks(diff: string): Hunk[] {
       continue;
     }
     if (!current || raw === '') continue;
+    // "\ No newline at end of file" is metadata, not a context line —
+    // counting it would shift every anchor after it by one.
+    if (raw.startsWith('\\')) continue;
     if (raw.startsWith('+')) {
       current.lines.push({ kind: 'add', text: raw.slice(1), newLine });
       newLine += 1;
