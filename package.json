@@ -51,7 +51,8 @@
       "verdict": [
         {
           "id": "codeVerdict.sidebar",
-          "name": "Verdict"
+          "name": "Verdict",
+          "type": "webview"
         }
       ]
     },
@@ -116,6 +117,51 @@
           "type": "boolean",
           "default": false,
           "description": "Quiet hours: demote everything except blockers and direct mentions."
+        },
+        "codeVerdict.notifications.events.agentFinished": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Interrupt"
+        },
+        "codeVerdict.notifications.events.replyPosted": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Interrupt"
+        },
+        "codeVerdict.notifications.events.authorPushed": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Badge"
+        },
+        "codeVerdict.notifications.events.pipelineFailed": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Digest"
+        },
+        "codeVerdict.notifications.events.reviewRequested": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Interrupt"
+        },
+        "codeVerdict.notifications.events.mentioned": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Badge"
+        },
+        "codeVerdict.notifications.events.threadStale": {
+          "type": "string",
+          "enum": ["Interrupt", "Badge", "Digest", "Off"],
+          "default": "Digest"
+        },
+        "codeVerdict.notifications.digestCadence": {
+          "type": "string",
+          "enum": ["Hourly", "Twice a day", "End of day"],
+          "default": "End of day"
+        },
+        "codeVerdict.shareAcceptRejectRates": {
+          "type": "boolean",
+          "default": false,
+          "description": "Share aggregate accept/reject rates while keeping finding text and rationale local."
         },
         "codeVerdict.changesets.trailer": {
           "type": "string",

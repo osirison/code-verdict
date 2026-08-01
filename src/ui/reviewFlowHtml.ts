@@ -1,12 +1,12 @@
 /**
  * The review-flow screens (spec/README.md §3–§8) as pure renderers:
- * Run review → Running (with the failure card) → Triage (split / queue)
+ * Run review → Running (with the failure card) → Triage (split / queue / in-diff)
  * → Clean bill → Summary (with the submit-failure banner) → Submitted.
- * In-diff mode remains tracked under issue #10.
  */
 import type { CandidateBucket } from '../domain/agentResponse';
 import type { Category, Criteria, ReviewItem, Severity, Verdict } from '../domain/types';
 import type { AgentDescriptor } from '../app/agents';
+import type { HunkLine } from '../domain/diffHunks';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
 
@@ -27,6 +27,18 @@ export interface TriageItemView {
   verdict?: Verdict;
   applyFix?: boolean;
   thread: Array<{ label: string; text: string }>;
+  projectLabel?: string;
+  refLabel?: string;
+}
+
+export interface ChangesetReviewScope {
+  id: string;
+  name: string;
+  linkedIssue: string;
+  memberCount: number;
+  projectCount: number;
+  refs: string[];
+  repoLabels?: Record<string, string>;
 }
 
 export interface FlowViewState {
@@ -43,11 +55,13 @@ export interface FlowViewState {
   runStep: number;
   runError?: { message: string; requestId: string; partialCount: number; code: string };
   // triage
-  mode: 'split' | 'queue';
+  mode: 'split' | 'queue' | 'diff';
   items: TriageItemView[];
   selectedId?: string;
+  diffLines?: HunkLine[];
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
   stale?: { newHead: string; affected: number };
+  changeset?: ChangesetReviewScope;
   // clean
   candidates: CandidateBucket[];
   filesRead: number;
@@ -75,7 +89,7 @@ export type FlowMessage =
   | { type: 'cancel' }
   | { type: 'usePartial' }
   | { type: 'retryRun' }
-  | { type: 'setMode'; mode: 'split' | 'queue' }
+  | { type: 'setMode'; mode: 'split' | 'queue' | 'diff' }
   | { type: 'select'; itemId: string }
   | { type: 'verdict'; itemId: string; verdict: Verdict; applyFix: boolean }
   | { type: 'undo'; itemId: string }
@@ -101,6 +115,7 @@ export type FlowMessage =
   | { type: 'openMr' }
   | { type: 'trackReplies' }
   | { type: 'openTuning' }
+  | { type: 'reviewSingle'; repoId: string; number: string }
   | { type: 'help' };
 
 export const SEVERITIES: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
@@ -192,6 +207,10 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .stale { display: flex; align-items: center; gap: 12px; background: var(--sev-major-t); padding: 10px 20px; font-size: 11.5px; color: var(--fg); }
 .stale b { font-size: 12px; font-weight: 600; display: block; }
 .stale .grow { flex: 1; }
+.changeset-scope { display: flex; align-items: center; gap: 10px; padding: 9px 20px; border-bottom: 1px solid var(--agent-b); background: var(--agent-f); color: var(--fg); font-size: 11.5px; }
+.changeset-scope .glyph { color: var(--agent); font-size: 14px; }
+.changeset-scope strong { color: var(--fg-hi); font-weight: 600; }
+.changeset-scope a { margin-left: auto; }
 
 .detail { max-width: 820px; margin: 0 auto; padding: 24px 30px 120px; display: flex; flex-direction: column; gap: 16px; }
 .detail-title { font-size: 15.5px; font-weight: 600; color: var(--fg-max); }
@@ -209,6 +228,12 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .thread-entry { border-left: 2px solid var(--agent); background: var(--agent-f); padding: 10px 14px; }
 .thread-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--agent); margin-bottom: 4px; font-family: var(--font-mono); }
 .thread-text { font-size: 12.5px; line-height: 1.6; color: var(--fg); }
+.cross-card { border: 1px solid var(--agent-b); border-left: 3px solid var(--agent); border-radius: 6px; background: var(--agent-f); overflow: hidden; }
+.cross-head { padding: 8px 12px; color: var(--agent); font: 600 10px/1.2 var(--font-mono); text-transform: uppercase; }
+.cross-side { display: grid; grid-template-columns: 90px 190px minmax(0,1fr); gap: 8px; padding: 7px 12px; border-top: 1px solid var(--agent-b); font-size: 11.5px; }
+.cross-repo { color: var(--agent); font-family: var(--font-mono); }
+.cross-location { color: var(--fg); font-family: var(--font-mono); }
+.cross-role { color: var(--fg-dimmer); }
 .ask-row { display: flex; gap: 8px; align-items: center; }
 .ask-row .prompt { color: var(--fg-dimmer); font-family: var(--font-mono); }
 .action-bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 10px; padding: 13px 22px; background: var(--bg2); border-top: 1px solid var(--line); }
@@ -226,6 +251,27 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .deck-actions { display: flex; gap: 10px; margin-top: 14px; }
 .deck-actions .grow { flex: 1; }
 .deck-foot { display: flex; justify-content: space-between; margin-top: 12px; font-size: 11.5px; color: var(--fg-dim); }
+
+.diff-wrap { max-width: 1040px; margin: 0 auto 100px; padding: 20px 30px; }
+.diff-file-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--bg2); border: 1px solid var(--line); border-radius: 6px 6px 0 0; }
+.diff-file-path { color: var(--fg-hi); font: 500 11.5px/1.3 var(--font-mono); }
+.diff-file-count { margin-left: auto; color: var(--fg-dimmer); font: 10.5px/1 var(--font-mono); }
+.diff-nav { border: 0; background: none; color: var(--fg-dim); cursor: pointer; }
+.diff-code { border: 1px solid var(--line); border-top: 0; background: var(--code); overflow: hidden; }
+.diff-line { display: grid; grid-template-columns: 56px 22px minmax(0,1fr); min-height: 24px; font: 12.5px/1.9 var(--font-mono); }
+.diff-line.add { background: var(--add-bg); color: var(--add-fg); }
+.diff-line.del { background: var(--del-bg); color: var(--del-fg); }
+.diff-line.diff-flagged { border-left: 2px solid var(--item-sev); background: var(--del-bg); }
+.diff-gutter { padding-right: 9px; color: var(--gutter); text-align: right; user-select: none; }
+.diff-prefix { color: var(--gutter); text-align: center; user-select: none; }
+.diff-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.peek-widget { margin: 8px 40px 8px 56px; border: 1px solid var(--line2); border-radius: 6px; background: var(--card); animation: tin .18s ease-out; overflow: hidden; }
+.peek-head { display: flex; align-items: center; gap: 8px; border-left: 3px solid var(--item-sev); padding: 9px 12px; background: var(--bg2); }
+.peek-title { min-width: 0; color: var(--fg-hi); font-size: 12.5px; font-weight: 600; }
+.peek-count { margin-left: auto; color: var(--fg-dimmer); font: 10.5px/1 var(--font-mono); }
+.peek-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 14px; }
+.peek-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ask-link { margin-left: auto; color: var(--agent); }
 
 .clean-col { max-width: 660px; margin: 0 auto; padding: 40px 30px; display: flex; flex-direction: column; gap: 18px; text-align: center; }
 .ok-circle { width: 44px; height: 44px; border-radius: 50%; background: var(--ok-strong-t); color: var(--ok); display: flex; align-items: center; justify-content: center; font-size: 18px; margin: 0 auto; }
@@ -398,7 +444,10 @@ function triageHeader(s: FlowViewState): string {
     .filter((sev) => bySev(sev) > 0)
     .map((sev) => `<span class="sev sev-${sev}">${bySev(sev)} ${sev}</span>`)
     .join('');
-  return `<div class="tri-head">
+  const scope = s.changeset
+    ? `<div class="changeset-scope"><span class="glyph">⧉</span><span><strong>Reviewing ${e(s.changeset.name)} · ${s.changeset.memberCount} MRs</strong> · findings are labelled with the repo they land in</span><a href="#" id="review-single">Review this MR alone</a></div>`
+    : '';
+  return `${scope}<div class="tri-head">
     <div>
       <div class="tri-title">${e(s.header.title)}</div>
       <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}</div>
@@ -407,7 +456,7 @@ function triageHeader(s: FlowViewState): string {
     <div class="seg mode" id="mode">
       <button data-mode="split" class="${s.mode === 'split' ? 'active' : ''}">Split</button>
       <button data-mode="queue" class="${s.mode === 'queue' ? 'active' : ''}">Queue</button>
-      <button disabled title="In-diff mode arrives with issue #10">In diff</button>
+      <button data-mode="diff" class="${s.mode === 'diff' ? 'active' : ''}">In diff</button>
     </div>
   </div>
   ${
@@ -420,12 +469,17 @@ function triageHeader(s: FlowViewState): string {
   }`;
 }
 
-function itemDetail(view: TriageItemView, agentLabel: string): string {
+function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Record<string, string>): string {
   const item = view.item;
+  const owner = view.projectLabel && view.refLabel ? `<span class="agent-fg">${e(view.projectLabel)} · ${e(view.refLabel)}</span> · ` : '';
+  const cross = item.cross && item.spans?.length
+    ? `<div class="cross-card"><div class="cross-head">⧉ spans two repositories</div>${item.spans.map((span) => `<div class="cross-side"><span class="cross-repo">${e(repoLabels?.[span.repoId] ?? span.repoId)}</span><span class="cross-location">${e(span.location)}</span><span class="cross-role">${e(span.role)}</span></div>`).join('')}</div>`
+    : '';
   return `
-    <div>${sevChip(item.severity)}</div>
+    <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}</div>
     <div class="detail-title">${e(item.title)}</div>
-    <div class="detail-meta">${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span></div>
+    <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span></div>
+    ${cross}
     <p class="prose">${e(item.body)}</p>
     <div class="code-card">
       <div class="code-head"><span>${e(item.file)}:${item.line}</span><a href="#" id="open-editor" data-file="${e(item.file)}" data-line="${item.line}">Open in editor</a></div>
@@ -463,8 +517,8 @@ function renderTriageSplit(s: FlowViewState, agentLabel: string): string {
   const decided = s.items.length - s.counts.undecided;
   const all = s.counts.undecided === 0;
   return `${triageHeader(s)}
-  <div class="detail" data-item="${e(selected?.item.id ?? '')}">
-    ${selected ? itemDetail(selected, agentLabel) : '<p class="prose">No review items.</p>'}
+  <div class="detail" data-item="${e(selected?.item.id ?? '')}" data-repo-id="${e(selected?.item.repoId ?? '')}" data-cr-number="${e(selected?.item.crNumber ?? '')}">
+    ${selected ? itemDetail(selected, agentLabel, s.changeset?.repoLabels) : '<p class="prose">No review items.</p>'}
   </div>
   <div class="action-bar">
     <button class="btn btn-ok" id="accept">Accept<span class="key">A</span></button>
@@ -495,15 +549,15 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
     })
     .join('');
   return `${triageHeader(s)}
-  <div class="deck" data-item="${e(selected?.item.id ?? '')}">
+  <div class="deck" data-item="${e(selected?.item.id ?? '')}" data-repo-id="${e(selected?.item.repoId ?? '')}" data-cr-number="${e(selected?.item.crNumber ?? '')}">
     <div class="pips">${pips}</div>
     <div class="peek"></div>
     <div class="qcard">
       ${
         selected
-          ? `<div class="qrow">${sevChip(selected.item.severity)}${catPill(selected.item.category)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
+          ? `<div class="qrow">${sevChip(selected.item.severity)}${selected.item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${catPill(selected.item.category)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
         <div class="qtitle">${e(selected.item.title)}</div>
-        <div class="detail-meta">${e(selected.item.file)}:${selected.item.line}</div>
+        <div class="detail-meta">${selected.projectLabel && selected.refLabel ? `<span class="agent-fg">${e(selected.projectLabel)} · ${e(selected.refLabel)}</span> · ` : ''}${e(selected.item.file)}:${selected.item.line}</div>
         <div class="code-card"><div class="code-body">${e(selected.item.code)}</div></div>
         <p class="prose">${e(selected.item.body)}</p>
         <div class="presets">
@@ -529,6 +583,39 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
       <span>${decided} of ${s.items.length} triaged</span>
       <a href="#" id="gen-summary" class="${all ? '' : 'dimmer'}">Generate summary →</a>
     </div>
+  </div>`;
+}
+
+function renderTriageDiff(s: FlowViewState): string {
+  const selected = s.items.find((view) => view.item.id === s.selectedId) ?? s.items[0];
+  if (!selected) return `${triageHeader(s)}<div class="detail"><p class="prose">No review items.</p></div>`;
+  const itemIndex = Math.max(0, s.items.findIndex((view) => view.item.id === selected.item.id));
+  const item = selected.item;
+  const severityColor = item.severity === 'nit' ? 'var(--fg-dim)' : `var(--sev-${item.severity})`;
+  const suggestion = item.suggestion
+    ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a GitLab suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
+    : '';
+  const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text">${e(entry.text)}</div></div>`).join('');
+  const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
+    <div class="peek-head">${sevChip(item.severity)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
+    <div class="peek-body"><p class="prose">${e(item.body)}</p>${suggestion}${thread}
+      <div class="peek-actions">
+        <button class="btn btn-ok" id="accept">${item.suggestion ? 'Accept &amp; apply' : 'Accept'}</button>
+        ${item.suggestion ? '<button class="btn" id="accept-comment">Accept, comment only</button>' : ''}
+        <button class="btn btn-danger" id="reject">Reject</button><button class="btn" id="skip">Skip</button>
+        <a href="#" class="ask-link preset" data-preset="explain">Ask agent <span class="kbd">⌘↩</span></a>
+      </div>
+    </div>
+  </div>`;
+  const lines = (s.diffLines ?? []).map((line) => {
+    const lineNumber = line.newLine ?? line.oldLine;
+    const flagged = line.newLine === item.line;
+    const prefix = line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' ';
+    return `<div class="diff-line ${line.kind} ${flagged ? 'diff-flagged' : ''}" style="--item-sev:${severityColor}"><span class="diff-gutter">${lineNumber ?? ''}</span><span class="diff-prefix">${prefix}</span><span class="diff-text">${e(line.text)}</span></div>${flagged ? widget : ''}`;
+  }).join('');
+  return `${triageHeader(s)}<div class="diff-wrap">
+    <div class="diff-file-head"><span class="diff-file-path">${selected.projectLabel && selected.refLabel ? `${e(selected.projectLabel)} · ${e(selected.refLabel)} · ` : ''}${e(item.file)}</span><span class="diff-file-count">${itemIndex + 1} of ${s.items.length}</span><button class="diff-nav" id="prev-item" title="Previous finding">↑ prev</button><button class="diff-nav" id="next-item" title="Next finding">↓ next</button></div>
+    <div class="diff-code">${lines || widget}</div>
   </div>`;
 }
 
@@ -584,7 +671,7 @@ function renderSummary(s: FlowViewState): string {
   return `<div class="wrap wrap-wide">
     ${subline(s.header)}
     <div>
-      <h1>Submit review to GitLab</h1>
+      <h1>${s.changeset ? `Submit review across ${s.changeset.memberCount} merge requests` : 'Submit review to GitLab'}</h1>
       <p class="lede">${s.items.length} findings triaged — ${s.counts.accepted} accepted, ${s.counts.rejected} rejected, ${s.counts.skipped} skipped.</p>
     </div>
     <div class="tally-blocks">
@@ -605,7 +692,7 @@ function renderSummary(s: FlowViewState): string {
               .map(
                 (v) => `<div class="comment-row">
           <span>☑</span>
-          <span class="comment-loc">${e(v.item.file.split('/').pop() ?? v.item.file)}:${v.item.line}</span>
+          <span class="comment-loc">${v.projectLabel ? `${e(v.projectLabel)} · ` : ''}${e(v.item.file.split('/').pop() ?? v.item.file)}:${v.item.line}</span>
           <span class="comment-title">${e(v.item.title)}</span>
           <span class="sugg-mark">${v.applyFix && v.item.suggestion ? '+suggestion' : ''}</span>
         </div>`,
@@ -639,6 +726,7 @@ function renderSummary(s: FlowViewState): string {
           : ''
       }
     </div>
+    ${s.changeset ? `<div class="hint">Accepted comments route to their owning MR; the summary is posted to every member and cross-linked to ${e(s.changeset.linkedIssue)}.</div>` : ''}
     ${
       s.submitError
         ? `<div class="submit-fail">
@@ -652,7 +740,7 @@ function renderSummary(s: FlowViewState): string {
         : ''
     }
     <div class="actions-row">
-      <button class="btn btn-brand" id="submit">Submit to GitLab</button>
+      <button class="btn btn-brand" id="submit">${s.changeset ? `Submit across ${s.changeset.memberCount} MRs` : 'Submit to GitLab'}</button>
       <button class="btn" id="copy-md">Copy as markdown</button>
       <button class="btn" id="back-triage">Back to triage</button>
       <span class="posts-as">posts as @${e(s.username)}</span>
@@ -665,7 +753,7 @@ function renderSummary(s: FlowViewState): string {
 function renderDone(s: FlowViewState): string {
   return `<div class="done-col">
     <div class="ok-circle">✓</div>
-    <h1>Review submitted to ${e(s.header.refLabel)}</h1>
+    <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} MRs` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
     <p class="lede">${e(s.doneSentence)}</p>
     <div class="actions-row" style="justify-content:center">
       <button class="btn btn-accent" id="track-replies">Track replies</button>
@@ -678,7 +766,7 @@ function renderDone(s: FlowViewState): string {
 // ---- dispatcher -----------------------------------------------------------------
 
 const SCRIPT = `
-const vscode = acquireVsCodeApi();
+const vscode = window.verdictVscode;
 const post = (m) => vscode.postMessage(m);
 const on = (id, type, extra) => document.getElementById(id)?.addEventListener('click', (ev) => { ev.preventDefault(); post({ type, ...(extra ?? {}) }); });
 
@@ -697,8 +785,10 @@ on('reanchor', 'reanchor'); on('rerun', 'rerun');
 const itemId = () => document.querySelector('[data-item]')?.dataset.item;
 const verdict = (v, applyFix) => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: v, applyFix }); };
 document.getElementById('accept')?.addEventListener('click', () => verdict('accepted', true));
+document.getElementById('accept-comment')?.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: 'accepted', applyFix: false }); });
 document.getElementById('reject')?.addEventListener('click', () => verdict('rejected', false));
 document.getElementById('skip')?.addEventListener('click', () => verdict('skipped', false));
+on('prev-item', 'move', { delta: -1 }); on('next-item', 'move', { delta: 1 });
 document.querySelectorAll('.pip[data-select]').forEach((p) => p.addEventListener('click', () => post({ type: 'select', itemId: p.dataset.select })));
 document.querySelectorAll('.preset').forEach((p) => p.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset }); }));
 document.getElementById('ask')?.addEventListener('keydown', (ev) => {
@@ -717,6 +807,7 @@ document.getElementById('opt-changes')?.addEventListener('change', () => post({ 
 on('submit', 'submit'); on('retry-submit', 'retrySubmit'); on('reconnect', 'reconnect'); on('back-triage', 'backToTriage'); on('copy-md', 'copyMarkdown');
 on('approve', 'approve'); on('lower-bar', 'lowerBar'); on('back-dash', 'backToDashboard');
 on('track-replies', 'trackReplies'); on('open-mr', 'openMr'); on('tuning-link', 'openTuning');
+document.getElementById('review-single')?.addEventListener('click', (ev) => { ev.preventDefault(); const el = document.querySelector('[data-item]'); if (el) post({ type: 'reviewSingle', repoId: el.dataset.repoId, number: el.dataset.crNumber }); });
 
 // Keyboard (spec §12 Triage group) — active while the review tab has focus.
 document.addEventListener('keydown', (ev) => {
@@ -739,17 +830,28 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
         : s.screen === 'triage'
           ? s.mode === 'queue'
             ? renderTriageQueue(s, agentLabel)
-            : renderTriageSplit(s, agentLabel)
+            : s.mode === 'diff'
+              ? renderTriageDiff(s)
+              : renderTriageSplit(s, agentLabel)
           : s.screen === 'clean'
             ? renderClean(s)
             : s.screen === 'summary'
               ? renderSummary(s)
               : renderDone(s);
   const title =
-    s.screen === 'agent'
+    s.changeset && s.screen !== 'done'
+      ? `Verdict: Review · ${s.changeset.memberCount} MRs`
+      : s.screen === 'agent'
       ? `Verdict: Run review · ${s.header.refLabel}`
       : s.screen === 'done'
         ? `Verdict: Posted · ${s.header.refLabel}`
         : `Verdict: Review · ${s.header.refLabel}`;
-  return renderPage({ title, nonce, css: CSS, body, script: SCRIPT });
+  return renderPage({
+    title,
+    nonce,
+    css: CSS,
+    body,
+    script: SCRIPT,
+    breadcrumb: { current: s.changeset ? s.changeset.name : `${s.header.refLabel} · ${s.header.title}` },
+  });
 }

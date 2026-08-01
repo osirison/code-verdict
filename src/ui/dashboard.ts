@@ -3,29 +3,25 @@ import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
 import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
-import { fetchPodData } from '../app/podQuery';
+import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import type { DashboardMessage } from './dashboardHtml';
 import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboardHtml';
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
+import { AppSurface, type AppRoute } from './appSurface';
 
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
 
   static async show(podStore: PodStore, secrets: SecretStore, deps: DashboardDeps = {}): Promise<void> {
-    if (DashboardPanel.current) {
-      DashboardPanel.current.panel.reveal();
+    if (DashboardPanel.current && !DashboardPanel.current.disposed) {
+      AppSurface.reveal();
       await DashboardPanel.current.refresh();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.dashboard',
-      'Verdict: Dashboard',
-      vscode.ViewColumn.One,
-      { enableScripts: true },
-    );
-    DashboardPanel.current = new DashboardPanel(panel, podStore, secrets, deps);
+    const route = AppSurface.show('dashboard', 'Verdict');
+    DashboardPanel.current = new DashboardPanel(route, podStore, secrets, deps);
     await DashboardPanel.current.refresh();
   }
 
@@ -37,22 +33,30 @@ export class DashboardPanel {
   private refreshSeq = 0;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly podStore: PodStore,
     private readonly secrets: SecretStore,
     private readonly deps: DashboardDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: DashboardMessage) => {
+    route.onMessage((rawMessage) => {
+      const message = rawMessage as DashboardMessage;
       switch (message.type) {
         case 'refresh':
           void this.refresh();
           break;
         case 'switchPod':
           void vscode.commands.executeCommand(COMMANDS.switchPod);
+          break;
+        case 'selectPod':
+          void (async () => {
+            await this.podStore.setActive(message.podId);
+            this.deps.onPodChanged?.();
+            await this.refresh();
+          })();
           break;
         case 'addProjects':
           void vscode.commands.executeCommand(COMMANDS.addProject);
@@ -69,8 +73,15 @@ export class DashboardPanel {
             void vscode.commands.executeCommand(COMMANDS.openReview);
           }
           break;
+        case 'openChangeset':
+          this.deps.openChangeset?.(message.changesetId);
+          break;
       }
     });
+  }
+
+  private get panel(): vscode.WebviewPanel {
+    return this.route.panel;
   }
 
   async refresh(): Promise<void> {
@@ -94,7 +105,16 @@ export class DashboardPanel {
       if (!canRender()) return;
       const nonce = crypto.randomBytes(16).toString('hex');
       const submitted = this.deps.submittedRefs?.() ?? new Set<string>();
-      this.panel.webview.html = renderDashboardHtml(toViewState(data, Date.now(), submitted), nonce);
+      const podOptions = this.podStore.list().map((candidate) => ({
+        id: candidate.id,
+        name: candidate.name,
+        active: candidate.id === pod.id,
+        meta: `${repoIdsOf(candidate).length} projects`,
+      }));
+      this.panel.webview.html = renderDashboardHtml(
+        toViewState({ ...data, podOptions }, Date.now(), submitted),
+        nonce,
+      );
     } catch (e) {
       if (!canRender()) return;
       const message = escapeHtml(e instanceof Error ? e.message : String(e));

@@ -36,6 +36,7 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
   {
     ref: { repoId: '9101', number: '2841' },
     title: 'Refactor token refresh',
+    description: 'Part-of: #1180\n\nMoves refresh into TokenStore and adds the retry envelope.',
     state: 'open',
     sourceBranch: 'feat/auth-refresh',
     targetBranch: 'main',
@@ -50,6 +51,7 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
   {
     ref: { repoId: '9102', number: '812' },
     title: 'Rotate signing keys on schedule',
+    description: 'Part-of: #1180\n\nDeclares the new TTL and key ids.',
     state: 'open',
     sourceBranch: 'feat/key-rotation',
     targetBranch: 'main',
@@ -64,6 +66,7 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
   {
     ref: { repoId: '9103', number: '381' },
     title: 'Propagate rotated key ids',
+    description: 'Part-of: #1180\n\nRenames the response field.',
     state: 'open',
     sourceBranch: 'feat/key-rotation',
     targetBranch: 'main',
@@ -78,6 +81,7 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
   {
     ref: { repoId: '9210', number: '1509' },
     title: 'Show key expiry banner',
+    description: 'Part-of: #1180\n\nReads the renamed field.',
     state: 'open',
     sourceBranch: 'feat/key-rotation',
     targetBranch: 'main',

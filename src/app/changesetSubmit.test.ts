@@ -1,0 +1,55 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { Review } from '../domain/types';
+import type { Connection } from '../platform/provider';
+import type { ReviewSubmission, SubmitResult } from '../platform/types';
+import { buildChangesetSubmitPlans, performChangesetSubmit } from './changesetSubmit';
+
+const review: Review = {
+  repoId: 'changeset', crNumber: 'trailer:1180', agentId: 'agent', headSha: 'combined', summary: '',
+  criteria: { severityFloor: 'minor', minConfidence: 70, categories: ['apiContract'], extraInstructions: '' },
+  items: [
+    { id: 'gateway', repoId: '9103', crNumber: '381', file: 'src/routes/session.ts', line: 88, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Gateway contract changed', body: 'The response changed.', code: 'expires_at' },
+    { id: 'console-a', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 41, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Console reads old field', body: 'The old field remains.', code: 'data.expiry', cross: true, spans: [{ repoId: '9103', location: 'src/routes/session.ts:88', role: 'renames the field' }, { repoId: '9210', location: 'src/api/session.ts:41', role: 'reads the old field' }] },
+    { id: 'console-b', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 42, severity: 'minor', category: 'apiContract', confidence: 80, title: 'Missing compatibility test', body: 'Add a test.', code: 'expect(expiry)' },
+  ],
+  verdicts: {
+    gateway: { verdict: 'accepted', applyFix: false },
+    'console-a': { verdict: 'accepted', applyFix: false },
+    'console-b': { verdict: 'accepted', applyFix: false },
+  },
+};
+
+describe('changeset submission', () => {
+  it('routes comments by owning MR and retries only missing operations', async () => {
+    const plans = buildChangesetSubmitPlans(review, [
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, projectLabel: 'hve/platform/gateway' },
+      { ref: { repoId: '9210', number: '1509' }, anchorRefs: { head: 'console' }, projectLabel: 'hve/platform/console' },
+    ], 'HVE Core / PR Review', 'you', 'Combined summary.', true, true);
+    expect(plans[0]?.submission.comments.map((comment) => comment.key)).toEqual(['gateway']);
+    expect(plans[1]?.submission.comments.map((comment) => comment.key)).toEqual(['console-a', 'console-b']);
+    expect(plans[1]?.submission.comments[0]?.body).toContain('Spans two repositories');
+    expect(plans[1]?.submission.comments[0]?.body).toContain('hve/platform/gateway · src/routes/session.ts:88');
+    expect(plans[1]?.submission.comments[0]?.body).toContain('hve/platform/console · src/api/session.ts:41');
+
+    let consoleAttempt = 0;
+    const submitReview = vi.fn(async (ref: { repoId: string }, submission: ReviewSubmission): Promise<SubmitResult> => {
+      if (ref.repoId === '9103') return { comments: submission.comments.map((comment) => ({ key: comment.key, ok: true, threadId: `thread-${comment.key}` })), summaryPosted: true, requestChangesApplied: true };
+      consoleAttempt += 1;
+      if (consoleAttempt === 1) return { comments: [{ key: 'console-a', ok: true, threadId: 'thread-console-a' }, { key: 'console-b', ok: false }], summaryPosted: false };
+      return { comments: submission.comments.map((comment) => ({ key: comment.key, ok: true, threadId: `thread-${comment.key}` })), summaryPosted: true, requestChangesApplied: true };
+    });
+    const connection = { submitReview } as unknown as Connection;
+
+    const first = await performChangesetSubmit(connection, plans);
+    expect(first.complete).toBe(false);
+    expect(first.state.postedCommentKeys).toEqual(['gateway', 'console-a']);
+    expect(first.state.summaryRefs).toEqual(['9103!381']);
+
+    const second = await performChangesetSubmit(connection, plans, first.state);
+    expect(second.complete).toBe(true);
+    expect(submitReview).toHaveBeenCalledTimes(3);
+    const retrySubmission = submitReview.mock.calls[2]?.[1];
+    expect(retrySubmission?.comments.map((comment) => comment.key)).toEqual(['console-b']);
+    expect(second.state.summaryRefs).toEqual(['9103!381', '9210!1509']);
+  });
+});

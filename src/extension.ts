@@ -3,28 +3,26 @@ import { ALL_COMMAND_IDS, COMMANDS } from './commands';
 import { runDebugBootstrap } from './app/debugBootstrap';
 import { PodStore } from './app/pods';
 import { ReviewHistory } from './app/reviewHistory';
-import { tokenSecretKey } from './app/storage';
 import { getDebugAuthBypass } from './debugAuth';
-import { getProvider } from './platform/registry';
 import { registerBuiltInProviders } from './registry';
-import { getSignInOptions } from './signInFlow';
 import { DashboardPanel } from './ui/dashboard';
+import { ChangesetPanel } from './ui/changeset';
+import { ChangesetReviewPanel } from './ui/changesetReview';
+import { OnboardingPanel } from './ui/onboarding';
 import { PostedReviewsPanel } from './ui/postedReviews';
 import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
+import { SettingsPanel } from './ui/settings';
 import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
+import type { SidebarActiveReview } from './ui/sidebarHtml';
+import { TuningPanel } from './ui/tuning';
+import { AppSurface } from './ui/appSurface';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
   const podStore = new PodStore(context.globalState);
   const secrets = context.secrets;
   const reviewHistory = new ReviewHistory(context.globalState);
-
-  const sidebar = new VerdictSidebarProvider(podStore);
-  context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('codeVerdict.sidebar', sidebar),
-    createStatusBarItem(),
-  );
 
   const flowDeps = {
     podStore,
@@ -35,7 +33,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.refresh();
       void DashboardPanel.refreshIfOpen();
     },
+    onSidebarState: (state?: SidebarActiveReview) => sidebar.setActiveReview(state),
   };
+
+  const sidebar = new VerdictSidebarProvider(podStore, {
+    secrets,
+    openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+    selectFinding: (itemId) => {
+      ReviewFlowPanel.selectItem(itemId);
+      ChangesetReviewPanel.selectItem(itemId);
+    },
+    onPodChanged: () => void DashboardPanel.refreshIfOpen(),
+  });
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('codeVerdict.sidebar', sidebar),
+    createStatusBarItem(),
+    AppSurface.onDidChangeRoute((route) => sidebar.setActiveRoute(route)),
+  );
 
   const postedDeps = {
     podStore,
@@ -47,6 +61,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
+    onPodChanged: () => sidebar.refresh(),
     openCr: (ref, submitted) => {
       if (submitted) {
         void PostedReviewsPanel.show(postedDeps, ref);
@@ -54,6 +69,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       void ReviewFlowPanel.open(flowDeps, ref);
     },
+    openChangeset: (changesetId) => void ChangesetPanel.show({
+      podStore,
+      secrets,
+      globalState: context.globalState,
+      openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+      openReview: (id) => void ChangesetReviewPanel.open({
+        podStore,
+        secrets,
+        workspaceState: context.workspaceState,
+        globalState: context.globalState,
+        openSingle: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+        openDashboard: () => void openDashboard(),
+        onSubmitted: () => {
+          sidebar.refresh();
+          void DashboardPanel.refreshIfOpen();
+        },
+        onSidebarState: (state) => sidebar.setActiveReview(state),
+      }, id),
+      openDashboard: () => void openDashboard(),
+    }, changesetId),
   };
 
   const openDashboard = async (): Promise<void> => {
@@ -86,45 +121,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const signIn = async (): Promise<void> => {
-    const bypass = getDebugAuthBypass(context.extensionMode);
-    const options = getSignInOptions(Boolean(bypass));
-    const selected = await vscode.window.showQuickPick(options, {
-      placeHolder: 'Choose how to continue',
+    OnboardingPanel.show({
+      podStore,
+      secrets,
+      onComplete: () => {
+        sidebar.refresh();
+        void openDashboard();
+      },
     });
-    if (!selected) return;
-
-    if (selected.flow === 'debug') {
-      await bootstrapFromDebugBypass();
-      return;
-    }
-
-    const instanceUrl = await vscode.window.showInputBox({
-      prompt: 'Enter your GitLab instance URL',
-      ignoreFocusOut: true,
-      value: 'https://gitlab.com',
-    });
-    if (!instanceUrl) return;
-    const token = await vscode.window.showInputBox({
-      prompt: 'Access token (stored in the VS Code secret store, never in settings)',
-      ignoreFocusOut: true,
-      password: true,
-    });
-    if (!token) return;
-
-    const status = await getProvider('gitlab').connect({ instanceUrl, token }).testConnection();
-    if (status.ok) {
-      // Persist only credentials that actually work — a failed token must
-      // not linger in the secret store for other flows to reuse.
-      await secrets.store(tokenSecretKey(instanceUrl), token);
-      const scope = status.scopes?.join(', ') ?? 'unknown scope';
-      void vscode.window.showInformationMessage(
-        `Verdict: connected as @${status.username} · ${scope}. Pods and projects arrive with the onboarding wizard (issue #7).`,
-      );
-    } else {
-      void vscode.window.showErrorMessage(
-        `Verdict: connection failed — ${status.error?.message ?? 'unknown error'}.`,
-      );
-    }
   };
 
   const switchPod = async (): Promise<void> => {
@@ -159,7 +163,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await DashboardPanel.refreshIfOpen();
     },
     [COMMANDS.signIn]: signIn,
+    [COMMANDS.newPod]: signIn,
     [COMMANDS.switchPod]: switchPod,
+    [COMMANDS.editCriteria]: () => SettingsPanel.show({ podStore, secrets }),
+    [COMMANDS.selectAgent]: () => TuningPanel.show({ podStore, globalState: context.globalState }),
   };
 
   for (const id of ALL_COMMAND_IDS) {

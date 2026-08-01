@@ -189,7 +189,7 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
     }`;
 
   const script = `
-    const vscode = acquireVsCodeApi();
+    const vscode = window.verdictVscode;
     const post = (m) => vscode.postMessage(m);
     document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
     document.getElementById('back-dash')?.addEventListener('click', () => post({ type: 'backToDashboard' }));
@@ -215,5 +215,5 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       }));
   `;
 
-  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script });
+  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script, breadcrumb: { current: 'Posted reviews' } });
 }

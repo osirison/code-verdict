@@ -6,6 +6,12 @@
 import { describe, expect, it } from 'vitest';
 import { GitLabEmulator } from '../../../emulator/engine';
 import { emulatorFetch } from '../../../emulator/fetch';
+import { detectChangesets } from '../../app/changesets';
+import { runDemoChangesetAgent } from '../../app/combinedAgent';
+import { buildChangesetSubmitPlans, performChangesetSubmit } from '../../app/changesetSubmit';
+import { DEFAULT_CRITERIA } from '../../domain/criteria';
+import { createReview, setVerdict } from '../../domain/reviewState';
+import type { Pod } from '../../domain/types';
 import { describeProviderContract } from '../../platform/contract/providerContract';
 import { isScmError } from '../../platform/errors';
 import { createGitLabProvider } from './gitlabProvider';
@@ -40,6 +46,60 @@ describeProviderContract('gitlab provider against the emulator', {
 });
 
 describe('end-to-end flows against the emulator', () => {
+  it('detects the seeded four-MR changeset through the real provider mapping', async () => {
+    const emulator = new GitLabEmulator({ seed: 1 });
+    const conn = connect(emulator);
+    const repoIds = ['9101', '9102', '9103', '9210'];
+    const [changeRequests, workItems] = await Promise.all([
+      conn.listOpenChangeRequests(repoIds),
+      conn.listWorkItems(repoIds),
+    ]);
+    const pod: Pod = {
+      id: 'pod', name: 'Platform', providerId: 'gitlab', instanceUrl: CONFIG.instanceUrl,
+      sources: [], criteria: { severityFloor: 'minor', minConfidence: 70, categories: ['security'], extraInstructions: '' },
+      agentId: '', repos: repoIds.map((id) => ({ id, name: id, path: id })),
+    };
+
+    const [changeset] = detectChangesets(pod, changeRequests, workItems);
+    expect(changeset?.linkedIssue).toBe('#1180');
+    expect(changeset?.members).toHaveLength(4);
+
+    const members = await Promise.all((changeset?.members ?? []).map(async (member) => ({
+      ref: member.ref,
+      projectPath: member.projectPath,
+      diff: await conn.getChangeRequestDiff(member.ref),
+    })));
+    const response = runDemoChangesetAgent(
+      members,
+      { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories, 'apiContract'] },
+    ).response;
+    const cross = response.items.find((item) => item.cross);
+    expect(cross).toMatchObject({ repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 41 });
+
+    let review = createReview({
+      repoId: 'changeset', crNumber: changeset?.id ?? '', agentId: response.agentId,
+      criteria: DEFAULT_CRITERIA, response,
+    });
+    review = setVerdict(review, cross?.id ?? '', 'accepted', true);
+    const plans = buildChangesetSubmitPlans(
+      review,
+      members.map((member) => ({ ref: member.ref, anchorRefs: member.diff.anchorRefs })),
+      response.agentLabel,
+      'you',
+      'Combined changeset summary.',
+      false,
+      false,
+    );
+    const submitted = await performChangesetSubmit(conn, plans);
+    expect(submitted.complete).toBe(true);
+    expect(emulator.world.discussions.filter((discussion) => discussion.mr_iid === 1509)).toHaveLength(1);
+    expect(emulator.world.discussions.filter((discussion) => [812, 2841, 381].includes(discussion.mr_iid))).toHaveLength(0);
+    for (const member of changeset?.members ?? []) {
+      const mergeRequest = emulator.world.mergeRequests.find((candidate) => candidate.project_id === Number(member.ref.repoId) && candidate.iid === Number(member.ref.number));
+      expect(mergeRequest?.notes.map((note) => note.body)).toContain('Combined changeset summary.');
+    }
+  });
+
   it('runs the whole submit pipeline: diff → comments with suggestion → summary → request changes', async () => {
     const emulator = new GitLabEmulator({ seed: 3 });
     const conn = connect(emulator);

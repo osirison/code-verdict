@@ -403,6 +403,25 @@ export function generateWorld(
   for (const [projectId, iid, title, author, note] of changesetMembers) {
     const head = rng.hex(40);
     const base = rng.hex(40);
+    const files = FILE_STEMS.slice(0, rng.int(2, 4)).map((stem) => ({
+      old_path: `src/${stem}.ts`,
+      new_path: `src/${stem}.ts`,
+      diff: makeDiff(rng, stem),
+    }));
+    if (projectId === 9103) {
+      files.push({
+        old_path: 'src/routes/session.ts',
+        new_path: 'src/routes/session.ts',
+        diff: '@@ -87,1 +87,2 @@\n return session\n+return { expires_at: session.expiresAt }\n',
+      });
+    }
+    if (projectId === 9210) {
+      files.push({
+        old_path: 'src/api/session.ts',
+        new_path: 'src/api/session.ts',
+        diff: '@@ -40,1 +40,2 @@\n const data = await load()\n+const expiry = data.expiry\n',
+      });
+    }
     addMr({
       project_id: projectId,
       iid,
@@ -417,11 +436,7 @@ export function generateWorld(
       base_sha: base,
       start_sha: base,
       head_sha: head,
-      files: FILE_STEMS.slice(0, rng.int(2, 4)).map((stem) => ({
-        old_path: `src/${stem}.ts`,
-        new_path: `src/${stem}.ts`,
-        diff: makeDiff(rng, stem),
-      })),
+      files,
     });
     addPipeline(
       projectId,

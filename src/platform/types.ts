@@ -42,6 +42,8 @@ export type CiStatus = 'success' | 'failed' | 'running' | 'pending' | 'canceled'
 export interface ChangeRequest {
   ref: ChangeRequestRef;
   title: string;
+  /** Provider-authored body, used for neutral conventions such as changeset trailers. */
+  description?: string;
   state: 'open' | 'merged' | 'closed';
   sourceBranch: string;
   targetBranch: string;

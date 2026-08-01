@@ -9,6 +9,8 @@ import { GitLabEmulator } from '../../emulator/engine';
 import { registerBuiltInProviders } from '../registry';
 import { renderDashboardHtml } from '../ui/dashboardHtml';
 import { toViewState } from '../ui/dashboardState';
+import { renderSidebarHtml } from '../ui/sidebarHtml';
+import { toSidebarViewState } from '../ui/sidebarState';
 import { connectionForPod } from './connections';
 import { fetchPodData, repoIdsOf, repoLabel } from './podQuery';
 import { PodStore } from './pods';
@@ -115,6 +117,14 @@ describe('debug bootstrap against a live emulator', () => {
     expect(html).toContain('feat/auth-refresh');
     expect(html).toContain('Projects in pod');
     expect(html).toContain('Waiting on you ·');
+
+    const sidebarHtml = renderSidebarHtml(
+      toSidebarViewState(data, podStore.list()),
+      'testnonce',
+    );
+    expect(sidebarHtml).toContain('Refactor token refresh');
+    expect(sidebarHtml).toContain('Issues · in progress');
+    expect(sidebarHtml).toContain('#1180');
   });
 
   it('drives the whole review loop: demo agent → triage → submit → threads', async () => {

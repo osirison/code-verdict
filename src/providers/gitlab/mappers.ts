@@ -54,6 +54,7 @@ export interface GlMergeRequest {
   iid: number;
   project_id: number;
   title: string;
+  description?: string;
   state: string;
   source_branch: string;
   target_branch: string;
@@ -174,6 +175,7 @@ export function toChangeRequest(mr: GlMergeRequest): ChangeRequest {
   return {
     ref: { repoId: String(mr.project_id), number: String(mr.iid) },
     title: mr.title,
+    description: mr.description,
     state,
     sourceBranch: mr.source_branch,
     targetBranch: mr.target_branch,
