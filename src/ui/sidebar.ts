@@ -4,18 +4,21 @@ import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import { COMMANDS } from '../commands';
-import { renderSidebarHtml, type SidebarMessage, type SidebarViewState } from './sidebarHtml';
+import { renderSidebarHtml, type SidebarActiveReview, type SidebarMessage, type SidebarViewState } from './sidebarHtml';
 import { toSidebarViewState } from './sidebarState';
 
 export interface VerdictSidebarDeps {
   secrets: vscode.SecretStorage;
   openCr: (ref: { repoId: string; number: string }) => void;
+  selectFinding?: (itemId: string) => void;
   onPodChanged?: () => void;
 }
 
 export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   private refreshSeq = 0;
+  private activeReview?: SidebarActiveReview;
+  private activeRoute?: string;
 
   constructor(
     private readonly podStore: PodStore,
@@ -23,6 +26,16 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   ) {}
 
   refresh(): void {
+    void this.render();
+  }
+
+  setActiveReview(review?: SidebarActiveReview): void {
+    this.activeReview = review;
+    void this.render();
+  }
+
+  setActiveRoute(route?: string): void {
+    this.activeRoute = route;
     void this.render();
   }
 
@@ -56,7 +69,7 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       const data = await fetchPodData(await connectionForPod(pod, this.deps.secrets), pod, Date.now());
       if (seq !== this.refreshSeq || this.view !== view) return;
       const state: SidebarViewState = toSidebarViewState(data, this.podStore.list());
-      view.webview.html = renderSidebarHtml(state, crypto.randomBytes(16).toString('hex'));
+      view.webview.html = renderSidebarHtml({ ...state, activeReview: this.activeReview, activeRoute: this.activeRoute }, crypto.randomBytes(16).toString('hex'));
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
       view.webview.html = renderSidebarHtml({
@@ -96,6 +109,9 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
         break;
       case 'openSettings':
         await vscode.commands.executeCommand(COMMANDS.editCriteria);
+        break;
+      case 'selectFinding':
+        this.deps.selectFinding?.(message.itemId);
         break;
       case 'openCr':
         this.deps.openCr({ repoId: message.repoId, number: message.number });

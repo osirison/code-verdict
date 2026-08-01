@@ -766,7 +766,7 @@ function renderDone(s: FlowViewState): string {
 // ---- dispatcher -----------------------------------------------------------------
 
 const SCRIPT = `
-const vscode = acquireVsCodeApi();
+const vscode = window.verdictVscode;
 const post = (m) => vscode.postMessage(m);
 const on = (id, type, extra) => document.getElementById(id)?.addEventListener('click', (ev) => { ev.preventDefault(); post({ type, ...(extra ?? {}) }); });
 
@@ -846,5 +846,12 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
       : s.screen === 'done'
         ? `Verdict: Posted · ${s.header.refLabel}`
         : `Verdict: Review · ${s.header.refLabel}`;
-  return renderPage({ title, nonce, css: CSS, body, script: SCRIPT });
+  return renderPage({
+    title,
+    nonce,
+    css: CSS,
+    body,
+    script: SCRIPT,
+    breadcrumb: { current: s.changeset ? s.changeset.name : `${s.header.refLabel} · ${s.header.title}` },
+  });
 }

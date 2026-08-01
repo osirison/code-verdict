@@ -78,7 +78,7 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
       : `<section class="content"><h1>Add projects to ${e(state.podName)}</h1><p class="lede">Add a project URL, numeric project id, or a GitLab group and choose which projects the pod watches.</p><div class="source-input"><input class="input" id="source" placeholder="https://gitlab.com/hve/platform/core · 9102 · group 4821"><button class="btn btn-accent" id="add">Add</button></div><span class="status">Accepts a full URL, a numeric project id, or “group &lt;id&gt;”.</span><div class="samples"><button class="chip" data-sample="https://gitlab.com/hve/platform/core">project URL</button><button class="chip" data-sample="9102">project id</button><button class="chip" data-sample="group 4821">group 4821</button></div><div class="sources">${sourceCards}</div></section>`;
   const body = `<main class="wrap"><div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next">${state.step === 3 ? `Create pod · ${state.selectedProjects} projects` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer></main>`;
   const script = `
-    const vscode = acquireVsCodeApi(); const post = (message) => vscode.postMessage(message);
+    const vscode = window.verdictVscode; const post = (message) => vscode.postMessage(message);
     document.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => post({ type: 'goStep', step: Number(button.dataset.step) })));
     document.getElementById('test')?.addEventListener('click', () => post({ type: 'testConnection', instanceUrl: document.getElementById('instance').value, token: document.getElementById('token').value }));
     document.getElementById('pod-name')?.addEventListener('change', (event) => post({ type: 'setName', name: event.target.value }));
@@ -90,5 +90,5 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
     document.getElementById('back')?.addEventListener('click', () => post({ type: 'goStep', step: ${Math.max(1, state.step - 1)} }));
     document.getElementById('next')?.addEventListener('click', () => ${state.step === 3 ? "post({ type: 'createPod' })" : `post({ type: 'goStep', step: ${state.step + 1} })`});
   `;
-  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script });
+  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script, breadcrumb: { current: 'Connect GitLab' } });
 }

@@ -6,6 +6,7 @@
  */
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import { COMMANDS } from '../commands';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
@@ -34,7 +35,8 @@ import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
-import { DashboardPanel } from './dashboard';
+import { AppSurface, type AppRoute } from './appSurface';
+import type { SidebarActiveReview } from './sidebarHtml';
 
 interface SessionDraft {
   review: Review;
@@ -52,6 +54,7 @@ export interface ReviewFlowDeps {
   workspaceState: KeyValueStore;
   globalState: KeyValueStore;
   onSubmitted?: () => void;
+  onSidebarState?: (state?: SidebarActiveReview) => void;
 }
 
 export class ReviewFlowPanel {
@@ -61,16 +64,15 @@ export class ReviewFlowPanel {
     const existing = ReviewFlowPanel.current;
     if (existing && !existing.disposed) {
       await existing.load(ref);
-      if (!existing.disposed) existing.panel.reveal();
+      if (!existing.disposed) AppSurface.reveal();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.review',
+    const route = AppSurface.show(
+      'review',
       'Verdict: Run review',
-      vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
+      () => void vscode.commands.executeCommand(COMMANDS.openDashboard),
     );
-    ReviewFlowPanel.current = new ReviewFlowPanel(panel, deps);
+    ReviewFlowPanel.current = new ReviewFlowPanel(route, deps);
     await ReviewFlowPanel.current.load(ref);
   }
 
@@ -78,7 +80,7 @@ export class ReviewFlowPanel {
   static revealIfOpen(): boolean {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed) return false;
-    panel.panel.reveal();
+    AppSurface.reveal();
     return true;
   }
 
@@ -86,6 +88,14 @@ export class ReviewFlowPanel {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed) return false;
     return panel.dispatchCommand(command);
+  }
+
+  static selectItem(itemId: string): void {
+    const panel = ReviewFlowPanel.current;
+    if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;
+    panel.selectedId = itemId;
+    panel.render();
+    AppSurface.reveal();
   }
 
   private disposed = false;
@@ -116,20 +126,22 @@ export class ReviewFlowPanel {
   private staleHead?: string;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: ReviewFlowDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       this.runToken += 1;
+      this.deps.onSidebarState?.();
       void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', false);
       if (ReviewFlowPanel.current === this) ReviewFlowPanel.current = undefined;
     });
-    panel.onDidChangeViewState(() => {
-      void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', this.panel.active);
-    });
     void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', true);
-    panel.webview.onDidReceiveMessage((m: FlowMessage) => void this.onMessage(m));
+    route.onMessage((message) => void this.onMessage(message as FlowMessage));
+  }
+
+  private get panel(): vscode.WebviewPanel {
+    return this.route.panel;
   }
 
   // ---- loading ---------------------------------------------------------------
@@ -181,7 +193,7 @@ export class ReviewFlowPanel {
     const cr = crs.find((c) => c.ref.number === ref.number);
     if (!cr) {
       void vscode.window.showWarningMessage(`Verdict: ${ref.number} is no longer open.`);
-      this.panel.dispose();
+      void vscode.commands.executeCommand(COMMANDS.openDashboard);
       return;
     }
     this.cr = cr;
@@ -504,9 +516,7 @@ export class ReviewFlowPanel {
         break;
       }
       case 'backToDashboard':
-        void DashboardPanel.show(this.deps.podStore, this.deps.secrets, {
-          submittedRefs: () => new ReviewHistory(this.deps.globalState).submittedRefs(),
-        });
+        void vscode.commands.executeCommand(COMMANDS.openDashboard);
         return;
       case 'openMr':
         void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
@@ -733,5 +743,21 @@ export class ReviewFlowPanel {
           ? `Verdict: Posted · ${state.header.refLabel}`
           : `Verdict: Review · ${state.header.refLabel}`;
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), nonce);
+    this.deps.onSidebarState?.(this.review ? {
+      headline: `${state.header.refLabel} · ${state.header.title}`,
+      context: state.header.branch,
+      agent: this.agentLabel(),
+      added: state.header.added,
+      removed: state.header.removed,
+      counts,
+      items: this.review.items.map((item) => ({
+        id: item.id,
+        title: item.title,
+        file: item.file,
+        severity: item.severity,
+        verdict: this.review?.verdicts[item.id]?.verdict,
+        selected: item.id === this.selectedId,
+      })),
+    } : undefined);
   }
 }

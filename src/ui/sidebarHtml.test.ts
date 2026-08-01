@@ -13,6 +13,7 @@ const state: SidebarViewState = {
   ],
   issues: [{ label: '#1180', title: 'Key rotation, end to end', project: 'api-gateway' }],
   waitingOnYou: 1,
+  activeRoute: 'dashboard',
 };
 
 describe('sidebar fidelity (prototype navigation)', () => {
@@ -21,6 +22,7 @@ describe('sidebar fidelity (prototype navigation)', () => {
 
     expect(html).toContain('font-size: 12.5px');
     expect(html).toContain('Pod dashboard');
+    expect(html).toContain('nav-row active" id="dashboard"');
     expect(html).toContain('Posted reviews');
     expect(html).toContain('Agent tuning');
     expect(html).toContain('Settings');
@@ -40,5 +42,30 @@ describe('sidebar fidelity (prototype navigation)', () => {
     expect(html).toContain("type: 'openCr'");
     expect(html).toContain("type: 'openDashboard'");
     expect(html).toContain("type: 'openPostedReviews'");
+  });
+
+  it('replaces the general lists with live review progress, filters, and findings', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeReview: {
+        headline: '!2841 · Refactor token refresh',
+        context: 'feat/token-refresh',
+        agent: 'Copilot review',
+        added: 42,
+        removed: 9,
+        counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 1 },
+        items: [
+          { id: 'one', title: 'Refresh token can race', file: 'src/auth.ts', severity: 'major', verdict: 'accepted', selected: false },
+          { id: 'two', title: 'Missing expiry guard', file: 'src/session.ts', severity: 'blocker', selected: true },
+        ],
+      },
+    }, 'nonce123');
+
+    expect(html).toContain('1 acc');
+    expect(html).toContain('1 left');
+    expect(html).toContain('Refresh token can race');
+    expect(html).toContain('data-review-filter="undecided"');
+    expect(html).toContain("type: 'selectFinding'");
+    expect(html).not.toContain('Issues · in progress');
   });
 });

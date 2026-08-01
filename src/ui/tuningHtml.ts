@@ -47,6 +47,6 @@ export function renderTuningHtml(state: TuningViewState, nonce: string): string 
     <section class="section"><div class="label">Accept rate by category</div>${rows(state.categories)}</section>
     <section class="section"><div class="label">Accept rate by agent confidence</div>${rows(state.confidence)}</section>
     <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section></main>`;
-  const script = `const vscode = acquireVsCodeApi(); document.querySelectorAll('[data-suggestion]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion })));`;
-  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script });
+  const script = `const vscode = window.verdictVscode; document.querySelectorAll('[data-suggestion]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion })));`;
+  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script, breadcrumb: { current: 'Agent tuning' } });
 }

@@ -1,5 +1,4 @@
 import * as crypto from 'node:crypto';
-import * as vscode from 'vscode';
 import { detectChangesets } from '../app/changesets';
 import { connectionForPod } from '../app/connections';
 import { fetchPodData } from '../app/podQuery';
@@ -9,6 +8,7 @@ import type { KeyValueStore, SecretStore } from '../app/storage';
 import { diffStats } from '../domain/diffHunks';
 import type { ChangesetMessage } from './changesetHtml';
 import { renderChangesetHtml } from './changesetHtml';
+import { AppSurface } from './appSurface';
 
 export interface ChangesetPanelDeps {
   podStore: PodStore;
@@ -21,14 +21,19 @@ export interface ChangesetPanelDeps {
 
 export class ChangesetPanel {
   static async show(deps: ChangesetPanelDeps, changesetId: string): Promise<void> {
-    const panel = vscode.window.createWebviewPanel('codeVerdict.changeset', 'Verdict: Changeset', vscode.ViewColumn.One, { enableScripts: true });
+    const route = AppSurface.show(`changeset:${changesetId}`, 'Verdict: Changeset', deps.openDashboard);
+    const panel = route.panel;
+    let active = true;
+    route.onLeave(() => { active = false; });
     const pod = deps.podStore.activePod;
-    if (!pod) return panel.dispose();
+    if (!pod) return deps.openDashboard();
     const connection = await connectionForPod(pod, deps.secrets);
     const data = await fetchPodData(connection, pod, Date.now());
+    if (!active) return;
     const changeset = detectChangesets(pod, data.changeRequests, data.workItems).find((candidate) => candidate.id === changesetId);
-    if (!changeset) return panel.dispose();
+    if (!changeset) return deps.openDashboard();
     const diffs = await Promise.all(changeset.members.map((member) => connection.getChangeRequestDiff(member.ref)));
+    if (!active) return;
     const stats = diffStats(diffs.flatMap((diff) => diff.files.map((file) => file.diff)));
     const submitted = new ReviewHistory(deps.globalState).submittedRefs();
     panel.title = `Verdict: Changeset · ${changeset.name}`;
@@ -52,7 +57,8 @@ export class ChangesetPanel {
         reason: member.description?.split(/\n\s*\n/)[1]?.trim() ?? 'Member detected from the shared changeset trailer.',
       })),
     }, crypto.randomBytes(16).toString('hex'));
-    panel.webview.onDidReceiveMessage((message: ChangesetMessage) => {
+    route.onMessage((rawMessage) => {
+      const message = rawMessage as ChangesetMessage;
       if (message.type === 'openMember') deps.openCr({ repoId: message.repoId, number: message.number });
       else if (message.type === 'back') deps.openDashboard();
       else deps.openReview(message.changesetId);

@@ -11,6 +11,7 @@ import {
   type SettingsMessage,
   type SettingsViewState,
 } from './settingsHtml';
+import { AppSurface, type AppRoute } from './appSurface';
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -32,32 +33,29 @@ export class SettingsPanel {
 
   static async show(deps: SettingsPanelDeps): Promise<void> {
     if (SettingsPanel.current) {
-      SettingsPanel.current.panel.reveal();
+      AppSurface.reveal();
       await SettingsPanel.current.render();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.settings',
-      'Verdict: Settings',
-      vscode.ViewColumn.One,
-      { enableScripts: true },
-    );
-    SettingsPanel.current = new SettingsPanel(panel, deps);
+    const route = AppSurface.show('settings', 'Verdict: Settings', () => void vscode.commands.executeCommand(COMMANDS.openDashboard));
+    SettingsPanel.current = new SettingsPanel(route, deps);
     await SettingsPanel.current.render();
   }
 
   private disposed = false;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: SettingsPanelDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (SettingsPanel.current === this) SettingsPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: SettingsMessage) => void this.onMessage(message));
+    route.onMessage((message) => void this.onMessage(message as SettingsMessage));
   }
+
+  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private async render(): Promise<void> {
     const pod = this.deps.podStore.activePod;

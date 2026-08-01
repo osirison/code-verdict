@@ -38,7 +38,7 @@ const state: DashboardViewState = {
 
 describe('design tokens (POC :root block, verbatim)', () => {
   it('carries the exact POC dark palette', () => {
-    const dark = VERDICT_TOKENS_CSS.slice(0, VERDICT_TOKENS_CSS.indexOf('body.vscode-light'));
+    const dark = VERDICT_TOKENS_CSS.slice(0, VERDICT_TOKENS_CSS.indexOf('[data-verdict-theme="light"]'));
     for (const decl of [
       '--bg: #1f1f1f', '--bg2: #181818', '--bg3: #252525', '--card: #242424', '--code: #141414',
       '--row: #232323', '--line: #2b2b2b', '--line2: #3c3c3c', '--hover: #383838',
@@ -53,8 +53,9 @@ describe('design tokens (POC :root block, verbatim)', () => {
     expect(dark).toContain('--font-mono: "JetBrains Mono"');
   });
 
-  it('carries the exact POC light theme under body.vscode-light', () => {
-    const light = VERDICT_TOKENS_CSS.slice(VERDICT_TOKENS_CSS.indexOf('body.vscode-light'));
+  it('keeps the optional POC light palette behind an explicit Verdict theme', () => {
+    const light = VERDICT_TOKENS_CSS.slice(VERDICT_TOKENS_CSS.indexOf('[data-verdict-theme="light"]'));
+    expect(VERDICT_TOKENS_CSS).not.toContain('body.vscode-light');
     for (const decl of [
       '--bg: #ffffff', '--bg2: #f3f3f3', '--bg3: #e8e8e8', '--card: #fafafa', '--hover: #dcdcdc',
       '--sev-blocker: #b3252b', '--sev-major: #8a6100', '--sev-minor: #0b62c4', '--ok: #116329',
@@ -115,6 +116,7 @@ describe('dashboard fidelity (spec §2)', () => {
     expect(html).toContain('Changesets <span class="dimmer">· merge requests that ship together</span>');
     expect(html).toContain('Key rotation, end to end');
     expect(html).toContain('4 MRs · 4 projects');
+    expect(html).toContain('.changeset-card .row-title, .changeset-card .row-meta { display: block; }');
     expect(html).toContain("type: 'openChangeset'");
   });
 

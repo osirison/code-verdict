@@ -4,10 +4,8 @@
  * verbatim, so every screen resolves pixel-identical to the prototype.
  *
  * Product decision (overriding the README's theme-variable rule): the POC
- * palette is canonical. Light/dark still follows VS Code's mode via the
- * body class — `body.vscode-light` carries the POC's own light theme, and
- * high-contrast falls back to the dark set. Revisit theme-variable
- * adaptation only if product asks for it.
+ * palette is canonical. Host theme classes do not replace product colors;
+ * alternate Verdict themes require an explicit product-level selection.
  *
  * Type: UI text uses the system stack; code, ids, paths, counts and
  * metadata use JetBrains Mono like the POC, falling back to the user's
@@ -73,7 +71,7 @@ export const VERDICT_TOKENS_CSS = `
   --font-mono: "JetBrains Mono", var(--vscode-editor-font-family, ui-monospace), monospace;
 }
 /* POC light theme, verbatim ([data-theme="light"] in the prototype). */
-body.vscode-light {
+[data-verdict-theme="light"] {
   --bg: #ffffff;
   --bg2: #f3f3f3;
   --bg3: #e8e8e8;
@@ -124,13 +122,27 @@ body.vscode-light {
 export const VERDICT_BASE_CSS = `
 * { box-sizing: border-box; margin: 0; }
 body {
-  background: var(--bg);
+  background: #0a0a0a;
   color: var(--fg);
   font-family: var(--font-ui);
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
   padding: 0;
 }
+.verdict-app { min-height: 100vh; background: var(--bg); color: var(--fg); }
+.app-breadcrumb {
+  height: 38px; display: flex; align-items: center; gap: 7px; padding: 0 18px;
+  border-bottom: 1px solid var(--line); background: var(--bg2);
+  color: var(--fg-dim); font-size: 11.5px;
+}
+.app-back {
+  display: inline-flex; align-items: center; gap: 6px; border: 0; padding: 4px 2px;
+  background: none; color: var(--link); font: 500 11.5px/1 var(--font-ui); cursor: pointer;
+}
+.app-back:hover { color: var(--fg-hi); }
+.app-crumb-separator { color: var(--fg-dimmer); }
+.app-crumb-current { color: var(--fg2); }
+.app-content { min-height: calc(100vh - 38px); }
 a { color: var(--link); text-decoration: none; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 5px; }
@@ -247,10 +259,17 @@ export function renderPage(opts: {
   css: string;
   body: string;
   script?: string;
+  breadcrumb?: { parent?: string; current: string };
+  embedded?: boolean;
 }): string {
-  const script = opts.script
-    ? `<script nonce="${opts.nonce}">${opts.script}</script>`
+  const breadcrumb = opts.breadcrumb
+    ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
     : '';
+  const body = opts.embedded ? opts.body : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>`;
+  const bootstrap = opts.script || opts.breadcrumb
+    ? `window.verdictVscode=acquireVsCodeApi();document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));${opts.script ?? ''}`
+    : '';
+  const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -260,7 +279,7 @@ export function renderPage(opts: {
 <title>${escapeHtml(opts.title)}</title>
 </head>
 <body>
-${opts.body}
+${body}
 ${script}
 </body>
 </html>`;

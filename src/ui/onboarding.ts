@@ -8,6 +8,8 @@ import type { Connection } from '../platform/provider';
 import { getProvider } from '../platform/registry';
 import type { Repository } from '../platform/types';
 import { renderOnboardingHtml, type OnboardingMessage, type OnboardingSourceView } from './onboardingHtml';
+import { AppSurface, type AppRoute } from './appSurface';
+import { COMMANDS } from '../commands';
 
 interface DraftSource extends OnboardingSourceView {
   repositories: Repository[];
@@ -24,16 +26,11 @@ export class OnboardingPanel {
 
   static show(deps: OnboardingDeps): void {
     if (OnboardingPanel.current) {
-      OnboardingPanel.current.panel.reveal();
+      AppSurface.reveal();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.onboarding',
-      'Verdict: Setup',
-      vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    OnboardingPanel.current = new OnboardingPanel(panel, deps);
+    const route = AppSurface.show('onboarding', 'Verdict: Setup', () => void vscode.commands.executeCommand(COMMANDS.openDashboard));
+    OnboardingPanel.current = new OnboardingPanel(route, deps);
     OnboardingPanel.current.render();
   }
 
@@ -49,15 +46,17 @@ export class OnboardingPanel {
   private disposed = false;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: OnboardingDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (OnboardingPanel.current === this) OnboardingPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: OnboardingMessage) => void this.onMessage(message));
+    route.onMessage((message) => void this.onMessage(message as OnboardingMessage));
   }
+
+  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private render(): void {
     if (this.disposed) return;
@@ -178,6 +177,5 @@ export class OnboardingPanel {
     await this.deps.podStore.upsert(pod);
     await this.deps.podStore.setActive(pod.id);
     this.deps.onComplete();
-    this.panel.dispose();
   }
 }

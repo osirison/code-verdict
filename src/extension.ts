@@ -14,7 +14,9 @@ import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
 import { SettingsPanel } from './ui/settings';
 import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
+import type { SidebarActiveReview } from './ui/sidebarHtml';
 import { TuningPanel } from './ui/tuning';
+import { AppSurface } from './ui/appSurface';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
@@ -31,16 +33,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.refresh();
       void DashboardPanel.refreshIfOpen();
     },
+    onSidebarState: (state?: SidebarActiveReview) => sidebar.setActiveReview(state),
   };
 
   const sidebar = new VerdictSidebarProvider(podStore, {
     secrets,
     openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+    selectFinding: (itemId) => {
+      ReviewFlowPanel.selectItem(itemId);
+      ChangesetReviewPanel.selectItem(itemId);
+    },
     onPodChanged: () => void DashboardPanel.refreshIfOpen(),
   });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('codeVerdict.sidebar', sidebar),
     createStatusBarItem(),
+    AppSurface.onDidChangeRoute((route) => sidebar.setActiveRoute(route)),
   );
 
   const postedDeps = {
@@ -77,6 +85,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           sidebar.refresh();
           void DashboardPanel.refreshIfOpen();
         },
+        onSidebarState: (state) => sidebar.setActiveReview(state),
       }, id),
       openDashboard: () => void openDashboard(),
     }, changesetId),

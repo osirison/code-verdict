@@ -15,6 +15,8 @@ import { formatAge } from './dashboardState';
 import { escapeHtml, renderFallbackHtml } from './dashboardHtml';
 import type { PostedMessage, PostedRow } from './postedReviewsHtml';
 import { renderPostedReviewsHtml } from './postedReviewsHtml';
+import { AppSurface, type AppRoute } from './appSurface';
+import { COMMANDS } from '../commands';
 
 export interface PostedReviewsDeps {
   podStore: PodStore;
@@ -33,17 +35,12 @@ export class PostedReviewsPanel {
   ): Promise<void> {
     if (PostedReviewsPanel.current && !PostedReviewsPanel.current.disposed) {
       PostedReviewsPanel.current.focusRef = focusRef;
-      PostedReviewsPanel.current.panel.reveal();
+      AppSurface.reveal();
       await PostedReviewsPanel.current.refresh();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.posted',
-      'Verdict: Posted reviews',
-      vscode.ViewColumn.One,
-      { enableScripts: true },
-    );
-    PostedReviewsPanel.current = new PostedReviewsPanel(panel, deps);
+    const route = AppSurface.show('posted', 'Verdict: Posted reviews', () => void vscode.commands.executeCommand(COMMANDS.openDashboard));
+    PostedReviewsPanel.current = new PostedReviewsPanel(route, deps);
     PostedReviewsPanel.current.focusRef = focusRef;
     await PostedReviewsPanel.current.refresh();
   }
@@ -62,15 +59,17 @@ export class PostedReviewsPanel {
   private opinions: Record<string, string> = {};
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: PostedReviewsDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (PostedReviewsPanel.current === this) PostedReviewsPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((m: PostedMessage) => void this.onMessage(m));
+    route.onMessage((message) => void this.onMessage(message as PostedMessage));
   }
+
+  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private selectedView(): PostedReviewView | undefined {
     return this.rows[this.selectedIndex]?.view;

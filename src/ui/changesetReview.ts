@@ -25,6 +25,8 @@ import type { Category, Review, Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
+import { AppSurface, type AppRoute } from './appSurface';
+import type { SidebarActiveReview } from './sidebarHtml';
 
 interface ChangesetDraft {
   review: Review;
@@ -42,24 +44,25 @@ export interface ChangesetReviewDeps {
   openSingle: (ref: { repoId: string; number: string }) => void;
   openDashboard: () => void;
   onSubmitted?: () => void;
+  onSidebarState?: (state?: SidebarActiveReview) => void;
 }
 
 export class ChangesetReviewPanel {
   private static current: ChangesetReviewPanel | undefined;
 
   static async open(deps: ChangesetReviewDeps, changesetId: string): Promise<void> {
-    if (ChangesetReviewPanel.current && !ChangesetReviewPanel.current.disposed) {
-      ChangesetReviewPanel.current.panel.dispose();
-    }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.changesetReview',
-      'Verdict: Review changeset',
-      vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    const controller = new ChangesetReviewPanel(panel, deps, changesetId);
+    const route = AppSurface.show(`changesetReview:${changesetId}`, 'Verdict: Review changeset', deps.openDashboard);
+    const controller = new ChangesetReviewPanel(route, deps, changesetId);
     ChangesetReviewPanel.current = controller;
     await controller.load();
+  }
+
+  static selectItem(itemId: string): void {
+    const panel = ChangesetReviewPanel.current;
+    if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;
+    panel.selectedId = itemId;
+    panel.render();
+    AppSurface.reveal();
   }
 
   private disposed = false;
@@ -87,17 +90,20 @@ export class ChangesetReviewPanel {
   private doneSentence = '';
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: ChangesetReviewDeps,
     private readonly changesetId: string,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       this.runToken += 1;
+      this.deps.onSidebarState?.();
       if (ChangesetReviewPanel.current === this) ChangesetReviewPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: FlowMessage) => void this.onMessage(message));
+    route.onMessage((message) => void this.onMessage(message as FlowMessage));
   }
+
+  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private pod() {
     const pod = this.deps.podStore.activePod;
@@ -142,7 +148,7 @@ export class ChangesetReviewPanel {
       this.render();
     } catch (error) {
       void vscode.window.showErrorMessage(`Verdict: ${error instanceof Error ? error.message : String(error)}`);
-      this.panel.dispose();
+      this.deps.openDashboard();
     }
   }
 
@@ -451,6 +457,22 @@ export class ChangesetReviewPanel {
     };
     this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${this.members.length} MRs` : `Verdict: Review · ${this.members.length} MRs`;
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), crypto.randomBytes(16).toString('hex'));
+    this.deps.onSidebarState?.(this.review ? {
+      headline: this.changeset.name,
+      context: `${this.members.length} MRs · ${state.header.fileCount} files`,
+      agent: this.agentLabel(),
+      added: state.header.added,
+      removed: state.header.removed,
+      counts,
+      items: this.review.items.map((item) => ({
+        id: item.id,
+        title: item.title,
+        file: `${state.changeset?.repoLabels?.[item.repoId ?? ''] ?? item.repoId} · ${item.file}`,
+        severity: item.severity,
+        verdict: this.review?.verdicts[item.id]?.verdict,
+        selected: item.id === this.selectedId,
+      })),
+    } : undefined);
   }
 }
 

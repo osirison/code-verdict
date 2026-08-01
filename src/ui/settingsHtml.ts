@@ -97,7 +97,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     </section>
   </main>`;
   const script = `
-    const vscode = acquireVsCodeApi();
+    const vscode = window.verdictVscode;
     const post = (message) => vscode.postMessage(message);
     document.getElementById('rotate-token')?.addEventListener('click', () => post({ type: 'rotateToken' }));
     document.querySelectorAll('[data-notification]').forEach((button) => button.addEventListener('click', () => post({ type: 'setNotification', key: button.dataset.notification, mode: button.dataset.mode })));
@@ -106,5 +106,5 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     document.getElementById('share-rates')?.addEventListener('click', () => post({ type: 'setShareRates', value: ${!state.shareRates} }));
     document.getElementById('open-json')?.addEventListener('click', () => post({ type: 'openSettingsJson' }));
   `;
-  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script });
+  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script, breadcrumb: { current: 'Settings' } });
 }

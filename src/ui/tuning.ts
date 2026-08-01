@@ -6,6 +6,8 @@ import type { KeyValueStore } from '../app/storage';
 import type { Category } from '../domain/types';
 import { renderTuningHtml, type TuningMessage } from './tuningHtml';
 import { deriveTuningState } from './tuningState';
+import { AppSurface, type AppRoute } from './appSurface';
+import { COMMANDS } from '../commands';
 
 export interface TuningPanelDeps {
   podStore: PodStore;
@@ -17,32 +19,29 @@ export class TuningPanel {
 
   static show(deps: TuningPanelDeps): void {
     if (TuningPanel.current) {
-      TuningPanel.current.panel.reveal();
+      AppSurface.reveal();
       TuningPanel.current.render();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.tuning',
-      'Verdict: Agent tuning',
-      vscode.ViewColumn.One,
-      { enableScripts: true },
-    );
-    TuningPanel.current = new TuningPanel(panel, deps);
+    const route = AppSurface.show('tuning', 'Verdict: Agent tuning', () => void vscode.commands.executeCommand(COMMANDS.openDashboard));
+    TuningPanel.current = new TuningPanel(route, deps);
     TuningPanel.current.render();
   }
 
   private disposed = false;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly deps: TuningPanelDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (TuningPanel.current === this) TuningPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: TuningMessage) => void this.onMessage(message));
+    route.onMessage((message) => void this.onMessage(message as TuningMessage));
   }
+
+  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private state() {
     const pod = this.deps.podStore.activePod;

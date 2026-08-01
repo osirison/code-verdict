@@ -9,23 +9,19 @@ import type { DashboardMessage } from './dashboardHtml';
 import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboardHtml';
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
+import { AppSurface, type AppRoute } from './appSurface';
 
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
 
   static async show(podStore: PodStore, secrets: SecretStore, deps: DashboardDeps = {}): Promise<void> {
-    if (DashboardPanel.current) {
-      DashboardPanel.current.panel.reveal();
+    if (DashboardPanel.current && !DashboardPanel.current.disposed) {
+      AppSurface.reveal();
       await DashboardPanel.current.refresh();
       return;
     }
-    const panel = vscode.window.createWebviewPanel(
-      'codeVerdict.dashboard',
-      'Verdict: Dashboard',
-      vscode.ViewColumn.One,
-      { enableScripts: true },
-    );
-    DashboardPanel.current = new DashboardPanel(panel, podStore, secrets, deps);
+    const route = AppSurface.show('dashboard', 'Verdict');
+    DashboardPanel.current = new DashboardPanel(route, podStore, secrets, deps);
     await DashboardPanel.current.refresh();
   }
 
@@ -37,16 +33,17 @@ export class DashboardPanel {
   private refreshSeq = 0;
 
   private constructor(
-    private readonly panel: vscode.WebviewPanel,
+    private readonly route: AppRoute,
     private readonly podStore: PodStore,
     private readonly secrets: SecretStore,
     private readonly deps: DashboardDeps,
   ) {
-    panel.onDidDispose(() => {
+    route.onLeave(() => {
       this.disposed = true;
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
-    panel.webview.onDidReceiveMessage((message: DashboardMessage) => {
+    route.onMessage((rawMessage) => {
+      const message = rawMessage as DashboardMessage;
       switch (message.type) {
         case 'refresh':
           void this.refresh();
@@ -81,6 +78,10 @@ export class DashboardPanel {
           break;
       }
     });
+  }
+
+  private get panel(): vscode.WebviewPanel {
+    return this.route.panel;
   }
 
   async refresh(): Promise<void> {

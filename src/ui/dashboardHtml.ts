@@ -146,6 +146,7 @@ section { padding: 16px 0 6px; }
 .changeset-card { display: grid; grid-template-columns: 22px minmax(0,1fr) auto; gap: 9px; align-items: center; border: 1px solid var(--line2); border-radius: 6px; background: var(--card); padding: 11px 12px; color: var(--fg); cursor: pointer; text-align: left; font-family: var(--font-ui); }
 .changeset-card:hover { border-color: var(--agent); background: var(--bg3); }
 .changeset-glyph { color: var(--agent); font-size: 16px; }
+.changeset-card .row-title, .changeset-card .row-meta { display: block; }
 
 .thead, .mr-row, .issue-row { display: grid; grid-template-columns: minmax(0,1fr) 108px 104px 84px 58px; gap: 10px; padding: 0 20px; align-items: center; }
 .thead { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .09em; color: var(--fg-dimmer); padding-bottom: 6px; }
@@ -350,7 +351,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
        </div>`;
 
   const script = `
-    const vscode = acquireVsCodeApi();
+    const vscode = window.verdictVscode;
     const post = (m) => vscode.postMessage(m);
     const podMenu = document.querySelector('[data-pod-menu]');
     const togglePodMenu = () => {
