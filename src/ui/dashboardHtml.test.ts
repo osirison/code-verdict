@@ -84,6 +84,40 @@ describe('dashboard fidelity (spec §2)', () => {
     expect(html).toContain('⟳ 2m ago');
   });
 
+  it('renders the pod picker menu and an issues section in the left panel', () => {
+    const html = renderDashboardHtml(
+      {
+        ...state,
+        issues: [],
+        podOptions: [
+          { id: 'pod-1', name: 'Platform squad', active: true, meta: '6 projects · 9 open MRs' },
+          { id: 'pod-2', name: 'Payments', active: false, meta: '3 projects · 2 open MRs' },
+        ],
+      },
+      'nonce123',
+    );
+    expect(html).toContain('data-pod-menu');
+    expect(html).toContain('Payments');
+    expect(html).toContain('Issues · in progress');
+    expect(html).toContain('No issues in progress');
+  });
+
+  it('renders detected changesets as the two-column prototype band', () => {
+    const html = renderDashboardHtml({
+      ...state,
+      changesets: [{
+        id: 'trailer:1180', name: 'Key rotation, end to end', memberCount: 4,
+        projectCount: 4, state: '2 blocked', stateClass: 'pill-bad',
+      }],
+    }, 'nonce123');
+
+    expect(html).toContain('grid-template-columns: repeat(2, minmax(0,1fr))');
+    expect(html).toContain('Changesets <span class="dimmer">· merge requests that ship together</span>');
+    expect(html).toContain('Key rotation, end to end');
+    expect(html).toContain('4 MRs · 4 projects');
+    expect(html).toContain("type: 'openChangeset'");
+  });
+
   it('derives every stat from the state and colors the AI pill by state', () => {
     expect(html).toContain('7/9');
     expect(html).toContain('pill pill-warn');

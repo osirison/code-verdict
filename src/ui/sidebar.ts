@@ -1,56 +1,106 @@
+import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
-import { repoIdsOf } from '../app/podQuery';
+import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import { COMMANDS } from '../commands';
+import { renderSidebarHtml, type SidebarMessage, type SidebarViewState } from './sidebarHtml';
+import { toSidebarViewState } from './sidebarState';
 
-interface NavRow {
-  label: string;
-  icon: string;
-  command?: string;
-  description?: string;
+export interface VerdictSidebarDeps {
+  secrets: vscode.SecretStorage;
+  openCr: (ref: { repoId: string; number: string }) => void;
+  onPodChanged?: () => void;
 }
 
-export class VerdictSidebarProvider implements vscode.TreeDataProvider<NavRow> {
-  private readonly emitter = new vscode.EventEmitter<void>();
-  readonly onDidChangeTreeData = this.emitter.event;
+export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | undefined;
+  private refreshSeq = 0;
 
-  constructor(private readonly podStore: PodStore) {}
+  constructor(
+    private readonly podStore: PodStore,
+    private readonly deps: VerdictSidebarDeps,
+  ) {}
 
   refresh(): void {
-    this.emitter.fire();
+    void this.render();
   }
 
-  getTreeItem(row: NavRow): vscode.TreeItem {
-    const item = new vscode.TreeItem(row.label);
-    item.iconPath = new vscode.ThemeIcon(row.icon);
-    item.description = row.description;
-    if (row.command) {
-      item.command = { command: row.command, title: row.label };
-    }
-    return item;
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.onDidDispose(() => {
+      if (this.view === view) this.view = undefined;
+    });
+    view.webview.onDidReceiveMessage((message: SidebarMessage) => void this.onMessage(message));
+    void this.render();
   }
 
-  getChildren(): NavRow[] {
+  private async render(): Promise<void> {
+    const view = this.view;
+    if (!view) return;
+    const seq = ++this.refreshSeq;
     const pod = this.podStore.activePod;
-    // No pod → empty tree, which is what lets the contributed viewsWelcome
-    // ("Sign in to GitLab") render. Nav rows appear once connected, per
-    // the spec's onboarding sidebar behaviour.
-    if (!pod) return [];
-    const rows: NavRow[] = [
-      {
-        label: pod.name,
-        icon: 'organization',
-        description: `${repoIdsOf(pod).length} projects`,
-        command: COMMANDS.switchPod,
-      },
-    ];
-    rows.push(
-      { label: 'Pod dashboard', icon: 'dashboard', command: COMMANDS.openDashboard },
-      { label: 'Posted reviews', icon: 'comment-discussion', command: 'codeVerdict.internal.postedReviews' },
-      { label: 'Agent tuning', icon: 'graph', command: COMMANDS.selectAgent },
-      { label: 'Settings', icon: 'gear', command: COMMANDS.editCriteria },
-    );
-    return rows;
+    if (!pod) {
+      view.webview.html = renderSidebarHtml({
+        podName: 'No active pod',
+        podMeta: 'Connect GitLab to begin',
+        pods: [],
+        mergeRequests: [],
+        issues: [],
+        waitingOnYou: 0,
+      }, crypto.randomBytes(16).toString('hex'));
+      return;
+    }
+    try {
+      const data = await fetchPodData(await connectionForPod(pod, this.deps.secrets), pod, Date.now());
+      if (seq !== this.refreshSeq || this.view !== view) return;
+      const state: SidebarViewState = toSidebarViewState(data, this.podStore.list());
+      view.webview.html = renderSidebarHtml(state, crypto.randomBytes(16).toString('hex'));
+    } catch {
+      if (seq !== this.refreshSeq || this.view !== view) return;
+      view.webview.html = renderSidebarHtml({
+        podName: pod.name,
+        podMeta: 'Could not reach GitLab',
+        pods: this.podStore.list().map((candidate) => ({
+          id: candidate.id,
+          name: candidate.name,
+          meta: `${repoIdsOf(candidate).length} projects`,
+          active: candidate.id === pod.id,
+        })),
+        mergeRequests: [],
+        issues: [],
+        waitingOnYou: 0,
+      }, crypto.randomBytes(16).toString('hex'));
+    }
+  }
+
+  private async onMessage(message: SidebarMessage): Promise<void> {
+    switch (message.type) {
+      case 'refresh':
+        await this.render();
+        break;
+      case 'selectPod':
+        await this.podStore.setActive(message.podId);
+        this.deps.onPodChanged?.();
+        await this.render();
+        break;
+      case 'openDashboard':
+        await vscode.commands.executeCommand(COMMANDS.openDashboard);
+        break;
+      case 'openPostedReviews':
+        await vscode.commands.executeCommand('codeVerdict.internal.postedReviews');
+        break;
+      case 'openTuning':
+        await vscode.commands.executeCommand(COMMANDS.selectAgent);
+        break;
+      case 'openSettings':
+        await vscode.commands.executeCommand(COMMANDS.editCriteria);
+        break;
+      case 'openCr':
+        this.deps.openCr({ repoId: message.repoId, number: message.number });
+        break;
+    }
   }
 }
 

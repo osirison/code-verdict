@@ -4,7 +4,7 @@
  * (issue #12) and agent tuning (issue #13) next.
  */
 import type { VerdictCounts } from '../domain/reviewState';
-import type { Severity } from '../domain/types';
+import type { Category, Severity, Verdict } from '../domain/types';
 import type { KeyValueStore } from './storage';
 
 export interface SubmittedItemSnapshot {
@@ -13,6 +13,12 @@ export interface SubmittedItemSnapshot {
   severity: Severity;
   file: string;
   line: number;
+}
+
+export interface SubmittedObservation {
+  category: Category;
+  confidence: number;
+  verdict: Verdict;
 }
 
 export interface SubmittedReview {
@@ -27,6 +33,8 @@ export interface SubmittedReview {
   threads: Record<string, string>;
   /** Accepted-item snapshot — posted-review rows need titles/severities offline. */
   items?: SubmittedItemSnapshot[];
+  /** All decisions, used for category/confidence tuning. Older records may omit it. */
+  observations?: SubmittedObservation[];
   requestedChanges: boolean;
 }
 

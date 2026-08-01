@@ -1,0 +1,44 @@
+import { describe, expect, it } from 'vitest';
+import { renderSettingsHtml, type SettingsViewState } from './settingsHtml';
+
+const state: SettingsViewState = {
+  instanceUrl: 'http://127.0.0.1:8971',
+  connectionStatus: 'connected as @you · api scope',
+  connected: true,
+  hasToken: true,
+  quietMode: false,
+  digestCadence: 'End of day',
+  shareRates: false,
+  notifications: [
+    { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', mode: 'Interrupt' },
+    { key: 'replyPosted', label: 'Reply on a comment you posted', hint: 'An author replied to your review.', mode: 'Interrupt' },
+    { key: 'authorPushed', label: 'Author pushed a fix', hint: 'The merge request changed after review.', mode: 'Badge' },
+    { key: 'pipelineFailed', label: 'Pipeline failed', hint: 'A watched pipeline needs attention.', mode: 'Digest' },
+    { key: 'reviewRequested', label: 'Review requested from you', hint: 'A merge request is waiting on you.', mode: 'Interrupt' },
+    { key: 'mentioned', label: 'You were mentioned', hint: 'A discussion mentioned your username.', mode: 'Badge' },
+    { key: 'threadStale', label: 'A posted thread went stale', hint: 'New commits moved a reviewed line.', mode: 'Digest' },
+  ],
+};
+
+describe('settings fidelity (spec §11)', () => {
+  it('renders every required section and notification event', () => {
+    const html = renderSettingsHtml(state, 'nonce123');
+    expect(html).toContain('Settings');
+    expect(html).toContain('Connection');
+    expect(html).toContain('Notifications');
+    expect(html).toContain('Data &amp; privacy');
+    expect(html).toContain('settings.json');
+    expect(html).toContain('Agent finished a review');
+    expect(html).toContain('A posted thread went stale');
+    expect(html).toContain('Rotate token');
+    expect(html).toContain('glpat-••••••••');
+  });
+
+  it('wires controls through typed CSP-safe messages', () => {
+    const html = renderSettingsHtml(state, 'nonce123');
+    expect(html).toContain(`script-src 'nonce-nonce123'`);
+    expect(html).toContain("type: 'setNotification'");
+    expect(html).toContain("type: 'setQuietMode'");
+    expect(html).toContain("type: 'openSettingsJson'");
+  });
+});

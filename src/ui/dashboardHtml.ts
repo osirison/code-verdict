@@ -61,7 +61,16 @@ export interface DashboardViewState {
     projectsInPod: number;
   };
   fetchedAgo: string;
+  podOptions?: Array<{ id: string; name: string; active: boolean; meta: string }>;
   projects: Array<{ id: string; label: string; count: number }>;
+  changesets?: Array<{
+    id: string;
+    name: string;
+    memberCount: number;
+    projectCount: number;
+    state: string;
+    stateClass: 'pill-bad' | 'pill-warn' | 'pill-ok';
+  }>;
   rows: DashboardRow[];
   issues: DashboardIssueRow[];
   activity: ActivityEntry[];
@@ -72,7 +81,9 @@ export interface DashboardViewState {
 export type DashboardMessage =
   | { type: 'refresh' }
   | { type: 'openCr'; repoId: string; number: string; submitted: boolean }
+  | { type: 'openChangeset'; changesetId: string }
   | { type: 'switchPod' }
+  | { type: 'selectPod'; podId: string }
   | { type: 'addProjects' }
   | { type: 'filters' };
 
@@ -99,11 +110,19 @@ const CI_TEXT: Record<CiStatus, { label: string; cls: string }> = {
 };
 
 const CSS = `
-header { display: flex; align-items: center; gap: 14px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+header { position: relative; display: flex; align-items: center; gap: 14px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+.pod-wrap { position: relative; display: inline-flex; align-items: center; }
 .pod-switch { display: flex; align-items: baseline; gap: 8px; cursor: pointer; background: none; border: none; color: var(--fg); font-family: var(--font-ui); padding: 0; }
 .pod-switch h1 { font-size: 14px; font-weight: 600; color: var(--fg-hi); }
 .pod-switch .meta { font-size: 11px; color: var(--fg-dim); }
 .pod-switch .caret { font-size: 9px; color: var(--fg-dimmer); }
+.pod-menu { position: absolute; top: calc(100% + 8px); left: 0; min-width: 260px; background: var(--bg3); border: 1px solid var(--line2); border-radius: 6px; box-shadow: 0 10px 28px rgba(0,0,0,.5); padding: 6px; z-index: 25; }
+.pod-menu[hidden] { display: none; }
+.pod-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border: none; background: none; color: var(--fg); font-family: var(--font-ui); font-size: 12px; border-radius: 4px; cursor: pointer; text-align: left; }
+.pod-option:hover { background: var(--hover); }
+.pod-option.active { background: var(--sel); color: var(--fg-hi); }
+.pod-option .meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); }
+.pod-option .check { color: var(--accent); font-size: 11px; width: 12px; text-align: center; }
 .scope { display: inline-flex; background: var(--bg3); border-radius: 5px; padding: 2px; gap: 2px; }
 .scope button { border: none; background: none; color: var(--fg-dim); font-size: 11px; font-family: var(--font-ui); padding: 4px 10px; border-radius: 4px; cursor: pointer; }
 .scope button.active { background: var(--accent); color: var(--accent-fg); }
@@ -123,6 +142,10 @@ section { padding: 16px 0 6px; }
 .section-pad { padding: 0 20px 8px; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 20px 10px; }
 .chips .chip { padding: 4px 10px; }
+.changeset-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; padding: 0 20px 12px; }
+.changeset-card { display: grid; grid-template-columns: 22px minmax(0,1fr) auto; gap: 9px; align-items: center; border: 1px solid var(--line2); border-radius: 6px; background: var(--card); padding: 11px 12px; color: var(--fg); cursor: pointer; text-align: left; font-family: var(--font-ui); }
+.changeset-card:hover { border-color: var(--agent); background: var(--bg3); }
+.changeset-glyph { color: var(--agent); font-size: 16px; }
 
 .thead, .mr-row, .issue-row { display: grid; grid-template-columns: minmax(0,1fr) 108px 104px 84px 58px; gap: 10px; padding: 0 20px; align-items: center; }
 .thead { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .09em; color: var(--fg-dimmer); padding-bottom: 6px; }
@@ -130,6 +153,7 @@ section { padding: 16px 0 6px; }
 .mr-row { cursor: pointer; }
 .mr-row:hover, .mr-row:focus { background: var(--bg3); outline: none; }
 .mr-row[hidden], .chip[hidden] { display: none; }
+.issue-empty { color: var(--fg-dim); font-size: 12px; }
 .row-title { font-size: 12.5px; font-weight: 500; color: var(--fg-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); margin-top: 3px; }
 .cell-project { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -152,13 +176,25 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
   const e = escapeHtml;
   const empty = state.rows.length === 0;
 
+  const podOptions = (state.podOptions ?? []).map((pod) => `
+      <button class="pod-option ${pod.active ? 'active' : ''}" type="button" data-pod-id="${e(pod.id)}">
+        <span>${e(pod.name)}</span>
+        <span class="meta">${e(pod.meta)}</span>
+        <span class="check">${pod.active ? '✓' : ''}</span>
+      </button>`).join('');
+
   const header = `
   <header>
-    <button class="pod-switch" id="pod-switch" title="Switch pod">
-      <h1>${e(state.podName)}</h1>
-      <span class="meta">${e(state.meta)}</span>
-      <span class="caret">▼</span>
-    </button>
+    <div class="pod-wrap">
+      <button class="pod-switch" id="pod-switch" title="Switch pod" type="button">
+        <h1>${e(state.podName)}</h1>
+        <span class="meta">${e(state.meta)}</span>
+        <span class="caret">▼</span>
+      </button>
+      <div class="pod-menu" data-pod-menu hidden>
+        ${podOptions}
+      </div>
+    </div>
     ${
       empty
         ? ''
@@ -213,6 +249,13 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       .filter((p) => p.count > 0)
       .map((p) => `<button class="chip" data-project="${e(p.id)}">${e(p.label)} · ${p.count}</button>`),
   ].join('');
+
+  const changesetCards = (state.changesets ?? []).map((changeset) => `
+    <button class="changeset-card" data-changeset="${e(changeset.id)}">
+      <span class="changeset-glyph">⧉</span>
+      <span><span class="row-title">${e(changeset.name)}</span><span class="row-meta">${changeset.memberCount} MRs · ${changeset.projectCount} projects</span></span>
+      <span class="pill ${changeset.stateClass}">${e(changeset.state)}</span>
+    </button>`).join('');
 
   const mrRows = state.rows
     .map(
@@ -280,17 +323,17 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
        <div class="stats">${statCards}</div>
        <div class="split">
          <div>
+           ${changesetCards ? `<section><div class="section-label section-pad">Changesets <span class="dimmer">· merge requests that ship together</span></div><div class="changeset-grid">${changesetCards}</div></section>` : ''}
            <section>
              <div class="section-label section-pad">Merge requests</div>
              <div class="chips">${chips}</div>
              <div class="thead"><div>Title</div><div>Project</div><div>AI review</div><div>Pipeline</div><div>Age</div></div>
              ${mrRows}
            </section>
-           ${
-             state.issues.length > 0
-               ? `<section><div class="section-label section-pad">Issues · in progress</div>${issueRows}</section>`
-               : ''
-           }
+           <section>
+             <div class="section-label section-pad">Issues · in progress</div>
+             ${state.issues.length > 0 ? issueRows : '<div class="issue-row issue-empty">No issues in progress</div>'}
+           </section>
          </div>
          <div class="col-right">
            ${
@@ -309,11 +352,34 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
   const script = `
     const vscode = acquireVsCodeApi();
     const post = (m) => vscode.postMessage(m);
+    const podMenu = document.querySelector('[data-pod-menu]');
+    const togglePodMenu = () => {
+      if (!podMenu) return;
+      const open = podMenu.hasAttribute('hidden');
+      podMenu.toggleAttribute('hidden', !open);
+    };
+
     document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
     document.getElementById('filters')?.addEventListener('click', () => post({ type: 'filters' }));
-    document.getElementById('pod-switch')?.addEventListener('click', () => post({ type: 'switchPod' }));
+    document.getElementById('pod-switch')?.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      togglePodMenu();
+    });
     document.getElementById('switch-pod-empty')?.addEventListener('click', () => post({ type: 'switchPod' }));
     document.getElementById('add-projects')?.addEventListener('click', () => post({ type: 'addProjects' }));
+    document.querySelectorAll('[data-pod-id]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const podId = btn.dataset.podId;
+        if (podId) post({ type: 'selectPod', podId });
+        if (podMenu) podMenu.setAttribute('hidden', '');
+      });
+    });
+    document.addEventListener('click', (ev) => {
+      if (!podMenu || podMenu.hasAttribute('hidden')) return;
+      if (ev.target instanceof Node && !ev.target.closest('.pod-wrap')) {
+        podMenu.setAttribute('hidden', '');
+      }
+    });
 
     let scopeSel = 'all';
     let projectSel = '*';
@@ -359,6 +425,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       row.addEventListener('click', open);
       row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') open(); });
     }
+    document.querySelectorAll('[data-changeset]').forEach((card) => card.addEventListener('click', () => post({ type: 'openChangeset', changesetId: card.dataset.changeset })));
   `;
 
   return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script });

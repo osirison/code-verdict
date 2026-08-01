@@ -7,6 +7,7 @@ interface PackageJson {
   contributes: {
     commands: Array<{ command: string; title: string }>;
     keybindings: Array<{ command: string; when?: string }>;
+    views: Record<string, Array<{ id: string; name: string; type?: string }>>;
   };
 }
 
@@ -31,5 +32,13 @@ describe('package.json contributions', () => {
     for (const kb of pkg.contributes.keybindings) {
       expect(kb.when).toBe('verdict.reviewFocus');
     }
+  });
+
+  it('declares the registered Verdict sidebar provider as a webview', () => {
+    expect(pkg.contributes.views.verdict).toContainEqual({
+      id: 'codeVerdict.sidebar',
+      name: 'Verdict',
+      type: 'webview',
+    });
   });
 });

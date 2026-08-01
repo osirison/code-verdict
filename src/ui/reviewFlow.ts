@@ -16,7 +16,7 @@ import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import { addedLines, diffStats } from '../domain/diffHunks';
+import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
 import { composeSummary } from '../domain/summary';
 import type { AgentVoice } from '../domain/summary';
 import {
@@ -99,7 +99,7 @@ export class ReviewFlowPanel {
   private review?: Review;
   private response?: AgentReviewResponse;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
-  private mode: 'split' | 'queue' = 'split';
+  private mode: 'split' | 'queue' | 'diff' = 'split';
   private selectedId?: string;
   private runSteps: string[] = [];
   private runStep = 0;
@@ -352,9 +352,7 @@ export class ReviewFlowPanel {
         void this.run();
         return;
       case 'openTuning':
-        void vscode.window.showInformationMessage(
-          'Verdict: the agent scorecard arrives with issue #13.',
-        );
+        await vscode.commands.executeCommand('codeVerdict.selectAgent');
         return;
       case 'usePartial':
         // The demo agent never produces partials; the lm path reports 0
@@ -601,6 +599,10 @@ export class ReviewFlowPanel {
         items: this.review.items
           .filter((i) => this.review?.verdicts[i.id]?.verdict === 'accepted')
           .map((i) => ({ id: i.id, title: i.title, severity: i.severity, file: i.file, line: i.line })),
+        observations: this.review.items.flatMap((item) => {
+          const verdict = this.review?.verdicts[item.id]?.verdict;
+          return verdict ? [{ category: item.category, confidence: item.confidence, verdict }] : [];
+        }),
         requestedChanges: result.requestChangesApplied === true,
       });
       await this.deps.workspaceState.update(this.draftKey(), undefined);
@@ -704,6 +706,9 @@ export class ReviewFlowPanel {
       mode: this.mode,
       items,
       selectedId: this.selectedId,
+      diffLines: this.diff?.files
+        .filter((file) => file.newPath === items.find((view) => view.item.id === this.selectedId)?.item.file)
+        .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines)),
       counts,
       stale: this.staleHead
         ? { newHead: this.staleHead, affected: this.review?.items.length ?? 0 }

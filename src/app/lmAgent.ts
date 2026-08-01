@@ -10,6 +10,7 @@ import { AgentResponseError, parseAgentReviewResponse } from '../domain/agentRes
 import type { Criteria } from '../domain/types';
 import type { ChangeRequestDiff } from '../platform/types';
 import type { AgentDescriptor } from './agents';
+import { changesetHeadSha, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
 
 const LM_PREFIX = 'lm:';
 const TIMEOUT_MS = 90_000;
@@ -45,12 +46,6 @@ export async function runLmAgent(
   diff: ChangeRequestDiff,
   criteria: Criteria,
 ): Promise<AgentReviewResponse> {
-  const [vendor, family] = agentId.slice(LM_PREFIX.length).split('/');
-  const requestId = Math.random().toString(16).slice(2, 8);
-  const models = await vscode.lm.selectChatModels({ vendor, family });
-  const model = models[0];
-  if (!model) throw new AgentRunError(`Agent ${agentId} is no longer available`, requestId, false);
-
   const prompt = [
     'You are a code review agent. Review ONLY the diffs below.',
     `Respond with a single JSON object matching this contract: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": "${diff.headSha}", "items": [{ "id", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "suggestion"?: {"old","new"} }], "candidates": [] }`,
@@ -58,6 +53,37 @@ export async function runLmAgent(
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
     ...diff.files.map((f) => `--- ${f.newPath}\n${f.diff}`),
   ].join('\n\n');
+  return runPrompt(agentId, prompt);
+}
+
+export async function runLmChangesetAgent(
+  agentId: string,
+  members: readonly ChangesetAgentMember[],
+  criteria: Criteria,
+): Promise<AgentReviewResponse> {
+  const headSha = changesetHeadSha(members);
+  const contract = '{ "id", "projectId", "mrIid", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "cross"?: true, "spans"?: [{"projectId","location","role"}], "suggestion"?: {"old","new"} }';
+  const prompt = [
+    'You are a code review agent. Review this changeset as one distributed unit. Review ONLY the labelled diffs below.',
+    'Find both normal per-repository issues and failures that exist only between repositories. A cross-repository item must set cross=true and name both sides in spans[].',
+    `Respond with one JSON object: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": ${JSON.stringify(headSha)}, "items": [${contract}], "candidates": [] }`,
+    'Every item must use the exact projectId and mrIid labels supplied below. The file and line must identify an added line in that member diff.',
+    `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
+    criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
+    ...members.flatMap((member) => member.diff.files.map((file) => [
+      `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${file.newPath}`,
+      file.diff,
+    ].join('\n'))),
+  ].join('\n\n');
+  return validateChangesetResponse(await runPrompt(agentId, prompt), members);
+}
+
+async function runPrompt(agentId: string, prompt: string): Promise<AgentReviewResponse> {
+  const [vendor, family] = agentId.slice(LM_PREFIX.length).split('/');
+  const requestId = Math.random().toString(16).slice(2, 8);
+  const models = await vscode.lm.selectChatModels({ vendor, family });
+  const model = models[0];
+  if (!model) throw new AgentRunError(`Agent ${agentId} is no longer available`, requestId, false);
 
   const tokenSource = new vscode.CancellationTokenSource();
   const timeout = setTimeout(() => tokenSource.cancel(), TIMEOUT_MS);

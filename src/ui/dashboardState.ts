@@ -4,6 +4,7 @@
  */
 import { deriveStats, repoIdsOf, repoLabel } from '../app/podQuery';
 import type { PodData } from '../app/podQuery';
+import { detectChangesets } from '../app/changesets';
 import { getProvider } from '../platform/registry';
 import type { ActivityEntry, DashboardViewState, RowScope } from './dashboardHtml';
 
@@ -21,16 +22,30 @@ export interface DashboardDeps {
   submittedRefs?: () => ReadonlySet<string>;
   /** Row click: submitted rows open Posted reviews, others Run review (§2). */
   openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
+  openChangeset?: (changesetId: string) => void;
+  /** Notify sibling views after the dashboard changes the active pod. */
+  onPodChanged?: () => void;
+}
+
+export interface DashboardPodOption {
+  id: string;
+  name: string;
+  meta: string;
+}
+
+export interface PodDataWithOptions extends PodData {
+  podOptions?: DashboardPodOption[];
 }
 
 export function toViewState(
-  data: PodData,
+  data: PodDataWithOptions,
   now: number,
   submittedRefs: ReadonlySet<string>,
 ): DashboardViewState {
   const pod = data.pod;
   const you = pod.username;
   const vocabulary = getProvider(pod.providerId).vocabulary;
+  const changesets = detectChangesets(pod, data.changeRequests, data.workItems);
 
   const counts = new Map<string, number>();
   const scopeCounts = { you: 0, them: 0 };
@@ -98,6 +113,12 @@ export function toViewState(
   return {
     podName: pod.name,
     meta: `${repoIdsOf(pod).length} ${vocabulary.repoNoun}s · ${data.changeRequests.length} open ${vocabulary.changeRequestAbbrev}s`,
+    podOptions: data.podOptions?.map((p) => ({
+      id: p.id,
+      name: p.name,
+      active: p.id === pod.id,
+      meta: p.meta,
+    })),
     scopeCounts,
     stats: {
       ...deriveStats(data),
@@ -109,6 +130,18 @@ export function toViewState(
       label: repoLabel(pod, id),
       count: counts.get(id) ?? 0,
     })),
+    changesets: changesets.map((changeset) => {
+      const blocked = changeset.members.filter((member) => member.ci?.status === 'failed').length;
+      const toReview = changeset.members.filter((member) => !submittedRefs.has(`${member.ref.repoId}!${member.ref.number}`)).length;
+      return {
+        id: changeset.id,
+        name: changeset.name,
+        memberCount: changeset.members.length,
+        projectCount: new Set(changeset.members.map((member) => member.ref.repoId)).size,
+        state: blocked > 0 ? `${blocked} blocked` : toReview > 0 ? `${toReview} to review` : 'ready to merge',
+        stateClass: blocked > 0 ? 'pill-bad' as const : toReview > 0 ? 'pill-warn' as const : 'pill-ok' as const,
+      };
+    }),
     rows,
     issues: data.workItems.slice(0, 8).map((wi) => ({
       title: wi.title,

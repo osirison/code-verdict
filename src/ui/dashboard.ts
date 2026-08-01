@@ -54,6 +54,13 @@ export class DashboardPanel {
         case 'switchPod':
           void vscode.commands.executeCommand(COMMANDS.switchPod);
           break;
+        case 'selectPod':
+          void (async () => {
+            await this.podStore.setActive(message.podId);
+            this.deps.onPodChanged?.();
+            await this.refresh();
+          })();
+          break;
         case 'addProjects':
           void vscode.commands.executeCommand(COMMANDS.addProject);
           break;
@@ -68,6 +75,9 @@ export class DashboardPanel {
           } else {
             void vscode.commands.executeCommand(COMMANDS.openReview);
           }
+          break;
+        case 'openChangeset':
+          this.deps.openChangeset?.(message.changesetId);
           break;
       }
     });
@@ -94,7 +104,16 @@ export class DashboardPanel {
       if (!canRender()) return;
       const nonce = crypto.randomBytes(16).toString('hex');
       const submitted = this.deps.submittedRefs?.() ?? new Set<string>();
-      this.panel.webview.html = renderDashboardHtml(toViewState(data, Date.now(), submitted), nonce);
+      const podOptions = this.podStore.list().map((candidate) => ({
+        id: candidate.id,
+        name: candidate.name,
+        active: candidate.id === pod.id,
+        meta: `${candidate.repos?.length ?? 0} projects`,
+      }));
+      this.panel.webview.html = renderDashboardHtml(
+        toViewState({ ...data, podOptions }, Date.now(), submitted),
+        nonce,
+      );
     } catch (e) {
       if (!canRender()) return;
       const message = escapeHtml(e instanceof Error ? e.message : String(e));

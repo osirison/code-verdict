@@ -71,6 +71,28 @@ const server = http.createServer((req, res) => {
   });
 });
 
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code !== 'EADDRINUSE') {
+    console.error(`ERROR: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const probe = http.get(`http://127.0.0.1:${port}/_emulator/state`, (response) => {
+    response.resume();
+    if (response.statusCode === 200) {
+      console.log(`GitLab emulator listening on http://127.0.0.1:${port} (existing process)`);
+      return;
+    }
+    console.error(`ERROR: port ${port} is occupied by a non-emulator process`);
+    process.exitCode = 1;
+  });
+  probe.on('error', () => {
+    console.error(`ERROR: port ${port} is occupied and the emulator health probe failed`);
+    process.exitCode = 1;
+  });
+});
+
 server.listen(port, '127.0.0.1', () => {
   console.log(`GitLab emulator listening on http://127.0.0.1:${port}`);
   console.log(`  seed ${seed} · scenario ${scenario} · token glpat-emulator`);
