@@ -20,7 +20,7 @@
 
 ## Validation
 
-* `npm test`: 146 tests passed across 31 files
+* `npm test`: 148 tests passed across 31 files
 * `npm run typecheck`: passed
 * `npm run lint`: passed
 * `npm run build`: passed

@@ -26,6 +26,16 @@ Use one panel host with route-scoped handlers, then layer breadcrumb and sidebar
 * Passed strict TypeScript checking, ESLint, and the production esbuild bundle.
 * Confirmed one `Verdict` editor tab, canonical dark palette, populated dashboard, and overflow-free sidebar in the Development Host.
 
+## Pull Request Review
+
+* Gated unified-diff parsing behind In diff mode for single and combined reviews.
+* Made settings toggles flip local webview state on every click.
+* Deduplicated repeated changeset trailers per merge request.
+* Added combined-review editor-open failure feedback.
+* Derived pod project counts from configured sources.
+* Serialized changeset identifiers with `JSON.stringify` in webview scripts.
+* Expanded final validation to 148 tests across 31 files.
+
 ## Plan Deviations
 
 None.

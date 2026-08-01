@@ -55,4 +55,12 @@ describe('changeset detection', () => {
   it('does not promote a trailer used by only one merge request', () => {
     expect(detectChangesets(pod, CHANGE_REQUESTS.slice(0, 1), [])).toEqual([]);
   });
+
+  it('counts a merge request once when its description repeats the same trailer', () => {
+    const repeated = CHANGE_REQUESTS.map((changeRequest, index) => index === 0
+      ? { ...changeRequest, description: 'Part-of: #1180\nPart-of: #1180' }
+      : changeRequest);
+
+    expect(detectChangesets(pod, repeated, [])[0]?.members).toHaveLength(4);
+  });
 });

@@ -22,9 +22,8 @@ export function detectChangesets(
   const groups = new Map<string, ChangeRequest[]>();
   for (const changeRequest of changeRequests) {
     const matches = [...(changeRequest.description ?? '').matchAll(PART_OF)];
-    for (const match of matches) {
-      const issueNumber = match[1];
-      if (!issueNumber) continue;
+    const issueNumbers = new Set(matches.flatMap((match) => match[1] ? [match[1]] : []));
+    for (const issueNumber of issueNumbers) {
       const members = groups.get(issueNumber) ?? [];
       members.push(changeRequest);
       groups.set(issueNumber, members);

@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
 import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
-import { fetchPodData } from '../app/podQuery';
+import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import type { DashboardMessage } from './dashboardHtml';
 import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboardHtml';
@@ -109,7 +109,7 @@ export class DashboardPanel {
         id: candidate.id,
         name: candidate.name,
         active: candidate.id === pod.id,
-        meta: `${candidate.repos?.length ?? 0} projects`,
+        meta: `${repoIdsOf(candidate).length} projects`,
       }));
       this.panel.webview.html = renderDashboardHtml(
         toViewState({ ...data, podOptions }, Date.now(), submitted),

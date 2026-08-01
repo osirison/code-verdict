@@ -282,7 +282,14 @@ export class ChangesetReviewPanel {
         await this.persist();
         break;
       }
-      case 'openInEditor': void vscode.window.showTextDocument(vscode.Uri.file(message.file), { preview: true }); return;
+      case 'openInEditor':
+        void vscode.window.showTextDocument(vscode.Uri.file(message.file), { preview: true }).then(
+          undefined,
+          () => vscode.window.showInformationMessage(
+            `Verdict: ${message.file} is not in this workspace — it lives in the reviewed repository.`,
+          ),
+        );
+        return;
       case 'generateSummary':
         if (!this.review || !allDecided(this.review)) return;
         this.summaryText = this.generateSummary();
@@ -403,9 +410,11 @@ export class ChangesetReviewPanel {
     }));
     const selected = items.find((view) => view.item.id === this.selectedId) ?? items[0];
     const selectedMember = this.members.find((member) => member.ref.repoId === selected?.item.repoId && member.ref.number === selected.item.crNumber);
-    const diffLines = selectedMember?.diff.files
-      .filter((file) => file.newPath === selected?.item.file)
-      .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines));
+    const diffLines = this.mode === 'diff'
+      ? selectedMember?.diff.files
+        .filter((file) => file.newPath === selected?.item.file)
+        .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines))
+      : undefined;
     const counts = this.review ? verdictCounts(this.review) : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
     const totalFiles = this.members.reduce((count, member) => count + member.diff.files.length, 0);
     const history = new ReviewHistory(this.deps.globalState).list().filter((record) => record.podId === pod.id);

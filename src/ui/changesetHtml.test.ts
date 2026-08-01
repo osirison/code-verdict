@@ -39,4 +39,11 @@ describe('changeset fidelity (spec §15)', () => {
     expect(html).toContain("type:'openMember'");
     expect(html).toContain("type:'reviewTogether'");
   });
+
+  it('serializes the changeset id as a JavaScript string literal', () => {
+    const html = renderChangesetHtml({ ...state, id: "trailer:'1180" }, 'nonce123');
+
+    expect(html).toContain(`changesetId:"trailer:'1180"`);
+    expect(html).not.toContain(`changesetId:'trailer:'1180'`);
+  });
 });

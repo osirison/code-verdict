@@ -40,5 +40,8 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain("type: 'setNotification'");
     expect(html).toContain("type: 'setQuietMode'");
     expect(html).toContain("type: 'openSettingsJson'");
+    expect(html).toContain('let quietMode = false');
+    expect(html).toContain('quietMode = !quietMode');
+    expect(html).toContain('shareRates = !shareRates');
   });
 });

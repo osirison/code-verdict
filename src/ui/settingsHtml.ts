@@ -99,11 +99,13 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
   const script = `
     const vscode = window.verdictVscode;
     const post = (message) => vscode.postMessage(message);
+    let quietMode = ${state.quietMode};
+    let shareRates = ${state.shareRates};
     document.getElementById('rotate-token')?.addEventListener('click', () => post({ type: 'rotateToken' }));
     document.querySelectorAll('[data-notification]').forEach((button) => button.addEventListener('click', () => post({ type: 'setNotification', key: button.dataset.notification, mode: button.dataset.mode })));
-    document.getElementById('quiet')?.addEventListener('click', () => post({ type: 'setQuietMode', value: ${!state.quietMode} }));
+    document.getElementById('quiet')?.addEventListener('click', () => { quietMode = !quietMode; post({ type: 'setQuietMode', value: quietMode }); });
     document.querySelectorAll('[data-cadence]').forEach((button) => button.addEventListener('click', () => post({ type: 'setDigestCadence', value: button.dataset.cadence })));
-    document.getElementById('share-rates')?.addEventListener('click', () => post({ type: 'setShareRates', value: ${!state.shareRates} }));
+    document.getElementById('share-rates')?.addEventListener('click', () => { shareRates = !shareRates; post({ type: 'setShareRates', value: shareRates }); });
     document.getElementById('open-json')?.addEventListener('click', () => post({ type: 'openSettingsJson' }));
   `;
   return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script, breadcrumb: { current: 'Settings' } });

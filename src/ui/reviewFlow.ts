@@ -716,9 +716,11 @@ export class ReviewFlowPanel {
       mode: this.mode,
       items,
       selectedId: this.selectedId,
-      diffLines: this.diff?.files
-        .filter((file) => file.newPath === items.find((view) => view.item.id === this.selectedId)?.item.file)
-        .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines)),
+      diffLines: this.mode === 'diff'
+        ? this.diff?.files
+          .filter((file) => file.newPath === items.find((view) => view.item.id === this.selectedId)?.item.file)
+          .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines))
+        : undefined,
       counts,
       stale: this.staleHead
         ? { newHead: this.staleHead, affected: this.review?.items.length ?? 0 }
