@@ -177,12 +177,26 @@
     },
     "keybindings": [
       { "command": "codeVerdict.acceptItem", "key": "a", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.acceptCommentOnly", "key": "shift+a", "when": "verdict.reviewFocus" },
       { "command": "codeVerdict.rejectItem", "key": "r", "when": "verdict.reviewFocus" },
       { "command": "codeVerdict.skipItem", "key": "s", "when": "verdict.reviewFocus" },
       { "command": "codeVerdict.nextItem", "key": "j", "when": "verdict.reviewFocus" },
       { "command": "codeVerdict.prevItem", "key": "k", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.undoVerdict", "key": "u", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.jumpSeverity", "key": "1", "args": "blocker", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.jumpSeverity", "key": "2", "args": "major", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.jumpSeverity", "key": "3", "args": "minor", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.jumpSeverity", "key": "4", "args": "nit", "when": "verdict.reviewFocus" },
+      { "command": "codeVerdict.internal.keyboardHelp", "key": "shift+/", "when": "verdict.reviewFocus" },
       { "command": "codeVerdict.askAgent", "key": "ctrl+enter", "mac": "cmd+enter", "when": "verdict.reviewFocus" }
-    ]
+    ],
+    "menus": {
+      "comments/commentThread/title": [
+        { "command": "codeVerdict.acceptItem", "group": "inline@1", "when": "commentController == codeVerdict.review" },
+        { "command": "codeVerdict.rejectItem", "group": "inline@2", "when": "commentController == codeVerdict.review" },
+        { "command": "codeVerdict.skipItem", "group": "inline@3", "when": "commentController == codeVerdict.review" }
+      ]
+    }
   },
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --sourcemap",

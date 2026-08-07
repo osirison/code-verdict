@@ -27,12 +27,18 @@ export interface SidebarReviewItem {
   title: string;
   file: string;
   severity: 'blocker' | 'major' | 'minor' | 'nit';
+  category?: string;
+  confidence?: number;
   verdict?: 'accepted' | 'rejected' | 'skipped';
   selected: boolean;
+  /** New commits moved this finding off the agent's line (spec §5). */
+  lineMoved?: boolean;
 }
 
 export interface SidebarActiveReview {
   headline: string;
+  /** "!2841" on its own — the status bar shows this without the title. */
+  refLabel?: string;
   context: string;
   agent: string;
   added: number;
@@ -60,6 +66,7 @@ export type SidebarMessage =
   | { type: 'openTuning' }
   | { type: 'openSettings' }
   | { type: 'selectFinding'; itemId: string }
+  | { type: 'openReviewTab' }
   | { type: 'openCr'; repoId: string; number: string };
 
 const CSS = `
@@ -114,21 +121,85 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .review-filters { display: flex; gap: 5px; padding: 9px 10px; border-bottom: 1px solid var(--line); }
 .review-filter { border: 1px solid var(--line2); border-radius: 12px; padding: 3px 7px; background: none; color: var(--fg-dim); font: 10px/1 var(--font-ui); cursor: pointer; }
 .review-filter:hover, .review-filter.active { border-color: var(--accent); color: var(--fg-hi); }
-.finding { display: grid; grid-template-columns: 8px minmax(0,1fr) auto; gap: 7px; width: 100%; padding: 8px 11px; border: 0; background: none; color: var(--fg); text-align: left; cursor: pointer; }
+/* The tree groups by file (spec §5): a ▾ file row, then indented items. */
+.file-row { display: flex; align-items: center; gap: 6px; width: 100%; padding: 7px 11px 5px; border: 0; background: none; color: var(--fg-dim); text-align: left; font: 500 11px/1.3 var(--font-mono); cursor: default; }
+.file-row[hidden] { display: none; }
+.file-caret { color: var(--fg-dimmer); font-size: 9px; }
+.file-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.file-count { color: var(--fg-dimmer); font-size: 10px; }
+.finding { display: grid; grid-template-columns: 7px minmax(0,1fr) auto; align-items: start; gap: 7px; width: 100%; padding: 6px 11px 6px 28px; border: 0; border-left: 2px solid transparent; background: none; color: var(--fg); text-align: left; cursor: pointer; }
 .finding:hover { background: var(--hover); }
-.finding.selected { background: var(--sel); }
+.finding.selected { background: var(--sel); border-left-color: var(--accent); }
 .finding[hidden] { display: none; }
 .finding-dot { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--fg-dimmer); }
 .finding-dot.blocker { background: var(--sev-blocker); }
 .finding-dot.major { background: var(--sev-major); }
 .finding-dot.minor { background: var(--sev-minor); }
 .finding-title { display: block; overflow: hidden; color: var(--fg-hi); font: 500 11.5px/1.3 var(--font-ui); text-overflow: ellipsis; white-space: nowrap; }
-.finding-file { display: block; margin-top: 2px; overflow: hidden; color: var(--fg-dimmer); font: 9.5px/1.3 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+/* Decided items read as done — struck through and dimmed (spec §5). */
+.finding.decided .finding-title { color: var(--fg-dimmer); text-decoration: line-through; }
+.finding-moved { display: block; margin-top: 2px; color: var(--sev-major); font: 9.5px/1.3 var(--font-mono); }
 .finding-verdict { color: var(--fg-dim2); font: 10px/1 var(--font-mono); }
 .finding-verdict.accepted { color: var(--ok); }
 .finding-verdict.rejected { color: var(--sev-blocker); }
 .foot { margin-top: auto; border-top: 1px solid var(--line); padding: 10px 12px; color: var(--fg-dimmer); font: 10.5px/1.4 var(--font-mono); }
+.foot-link { border: 0; background: none; padding: 0; color: var(--accent); font: 11px/1.4 var(--font-ui); cursor: pointer; }
+.foot-link:hover { text-decoration: underline; }
 `;
+
+/** ✓ / ✕ / ⤼ once decided, the agent's confidence while it is still open. */
+function verdictGlyph(item: SidebarReviewItem): string {
+  if (item.verdict === 'accepted') return '✓';
+  if (item.verdict === 'rejected') return '✕';
+  if (item.verdict === 'skipped') return '⤼';
+  return item.confidence === undefined ? '·' : `${item.confidence}%`;
+}
+
+/**
+ * The triage tree, grouped by file (spec §5). Rows carry the data the filter
+ * pills need so filtering stays in the webview — a verdict never costs a
+ * round trip to re-render the sidebar.
+ */
+function renderReviewTree(items: readonly SidebarReviewItem[]): string {
+  const e = escapeHtml;
+  const files = [...new Set(items.map((item) => item.file))];
+  return files
+    .map((file) => {
+      const inFile = items.filter((item) => item.file === file);
+      const rows = inFile
+        .map(
+          (item) => `<button class="finding ${item.selected ? 'selected' : ''} ${
+            item.verdict === 'accepted' || item.verdict === 'rejected' ? 'decided' : ''
+          }" data-finding="${e(item.id)}" data-file="${e(file)}" data-verdict="${e(item.verdict ?? 'undecided')}" data-category="${e(item.category ?? '')}" title="${e(item.title)}">
+        <span class="finding-dot ${item.severity}"></span>
+        <span><span class="finding-title">${e(item.title)}</span>${
+          item.lineMoved ? '<span class="finding-moved">⚠ line moved</span>' : ''
+        }</span>
+        <span class="finding-verdict ${item.verdict ?? ''}">${e(verdictGlyph(item))}</span>
+      </button>`,
+        )
+        .join('');
+      return `<div class="file-row" data-file-row="${e(file)}"><span class="file-caret">▾</span><span class="file-path">${e(file)}</span><span class="file-count">${inFile.length}</span></div>${rows}`;
+    })
+    .join('');
+}
+
+/** "All 8 / Open 5 / Security 3" — every pill carries its own count (spec §5). */
+function renderFilterPills(items: readonly SidebarReviewItem[]): string {
+  const e = escapeHtml;
+  const open = items.filter((item) => !item.verdict).length;
+  const security = items.filter((item) => item.category === 'security').length;
+  const pills: Array<{ key: string; label: string; count: number }> = [
+    { key: 'all', label: 'All', count: items.length },
+    { key: 'undecided', label: 'Open', count: open },
+  ];
+  if (security > 0) pills.push({ key: 'category:security', label: 'Security', count: security });
+  return pills
+    .map(
+      (pill, index) => `<button class="review-filter ${index === 0 ? 'active' : ''}" data-review-filter="${e(pill.key)}">${e(pill.label)} ${pill.count}</button>`,
+    )
+    .join('');
+}
 
 export function renderSidebarHtml(state: SidebarViewState, nonce: string): string {
   const e = escapeHtml;
@@ -154,15 +225,14 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
   const activeReview = state.activeReview;
   const decided = activeReview ? activeReview.items.length - activeReview.counts.undecided : 0;
   const progressWidth = (count: number) => activeReview?.items.length ? (count / activeReview.items.length) * 100 : 0;
-  const reviewTree = activeReview?.items.map((item) => `<button class="finding ${item.selected ? 'selected' : ''}" data-finding="${e(item.id)}" data-verdict="${e(item.verdict ?? 'undecided')}">
-    <span class="finding-dot ${item.severity}"></span><span><span class="finding-title">${e(item.title)}</span><span class="finding-file">${e(item.file)}</span></span><span class="finding-verdict ${item.verdict ?? ''}">${item.verdict === 'accepted' ? '✓' : item.verdict === 'rejected' ? '×' : item.verdict === 'skipped' ? '−' : '·'}</span>
-  </button>`).join('') ?? '';
+  const reviewTree = activeReview ? renderReviewTree(activeReview.items) : '';
+  const filterPills = activeReview ? renderFilterPills(activeReview.items) : '';
   const reviewSection = activeReview ? `<section>
     <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(activeReview.headline)}</span><span class="review-context-meta">${e(activeReview.context)} · <span class="ok">+${activeReview.added}</span> · <span class="bad">−${activeReview.removed}</span></span></span></div>
     <div class="review-agent"><span>Agent · <span class="agent-fg">${e(activeReview.agent)}</span></span><span>${decided}/${activeReview.items.length}</span></div>
     <div class="progress"><span class="progress-accepted" style="width:${progressWidth(activeReview.counts.accepted)}%"></span><span class="progress-rejected" style="width:${progressWidth(activeReview.counts.rejected)}%"></span><span class="progress-skipped" style="width:${progressWidth(activeReview.counts.skipped)}%"></span></div>
     <div class="review-counts"><span class="ok">${activeReview.counts.accepted} acc</span><span class="bad">${activeReview.counts.rejected} rej</span><span>${activeReview.counts.skipped} skip</span><span class="left">${activeReview.counts.undecided} left</span></div></div>
-    <div class="review-filters"><button class="review-filter active" data-review-filter="all">All</button><button class="review-filter" data-review-filter="undecided">Open</button><button class="review-filter" data-review-filter="accepted">Accepted</button><button class="review-filter" data-review-filter="rejected">Rejected</button></div>
+    <div class="review-filters">${filterPills}</div>
     <div class="list">${reviewTree}</div>
   </section>` : '';
 
@@ -177,7 +247,11 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     <div class="divider"></div>
     <div class="section">Pods</div><div class="pod-list">${podRows}</div>
     ${activeReview ? reviewSection : `<div class="divider"></div><div class="section">Merge requests</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`}
-    <footer class="foot">${e(state.podName)} · ${e(state.podMeta)}</footer>
+    <footer class="foot">${
+      activeReview
+        ? '<button class="foot-link" id="open-review-tab">Open review tab</button>'
+        : `${e(state.podName)} · ${e(state.podMeta)}`
+    }</footer>
   </main>`;
 
   const script = `
@@ -191,10 +265,23 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     document.querySelectorAll('[data-pod]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectPod', podId: row.dataset.pod })));
     document.querySelectorAll('[data-cr-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'openCr', repoId: row.dataset.crRepo, number: row.dataset.crNumber })));
     document.querySelectorAll('[data-finding]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectFinding', itemId: row.dataset.finding })));
+    document.getElementById('open-review-tab')?.addEventListener('click', () => post({ type: 'openReviewTab' }));
+    const matches = (row, filter) => {
+      if (filter === 'all') return true;
+      if (filter.startsWith('category:')) return row.dataset.category === filter.slice('category:'.length);
+      return row.dataset.verdict === filter;
+    };
     document.querySelectorAll('[data-review-filter]').forEach((button) => button.addEventListener('click', () => {
       document.querySelectorAll('[data-review-filter]').forEach((candidate) => candidate.classList.remove('active'));
       button.classList.add('active');
-      document.querySelectorAll('[data-finding]').forEach((row) => { row.hidden = button.dataset.reviewFilter !== 'all' && row.dataset.verdict !== button.dataset.reviewFilter; });
+      const filter = button.dataset.reviewFilter;
+      const shown = {};
+      document.querySelectorAll('[data-finding]').forEach((row) => {
+        row.hidden = !matches(row, filter);
+        if (!row.hidden) shown[row.dataset.file] = true;
+      });
+      // A file heading with nothing under it is noise — hide it with its items.
+      document.querySelectorAll('[data-file-row]').forEach((row) => { row.hidden = !shown[row.dataset.fileRow]; });
     }));
   `;
 

@@ -3,7 +3,7 @@
  * staleness, auto-advance. UI layers call these; they never own the rules.
  */
 import type { AgentReviewResponse } from './agentResponse';
-import type { Criteria, Review, ReviewItem, Verdict } from './types';
+import type { Criteria, Review, ReviewItem, Severity, Verdict } from './types';
 
 export function createReview(input: {
   repoId: string;
@@ -70,6 +70,15 @@ export function allDecided(review: Review): boolean {
 /** New commits landed since the agent read the diff. */
 export function isStale(review: Review, currentHeadSha: string): boolean {
   return review.headSha !== currentHeadSha;
+}
+
+/**
+ * `1`–`4` jump to severity (handoff §6). The undecided item comes first —
+ * the key exists to reach the work that is left, not to re-read a decision.
+ */
+export function firstOfSeverity(review: Review, severity: Severity): ReviewItem | undefined {
+  const ofSeverity = review.items.filter((i) => i.severity === severity);
+  return ofSeverity.find((i) => review.verdicts[i.id] === undefined) ?? ofSeverity[0];
 }
 
 /**

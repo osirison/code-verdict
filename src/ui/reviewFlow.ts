@@ -6,7 +6,7 @@
  */
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import { COMMANDS } from '../commands';
+import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
@@ -17,13 +17,16 @@ import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
+import { diffStats, parseHunks } from '../domain/diffHunks';
 import { composeSummary } from '../domain/summary';
 import type { AgentVoice } from '../domain/summary';
 import {
   allDecided,
   clearVerdict,
   createReview,
+  firstOfSeverity,
+  isStale,
   nextUndecided,
   setVerdict,
   verdictCounts,
@@ -36,7 +39,15 @@ import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../plat
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
+import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview } from './sidebarHtml';
+
+/**
+ * How often triage asks whether the branch moved under it (handoff §6 —
+ * "poll the MR head"). Slow enough to be invisible on the API budget, quick
+ * enough that a push lands in the banner while the reviewer is still reading.
+ */
+const HEAD_POLL_MS = 45_000;
 
 interface SessionDraft {
   review: Review;
@@ -84,10 +95,10 @@ export class ReviewFlowPanel {
     return true;
   }
 
-  static handleCommand(command: string): boolean {
+  static handleCommand(command: string, arg?: unknown): boolean {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed) return false;
-    return panel.dispatchCommand(command);
+    return panel.dispatchCommand(command, arg);
   }
 
   static selectItem(itemId: string): void {
@@ -124,6 +135,12 @@ export class ReviewFlowPanel {
   private summaryPosted = false;
   private doneSentence = '';
   private staleHead?: string;
+  /** Items whose anchor no longer resolves against the branch's new head. */
+  private staleItemIds = new Set<string>();
+  private headPoll?: ReturnType<typeof setInterval>;
+  private readonly inDiff = new InDiffEditor();
+  private inDiffKey = '';
+  private focusWatch?: vscode.Disposable;
 
   private constructor(
     private readonly route: AppRoute,
@@ -132,12 +149,31 @@ export class ReviewFlowPanel {
     route.onLeave(() => {
       this.disposed = true;
       this.runToken += 1;
+      this.stopHeadPoll();
+      this.inDiff.dispose();
+      this.focusWatch?.dispose();
+      this.focusWatch = undefined;
       this.deps.onSidebarState?.();
-      void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', false);
+      this.setReviewFocus(false);
       if (ReviewFlowPanel.current === this) ReviewFlowPanel.current = undefined;
     });
-    void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', true);
+    // Spec §12: "shortcuts apply when the review tab has focus". Tying the
+    // context to the tab's existence would arm A/R/S/J/K globally — including
+    // in the file in-diff mode opens beside the review, where a keystroke
+    // meant for the editor would silently record a verdict.
+    this.setReviewFocus(route.panel.active !== false);
+    this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
+      this.setReviewFocus(event.webviewPanel.active),
+    );
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
+  }
+
+  private setReviewFocus(active: boolean): void {
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewFocus',
+      active && !this.disposed,
+    );
   }
 
   private get panel(): vscode.WebviewPanel {
@@ -185,6 +221,7 @@ export class ReviewFlowPanel {
     this.threadsAccum = {};
     this.doneSentence = '';
     this.staleHead = undefined;
+    this.staleItemIds = new Set();
     this.agentOpen = false;
 
     const connection = await this.connection();
@@ -217,11 +254,77 @@ export class ReviewFlowPanel {
       this.summaryPosted = draft.summaryPosted ?? false;
       this.screen = 'triage';
       this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
-      this.staleHead = draft.review.headSha === cr.headSha ? undefined : cr.headSha;
+      // The diff just fetched is the branch as it stands now, so the same
+      // fetch that detects the moved head also says which findings moved.
+      this.staleHead = isStale(draft.review, cr.headSha) ? cr.headSha : undefined;
+      this.staleItemIds = this.staleHead ? this.markMoved(this.diff) : new Set();
     } else {
       this.screen = 'agent';
     }
     this.render();
+  }
+
+  // ---- staleness (handoff §6) --------------------------------------------------
+
+  /** The lines a finding can legitimately sit on: everything the new diff shows. */
+  private anchorCandidates(diff: ChangeRequestDiff, file: string): AnchorCandidate[] | undefined {
+    const changed = diff.files.find((f) => f.newPath === file);
+    if (!changed) return undefined;
+    return parseHunks(changed.diff)
+      .flatMap((hunk) => hunk.lines)
+      .filter((line) => line.newLine !== undefined)
+      .map((line) => ({ line: line.newLine as number, text: line.text }));
+  }
+
+  private markMoved(diff: ChangeRequestDiff): Set<string> {
+    if (!this.review) return new Set();
+    return movedAnchors(this.review.items, (file) => this.anchorCandidates(diff, file));
+  }
+
+  private startHeadPoll(): void {
+    if (this.headPoll || this.disposed) return;
+    this.headPoll = setInterval(() => void this.pollHead(), HEAD_POLL_MS);
+  }
+
+  private stopHeadPoll(): void {
+    if (!this.headPoll) return;
+    clearInterval(this.headPoll);
+    this.headPoll = undefined;
+  }
+
+  /**
+   * Ask whether the branch moved while the reviewer was deciding. The diff the
+   * agent read is deliberately *not* replaced here — comment positions must
+   * keep carrying the refs the agent saw until the reviewer explicitly
+   * re-anchors (handoff §14). This only computes what the banner claims.
+   */
+  private async pollHead(): Promise<void> {
+    if (this.disposed || this.screen !== 'triage' || !this.review) return;
+    // Identify the review by what it was read against, not by object identity:
+    // every verdict replaces `this.review`, and a poll must survive the
+    // reviewer working while it is in flight.
+    const { number } = this.ref;
+    const readHead = this.review.headSha;
+    const sameReview = (): boolean =>
+      !this.disposed &&
+      this.screen === 'triage' &&
+      this.ref.number === number &&
+      this.review?.headSha === readHead;
+    try {
+      const connection = await this.connection();
+      const crs = await connection.listOpenChangeRequests([this.ref.repoId]);
+      if (!sameReview()) return;
+      const cr = crs.find((c) => c.ref.number === number);
+      if (!cr || cr.headSha === readHead || this.staleHead === cr.headSha) return;
+      const fresh = await connection.getChangeRequestDiff(this.ref);
+      if (!sameReview()) return;
+      this.staleHead = cr.headSha;
+      this.staleItemIds = this.markMoved(fresh);
+      this.render();
+    } catch {
+      // A failed poll is not the reviewer's problem — the banner can wait
+      // for the next tick rather than interrupting triage with an error.
+    }
   }
 
   private async persistDraft(): Promise<void> {
@@ -404,7 +507,7 @@ export class ReviewFlowPanel {
         break;
       }
       case 'jumpSeverity': {
-        const target = this.review?.items.find((i) => i.severity === m.severity);
+        const target = this.review ? firstOfSeverity(this.review, m.severity) : undefined;
         if (target) this.selectedId = target.id;
         break;
       }
@@ -425,15 +528,26 @@ export class ReviewFlowPanel {
         await this.persistDraft();
         break;
       }
-      case 'openInEditor':
-        void vscode.window.showTextDocument(vscode.Uri.file(m.file), { preview: true }).then(
-          undefined,
-          () =>
-            vscode.window.showInformationMessage(
-              `Verdict: ${m.file} is not in this workspace — it lives in the reviewed repository.`,
-            ),
+      case 'openInEditor': {
+        // Land on the flagged line, not just the file — and only when this
+        // workspace really holds the reviewed code.
+        const item = this.review?.items.find((i) => i.file === m.file && i.line === m.line);
+        const located = item ? await locateInWorkspace(item) : undefined;
+        if (!located) {
+          void vscode.window.showInformationMessage(
+            `Verdict: could not open ${m.file} at the flagged line — it is not in this workspace, or the code has changed since the agent read it.`,
+          );
+          return;
+        }
+        const editor = await vscode.window.showTextDocument(located.document, { preview: true });
+        const position = new vscode.Position(located.line - 1, 0);
+        editor.selection = new vscode.Selection(position, position);
+        editor.revealRange(
+          located.document.lineAt(located.line - 1).range,
+          vscode.TextEditorRevealType.InCenterIfOutsideViewport,
         );
         return;
+      }
       case 'reanchor': {
         // Refetch the diff and recompute each item's line from where its
         // flagged code now sits (spec §6: re-anchor = recompute line
@@ -443,22 +557,32 @@ export class ReviewFlowPanel {
         if (this.review && this.diff) {
           const diff = this.diff;
           let moved = 0;
+          let lost = 0;
           const items = this.review.items.map((item) => {
-            const file = diff.files.find((f) => f.newPath === item.file);
-            if (!file) return item;
-            const match = addedLines(file.diff).find((a) => a.text.trim() === item.code.trim());
-            if (!match || match.line === item.line) return item;
+            const candidates = this.anchorCandidates(diff, item.file);
+            if (!candidates) {
+              lost += 1;
+              return item;
+            }
+            const resolved = resolveAnchor(candidates, item);
+            if (resolved.state === 'lost') lost += 1;
+            if (resolved.state !== 'moved') return item;
             moved += 1;
-            return { ...item, line: match.line };
+            return { ...item, line: resolved.line };
           });
           this.review = { ...this.review, items, headSha: diff.headSha };
-          if (moved > 0) {
-            void vscode.window.showInformationMessage(
-              `Verdict: re-anchored ${moved} ${moved === 1 ? 'finding' : 'findings'} to the new HEAD.`,
-            );
-          }
+          const sentence = [
+            moved > 0 ? `re-anchored ${moved} ${moved === 1 ? 'finding' : 'findings'} to the new HEAD` : '',
+            // Honest about what could not be saved: a rewritten line has no
+            // anchor to move to, and posting it blind would land in the wrong place.
+            lost > 0 ? `${lost} no longer ${lost === 1 ? 'has' : 'have'} matching code — re-run to re-read them` : '',
+          ].filter(Boolean).join('; ');
+          void vscode.window.showInformationMessage(
+            `Verdict: ${sentence || 'every finding still sits where the agent read it.'}`,
+          );
         }
         this.staleHead = undefined;
+        this.staleItemIds = new Set();
         await this.persistDraft();
         break;
       }
@@ -529,7 +653,7 @@ export class ReviewFlowPanel {
         return;
       case 'help':
         void vscode.window.showInformationMessage(
-          'Verdict keys — A accept · ⇧A accept comment-only · R reject · S skip · J/K move · 1–4 jump to severity · U undo. Full overlay arrives with issue #14.',
+          'Verdict keys — A accept · ⇧A accept comment-only · R reject · S skip · J/K move · 1–4 jump to severity · U undo · ⌘↩ ask. Full overlay arrives with issue #14.',
         );
         return;
     }
@@ -636,7 +760,13 @@ export class ReviewFlowPanel {
 
   // ---- commands from the palette / keybindings -------------------------------------
 
-  dispatchCommand(command: string): boolean {
+  dispatchCommand(command: string, arg?: unknown): boolean {
+    if (command === INTERNAL_COMMANDS.jumpSeverity) {
+      // `1`–`4` carry their severity as the keybinding's `args`.
+      if (!SEVERITY_ORDER.includes(arg as Severity)) return false;
+      void this.onMessage({ type: 'jumpSeverity', severity: arg as Severity });
+      return true;
+    }
     const simple: Record<string, FlowMessage | undefined> = {
       'codeVerdict.acceptItem': this.selectedId
         ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: true }
@@ -644,6 +774,14 @@ export class ReviewFlowPanel {
       'codeVerdict.acceptItemApplyFix': this.selectedId
         ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: true }
         : undefined,
+      // `⇧A` — accept the finding, leave the author's code alone.
+      [INTERNAL_COMMANDS.acceptCommentOnly]: this.selectedId
+        ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: false }
+        : undefined,
+      [INTERNAL_COMMANDS.undoVerdict]: this.selectedId
+        ? { type: 'undo', itemId: this.selectedId }
+        : undefined,
+      [INTERNAL_COMMANDS.keyboardHelp]: { type: 'help' },
       'codeVerdict.rejectItem': this.selectedId
         ? { type: 'verdict', itemId: this.selectedId, verdict: 'rejected' as Verdict, applyFix: false }
         : undefined,
@@ -681,6 +819,7 @@ export class ReviewFlowPanel {
       verdict: this.review?.verdicts[item.id]?.verdict,
       applyFix: this.review?.verdicts[item.id]?.applyFix,
       thread: this.threads[item.id] ?? [],
+      lineMoved: this.staleItemIds.has(item.id),
     }));
     const counts = this.review
       ? verdictCounts(this.review)
@@ -723,7 +862,15 @@ export class ReviewFlowPanel {
         : undefined,
       counts,
       stale: this.staleHead
-        ? { newHead: this.staleHead, affected: this.review?.items.length ?? 0 }
+        ? {
+            newHead: this.staleHead,
+            affected: this.staleItemIds.size,
+            // Callers need to know an accepted decision may now be misplaced —
+            // that is the part of the banner that costs the reviewer work.
+            affectedAccepted: [...this.staleItemIds].filter(
+              (id) => this.review?.verdicts[id]?.verdict === 'accepted',
+            ).length,
+          }
         : undefined,
       candidates: this.response?.candidates ?? [],
       filesRead: this.response?.stats?.filesRead ?? this.diff?.files.length ?? 0,
@@ -747,6 +894,7 @@ export class ReviewFlowPanel {
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), nonce);
     this.deps.onSidebarState?.(this.review ? {
       headline: `${state.header.refLabel} · ${state.header.title}`,
+      refLabel: state.header.refLabel,
       context: state.header.branch,
       agent: this.agentLabel(),
       added: state.header.added,
@@ -757,9 +905,36 @@ export class ReviewFlowPanel {
         title: item.title,
         file: item.file,
         severity: item.severity,
+        category: item.category,
+        confidence: item.confidence,
         verdict: this.review?.verdicts[item.id]?.verdict,
         selected: item.id === this.selectedId,
+        lineMoved: this.staleItemIds.has(item.id),
       })),
     } : undefined);
+    // Triage is the only screen that watches the branch, and the editor only
+    // carries decorations while the reviewer is actually in "In diff".
+    if (this.screen === 'triage') this.startHeadPoll();
+    else this.stopHeadPoll();
+    this.syncInDiffEditor(items);
+  }
+
+  /**
+   * Mirror the selected finding into the editor when in-diff mode is showing.
+   * Keyed so a re-render for an unrelated reason does not re-open the file.
+   */
+  private syncInDiffEditor(items: TriageItemView[]): void {
+    const target =
+      this.screen === 'triage' && this.mode === 'diff'
+        ? items.find((view) => view.item.id === this.selectedId) ?? items[0]
+        : undefined;
+    const key = target ? `${target.item.id}:${target.verdict ?? 'undecided'}` : '';
+    if (key === this.inDiffKey) return;
+    this.inDiffKey = key;
+    void this.inDiff.show(
+      target
+        ? { item: target.item, verdict: target.verdict, agentLabel: this.agentLabel() }
+        : undefined,
+    );
   }
 }

@@ -5,6 +5,7 @@ import {
   allDecided,
   clearVerdict,
   createReview,
+  firstOfSeverity,
   isStale,
   nextUndecided,
   setVerdict,
@@ -70,5 +71,21 @@ describe('review state (handoff §6)', () => {
   it('ignores verdicts for unknown items', () => {
     const review = freshReview();
     expect(setVerdict(review, 'itm_nope', 'accepted', false)).toBe(review);
+  });
+
+  it('the severity keys jump to the work that is left, then to any item', () => {
+    let review = freshReview();
+    expect(firstOfSeverity(review, 'blocker')?.id).toBe('itm_01H9Z4');
+    expect(firstOfSeverity(review, 'minor')?.id).toBe('itm_01H9Z6');
+    // No item of that severity — the key is a no-op rather than a wrong jump.
+    expect(firstOfSeverity(review, 'nit')).toBeUndefined();
+
+    // A decided blocker is skipped in favour of the undecided one…
+    review = setVerdict(review, 'itm_01H9Z4', 'accepted', false);
+    expect(firstOfSeverity(review, 'blocker')?.id).toBe('itm_01H9Z5');
+
+    // …and once every blocker is decided the key still reaches the first.
+    review = setVerdict(review, 'itm_01H9Z5', 'rejected', false);
+    expect(firstOfSeverity(review, 'blocker')?.id).toBe('itm_01H9Z4');
   });
 });

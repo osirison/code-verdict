@@ -468,6 +468,7 @@ export class ChangesetReviewPanel {
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), crypto.randomBytes(16).toString('hex'));
     this.deps.onSidebarState?.(this.review ? {
       headline: this.changeset.name,
+      refLabel: `${this.members.length} MRs`,
       context: `${this.members.length} MRs · ${state.header.fileCount} files`,
       agent: this.agentLabel(),
       added: state.header.added,
@@ -478,6 +479,8 @@ export class ChangesetReviewPanel {
         title: item.title,
         file: `${state.changeset?.repoLabels?.[item.repoId ?? ''] ?? item.repoId} · ${item.file}`,
         severity: item.severity,
+        category: item.category,
+        confidence: item.confidence,
         verdict: this.review?.verdicts[item.id]?.verdict,
         selected: item.id === this.selectedId,
       })),

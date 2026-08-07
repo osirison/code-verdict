@@ -80,6 +80,40 @@ describe('in-diff triage fidelity (spec §5)', () => {
   });
 });
 
+describe('stale anchors during triage (spec §5)', () => {
+  const stale = (over: Partial<FlowViewState>): string =>
+    renderReviewFlowHtml({ ...state, ...over }, 'HVE Core / PR Review', 'nonce123');
+
+  it('names how many findings moved and how many of them were accepted', () => {
+    const html = stale({
+      stale: { newHead: 'ff31ac2', affected: 2, affectedAccepted: 1 },
+      items: [{ ...state.items[0]!, lineMoved: true }],
+    });
+
+    expect(html).toContain('New commits on feat/auth-refresh while you were reviewing');
+    expect(html).toContain('2 findings — including one you accepted — no longer sit on the lines');
+    expect(html).toContain('Re-anchor to HEAD');
+    expect(html).toContain('Re-run agent');
+  });
+
+  it('does not claim work when the push left every anchor intact', () => {
+    const html = stale({ stale: { newHead: 'ff31ac2', affected: 0, affectedAccepted: 0 } });
+
+    expect(html).toContain('Every finding still sits on the line the agent read');
+    expect(html).not.toContain('no longer sit on the lines');
+  });
+
+  it('chips the moved item in every mode that shows it', () => {
+    const moved = [{ ...state.items[0]!, lineMoved: true }];
+
+    for (const mode of ['split', 'queue', 'diff'] as const) {
+      expect(stale({ mode, items: moved })).toContain('⚠ line moved');
+    }
+    // An item that did not move carries no chip.
+    expect(stale({ mode: 'split' })).not.toContain('line moved');
+  });
+});
+
 describe('changeset triage fidelity (spec §15)', () => {
   const changesetState: FlowViewState = {
     ...state,
