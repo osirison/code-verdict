@@ -65,18 +65,25 @@ export class InDiffEditor {
   private decorated?: vscode.TextEditor;
   private shownItemId?: string;
   private disposed = false;
+  /** Generation token: opening a document is async, and `J J J` is fast. */
+  private showSeq = 0;
 
   /**
    * Point the editor at one finding. Passing `undefined` (left triage, or the
    * mode is no longer "in diff") clears everything this class put on screen.
+   *
+   * A superseded call returns without touching the screen — the reviewer moved
+   * on, and the newer call owns what is decorated.
    */
   async show(target?: InDiffAnchorTarget): Promise<boolean> {
+    const token = ++this.showSeq;
     if (this.disposed) return false;
     if (!target) {
       this.clear();
       return false;
     }
     const located = await locateInWorkspace(target.item);
+    if (this.disposed || token !== this.showSeq) return false;
     if (!located) {
       // Nothing to decorate — the file is not in this workspace, or the
       // author rewrote the flagged code away. Leave no stale marks behind.
@@ -91,6 +98,7 @@ export class InDiffEditor {
       preserveFocus: true,
       viewColumn: vscode.ViewColumn.Beside,
     });
+    if (this.disposed || token !== this.showSeq) return false;
     const range = document.lineAt(line - 1).range;
     this.decorate(editor, target.item.severity, range);
     this.peek(document.uri, range, target);

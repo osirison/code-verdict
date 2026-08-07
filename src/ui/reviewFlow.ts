@@ -140,6 +140,7 @@ export class ReviewFlowPanel {
   private headPoll?: ReturnType<typeof setInterval>;
   private readonly inDiff = new InDiffEditor();
   private inDiffKey = '';
+  private focusWatch?: vscode.Disposable;
 
   private constructor(
     private readonly route: AppRoute,
@@ -150,12 +151,29 @@ export class ReviewFlowPanel {
       this.runToken += 1;
       this.stopHeadPoll();
       this.inDiff.dispose();
+      this.focusWatch?.dispose();
+      this.focusWatch = undefined;
       this.deps.onSidebarState?.();
-      void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', false);
+      this.setReviewFocus(false);
       if (ReviewFlowPanel.current === this) ReviewFlowPanel.current = undefined;
     });
-    void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', true);
+    // Spec §12: "shortcuts apply when the review tab has focus". Tying the
+    // context to the tab's existence would arm A/R/S/J/K globally — including
+    // in the file in-diff mode opens beside the review, where a keystroke
+    // meant for the editor would silently record a verdict.
+    this.setReviewFocus(route.panel.active !== false);
+    this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
+      this.setReviewFocus(event.webviewPanel.active),
+    );
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
+  }
+
+  private setReviewFocus(active: boolean): void {
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewFocus',
+      active && !this.disposed,
+    );
   }
 
   private get panel(): vscode.WebviewPanel {
@@ -282,15 +300,24 @@ export class ReviewFlowPanel {
    */
   private async pollHead(): Promise<void> {
     if (this.disposed || this.screen !== 'triage' || !this.review) return;
-    const review = this.review;
+    // Identify the review by what it was read against, not by object identity:
+    // every verdict replaces `this.review`, and a poll must survive the
+    // reviewer working while it is in flight.
+    const { number } = this.ref;
+    const readHead = this.review.headSha;
+    const sameReview = (): boolean =>
+      !this.disposed &&
+      this.screen === 'triage' &&
+      this.ref.number === number &&
+      this.review?.headSha === readHead;
     try {
       const connection = await this.connection();
       const crs = await connection.listOpenChangeRequests([this.ref.repoId]);
-      if (this.disposed || this.screen !== 'triage' || this.review !== review) return;
-      const cr = crs.find((c) => c.ref.number === this.ref.number);
-      if (!cr || !isStale(review, cr.headSha) || this.staleHead === cr.headSha) return;
+      if (!sameReview()) return;
+      const cr = crs.find((c) => c.ref.number === number);
+      if (!cr || cr.headSha === readHead || this.staleHead === cr.headSha) return;
       const fresh = await connection.getChangeRequestDiff(this.ref);
-      if (this.disposed || this.screen !== 'triage' || this.review !== review) return;
+      if (!sameReview()) return;
       this.staleHead = cr.headSha;
       this.staleItemIds = this.markMoved(fresh);
       this.render();
@@ -508,7 +535,7 @@ export class ReviewFlowPanel {
         const located = item ? await locateInWorkspace(item) : undefined;
         if (!located) {
           void vscode.window.showInformationMessage(
-            `Verdict: ${m.file} is not in this workspace — it lives in the reviewed repository.`,
+            `Verdict: could not open ${m.file} at the flagged line — it is not in this workspace, or the code has changed since the agent read it.`,
           );
           return;
         }

@@ -11,6 +11,8 @@ const FILE_TEXT = [
 const state = vi.hoisted(() => ({
   workspaceFolders: [{ uri: { path: '/repo' } }] as unknown[],
   files: new Map<string, string>(),
+  /** Paths whose open is held open until the test releases them. */
+  gate: new Map<string, Promise<void>>(),
 }));
 
 const editor = vi.hoisted(() => ({
@@ -64,6 +66,7 @@ vi.mock('vscode', () => ({
       return state.workspaceFolders;
     },
     openTextDocument: async (uri: { path: string }) => {
+      await state.gate.get(uri.path);
       const text = state.files.get(uri.path);
       if (text === undefined) throw new Error(`no such file: ${uri.path}`);
       const lines = text.split('\n');
@@ -93,6 +96,7 @@ describe('InDiffEditor', () => {
   beforeEach(() => {
     state.workspaceFolders = [{ uri: { path: '/repo' } }];
     state.files = new Map([['/repo/src/auth/token.ts', FILE_TEXT]]);
+    state.gate = new Map();
     editor.setDecorations.mockClear();
     editor.revealRange.mockClear();
     showTextDocument.mockClear();
@@ -158,6 +162,32 @@ describe('InDiffEditor', () => {
     const inDiff = new InDiffEditor();
 
     expect(await inDiff.show({ item: ITEM, agentLabel: 'agent' })).toBe(false);
+    inDiff.dispose();
+  });
+
+  it('discards a slow show that a newer selection already superseded', async () => {
+    const other = { ...ITEM, id: 'f2', title: 'Second finding', file: 'src/session.ts', line: 1, code: 'const session = load();' };
+    state.files.set('/repo/src/session.ts', 'const session = load();\n');
+    // Hold the first finding's file open until after the second one lands.
+    let release = (): void => {};
+    state.gate.set('/repo/src/auth/token.ts', new Promise<void>((resolve) => { release = resolve; }));
+
+    const { InDiffEditor } = await import('./inDiffEditor.js');
+    const inDiff = new InDiffEditor();
+
+    const slow = inDiff.show({ item: ITEM, agentLabel: 'agent' });
+    const fast = await inDiff.show({ item: other, agentLabel: 'agent' });
+    release();
+
+    expect(fast).toBe(true);
+    expect(await slow).toBe(false);
+    // The superseded finding never reaches the screen — the selection wins.
+    expect(inDiff.isShowing('f2')).toBe(true);
+    expect(inDiff.isShowing('f1')).toBe(false);
+    expect(createCommentThread).toHaveBeenCalledOnce();
+    expect(editor.setDecorations.mock.calls.at(-1)?.[1]).toEqual([
+      { line: 1, text: 'const session = load();' },
+    ]);
     inDiff.dispose();
   });
 
