@@ -69,3 +69,79 @@ describe('sidebar fidelity (prototype navigation)', () => {
     expect(html).not.toContain('Issues · in progress');
   });
 });
+
+describe('triage tree (spec §5 sidebar)', () => {
+  const withReview = (items: NonNullable<SidebarViewState['activeReview']>['items']) =>
+    renderSidebarHtml(
+      {
+        ...state,
+        activeReview: {
+          headline: '!2841 · Refactor token refresh',
+          refLabel: '!2841',
+          context: 'feat/token-refresh',
+          agent: 'Copilot review',
+          added: 42,
+          removed: 9,
+          counts: { accepted: 1, rejected: 1, skipped: 0, undecided: 1 },
+          items,
+        },
+      },
+      'nonce123',
+    );
+
+  const items: NonNullable<SidebarViewState['activeReview']>['items'] = [
+    { id: 'one', title: 'Refresh token can race', file: 'src/auth.ts', severity: 'major', category: 'concurrency', confidence: 88, verdict: 'accepted', selected: false },
+    { id: 'two', title: 'Key id is not checked', file: 'src/auth.ts', severity: 'blocker', category: 'security', confidence: 96, selected: true },
+    { id: 'three', title: 'Session never expires', file: 'src/session.ts', severity: 'minor', category: 'security', confidence: 71, verdict: 'rejected', selected: false },
+  ];
+
+  it('groups the findings under one row per file with its count', () => {
+    const html = withReview(items);
+
+    expect(html).toContain('data-file-row="src/auth.ts"');
+    expect(html).toContain('data-file-row="src/session.ts"');
+    // Two findings live in src/auth.ts, one in src/session.ts.
+    expect(html).toContain('<span class="file-path">src/auth.ts</span><span class="file-count">2</span>');
+    expect(html).toContain('<span class="file-path">src/session.ts</span><span class="file-count">1</span>');
+  });
+
+  it('shows confidence while open and a verdict glyph once decided', () => {
+    const html = withReview(items);
+
+    expect(html).toContain('>96%<');
+    expect(html).toContain('finding-verdict accepted">✓<');
+    expect(html).toContain('finding-verdict rejected">✕<');
+  });
+
+  it('strikes through decided findings and marks the active one', () => {
+    const html = withReview(items);
+
+    expect(html).toContain('.finding.decided .finding-title');
+    expect(html).toContain('text-decoration: line-through');
+    expect(html).toContain('.finding.selected { background: var(--sel); border-left-color: var(--accent); }');
+    expect(html).toContain('class="finding  decided" data-finding="one"');
+    expect(html).toContain('class="finding selected " data-finding="two"');
+  });
+
+  it('flags a finding whose anchor moved under it', () => {
+    const html = withReview([{ ...items[1]!, lineMoved: true }]);
+
+    expect(html).toContain('⚠ line moved');
+  });
+
+  it('counts every filter pill and offers the review tab in the footer', () => {
+    const html = withReview(items);
+
+    expect(html).toContain('data-review-filter="all">All 3<');
+    expect(html).toContain('data-review-filter="undecided">Open 1<');
+    expect(html).toContain('data-review-filter="category:security">Security 2<');
+    expect(html).toContain('Open review tab');
+    expect(html).toContain("type: 'openReviewTab'");
+  });
+
+  it('omits the security pill when nothing in the review is a security finding', () => {
+    const html = withReview([items[0]!]);
+
+    expect(html).not.toContain('category:security');
+  });
+});

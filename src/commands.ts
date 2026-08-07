@@ -28,3 +28,26 @@ export const COMMANDS = {
 export type CommandId = (typeof COMMANDS)[keyof typeof COMMANDS];
 
 export const ALL_COMMAND_IDS: readonly CommandId[] = Object.values(COMMANDS);
+
+/**
+ * Commands the naming doc's 19-command table does not reserve a palette entry
+ * for. They are registered at runtime and reachable from keybindings, menus
+ * and other screens — never contributed to `contributes.commands`, so the
+ * palette keeps showing exactly the specified 19.
+ */
+export const INTERNAL_COMMANDS = {
+  postedReviews: 'codeVerdict.internal.postedReviews',
+  /** `⇧A` — accept without applying the agent's suggested diff. */
+  acceptCommentOnly: 'codeVerdict.internal.acceptCommentOnly',
+  /** `U` — take the verdict back off the current item. */
+  undoVerdict: 'codeVerdict.internal.undoVerdict',
+  /** `1`–`4` — jump to the first undecided item of a severity. */
+  jumpSeverity: 'codeVerdict.internal.jumpSeverity',
+  /** `?` — the keyboard map (the full overlay is issue #14). */
+  keyboardHelp: 'codeVerdict.internal.keyboardHelp',
+} as const;
+
+export type InternalCommandId = (typeof INTERNAL_COMMANDS)[keyof typeof INTERNAL_COMMANDS];
+
+export const ALL_INTERNAL_COMMAND_IDS: readonly InternalCommandId[] =
+  Object.values(INTERNAL_COMMANDS);

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ALL_COMMAND_IDS, COMMANDS } from './commands';
+import { ALL_COMMAND_IDS, COMMANDS, INTERNAL_COMMANDS } from './commands';
 import { runDebugBootstrap } from './app/debugBootstrap';
 import { PodStore } from './app/pods';
 import { ReviewHistory } from './app/reviewHistory';
@@ -13,7 +13,7 @@ import { PostedReviewsPanel } from './ui/postedReviews';
 import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
 import { SettingsPanel } from './ui/settings';
-import { VerdictSidebarProvider, createStatusBarItem } from './ui/sidebar';
+import { VerdictSidebarProvider, VerdictStatusBar } from './ui/sidebar';
 import type { SidebarActiveReview } from './ui/sidebarHtml';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
@@ -33,8 +33,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.refresh();
       void DashboardPanel.refreshIfOpen();
     },
-    onSidebarState: (state?: SidebarActiveReview) => sidebar.setActiveReview(state),
+    onSidebarState: (state?: SidebarActiveReview) => {
+      sidebar.setActiveReview(state);
+      statusBar.setActiveReview(state);
+    },
   };
+
+  const statusBar = new VerdictStatusBar();
 
   const sidebar = new VerdictSidebarProvider(podStore, {
     secrets,
@@ -47,7 +52,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('codeVerdict.sidebar', sidebar),
-    createStatusBarItem(),
+    statusBar,
     AppSurface.onDidChangeRoute((route) => sidebar.setActiveRoute(route)),
   );
 
@@ -188,11 +193,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // reach Posted reviews through this internal id.
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      'codeVerdict.internal.postedReviews',
+      INTERNAL_COMMANDS.postedReviews,
       (focusRef?: { repoId: string; number: string }) =>
         void PostedReviewsPanel.show(postedDeps, focusRef),
     ),
   );
+
+  // The rest of the triage keyboard map (handoff §6: ⇧A, U, 1–4, ?). These
+  // are keys, not palette entries, so they stay out of contributes.commands
+  // and route to whichever review panel currently holds verdict.reviewFocus.
+  for (const id of [
+    INTERNAL_COMMANDS.acceptCommentOnly,
+    INTERNAL_COMMANDS.undoVerdict,
+    INTERNAL_COMMANDS.jumpSeverity,
+    INTERNAL_COMMANDS.keyboardHelp,
+  ]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, (arg?: unknown) => {
+        ReviewFlowPanel.handleCommand(id, arg);
+      }),
+    );
+  }
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and

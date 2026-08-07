@@ -91,6 +91,30 @@ options) and reports **per-comment outcomes**. Nothing above the platform layer 
 on partial failure the app retries only the remainder. This is also what makes changeset submit
 across N change requests (handoff §16) implementable without provider knowledge upstream.
 
+## Commands: the specified 19, plus internal ids
+
+`contributes.commands` carries **exactly** the 19 palette entries in
+`spec/specs/Code Verdict - naming & commands.md` — `src/commands.test.ts` fails the build if that
+set drifts. Anything else the UI needs (the `⇧A` / `U` / `1`–`4` / `?` triage keys, the Posted
+reviews entry point, comment-thread actions) is an **internal id** in `INTERNAL_COMMANDS`
+(`codeVerdict.internal.*`): registered at runtime, reachable from keybindings and menus, invisible
+in the palette. Never repurpose a specified command for a screen it does not name — the palette is
+part of the product surface, not a convenience registry.
+
+Every keybinding stays scoped to `when: verdict.reviewFocus`, so single letters never steal typing
+elsewhere.
+
+## Anchoring: one matcher, three callers
+
+`src/domain/anchor.ts` answers "the agent read this code at line N — is it still there?" for
+re-anchoring after a push, for marking which findings went stale, and for placing in-diff editor
+decorations. Matching is trim-insensitive (re-indentation is not a move) and, when the code repeats,
+the occurrence nearest the original line wins. Findings whose code is gone come back as `lost`
+rather than being silently re-pointed — a comment posted on a guessed line is worse than none.
+
+Polling the head during triage never swaps the diff the agent read: comment positions must keep
+carrying those refs until the reviewer explicitly re-anchors.
+
 ## Adding a provider — the checklist
 
 1. Create `src/providers/<name>/` implementing `ScmProvider` + `Connection`.

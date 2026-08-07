@@ -29,6 +29,8 @@ export interface TriageItemView {
   thread: Array<{ label: string; text: string }>;
   projectLabel?: string;
   refLabel?: string;
+  /** New commits moved this finding off the line the agent read (spec §5). */
+  lineMoved?: boolean;
 }
 
 export interface ChangesetReviewScope {
@@ -60,7 +62,7 @@ export interface FlowViewState {
   selectedId?: string;
   diffLines?: HunkLine[];
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
-  stale?: { newHead: string; affected: number };
+  stale?: { newHead: string; affected: number; affectedAccepted?: number };
   changeset?: ChangesetReviewScope;
   // clean
   candidates: CandidateBucket[];
@@ -459,14 +461,33 @@ function triageHeader(s: FlowViewState): string {
       <button data-mode="diff" class="${s.mode === 'diff' ? 'active' : ''}">In diff</button>
     </div>
   </div>
-  ${
-    s.stale
-      ? `<div class="stale">⚠ <div class="grow"><b>New commits on ${e(s.header.branch)} while you were reviewing</b>
-         ${s.stale.affected} findings — including any you accepted — may no longer sit on the lines the agent read.</div>
-         <button class="btn btn-accent" id="reanchor">Re-anchor to HEAD</button>
-         <button class="btn" id="rerun">Re-run agent</button></div>`
-      : ''
-  }`;
+  ${s.stale ? staleBanner(s, s.stale) : ''}`;
+}
+
+/**
+ * The banner names exactly what moved (spec §5). "N findings" when the anchors
+ * really shifted, and a quieter line when the push left every anchor intact —
+ * claiming work that is not there would train the reviewer to ignore it.
+ */
+function staleBanner(s: FlowViewState, stale: NonNullable<FlowViewState['stale']>): string {
+  const accepted = stale.affectedAccepted ?? 0;
+  const detail =
+    stale.affected === 0
+      ? `Every finding still sits on the line the agent read — re-run only if the new commits changed the ground under them.`
+      : `${stale.affected} ${stale.affected === 1 ? 'finding' : 'findings'}${
+          accepted > 0
+            ? ` — including ${accepted === 1 ? 'one you accepted' : `${accepted} you accepted`} —`
+            : ''
+        } no longer ${stale.affected === 1 ? 'sits' : 'sit'} on the ${stale.affected === 1 ? 'line' : 'lines'} the agent read.`;
+  return `<div class="stale">⚠ <div class="grow"><b>New commits on ${e(s.header.branch)} while you were reviewing</b>
+     ${detail}</div>
+     <button class="btn btn-accent" id="reanchor">Re-anchor to HEAD</button>
+     <button class="btn" id="rerun">Re-run agent</button></div>`;
+}
+
+/** Spec §5: an item whose anchor drifted carries a "line moved" chip. */
+function movedChip(view?: TriageItemView): string {
+  return view?.lineMoved ? '<span class="pill pill-warn">⚠ line moved</span>' : '';
 }
 
 function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Record<string, string>): string {
@@ -476,7 +497,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Recor
     ? `<div class="cross-card"><div class="cross-head">⧉ spans two repositories</div>${item.spans.map((span) => `<div class="cross-side"><span class="cross-repo">${e(repoLabels?.[span.repoId] ?? span.repoId)}</span><span class="cross-location">${e(span.location)}</span><span class="cross-role">${e(span.role)}</span></div>`).join('')}</div>`
     : '';
   return `
-    <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}</div>
+    <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${movedChip(view)}</div>
     <div class="detail-title">${e(item.title)}</div>
     <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span></div>
     ${cross}
@@ -555,7 +576,7 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
     <div class="qcard">
       ${
         selected
-          ? `<div class="qrow">${sevChip(selected.item.severity)}${selected.item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${catPill(selected.item.category)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
+          ? `<div class="qrow">${sevChip(selected.item.severity)}${selected.item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${catPill(selected.item.category)}${movedChip(selected)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
         <div class="qtitle">${e(selected.item.title)}</div>
         <div class="detail-meta">${selected.projectLabel && selected.refLabel ? `<span class="agent-fg">${e(selected.projectLabel)} · ${e(selected.refLabel)}</span> · ` : ''}${e(selected.item.file)}:${selected.item.line}</div>
         <div class="code-card"><div class="code-body">${e(selected.item.code)}</div></div>
@@ -597,7 +618,7 @@ function renderTriageDiff(s: FlowViewState): string {
     : '';
   const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text">${e(entry.text)}</div></div>`).join('');
   const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
-    <div class="peek-head">${sevChip(item.severity)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
+    <div class="peek-head">${sevChip(item.severity)}${movedChip(selected)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
     <div class="peek-body"><p class="prose">${e(item.body)}</p>${suggestion}${thread}
       <div class="peek-actions">
         <button class="btn btn-ok" id="accept">${item.suggestion ? 'Accept &amp; apply' : 'Accept'}</button>

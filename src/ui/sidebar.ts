@@ -113,6 +113,9 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       case 'selectFinding':
         this.deps.selectFinding?.(message.itemId);
         break;
+      case 'openReviewTab':
+        await vscode.commands.executeCommand(COMMANDS.openReview);
+        break;
       case 'openCr':
         this.deps.openCr({ repoId: message.repoId, number: message.number });
         break;
@@ -120,11 +123,37 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   }
 }
 
-export function createStatusBarItem(): vscode.StatusBarItem {
-  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
-  item.text = '$(verified) Verdict: no active review';
-  item.tooltip = 'Code Verdict — open the pod dashboard';
-  item.command = COMMANDS.openDashboard;
-  item.show();
-  return item;
+/**
+ * The Verdict segment of the status bar (spec §14). State-dependent: it names
+ * the merge request under review and how much triage is left, so the count is
+ * visible without the sidebar open, and reverts to "no active review" the
+ * moment the review tab closes.
+ */
+export class VerdictStatusBar {
+  private readonly item: vscode.StatusBarItem;
+
+  constructor() {
+    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+    this.setActiveReview(undefined);
+    this.item.show();
+  }
+
+  setActiveReview(review?: SidebarActiveReview): void {
+    if (!review) {
+      this.item.text = '$(verified) Verdict: no active review';
+      this.item.tooltip = 'Code Verdict — open the pod dashboard';
+      this.item.command = COMMANDS.openDashboard;
+      return;
+    }
+    const left = review.counts.undecided;
+    this.item.text = `$(verified) Verdict: ${review.refLabel ?? review.headline} · ${
+      left === 0 ? 'all triaged' : `${left} left`
+    }`;
+    this.item.tooltip = `${review.headline} — ${review.counts.accepted} accepted, ${review.counts.rejected} rejected, ${review.counts.skipped} skipped`;
+    this.item.command = COMMANDS.openReview;
+  }
+
+  dispose(): void {
+    this.item.dispose();
+  }
 }
