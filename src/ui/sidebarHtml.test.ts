@@ -145,3 +145,167 @@ describe('triage tree (spec §5 sidebar)', () => {
     expect(html).not.toContain('category:security');
   });
 });
+
+describe('per-screen sidebar states (spec §1/§3/§9)', () => {
+  it('mirrors the wizard as a checklist and offers the demo pod', () => {
+    const html = renderSidebarHtml(
+      {
+        ...state,
+        setup: {
+          steps: [
+            { label: 'Connect GitLab', done: true, meta: 'gitlab.example.com' },
+            { label: 'Name the pod', done: true, meta: 'Platform squad' },
+            { label: 'Add projects', done: false, meta: '5 selected' },
+          ],
+        },
+      },
+      'nonce123',
+    );
+
+    expect(html).toContain('Setup');
+    expect(html).toContain('check-row done');
+    expect(html).toContain('gitlab.example.com');
+    expect(html).toContain('5 selected');
+    expect(html).toContain('Skip and use a demo pod');
+    expect(html).toContain("type: 'useDemoPod'");
+    // Spec §1: the later rows are hidden until setup completes.
+    expect(html).toContain('id="dashboard"');
+    expect(html).not.toContain('id="posted-reviews"');
+    expect(html).not.toContain('id="tuning"');
+    expect(html).not.toContain('id="settings"');
+  });
+
+  it('names the merge request and agent before a run, with no triage UI', () => {
+    const html = renderSidebarHtml(
+      {
+        ...state,
+        pendingReview: {
+          headline: '!2841 · Refactor token refresh',
+          context: 'feat/token-refresh',
+          agent: 'HVE Core / PR Review',
+          added: 284,
+          removed: 91,
+        },
+      },
+      'nonce123',
+    );
+
+    expect(html).toContain('!2841 · Refactor token refresh');
+    expect(html).toContain('HVE Core / PR Review');
+    expect(html).toContain('No review items yet. Pick an agent and run the review.');
+    expect(html).not.toContain('data-review-filter="');
+    expect(html).not.toContain('progress-accepted"');
+    expect(html).toContain('Open review tab');
+  });
+
+  it('lists posted threads with status dots and no triage counters or pills', () => {
+    const html = renderSidebarHtml(
+      {
+        ...state,
+        threads: {
+          headline: '!2833 · Session store',
+          context: 'core · HVE Core / PR Review',
+          summary: [
+            { status: 'awaiting', label: '3 waiting on you' },
+            { status: 'resolved', label: '2 resolved' },
+          ],
+          threads: [
+            { id: 't1', title: 'Token cache is unlocked', meta: 'src/auth.ts:63', status: 'awaiting', selected: true },
+            { id: 't2', title: 'Missing expiry guard', meta: 'src/session.ts:12', status: 'resolved', selected: false },
+          ],
+        },
+      },
+      'nonce123',
+    );
+
+    expect(html).toContain('3 waiting on you');
+    expect(html).toContain('thread-dot awaiting');
+    expect(html).toContain('thread-row selected');
+    expect(html).toContain('src/auth.ts:63');
+    expect(html).toContain('Open posted review');
+    expect(html).toContain("type: 'selectThread'");
+    // Spec §9 is explicit: no triage counters, no filter pills here.
+    expect(html).not.toContain('data-review-filter="');
+    expect(html).not.toContain('acc</span>');
+  });
+
+  it('resolves state precedence — setup wins over threads, threads over triage', () => {
+    const threads = {
+      headline: '!2833',
+      context: 'core',
+      summary: [],
+      threads: [{ id: 't1', title: 'A thread', meta: 'x.ts:1', status: 'awaiting' as const, selected: false }],
+    };
+    const activeReview = {
+      headline: '!2841',
+      context: 'feat/x',
+      agent: 'agent',
+      added: 1,
+      removed: 0,
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 1 },
+      items: [{ id: 'one', title: 'A finding', file: 'a.ts', severity: 'major' as const, selected: true }],
+    };
+
+    const bothThreadsAndReview = renderSidebarHtml({ ...state, threads, activeReview }, 'n');
+    expect(bothThreadsAndReview).toContain('A thread');
+    expect(bothThreadsAndReview).not.toContain('A finding');
+
+    const allThree = renderSidebarHtml(
+      { ...state, setup: { steps: [{ label: 'Connect GitLab', done: false }] }, threads, activeReview },
+      'n',
+    );
+    expect(allThree).toContain('Skip and use a demo pod');
+    expect(allThree).not.toContain('A thread');
+  });
+});
+
+describe('codicon chrome (issue #6)', () => {
+  it('renders nav and toolbar icons as codicons, admitting the font in the CSP', () => {
+    const html = renderSidebarHtml(
+      { ...state, codicons: { styleUri: 'vscode-resource://codicon.css', cspSource: 'vscode-resource:' } },
+      'nonce123',
+    );
+
+    expect(html).toContain('codicon codicon-dashboard');
+    expect(html).toContain('codicon codicon-comment-discussion');
+    expect(html).toContain('codicon codicon-graph');
+    expect(html).toContain('codicon codicon-gear');
+    expect(html).toContain('codicon codicon-refresh');
+    expect(html).toContain('<link rel="stylesheet" href="vscode-resource://codicon.css">');
+    expect(html).toContain('font-src vscode-resource:;');
+    expect(html).toContain("style-src 'nonce-nonce123' vscode-resource:;");
+    // The old Unicode chrome is gone.
+    expect(html).not.toContain('▦');
+    expect(html).not.toContain('⚙');
+  });
+
+  it('keeps the glyphs the spec names in prose', () => {
+    const html = renderSidebarHtml(
+      {
+        ...state,
+        codicons: { styleUri: 'u', cspSource: 'c' },
+        activeReview: {
+          headline: '!2841',
+          context: 'feat/x',
+          agent: 'agent',
+          added: 1,
+          removed: 0,
+          counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 },
+          items: [{ id: 'one', title: 'A finding', file: 'a.ts', severity: 'major', verdict: 'accepted', selected: true }],
+        },
+      },
+      'nonce123',
+    );
+
+    expect(html).toContain('▾');
+    expect(html).toContain('✓');
+  });
+
+  it('falls back to the strict no-font CSP when codicons are unavailable', () => {
+    const html = renderSidebarHtml(state, 'nonce123');
+
+    expect(html).toContain("style-src 'nonce-nonce123';");
+    expect(html).not.toContain('font-src');
+    expect(html).not.toContain('<link rel="stylesheet"');
+  });
+});

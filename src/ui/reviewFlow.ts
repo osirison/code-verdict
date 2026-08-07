@@ -40,7 +40,7 @@ import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './r
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
-import type { SidebarActiveReview } from './sidebarHtml';
+import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
 
 /**
  * How often triage asks whether the branch moved under it (handoff §6 —
@@ -66,6 +66,8 @@ export interface ReviewFlowDeps {
   globalState: KeyValueStore;
   onSubmitted?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
+  /** Spec §3: identity and agent, before any findings exist. */
+  onSidebarPending?: (state?: SidebarPendingReview) => void;
 }
 
 export class ReviewFlowPanel {
@@ -154,6 +156,7 @@ export class ReviewFlowPanel {
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
       this.deps.onSidebarState?.();
+      this.deps.onSidebarPending?.();
       this.setReviewFocus(false);
       if (ReviewFlowPanel.current === this) ReviewFlowPanel.current = undefined;
     });
@@ -782,6 +785,11 @@ export class ReviewFlowPanel {
         ? { type: 'undo', itemId: this.selectedId }
         : undefined,
       [INTERNAL_COMMANDS.keyboardHelp]: { type: 'help' },
+      // "Ask agent about this item" from the palette opens the deep dive on
+      // the selected finding; the presets stay idempotent per item.
+      'codeVerdict.askAgent': this.selectedId
+        ? { type: 'ask', itemId: this.selectedId, preset: 'explain' as const }
+        : undefined,
       'codeVerdict.rejectItem': this.selectedId
         ? { type: 'verdict', itemId: this.selectedId, verdict: 'rejected' as Verdict, applyFix: false }
         : undefined,
@@ -912,6 +920,15 @@ export class ReviewFlowPanel {
         lineMoved: this.staleItemIds.has(item.id),
       })),
     } : undefined);
+    // Before a run there is identity but no triage UI (spec §3).
+    this.deps.onSidebarPending?.(this.review ? undefined : {
+      headline: `${state.header.refLabel} · ${state.header.title}`,
+      refLabel: state.header.refLabel,
+      context: state.header.branch,
+      agent: this.agentLabel(),
+      added: state.header.added,
+      removed: state.header.removed,
+    });
     // Triage is the only screen that watches the branch, and the editor only
     // carries decorations while the reviewer is actually in "In diff".
     if (this.screen === 'triage') this.startHeadPoll();

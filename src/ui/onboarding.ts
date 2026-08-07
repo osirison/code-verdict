@@ -8,6 +8,7 @@ import type { Connection } from '../platform/provider';
 import { getProvider } from '../platform/registry';
 import type { Repository } from '../platform/types';
 import { renderOnboardingHtml, type OnboardingMessage, type OnboardingSourceView } from './onboardingHtml';
+import type { SidebarSetup } from './sidebarHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { COMMANDS } from '../commands';
 
@@ -19,6 +20,17 @@ export interface OnboardingDeps {
   podStore: PodStore;
   secrets: SecretStore;
   onComplete: () => void;
+  /** Live progress for the sidebar's Setup checklist (spec §1). */
+  onSetupState?: (setup?: SidebarSetup) => void;
+}
+
+/** "gitlab.example.com" — the host is the useful half of the instance URL. */
+function hostOf(instanceUrl: string): string {
+  try {
+    return new URL(instanceUrl).host;
+  } catch {
+    return instanceUrl;
+  }
 }
 
 export class OnboardingPanel {
@@ -51,6 +63,7 @@ export class OnboardingPanel {
   ) {
     route.onLeave(() => {
       this.disposed = true;
+      this.deps.onSetupState?.(undefined);
       if (OnboardingPanel.current === this) OnboardingPanel.current = undefined;
     });
     route.onMessage((message) => void this.onMessage(message as OnboardingMessage));
@@ -60,6 +73,10 @@ export class OnboardingPanel {
 
   private render(): void {
     if (this.disposed) return;
+    const selectedProjects = this.sources.reduce(
+      (count, source) => count + source.projects.filter((project) => project.selected).length,
+      0,
+    );
     this.panel.webview.html = renderOnboardingHtml({
       step: this.step,
       instanceUrl: this.instanceUrl,
@@ -67,8 +84,24 @@ export class OnboardingPanel {
       connected: this.connected,
       podName: this.podName,
       sources: this.sources,
-      selectedProjects: this.sources.reduce((count, source) => count + source.projects.filter((project) => project.selected).length, 0),
+      selectedProjects,
     }, crypto.randomBytes(16).toString('hex'));
+    // Spec §1: the sidebar checklist mirrors these steps with live meta.
+    this.deps.onSetupState?.({
+      steps: [
+        {
+          label: 'Connect GitLab',
+          done: this.connected,
+          meta: this.connected ? hostOf(this.instanceUrl) : undefined,
+        },
+        { label: 'Name the pod', done: this.step > 2 && this.podName !== '', meta: this.podName || undefined },
+        {
+          label: 'Add projects',
+          done: selectedProjects > 0,
+          meta: selectedProjects > 0 ? `${selectedProjects} selected` : undefined,
+        },
+      ],
+    });
   }
 
   private async onMessage(message: OnboardingMessage): Promise<void> {

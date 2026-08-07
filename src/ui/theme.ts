@@ -252,6 +252,17 @@ export function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+/**
+ * Codicons for the extension chrome (issue #6). A webview gets no icon font
+ * for free and its CSP blocks remote ones, so the caller passes the bundled
+ * stylesheet's webview URI plus the webview's own `cspSource`; both style-src
+ * and font-src have to admit that source for the font to load at all.
+ */
+export interface CodiconAssets {
+  styleUri: string;
+  cspSource: string;
+}
+
 /** Full webview document with the strict CSP and the design system inlined. */
 export function renderPage(opts: {
   title: string;
@@ -261,6 +272,7 @@ export function renderPage(opts: {
   script?: string;
   breadcrumb?: { parent?: string; current: string };
   embedded?: boolean;
+  codicons?: CodiconAssets;
 }): string {
   const breadcrumb = opts.breadcrumb
     ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
@@ -270,11 +282,17 @@ export function renderPage(opts: {
     ? `window.verdictVscode=acquireVsCodeApi();document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));${opts.script ?? ''}`
     : '';
   const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';
+  const codicons = opts.codicons;
+  const styleSrc = codicons ? `'nonce-${opts.nonce}' ${codicons.cspSource}` : `'nonce-${opts.nonce}'`;
+  const fontSrc = codicons ? ` font-src ${codicons.cspSource};` : '';
+  const codiconLink = codicons
+    ? `\n<link rel="stylesheet" href="${escapeHtml(codicons.styleUri)}">`
+    : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${opts.nonce}'; script-src 'nonce-${opts.nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${styleSrc}; script-src 'nonce-${opts.nonce}';${fontSrc}">${codiconLink}
 <style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.css}</style>
 <title>${escapeHtml(opts.title)}</title>
 </head>

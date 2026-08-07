@@ -1,18 +1,47 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const item = vi.hoisted(() => ({
-  text: '',
-  tooltip: '',
-  command: '',
-  show: vi.fn(),
-  dispose: vi.fn(),
-}));
+interface FakeItem {
+  priority: number;
+  text: string;
+  tooltip: string;
+  command: string;
+  visible: boolean;
+  show: () => void;
+  hide: () => void;
+  dispose: () => void;
+}
+
+const items = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
 vi.mock('vscode', () => ({
   StatusBarAlignment: { Left: 1 },
-  window: { createStatusBarItem: vi.fn(() => item) },
+  window: {
+    createStatusBarItem: vi.fn((_alignment: number, priority: number) => {
+      const item = {
+        priority,
+        text: '',
+        tooltip: '',
+        command: '',
+        visible: false,
+        show(): void {
+          item.visible = true;
+        },
+        hide(): void {
+          item.visible = false;
+        },
+        dispose: vi.fn(),
+      };
+      items.push(item as unknown as Record<string, unknown>);
+      return item;
+    }),
+  },
   commands: { executeCommand: vi.fn() },
 }));
+
+/** The three segments in the order they were created: verdict, agent, keys. */
+function segments(): [FakeItem, FakeItem, FakeItem] {
+  return items.slice(-3) as unknown as [FakeItem, FakeItem, FakeItem];
+}
 
 const review = {
   headline: '!2841 · Refactor token refresh',
@@ -25,35 +54,57 @@ const review = {
   items: [],
 };
 
-describe('status bar Verdict segment (spec §14)', () => {
+describe('status bar segments (spec §14)', () => {
   beforeEach(() => {
-    item.show.mockClear();
+    items.length = 0;
   });
 
-  it('starts on "no active review" and points at the dashboard', async () => {
+  it('shows only the Verdict segment with no review, pointing at the dashboard', async () => {
     const { VerdictStatusBar } = await import('./sidebar.js');
     const bar = new VerdictStatusBar();
+    const [verdict, agent, keys] = segments();
 
-    expect(item.text).toBe('$(verified) Verdict: no active review');
-    expect(item.command).toBe('codeVerdict.openDashboard');
-    expect(item.show).toHaveBeenCalledOnce();
+    expect(verdict.text).toBe('$(verified) Verdict: no active review');
+    expect(verdict.command).toBe('codeVerdict.openDashboard');
+    expect(verdict.visible).toBe(true);
+    // The agent and keys segments describe a review in progress.
+    expect(agent.visible).toBe(false);
+    expect(keys.visible).toBe(false);
     bar.dispose();
   });
 
-  it('names the merge request and how much triage is left', async () => {
+  it('names the merge request, the agent and the keys hint during a review', async () => {
     const { VerdictStatusBar } = await import('./sidebar.js');
     const bar = new VerdictStatusBar();
 
     bar.setActiveReview(review);
-    expect(item.text).toBe('$(verified) Verdict: !2841 · 5 left');
-    expect(item.tooltip).toBe(
+    const [verdict, agent, keys] = segments();
+    expect(verdict.text).toBe('$(verified) Verdict: !2841 · 5 left');
+    expect(verdict.tooltip).toBe(
       '!2841 · Refactor token refresh — 2 accepted, 1 rejected, 0 skipped',
     );
     // Clicking through goes to the review being counted, not the dashboard.
-    expect(item.command).toBe('codeVerdict.openReview');
+    expect(verdict.command).toBe('codeVerdict.openReview');
+    expect(agent.text).toBe('HVE Core / PR Review');
+    expect(agent.command).toBe('codeVerdict.selectAgent');
+    expect(agent.visible).toBe(true);
+    expect(keys.text).toBe('$(keyboard) ? keys');
+    expect(keys.command).toBe('codeVerdict.internal.keyboardHelp');
+    expect(keys.visible).toBe(true);
 
     bar.setActiveReview({ ...review, counts: { accepted: 8, rejected: 0, skipped: 0, undecided: 0 } });
-    expect(item.text).toBe('$(verified) Verdict: !2841 · all triaged');
+    expect(verdict.text).toBe('$(verified) Verdict: !2841 · all triaged');
+    bar.dispose();
+  });
+
+  it('keeps the segments in spec order, left to right', async () => {
+    const { VerdictStatusBar } = await import('./sidebar.js');
+    const bar = new VerdictStatusBar();
+    const [verdict, agent, keys] = segments();
+
+    // Higher priority sorts further left within the same alignment.
+    expect(verdict.priority).toBeGreaterThan(agent.priority);
+    expect(agent.priority).toBeGreaterThan(keys.priority);
     bar.dispose();
   });
 
@@ -63,8 +114,11 @@ describe('status bar Verdict segment (spec §14)', () => {
 
     bar.setActiveReview(review);
     bar.setActiveReview(undefined);
-    expect(item.text).toBe('$(verified) Verdict: no active review');
-    expect(item.command).toBe('codeVerdict.openDashboard');
+    const [verdict, agent, keys] = segments();
+    expect(verdict.text).toBe('$(verified) Verdict: no active review');
+    expect(verdict.command).toBe('codeVerdict.openDashboard');
+    expect(agent.visible).toBe(false);
+    expect(keys.visible).toBe(false);
     bar.dispose();
   });
 });

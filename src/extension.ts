@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 import { ALL_COMMAND_IDS, COMMANDS, INTERNAL_COMMANDS } from './commands';
 import { runDebugBootstrap } from './app/debugBootstrap';
 import { PodStore } from './app/pods';
+import { connectionForPod } from './app/connections';
+import { repoIdsOf } from './app/podQuery';
+import type { PodSource } from './domain/types';
 import { ReviewHistory } from './app/reviewHistory';
 import { getDebugAuthBypass } from './debugAuth';
 import { registerBuiltInProviders } from './registry';
@@ -14,7 +17,8 @@ import type { DashboardDeps } from './ui/dashboardState';
 import { ReviewFlowPanel } from './ui/reviewFlow';
 import { SettingsPanel } from './ui/settings';
 import { VerdictSidebarProvider, VerdictStatusBar } from './ui/sidebar';
-import type { SidebarActiveReview } from './ui/sidebarHtml';
+import type { SidebarActiveReview, SidebarPendingReview, SidebarThreads } from './ui/sidebarHtml';
+import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
 
@@ -37,17 +41,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.setActiveReview(state);
       statusBar.setActiveReview(state);
     },
+    onSidebarPending: (state?: SidebarPendingReview) => sidebar.setPendingReview(state),
   };
 
   const statusBar = new VerdictStatusBar();
 
+  const useDemoPod = async (): Promise<void> => {
+    const pod = await createDemoPod(podStore);
+    sidebar.refresh();
+    void vscode.window.showInformationMessage(
+      `Verdict: "${pod.name}" runs on built-in sample data — connect GitLab whenever you are ready.`,
+    );
+    await openDashboard();
+  };
+
   const sidebar = new VerdictSidebarProvider(podStore, {
     secrets,
+    extensionUri: context.extensionUri,
     openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
     selectFinding: (itemId) => {
       ReviewFlowPanel.selectItem(itemId);
       ChangesetReviewPanel.selectItem(itemId);
     },
+    selectThread: (threadId) => PostedReviewsPanel.selectThread(threadId),
+    useDemoPod: () => void useDemoPod(),
     onPodChanged: () => void DashboardPanel.refreshIfOpen(),
   });
   context.subscriptions.push(
@@ -62,6 +79,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     globalState: context.globalState,
     openReviewFlow: (ref: { repoId: string; number: string }) =>
       void ReviewFlowPanel.open(flowDeps, ref),
+    onSidebarThreads: (threads?: SidebarThreads) => sidebar.setThreads(threads),
   };
 
   const dashboardDeps: DashboardDeps = {
@@ -152,8 +170,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await DashboardPanel.refreshIfOpen();
   };
 
+  /**
+   * "Verdict: Add project to pod" — accepts a URL, a project id or a group id
+   * (naming doc). Group sources store the resolved project ids, never "all",
+   * so a project added to the group later cannot silently join the pod.
+   */
+  const addProject = async (): Promise<void> => {
+    const pod = podStore.activePod;
+    if (!pod) {
+      void vscode.window.showInformationMessage('Verdict: no pod yet — sign in first.');
+      return;
+    }
+    const input = await vscode.window.showInputBox({
+      title: `Add a project to "${pod.name}"`,
+      prompt: 'Project URL, numeric project id, or "group <id>"',
+      placeHolder: 'https://gitlab.com/hve/platform/core · 9102 · group 4821',
+    });
+    if (!input?.trim()) return;
+    try {
+      const connection = await connectionForPod(pod, secrets);
+      const resolved = await connection.resolveSource(input.trim());
+      if (resolved.kind === 'noMatch' || resolved.kind === 'notVisible') {
+        void vscode.window.showWarningMessage(
+          resolved.kind === 'notVisible'
+            ? `Verdict: ${resolved.id} is not visible with this pod's token.`
+            : `Verdict: nothing matched "${input.trim()}".`,
+        );
+        return;
+      }
+      const repositories = resolved.kind === 'group' ? resolved.repositories : [resolved.repo];
+      const source: PodSource =
+        resolved.kind === 'group'
+          ? { kind: 'group', groupId: resolved.group.id, repoIds: repositories.map((r) => r.id) }
+          : { kind: 'repository', repoId: resolved.repo.id };
+      const known = new Set(repoIdsOf(pod));
+      const added = repositories.filter((repo) => !known.has(repo.id));
+      if (added.length === 0) {
+        void vscode.window.showInformationMessage('Verdict: that project is already in this pod.');
+        return;
+      }
+      pod.sources = [...pod.sources, source];
+      pod.repos = [
+        ...(pod.repos ?? []),
+        ...added.map((repo) => ({ id: repo.id, path: repo.path, name: repo.name })),
+      ];
+      await podStore.upsert(pod);
+      sidebar.refresh();
+      await DashboardPanel.refreshIfOpen();
+      void vscode.window.showInformationMessage(
+        `Verdict: added ${added.length === 1 ? added[0]?.path ?? 'one project' : `${added.length} projects`} to "${pod.name}".`,
+      );
+    } catch (e) {
+      void vscode.window.showErrorMessage(
+        `Verdict: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  };
+
   const handlers: Partial<Record<string, () => Promise<void> | void>> = {
     [COMMANDS.openDashboard]: openDashboard,
+    [COMMANDS.addProject]: addProject,
     [COMMANDS.openReview]: () => {
       // Naming doc: "Verdict: Open review" is the triage tab for the
       // active MR — Posted reviews has its own (internal) entry point.

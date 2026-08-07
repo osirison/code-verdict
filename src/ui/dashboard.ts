@@ -20,7 +20,8 @@ export class DashboardPanel {
       await DashboardPanel.current.refresh();
       return;
     }
-    const route = AppSurface.show('dashboard', 'Verdict');
+    // Naming doc: the editor tab reads "Verdict: Dashboard".
+    const route = AppSurface.show('dashboard', 'Verdict: Dashboard');
     DashboardPanel.current = new DashboardPanel(route, podStore, secrets, deps);
     await DashboardPanel.current.refresh();
   }

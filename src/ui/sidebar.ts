@@ -3,14 +3,35 @@ import * as vscode from 'vscode';
 import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { fetchPodData, repoIdsOf } from '../app/podQuery';
-import { COMMANDS } from '../commands';
-import { renderSidebarHtml, type SidebarActiveReview, type SidebarMessage, type SidebarViewState } from './sidebarHtml';
+import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
+import {
+  renderSidebarHtml,
+  type SidebarActiveReview,
+  type SidebarMessage,
+  type SidebarPendingReview,
+  type SidebarSetup,
+  type SidebarThreads,
+  type SidebarViewState,
+} from './sidebarHtml';
 import { toSidebarViewState } from './sidebarState';
+import type { CodiconAssets } from './theme';
+
+/** The checklist before the wizard is open — nothing done, everything ahead. */
+const IDLE_SETUP: SidebarSetup = {
+  steps: [
+    { label: 'Connect GitLab', done: false },
+    { label: 'Name the pod', done: false },
+    { label: 'Add projects', done: false },
+  ],
+};
 
 export interface VerdictSidebarDeps {
   secrets: vscode.SecretStorage;
+  extensionUri: vscode.Uri;
   openCr: (ref: { repoId: string; number: string }) => void;
   selectFinding?: (itemId: string) => void;
+  selectThread?: (threadId: string) => void;
+  useDemoPod?: () => void;
   onPodChanged?: () => void;
 }
 
@@ -18,6 +39,9 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   private refreshSeq = 0;
   private activeReview?: SidebarActiveReview;
+  private pendingReview?: SidebarPendingReview;
+  private threads?: SidebarThreads;
+  private setup?: SidebarSetup;
   private activeRoute?: string;
 
   constructor(
@@ -34,19 +58,65 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
     void this.render();
   }
 
+  /** Spec §3 — a review that exists but has not run yet. */
+  setPendingReview(pending?: SidebarPendingReview): void {
+    this.pendingReview = pending;
+    void this.render();
+  }
+
+  setThreads(threads?: SidebarThreads): void {
+    this.threads = threads;
+    void this.render();
+  }
+
+  setSetup(setup?: SidebarSetup): void {
+    this.setup = setup;
+    void this.render();
+  }
+
   setActiveRoute(route?: string): void {
     this.activeRoute = route;
     void this.render();
   }
 
+  /** The bundled codicon stylesheet, addressed for this webview's origin. */
+  private codicons(webview: vscode.Webview): CodiconAssets | undefined {
+    const styleUri = webview.asWebviewUri?.(
+      vscode.Uri.joinPath(this.deps.extensionUri, 'media', 'codicons', 'codicon.css'),
+    );
+    return styleUri ? { styleUri: styleUri.toString(), cspSource: webview.cspSource } : undefined;
+  }
+
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
-    view.webview.options = { enableScripts: true };
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.deps.extensionUri, 'media')],
+    };
     view.onDidDispose(() => {
       if (this.view === view) this.view = undefined;
     });
     view.webview.onDidReceiveMessage((message: SidebarMessage) => void this.onMessage(message));
     void this.render();
+  }
+
+  /**
+   * Every screen's state carries the same chrome — the per-screen shells and
+   * the codicon assets ride along whichever data path produced the lists.
+   */
+  private paint(view: vscode.WebviewView, state: SidebarViewState): void {
+    view.webview.html = renderSidebarHtml(
+      {
+        ...state,
+        setup: this.setup ?? state.setup,
+        threads: this.threads,
+        activeReview: this.activeReview,
+        pendingReview: this.pendingReview,
+        activeRoute: this.activeRoute,
+        codicons: this.codicons(view.webview),
+      },
+      crypto.randomBytes(16).toString('hex'),
+    );
   }
 
   private async render(): Promise<void> {
@@ -55,24 +125,26 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
     const seq = ++this.refreshSeq;
     const pod = this.podStore.activePod;
     if (!pod) {
-      view.webview.html = renderSidebarHtml({
+      // No pod yet: the sidebar *is* the setup checklist (spec §1), including
+      // the demo-pod escape hatch, whether or not the wizard is open.
+      this.paint(view, {
         podName: 'No active pod',
         podMeta: 'Connect GitLab to begin',
         pods: [],
         mergeRequests: [],
         issues: [],
         waitingOnYou: 0,
-      }, crypto.randomBytes(16).toString('hex'));
+        setup: this.setup ?? IDLE_SETUP,
+      });
       return;
     }
     try {
       const data = await fetchPodData(await connectionForPod(pod, this.deps.secrets), pod, Date.now());
       if (seq !== this.refreshSeq || this.view !== view) return;
-      const state: SidebarViewState = toSidebarViewState(data, this.podStore.list());
-      view.webview.html = renderSidebarHtml({ ...state, activeReview: this.activeReview, activeRoute: this.activeRoute }, crypto.randomBytes(16).toString('hex'));
+      this.paint(view, toSidebarViewState(data, this.podStore.list()));
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
-      view.webview.html = renderSidebarHtml({
+      this.paint(view, {
         podName: pod.name,
         podMeta: 'Could not reach GitLab',
         pods: this.podStore.list().map((candidate) => ({
@@ -84,7 +156,7 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
         mergeRequests: [],
         issues: [],
         waitingOnYou: 0,
-      }, crypto.randomBytes(16).toString('hex'));
+      });
     }
   }
 
@@ -113,8 +185,17 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       case 'selectFinding':
         this.deps.selectFinding?.(message.itemId);
         break;
+      case 'selectThread':
+        this.deps.selectThread?.(message.threadId);
+        break;
+      case 'useDemoPod':
+        this.deps.useDemoPod?.();
+        break;
       case 'openReviewTab':
         await vscode.commands.executeCommand(COMMANDS.openReview);
+        break;
+      case 'openPostedReviewTab':
+        await vscode.commands.executeCommand(INTERNAL_COMMANDS.postedReviews);
         break;
       case 'openCr':
         this.deps.openCr({ repoId: message.repoId, number: message.number });
@@ -124,36 +205,59 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
 }
 
 /**
- * The Verdict segment of the status bar (spec §14). State-dependent: it names
- * the merge request under review and how much triage is left, so the count is
- * visible without the sidebar open, and reverts to "no active review" the
- * moment the review tab closes.
+ * Verdict's status bar segments (spec §14).
+ *
+ * The spec's bar is drawn from the prototype, which mocks the whole VS Code
+ * window — its `⎇ branch` and `✕ 1 ⚠ 0` segments are the editor's own git and
+ * problems indicators, and duplicating them would put two branch names on one
+ * bar. Verdict therefore contributes the three segments that are actually its
+ * own: the review state, the agent doing the reviewing, and the keys hint.
+ * The `🔔` notifications segment belongs to issue #14.
  */
 export class VerdictStatusBar {
-  private readonly item: vscode.StatusBarItem;
+  private readonly verdict: vscode.StatusBarItem;
+  private readonly agent: vscode.StatusBarItem;
+  private readonly keys: vscode.StatusBarItem;
 
   constructor() {
-    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+    // Descending priority keeps the three in spec order, left to right.
+    this.verdict = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+    this.agent = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
+    this.keys = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
+    this.keys.text = '$(keyboard) ? keys';
+    this.keys.tooltip = 'Verdict keyboard map';
+    this.keys.command = INTERNAL_COMMANDS.keyboardHelp;
+    this.agent.command = COMMANDS.selectAgent;
     this.setActiveReview(undefined);
-    this.item.show();
+    this.verdict.show();
   }
 
   setActiveReview(review?: SidebarActiveReview): void {
     if (!review) {
-      this.item.text = '$(verified) Verdict: no active review';
-      this.item.tooltip = 'Code Verdict — open the pod dashboard';
-      this.item.command = COMMANDS.openDashboard;
+      this.verdict.text = '$(verified) Verdict: no active review';
+      this.verdict.tooltip = 'Code Verdict — open the pod dashboard';
+      this.verdict.command = COMMANDS.openDashboard;
+      // The agent and keys segments describe a review in progress; with no
+      // review they are noise, not information.
+      this.agent.hide();
+      this.keys.hide();
       return;
     }
     const left = review.counts.undecided;
-    this.item.text = `$(verified) Verdict: ${review.refLabel ?? review.headline} · ${
+    this.verdict.text = `$(verified) Verdict: ${review.refLabel ?? review.headline} · ${
       left === 0 ? 'all triaged' : `${left} left`
     }`;
-    this.item.tooltip = `${review.headline} — ${review.counts.accepted} accepted, ${review.counts.rejected} rejected, ${review.counts.skipped} skipped`;
-    this.item.command = COMMANDS.openReview;
+    this.verdict.tooltip = `${review.headline} — ${review.counts.accepted} accepted, ${review.counts.rejected} rejected, ${review.counts.skipped} skipped`;
+    this.verdict.command = COMMANDS.openReview;
+    this.agent.text = review.agent;
+    this.agent.tooltip = `Reviewed with ${review.agent} — click to switch agent`;
+    this.agent.show();
+    this.keys.show();
   }
 
   dispose(): void {
-    this.item.dispose();
+    this.verdict.dispose();
+    this.agent.dispose();
+    this.keys.dispose();
   }
 }
