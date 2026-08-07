@@ -1,4 +1,13 @@
-import { renderPage, escapeHtml } from './theme';
+import { renderPage, escapeHtml, type CodiconAssets } from './theme';
+
+/**
+ * Chrome icons are codicons (issue #6). Glyphs the spec names in prose —
+ * the ✓/✕/⤼ verdicts, the ▾ file caret, ⚠, and the ○/✓ setup marks — stay as
+ * written characters: they are content the spec dictates, not chrome.
+ */
+function icon(name: string): string {
+  return `<span class="codicon codicon-${name}" aria-hidden="true"></span>`;
+}
 
 export interface SidebarPod {
   id: string;
@@ -47,6 +56,40 @@ export interface SidebarActiveReview {
   items: SidebarReviewItem[];
 }
 
+/** Spec §1: the sidebar mirrors the wizard's three steps while it runs. */
+export interface SidebarSetup {
+  steps: Array<{ label: string; done: boolean; meta?: string }>;
+}
+
+/**
+ * Spec §3: before a review has run, the sidebar names the merge request and
+ * the agent — and nothing else. No counts, no tree, no filter pills.
+ */
+export interface SidebarPendingReview {
+  headline: string;
+  refLabel?: string;
+  context: string;
+  agent: string;
+  added: number;
+  removed: number;
+}
+
+/** Spec §9: the posted-reviews thread list. */
+export interface SidebarThread {
+  id: string;
+  title: string;
+  meta: string;
+  status: 'awaiting' | 'replied' | 'resolved' | 'conceded' | 'stale';
+  selected: boolean;
+}
+
+export interface SidebarThreads {
+  headline: string;
+  context: string;
+  summary: Array<{ status: SidebarThread['status']; label: string }>;
+  threads: SidebarThread[];
+}
+
 export interface SidebarViewState {
   podName: string;
   podMeta: string;
@@ -54,8 +97,13 @@ export interface SidebarViewState {
   mergeRequests: SidebarMergeRequest[];
   issues: SidebarIssue[];
   waitingOnYou: number;
+  /** Precedence, highest first: setup → threads → review → pending → lists. */
+  setup?: SidebarSetup;
+  threads?: SidebarThreads;
   activeReview?: SidebarActiveReview;
+  pendingReview?: SidebarPendingReview;
   activeRoute?: string;
+  codicons?: CodiconAssets;
 }
 
 export type SidebarMessage =
@@ -66,6 +114,9 @@ export type SidebarMessage =
   | { type: 'openTuning' }
   | { type: 'openSettings' }
   | { type: 'selectFinding'; itemId: string }
+  | { type: 'selectThread'; threadId: string }
+  | { type: 'openPostedReviewTab' }
+  | { type: 'useDemoPod' }
   | { type: 'openReviewTab' }
   | { type: 'openCr'; repoId: string; number: string };
 
@@ -145,6 +196,32 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .foot { margin-top: auto; border-top: 1px solid var(--line); padding: 10px 12px; color: var(--fg-dimmer); font: 10.5px/1.4 var(--font-mono); }
 .foot-link { border: 0; background: none; padding: 0; color: var(--accent); font: 11px/1.4 var(--font-ui); cursor: pointer; }
 .foot-link:hover { text-decoration: underline; }
+/* Setup checklist (spec §1) — ○/✓ marks with live meta under each step. */
+.checklist { display: flex; flex-direction: column; padding-bottom: 8px; }
+.check-row { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 8px; padding: 6px 12px; color: var(--fg-dim); }
+.check-mark { color: var(--fg-dimmer); font: 11px/1.4 var(--font-mono); }
+.check-row.done .check-mark { color: var(--ok); }
+.check-label { display: block; font: 12px/1.35 var(--font-ui); }
+.check-row.done .check-label { color: var(--fg-hi); }
+.check-meta { display: block; margin-top: 2px; overflow: hidden; color: var(--fg-dimmer); font: 10.5px/1.35 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+/* Posted-reviews thread list (spec §9). */
+.thread-summary { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; color: var(--fg-dim); font: 10.5px/1.3 var(--font-mono); }
+.thread-summary-row { display: flex; align-items: center; gap: 7px; }
+.thread-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--fg-dimmer); }
+.thread-dot.awaiting { background: var(--sev-major); }
+.thread-dot.replied { background: var(--agent); }
+.thread-dot.resolved { background: var(--ok); }
+.thread-dot.conceded { background: var(--fg-dim2); }
+.thread-dot.stale { background: var(--sev-blocker); }
+.thread-row { display: grid; grid-template-columns: 7px minmax(0, 1fr); align-items: start; gap: 8px; width: 100%; padding: 7px 12px; border: 0; border-left: 2px solid transparent; background: none; color: var(--fg); text-align: left; cursor: pointer; }
+.thread-row:hover { background: var(--hover); }
+.thread-row.selected { background: var(--sel); border-left-color: var(--accent); }
+.thread-row .thread-dot { margin-top: 4px; }
+.thread-title { display: block; overflow: hidden; color: var(--fg-hi); font: 500 11.5px/1.3 var(--font-ui); text-overflow: ellipsis; white-space: nowrap; }
+.thread-meta { display: block; margin-top: 2px; overflow: hidden; color: var(--fg-dimmer); font: 9.5px/1.3 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+/* Codicon chrome sits on the mono baseline the prototype uses for nav glyphs. */
+.nav-glyph .codicon { font-size: 14px; vertical-align: -2px; }
+.icon-btn .codicon { font-size: 14px; }
 `;
 
 /** ✓ / ✕ / ⤼ once decided, the agent's confidence while it is still open. */
@@ -201,6 +278,51 @@ function renderFilterPills(items: readonly SidebarReviewItem[]): string {
     .join('');
 }
 
+/** Spec §1: "a Setup checklist mirroring the three steps with ○/✓ marks". */
+function renderSetup(setup: SidebarSetup): string {
+  const e = escapeHtml;
+  const rows = setup.steps
+    .map(
+      (step) => `<div class="check-row ${step.done ? 'done' : ''}">
+      <span class="check-mark">${step.done ? '✓' : '○'}</span>
+      <span><span class="check-label">${e(step.label)}</span>${step.meta ? `<span class="check-meta">${e(step.meta)}</span>` : ''}</span>
+    </div>`,
+    )
+    .join('');
+  return `<div class="divider"></div><div class="section">Setup</div><div class="checklist">${rows}</div>`;
+}
+
+/** Spec §3: identity and agent, and explicitly no triage UI. */
+function renderPending(pending: SidebarPendingReview): string {
+  const e = escapeHtml;
+  return `<section><div class="review-context">
+    <div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(pending.headline)}</span><span class="review-context-meta">${e(pending.context)} · <span class="ok">+${pending.added}</span> · <span class="bad">−${pending.removed}</span></span></span></div>
+    <div class="review-agent"><span>Agent · <span class="agent-fg">${e(pending.agent)}</span></span></div>
+  </div>
+  <div class="empty">No review items yet. Pick an agent and run the review.</div></section>`;
+}
+
+/** Spec §9: status summary over the thread list. No counters, no filter pills. */
+function renderThreads(threads: SidebarThreads): string {
+  const e = escapeHtml;
+  const summary = threads.summary
+    .map((row) => `<div class="thread-summary-row"><span class="thread-dot ${row.status}"></span><span>${e(row.label)}</span></div>`)
+    .join('');
+  const rows = threads.threads
+    .map(
+      (thread) => `<button class="thread-row ${thread.selected ? 'selected' : ''}" data-thread="${e(thread.id)}" title="${e(thread.title)}">
+      <span class="thread-dot ${thread.status}"></span>
+      <span><span class="thread-title">${e(thread.title)}</span><span class="thread-meta">${e(thread.meta)}</span></span>
+    </button>`,
+    )
+    .join('');
+  return `<section>
+    <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(threads.headline)}</span><span class="review-context-meta">${e(threads.context)}</span></span></div>
+    <div class="thread-summary">${summary}</div></div>
+    <div class="list">${rows || '<div class="empty">No threads on this review yet.</div>'}</div>
+  </section>`;
+}
+
 export function renderSidebarHtml(state: SidebarViewState, nonce: string): string {
   const e = escapeHtml;
   const podRows = state.pods.length > 0
@@ -236,22 +358,55 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     <div class="list">${reviewTree}</div>
   </section>` : '';
 
+  // One precedence rule, evaluated once, so the states cannot flap.
+  const screen = state.setup
+    ? 'setup'
+    : state.threads
+      ? 'threads'
+      : activeReview
+        ? 'triage'
+        : state.pendingReview
+          ? 'pending'
+          : 'lists';
+
+  const navRows = [
+    { id: 'dashboard', route: 'dashboard', icon: 'dashboard', label: 'Pod dashboard', count: `${state.mergeRequests.length}` },
+    { id: 'posted-reviews', route: 'posted', icon: 'comment-discussion', label: 'Posted reviews', count: `${state.waitingOnYou}` },
+    { id: 'tuning', route: 'tuning', icon: 'graph', label: 'Agent tuning' },
+    { id: 'settings', route: 'settings', icon: 'gear', label: 'Settings' },
+  ]
+    // Spec §1: the later rows are hidden until setup completes — there is
+    // nothing behind them yet.
+    .filter((row) => screen !== 'setup' || row.id === 'dashboard')
+    .map((row) => `<button class="nav-row ${state.activeRoute === row.route ? 'active' : ''}" id="${row.id}"><span class="nav-glyph">${icon(row.icon)}</span><span class="nav-label">${e(row.label)}</span>${row.count === undefined ? '' : `<span class="nav-count">${e(row.count)}</span>`}</button>`)
+    .join('');
+
+  const main =
+    screen === 'setup'
+      ? renderSetup(state.setup as SidebarSetup)
+      : screen === 'threads'
+        ? renderThreads(state.threads as SidebarThreads)
+        : screen === 'triage'
+          ? reviewSection
+          : screen === 'pending'
+            ? renderPending(state.pendingReview as SidebarPendingReview)
+            : `<div class="divider"></div><div class="section">Merge requests</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`;
+
+  const footer =
+    screen === 'setup'
+      ? '<button class="foot-link" id="use-demo-pod">Skip and use a demo pod</button>'
+      : screen === 'threads'
+        ? '<button class="foot-link" id="open-posted-tab">Open posted review</button>'
+        : screen === 'triage' || screen === 'pending'
+          ? '<button class="foot-link" id="open-review-tab">Open review tab</button>'
+          : `${e(state.podName)} · ${e(state.podMeta)}`;
+
   const body = `<main class="side">
-    <header class="head"><span class="brand">Verdict</span><span class="head-tools"><button class="icon-btn" id="refresh" title="Refresh">⟳</button><span>⋯</span></span></header>
-    <nav class="nav" aria-label="Verdict navigation">
-      <button class="nav-row ${state.activeRoute === 'dashboard' ? 'active' : ''}" id="dashboard"><span class="nav-glyph">▦</span><span class="nav-label">Pod dashboard</span><span class="nav-count">${state.mergeRequests.length}</span></button>
-      <button class="nav-row ${state.activeRoute === 'posted' ? 'active' : ''}" id="posted-reviews"><span class="nav-glyph">◍</span><span class="nav-label">Posted reviews</span><span class="nav-count">${state.waitingOnYou}</span></button>
-      <button class="nav-row ${state.activeRoute === 'tuning' ? 'active' : ''}" id="tuning"><span class="nav-glyph">◔</span><span class="nav-label">Agent tuning</span></button>
-      <button class="nav-row ${state.activeRoute === 'settings' ? 'active' : ''}" id="settings"><span class="nav-glyph">⚙</span><span class="nav-label">Settings</span></button>
-    </nav>
-    <div class="divider"></div>
-    <div class="section">Pods</div><div class="pod-list">${podRows}</div>
-    ${activeReview ? reviewSection : `<div class="divider"></div><div class="section">Merge requests</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`}
-    <footer class="foot">${
-      activeReview
-        ? '<button class="foot-link" id="open-review-tab">Open review tab</button>'
-        : `${e(state.podName)} · ${e(state.podMeta)}`
-    }</footer>
+    <header class="head"><span class="brand">Verdict</span><span class="head-tools"><button class="icon-btn" id="refresh" title="Refresh">${icon('refresh')}</button><span class="icon-btn">${icon('ellipsis')}</span></span></header>
+    <nav class="nav" aria-label="Verdict navigation">${navRows}</nav>
+    ${screen === 'setup' ? '' : `<div class="divider"></div><div class="section">Pods</div><div class="pod-list">${podRows}</div>`}
+    ${main}
+    <footer class="foot">${footer}</footer>
   </main>`;
 
   const script = `
@@ -266,6 +421,9 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     document.querySelectorAll('[data-cr-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'openCr', repoId: row.dataset.crRepo, number: row.dataset.crNumber })));
     document.querySelectorAll('[data-finding]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectFinding', itemId: row.dataset.finding })));
     document.getElementById('open-review-tab')?.addEventListener('click', () => post({ type: 'openReviewTab' }));
+    document.getElementById('open-posted-tab')?.addEventListener('click', () => post({ type: 'openPostedReviewTab' }));
+    document.getElementById('use-demo-pod')?.addEventListener('click', () => post({ type: 'useDemoPod' }));
+    document.querySelectorAll('[data-thread]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectThread', threadId: row.dataset.thread })));
     const matches = (row, filter) => {
       if (filter === 'all') return true;
       if (filter.startsWith('category:')) return row.dataset.category === filter.slice('category:'.length);
@@ -285,5 +443,5 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     }));
   `;
 
-  return renderPage({ title: 'Verdict', nonce, css: CSS, body, script, embedded: true });
+  return renderPage({ title: 'Verdict', nonce, css: CSS, body, script, embedded: true, codicons: state.codicons });
 }

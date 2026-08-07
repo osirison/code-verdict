@@ -104,6 +104,33 @@ part of the product surface, not a convenience registry.
 Every keybinding stays scoped to `when: verdict.reviewFocus`, so single letters never steal typing
 elsewhere.
 
+## The sidebar is a state machine
+
+`renderSidebarHtml` picks exactly one shell, in this precedence: **setup → threads → triage →
+pending → lists**. Feature panels publish their slice through a dep callback
+(`onSetupState`, `onSidebarThreads`, `onSidebarState`, `onSidebarPending`) and clear it on
+`route.onLeave`; the sidebar itself never reaches into a panel. Evaluate precedence once, in the
+renderer — two screens each deciding "am I visible?" is how state flapping starts.
+
+Spec §9 forbids triage counters and filter pills in the threads state; there is a test for it.
+
+## Chrome glyphs are codicons; content glyphs are not
+
+Nav rows, the toolbar and other chrome use codicons (issue #6). A webview gets no icon font for
+free: `media/codicons/` is populated from `@vscode/codicons` by `scripts/copy-codicons.mjs` at
+build time, `localResourceRoots` admits it, and `renderPage`'s `codicons` option widens `style-src`
+and `font-src` to the webview's `cspSource`. Without that option the CSP stays font-free.
+
+Glyphs the spec names in prose stay as written characters — the ✓/✕/⤼ verdict marks, the ▾ file
+caret, ⚠, and the ○/✓ setup marks. They are content the spec dictates, not chrome.
+
+## The status bar shows only what is Verdict's
+
+Spec §14 is drawn from a prototype that mocks the whole VS Code window, so its `⎇ branch` and
+`✕ 1 ⚠ 0` segments belong to the editor's own git and problems indicators. Verdict contributes the
+three that are its own — review state, agent, and the keys hint — and lets VS Code own the rest.
+Duplicating a native indicator is a bug, not fidelity.
+
 ## Anchoring: one matcher, three callers
 
 `src/domain/anchor.ts` answers "the agent read this code at line N — is it still there?" for

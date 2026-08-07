@@ -16,6 +16,7 @@ import { escapeHtml, renderFallbackHtml } from './dashboardHtml';
 import type { PostedMessage, PostedRow } from './postedReviewsHtml';
 import { renderPostedReviewsHtml } from './postedReviewsHtml';
 import { AppSurface, type AppRoute } from './appSurface';
+import type { SidebarThread, SidebarThreads } from './sidebarHtml';
 import { COMMANDS } from '../commands';
 
 export interface PostedReviewsDeps {
@@ -24,6 +25,8 @@ export interface PostedReviewsDeps {
   globalState: KeyValueStore;
   /** Re-run agent on the fix — routes back into the review flow. */
   openReviewFlow: (ref: { repoId: string; number: string }) => void;
+  /** Spec §9: the sidebar mirrors this screen's threads while it is open. */
+  onSidebarThreads?: (threads?: SidebarThreads) => void;
 }
 
 export class PostedReviewsPanel {
@@ -64,6 +67,7 @@ export class PostedReviewsPanel {
   ) {
     route.onLeave(() => {
       this.disposed = true;
+      this.deps.onSidebarThreads?.(undefined);
       if (PostedReviewsPanel.current === this) PostedReviewsPanel.current = undefined;
     });
     route.onMessage((message) => void this.onMessage(message as PostedMessage));
@@ -226,8 +230,55 @@ export class PostedReviewsPanel {
     }
   }
 
+  /** Select a thread from the sidebar list — expands it on this screen. */
+  static selectThread(threadId: string): void {
+    const panel = PostedReviewsPanel.current;
+    if (!panel || panel.disposed) return;
+    const index = panel.rows.findIndex((row) =>
+      row.view.threads.some((thread) => thread.threadId === threadId),
+    );
+    if (index < 0) return;
+    panel.selectedIndex = index;
+    panel.expandedThreadId = threadId;
+    panel.render();
+    AppSurface.reveal();
+  }
+
+  private publishSidebarThreads(): void {
+    const view = this.selectedView();
+    if (!view) {
+      this.deps.onSidebarThreads?.(undefined);
+      return;
+    }
+    const row = this.rows[this.selectedIndex];
+    const count = (status: SidebarThread['status']): number =>
+      view.threads.filter((thread) => thread.status === status).length;
+    const summary = ([
+      ['awaiting', 'waiting on you'],
+      ['replied', 'replied'],
+      ['resolved', 'resolved'],
+      ['conceded', 'conceded'],
+      ['stale', 'anchor lost'],
+    ] as Array<[SidebarThread['status'], string]>)
+      .filter(([status]) => count(status) > 0)
+      .map(([status, label]) => ({ status, label: `${count(status)} ${label}` }));
+    this.deps.onSidebarThreads?.({
+      headline: `${row?.refLabel ?? view.crNumber} · ${row?.title ?? ''}`.trim(),
+      context: `${row?.project ?? view.repoId} · ${view.agentLabel}`,
+      summary,
+      threads: view.threads.map((thread) => ({
+        id: thread.threadId,
+        title: thread.title,
+        meta: thread.file ? `${thread.file}${thread.line ? `:${thread.line}` : ''}` : thread.status,
+        status: thread.status,
+        selected: thread.threadId === this.expandedThreadId,
+      })),
+    });
+  }
+
   private render(): void {
     if (this.disposed) return;
+    this.publishSidebarThreads();
     const nonce = crypto.randomBytes(16).toString('hex');
     this.panel.webview.html = renderPostedReviewsHtml(
       {
