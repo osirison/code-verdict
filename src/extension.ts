@@ -47,12 +47,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const statusBar = new VerdictStatusBar();
 
   const useDemoPod = async (): Promise<void> => {
-    const pod = await createDemoPod(podStore);
-    sidebar.refresh();
-    void vscode.window.showInformationMessage(
-      `Verdict: "${pod.name}" runs on built-in sample data — connect GitLab whenever you are ready.`,
-    );
-    await openDashboard();
+    try {
+      const pod = await createDemoPod(podStore);
+      sidebar.refresh();
+      void vscode.window.showInformationMessage(
+        `Verdict: "${pod.name}" runs on built-in sample data — connect GitLab whenever you are ready.`,
+      );
+      await openDashboard();
+    } catch (e) {
+      void vscode.window.showErrorMessage(
+        `Verdict: could not create the demo pod — ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   };
 
   const sidebar = new VerdictSidebarProvider(podStore, {

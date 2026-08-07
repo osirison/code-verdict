@@ -920,8 +920,10 @@ export class ReviewFlowPanel {
         lineMoved: this.staleItemIds.has(item.id),
       })),
     } : undefined);
-    // Before a run there is identity but no triage UI (spec §3).
-    this.deps.onSidebarPending?.(this.review ? undefined : {
+    // Spec §3 is the Run-review screen specifically — its copy ("pick an
+    // agent and run the review") would be wrong mid-run and absurd on the
+    // clean bill, where a run just finished.
+    this.deps.onSidebarPending?.(this.review || this.screen !== 'agent' ? undefined : {
       headline: `${state.header.refLabel} · ${state.header.title}`,
       refLabel: state.header.refLabel,
       context: state.header.branch,
