@@ -215,12 +215,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showInformationMessage('Verdict: that project is already in this pod.');
         return;
       }
-      pod.sources = [...pod.sources, source];
-      pod.repos = [
-        ...(pod.repos ?? []),
-        ...added.map((repo) => ({ id: repo.id, path: repo.path, name: repo.name })),
-      ];
-      await podStore.upsert(pod);
+      // A new Pod, not a mutation: `list()` copies the array but not the pods
+      // inside it, so editing this object in place would edit the store's
+      // cached state behind its back.
+      await podStore.upsert({
+        ...pod,
+        sources: [...pod.sources, source],
+        repos: [
+          ...(pod.repos ?? []),
+          ...added.map((repo) => ({ id: repo.id, path: repo.path, name: repo.name })),
+        ],
+      });
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();
       void vscode.window.showInformationMessage(
