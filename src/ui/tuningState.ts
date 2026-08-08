@@ -37,6 +37,8 @@ export interface TuningViewState {
   subline: string;
   /** Nothing submitted in the window — render the explicit empty scorecard instead of 0-of-0 charts. */
   empty: boolean;
+  /** False for histories whose records predate per-finding observations — "no evidence", not "all healthy". */
+  hasObservations: boolean;
   categories: TuningRate[];
   confidence: TuningRate[];
   suggestions: TuningSuggestion[];
@@ -88,12 +90,16 @@ function deriveSuggestions(
     });
   }
   if (criteria.severityFloor === 'nit') {
-    const nits = observations.filter((observation) => observation.severity === 'nit');
+    // Share of triage over severity-bearing records only — legacy observations
+    // without the field can never be nits, so counting them dilutes the share.
+    const withSeverity = observations.filter((observation) => observation.severity !== undefined);
+    const nits = withSeverity.filter((observation) => observation.severity === 'nit');
+    const share = rate(nits.length, withSeverity.length);
     suggestions.push({
       id: 'severity:minor', kind: 'severity',
       title: 'Stop reporting nits',
       body: nits.length > 0
-        ? `You accepted ${acceptedCount(nits)} of ${plural(nits.length, 'nit')} — ${rate(nits.length, observations.length)}% of your triage. Start at minor severity.`
+        ? `You accepted ${acceptedCount(nits)} of ${plural(nits.length, 'nit')}${share > 0 ? ` — ${share}% of your triage` : ''}. Start at minor severity.`
         : 'Nits add review volume without changing merge decisions. Start at minor severity.',
       action: 'Raise floor to minor',
     });
@@ -121,14 +127,16 @@ export function deriveTuningState(
       enabled: criteria.categories.includes(category),
     };
   }).sort((left, right) => right.rate - left.rate || right.produced - left.produced);
+  // Half-open bands: the validator allows any finite confidence in [0,100],
+  // so closed integer ranges would drop fractional values like 89.5 entirely.
   const bands = [
-    { key: '90', label: '90–100', min: 90, max: 100 },
-    { key: '80', label: '80–89', min: 80, max: 89 },
-    { key: '70', label: '70–79', min: 70, max: 79 },
-    { key: 'below', label: 'below 70', min: 0, max: 69 },
+    { key: '90', label: '90–100', min: 90, max: Infinity },
+    { key: '80', label: '80–89', min: 80, max: 90 },
+    { key: '70', label: '70–79', min: 70, max: 80 },
+    { key: 'below', label: 'below 70', min: -Infinity, max: 70 },
   ];
   const confidence = bands.map((band) => {
-    const matching = observations.filter((observation) => observation.confidence >= band.min && observation.confidence <= band.max);
+    const matching = observations.filter((observation) => observation.confidence >= band.min && observation.confidence < band.max);
     const accepted = acceptedCount(matching);
     return { key: band.key, label: band.label, accepted, produced: matching.length, rate: rate(accepted, matching.length) };
   });
@@ -140,6 +148,7 @@ export function deriveTuningState(
       ? 'Nothing has been submitted from this pod in the last 30 days.'
       : `${totalAccepted} of ${plural(totalProduced, 'finding')} across ${plural(history.length, 'review')} in this pod · last 30 days`,
     empty,
+    hasObservations: observations.length > 0,
     categories,
     confidence,
     suggestions: deriveSuggestions(observations, categories, criteria),

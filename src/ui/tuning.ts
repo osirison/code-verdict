@@ -27,6 +27,11 @@ export class TuningPanel {
     TuningPanel.current.render();
   }
 
+  /** Repaint after the active pod (or its history) changes elsewhere — same contract as DashboardPanel. */
+  static refreshIfOpen(): void {
+    TuningPanel.current?.render();
+  }
+
   private disposed = false;
   /**
    * Applied suggestions, snapshotted at apply time: once the criteria change,
@@ -94,10 +99,21 @@ export class TuningPanel {
 
   private async onMessage(message: TuningMessage): Promise<void> {
     if (this.applied.has(message.suggestionId)) return;
+    // Capture before state() — it re-targets this.podId when the active pod
+    // changed under an open panel. Suggestion ids are pod-independent, so a
+    // click rendered against pod A must never tune pod B: repaint instead.
+    const renderedPodId = this.podId;
     const state = this.state();
     if (!state) return;
+    if (state.pod.id !== renderedPodId) {
+      this.render();
+      return;
+    }
     const suggestion = state.view.suggestions.find((candidate) => candidate.id === message.suggestionId);
-    if (!suggestion) return;
+    if (!suggestion) {
+      this.render();
+      return;
+    }
     const criteria = { ...state.pod.criteria, categories: [...state.pod.criteria.categories] };
     if (suggestion.kind === 'category') {
       criteria.categories = criteria.categories.filter((category) => category !== suggestion.category);

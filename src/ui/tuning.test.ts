@@ -106,11 +106,57 @@ describe('agent tuning fidelity (spec §10)', () => {
     expect(fallback?.body).toBe('Nits add review volume without changing merge decisions. Start at minor severity.');
   });
 
-  it('suggests nothing without observations, whatever the criteria', () => {
+  it('suggests nothing without observations, and never claims the data says all is healthy', () => {
     const countsOnly = [{ ...history[0]!, observations: undefined }];
     const state = deriveTuningState(countsOnly, DEFAULT_CRITERIA, 'agent');
     expect(state.headline).toBe('50% accepted');
     expect(state.suggestions).toEqual([]);
+    expect(state.hasObservations).toBe(false);
+    const html = renderTuningHtml(state, 'nonce123');
+    expect(html).toContain('predate per-finding decision records');
+    expect(html).not.toContain('Nothing to change');
+  });
+
+  it('keeps fractional confidences inside the bands', () => {
+    const fractional = [{
+      ...history[0]!,
+      observations: [
+        { category: 'security' as const, confidence: 89.5, verdict: 'accepted' as const, severity: 'major' as const },
+        { category: 'security' as const, confidence: 69.9, verdict: 'rejected' as const, severity: 'minor' as const },
+      ],
+    }];
+    const state = deriveTuningState(fractional, DEFAULT_CRITERIA, 'agent');
+    expect(state.confidence.find((band) => band.label === '80–89')?.produced).toBe(1);
+    expect(state.confidence.find((band) => band.label === 'below 70')?.produced).toBe(1);
+    expect(state.confidence.reduce((sum, band) => sum + band.produced, 0)).toBe(2);
+  });
+
+  it('computes the nit share over severity-bearing records and drops a 0% clause', () => {
+    const criteria = { ...DEFAULT_CRITERIA, severityFloor: 'nit' as const };
+    const diluted = [{
+      ...history[0]!,
+      observations: [
+        { category: 'tests' as const, confidence: 75, verdict: 'rejected' as const, severity: 'nit' as const },
+        ...Array.from({ length: 9 }, () => ({ category: 'tests' as const, confidence: 75, verdict: 'rejected' as const })),
+      ],
+    }];
+    const nits = deriveTuningState(diluted, criteria, 'agent').suggestions.find(
+      (suggestion) => suggestion.kind === 'severity',
+    );
+    // Legacy severity-less records can never be nits — they must not dilute the share.
+    expect(nits?.body).toBe('You accepted 0 of 1 nit — 100% of your triage. Start at minor severity.');
+
+    const roundsToZero = [{
+      ...history[0]!,
+      observations: [
+        { category: 'tests' as const, confidence: 75, verdict: 'rejected' as const, severity: 'nit' as const },
+        ...Array.from({ length: 200 }, () => ({ category: 'tests' as const, confidence: 90, verdict: 'accepted' as const, severity: 'minor' as const })),
+      ],
+    }];
+    const tiny = deriveTuningState(roundsToZero, criteria, 'agent').suggestions.find(
+      (suggestion) => suggestion.kind === 'severity',
+    );
+    expect(tiny?.body).toBe('You accepted 0 of 1 nit. Start at minor severity.');
   });
 
   it('renders the explicit empty scorecard when nothing was submitted', () => {
@@ -209,7 +255,14 @@ describe('TuningPanel apply flow', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(upsert).toHaveBeenCalledOnce();
 
+    // A click rendered against pod A that lands after a switch to pod B must
+    // repaint, never tune pod B off pod A's evidence.
     await store.setActive('other');
+    handlers.message?.({ type: 'applySuggestion', suggestionId: 'category:tests' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(upsert).toHaveBeenCalledOnce();
+    expect(panel.webview.html).toContain('No reviews yet');
+
     TuningPanel.show(deps);
     expect(panel.webview.html).not.toContain('✓ applied');
     expect(panel.webview.html).toContain('No reviews yet');

@@ -53,9 +53,14 @@ export function renderTuningHtml(state: TuningViewState, nonce: string): string 
       <div class="empty">The scorecard derives from your verdicts. Accept rates by category and confidence — and the criteria suggestions they generate — appear after your first submitted review.</div></main>`;
     return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: '', breadcrumb: { current: 'Agent tuning' } });
   }
+  // "No evidence" and "evidence says healthy" are different claims: histories
+  // predating per-finding observations must not render the all-healthy copy.
+  const noSuggestions = state.hasObservations
+    ? 'Nothing to change. Every category you have on is accepted more than a quarter of the time, and the confidence floor is where the data says it should be.'
+    : 'These reviews predate per-finding decision records, so there is nothing to derive suggestions from. The next submitted review fills the charts.';
   const suggestions = state.suggestions.length > 0
     ? state.suggestions.map((suggestion) => `<div class="suggestion"><div class="suggestion-copy"><span class="suggestion-title">${escapeHtml(suggestion.title)}</span><span class="suggestion-body">${escapeHtml(suggestion.body)}</span></div>${suggestionButton(suggestion)}</div>`).join('')
-    : '<div class="empty">Nothing to change. Every category you have on is accepted more than a quarter of the time, and the confidence floor is where the data says it should be.</div>';
+    : `<div class="empty">${noSuggestions}</div>`;
   const body = `<main class="wrap">${header}
     <section class="section"><div class="label">Accept rate by category</div>${rows(state.categories)}</section>
     <section class="section"><div class="label">Accept rate by agent confidence</div>${rows(state.confidence)}</section>

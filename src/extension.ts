@@ -37,6 +37,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onSubmitted: () => {
       sidebar.refresh();
       void DashboardPanel.refreshIfOpen();
+      TuningPanel.refreshIfOpen();
     },
     onSidebarState: (state?: SidebarActiveReview) => {
       sidebar.setActiveReview(state);
@@ -83,7 +84,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
     selectThread: (threadId) => PostedReviewsPanel.selectThread(threadId),
     useDemoPod: () => void useDemoPod(),
-    onPodChanged: () => void DashboardPanel.refreshIfOpen(),
+    onPodChanged: () => {
+      void DashboardPanel.refreshIfOpen();
+      TuningPanel.refreshIfOpen();
+    },
   });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('codeVerdict.sidebar', sidebar),
@@ -125,6 +129,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         onSubmitted: () => {
           sidebar.refresh();
           void DashboardPanel.refreshIfOpen();
+          TuningPanel.refreshIfOpen();
         },
         onSidebarState: (state) => sidebar.setActiveReview(state),
         onReviewReady: (info) => notifier.reviewReady({ refLabel: info.label, itemCount: info.itemCount }),
@@ -187,6 +192,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await podStore.setActive(picked.id);
     sidebar.refresh();
     await DashboardPanel.refreshIfOpen();
+    TuningPanel.refreshIfOpen();
   };
 
   /**
@@ -266,6 +272,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     [COMMANDS.refresh]: async () => {
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();
+      TuningPanel.refreshIfOpen();
     },
     [COMMANDS.signIn]: signIn,
     [COMMANDS.newPod]: signIn,
