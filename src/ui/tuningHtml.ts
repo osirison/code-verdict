@@ -26,6 +26,7 @@ h1 { color: var(--fg-max); font-size: 22px; font-weight: 600; line-height: 1.2; 
 .suggestion-title { color: var(--fg-hi); font-size: 12.5px; font-weight: 600; line-height: 1.3; }
 .suggestion-body { color: var(--fg-dim); font-size: 11.5px; line-height: 1.6; text-wrap: pretty; }
 .suggestion .btn { margin-left: auto; flex: none; }
+.btn.applied, .btn.applied:hover { background: var(--line); color: var(--fg-dimmer); border-color: transparent; cursor: default; }
 .empty { border: 1px dashed var(--line2); border-radius: 6px; padding: 18px; color: var(--fg-dimmer); font-size: 12.5px; line-height: 1.6; }
 .footnote { color: var(--fg-dimmer); font-size: 11px; line-height: 1.5; }
 `;
@@ -39,11 +40,28 @@ function rows(rates: readonly TuningRate[]): string {
   }).join('');
 }
 
+function suggestionButton(suggestion: TuningViewState['suggestions'][number]): string {
+  return suggestion.applied
+    ? '<button class="btn applied" disabled>✓ applied</button>'
+    : `<button class="btn btn-accent" data-suggestion="${escapeHtml(suggestion.id)}">${escapeHtml(suggestion.action)}</button>`;
+}
+
 export function renderTuningHtml(state: TuningViewState, nonce: string): string {
+  const header = `<header class="head"><span class="agent">${escapeHtml(state.agentLabel)}</span><h1>${escapeHtml(state.headline)}</h1><span class="subline">${escapeHtml(state.subline)}</span></header>`;
+  if (state.empty) {
+    const body = `<main class="wrap">${header}
+      <div class="empty">The scorecard derives from your verdicts. Accept rates by category and confidence — and the criteria suggestions they generate — appear after your first submitted review.</div></main>`;
+    return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: '', breadcrumb: { current: 'Agent tuning' } });
+  }
+  // "No evidence" and "evidence says healthy" are different claims: histories
+  // predating per-finding observations must not render the all-healthy copy.
+  const noSuggestions = state.hasObservations
+    ? 'Nothing to change. Every category you have on is accepted more than a quarter of the time, and the confidence floor is where the data says it should be.'
+    : 'These reviews predate per-finding decision records, so there is nothing to derive suggestions from. The next submitted review fills the charts.';
   const suggestions = state.suggestions.length > 0
-    ? state.suggestions.map((suggestion) => `<div class="suggestion"><div class="suggestion-copy"><span class="suggestion-title">${escapeHtml(suggestion.title)}</span><span class="suggestion-body">${escapeHtml(suggestion.body)}</span></div><button class="btn" data-suggestion="${escapeHtml(suggestion.id)}">${escapeHtml(suggestion.action)}</button></div>`).join('')
-    : '<div class="empty">Nothing to change. Every category you have on is accepted more than a quarter of the time, and the confidence floor is where the data says it should be.</div>';
-  const body = `<main class="wrap"><header class="head"><span class="agent">${escapeHtml(state.agentLabel)}</span><h1>${escapeHtml(state.headline)}</h1><span class="subline">${escapeHtml(state.subline)}</span></header>
+    ? state.suggestions.map((suggestion) => `<div class="suggestion"><div class="suggestion-copy"><span class="suggestion-title">${escapeHtml(suggestion.title)}</span><span class="suggestion-body">${escapeHtml(suggestion.body)}</span></div>${suggestionButton(suggestion)}</div>`).join('')
+    : `<div class="empty">${noSuggestions}</div>`;
+  const body = `<main class="wrap">${header}
     <section class="section"><div class="label">Accept rate by category</div>${rows(state.categories)}</section>
     <section class="section"><div class="label">Accept rate by agent confidence</div>${rows(state.confidence)}</section>
     <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section></main>`;

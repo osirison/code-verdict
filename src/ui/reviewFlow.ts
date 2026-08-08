@@ -740,7 +740,9 @@ export class ReviewFlowPanel {
           .map((i) => ({ id: i.id, title: i.title, severity: i.severity, file: i.file, line: i.line })),
         observations: this.review.items.flatMap((item) => {
           const verdict = this.review?.verdicts[item.id]?.verdict;
-          return verdict ? [{ category: item.category, confidence: item.confidence, verdict }] : [];
+          return verdict
+            ? [{ category: item.category, confidence: item.confidence, verdict, severity: item.severity }]
+            : [];
         }),
         requestedChanges: result.requestChangesApplied === true,
       });

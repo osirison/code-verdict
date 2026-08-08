@@ -381,7 +381,9 @@ export class ChangesetReviewPanel {
         items: memberItems.filter((item) => this.review?.verdicts[item.id]?.verdict === 'accepted').map((item) => ({ id: item.id, title: item.title, severity: item.severity, file: item.file, line: item.line })),
         observations: memberItems.flatMap((item) => {
           const verdict = this.review?.verdicts[item.id]?.verdict;
-          return verdict ? [{ category: item.category, confidence: item.confidence, verdict }] : [];
+          return verdict
+            ? [{ category: item.category, confidence: item.confidence, verdict, severity: item.severity }]
+            : [];
         }),
         requestedChanges: result.state.requestChangesRefs.includes(`${member.ref.repoId}!${member.ref.number}`),
       });
