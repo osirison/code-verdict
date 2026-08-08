@@ -1,8 +1,10 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import { detectChangesets } from '../app/changesets';
 import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { fetchPodData, repoIdsOf } from '../app/podQuery';
+import { changesetDetectionOptions } from './changesetOptions';
 import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
 import {
   renderSidebarHtml,
@@ -28,7 +30,12 @@ const IDLE_SETUP: SidebarSetup = {
 export interface VerdictSidebarDeps {
   secrets: vscode.SecretStorage;
   extensionUri: vscode.Uri;
+  /** Manual changesets + detection settings feed the Changesets nav row. */
+  globalState: vscode.Memento;
   openCr: (ref: { repoId: string; number: string }) => void;
+  openChangeset?: (changesetId: string) => void;
+  /** The manual route stays reachable when nothing was detected (handoff §16). */
+  createChangeset?: () => void;
   selectFinding?: (itemId: string) => void;
   selectThread?: (threadId: string) => void;
   useDemoPod?: () => void;
@@ -141,7 +148,15 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
     try {
       const data = await fetchPodData(await connectionForPod(pod, this.deps.secrets), pod, Date.now());
       if (seq !== this.refreshSeq || this.view !== view) return;
-      this.paint(view, toSidebarViewState(data, this.podStore.list()));
+      // The nav row's "N open" rides the fetch that just happened — the
+      // changesets are re-derived, never re-fetched.
+      const changesets = detectChangesets(
+        pod,
+        data.changeRequests,
+        data.workItems,
+        changesetDetectionOptions(this.deps.globalState, pod.id),
+      ).map((changeset) => ({ id: changeset.id, name: changeset.name }));
+      this.paint(view, { ...toSidebarViewState(data, this.podStore.list()), changesets });
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
       this.paint(view, {
@@ -172,6 +187,12 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
         break;
       case 'openDashboard':
         await vscode.commands.executeCommand(COMMANDS.openDashboard);
+        break;
+      case 'openChangesets':
+        // "Opens the active changeset, or the first one when none is active"
+        // (README §15) — with nothing detected, offer the manual route.
+        if (message.firstId) this.deps.openChangeset?.(message.firstId);
+        else this.deps.createChangeset?.();
         break;
       case 'openPostedReviews':
         await vscode.commands.executeCommand('codeVerdict.internal.postedReviews');
@@ -262,7 +283,8 @@ export class VerdictStatusBar {
       return;
     }
     const left = review.counts.undecided;
-    this.verdict.text = `$(verified) Verdict: ${review.refLabel ?? review.headline} · ${
+    // Changeset scope: "⧉ Verdict: 4 MRs · N left" (spec §15).
+    this.verdict.text = `$(verified) ${review.changeset ? '⧉ ' : ''}Verdict: ${review.refLabel ?? review.headline} · ${
       left === 0 ? 'all triaged' : `${left} left`
     }`;
     this.verdict.tooltip = `${review.headline} — ${review.counts.accepted} accepted, ${review.counts.rejected} rejected, ${review.counts.skipped} skipped`;

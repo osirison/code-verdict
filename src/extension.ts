@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import { ALL_COMMAND_IDS, COMMANDS, INTERNAL_COMMANDS } from './commands';
+import { detectChangesets } from './app/changesets';
 import { runDebugBootstrap } from './app/debugBootstrap';
+import { ManualChangesetStore } from './app/manualChangesets';
 import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
-import { repoIdsOf } from './app/podQuery';
+import { fetchPodData, repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
+import { getProvider } from './platform/registry';
 import { ReviewHistory } from './app/reviewHistory';
 import { getDebugAuthBypass } from './debugAuth';
 import { registerBuiltInProviders } from './registry';
@@ -21,6 +24,7 @@ import type { SidebarActiveReview, SidebarPendingReview, SidebarThreads } from '
 import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
+import { changesetDetectionOptions } from './ui/changesetOptions';
 import { VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -28,6 +32,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const podStore = new PodStore(context.globalState);
   const secrets = context.secrets;
   const reviewHistory = new ReviewHistory(context.globalState);
+
+  const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
+
+  /** One pod fetch → the detected changesets, with the current settings applied. */
+  const detectForActivePod = async () => {
+    const pod = podStore.activePod;
+    if (!pod) return [];
+    const connection = await connectionForPod(pod, secrets);
+    const data = await fetchPodData(connection, pod, Date.now());
+    return detectChangesets(pod, data.changeRequests, data.workItems, changesetOptions());
+  };
 
   const flowDeps = {
     podStore,
@@ -37,6 +52,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onSubmitted: () => {
       sidebar.refresh();
       void DashboardPanel.refreshIfOpen();
+      ChangesetPanel.refreshIfOpen();
       TuningPanel.refreshIfOpen();
     },
     onSidebarState: (state?: SidebarActiveReview) => {
@@ -46,6 +62,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onSidebarPending: (state?: SidebarPendingReview) => sidebar.setPendingReview(state),
     onReviewReady: (info: { ref: { repoId: string; number: string }; refLabel: string; itemCount: number }) =>
       notifier.reviewReady(info),
+    // §15 entry point "a member MR" — resolved after the review paints.
+    changesetForCr: async (ref: { repoId: string; number: string }) => {
+      const found = (await detectForActivePod()).find((changeset) =>
+        changeset.members.some((member) => member.ref.repoId === ref.repoId && member.ref.number === ref.number),
+      );
+      return found ? { id: found.id, name: found.name, memberCount: found.members.length } : undefined;
+    },
+    openChangeset: (changesetId: string) => openChangeset(changesetId),
   };
 
   const statusBar = new VerdictStatusBar();
@@ -77,7 +101,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const sidebar = new VerdictSidebarProvider(podStore, {
     secrets,
     extensionUri: context.extensionUri,
+    globalState: context.globalState,
     openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+    openChangeset: (changesetId) => openChangeset(changesetId),
+    createChangeset: () => void createManualChangeset(),
     selectFinding: (itemId) => {
       ReviewFlowPanel.selectItem(itemId);
       ChangesetReviewPanel.selectItem(itemId);
@@ -86,6 +113,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     useDemoPod: () => void useDemoPod(),
     onPodChanged: () => {
       void DashboardPanel.refreshIfOpen();
+      ChangesetPanel.refreshIfOpen();
       TuningPanel.refreshIfOpen();
     },
   });
@@ -104,9 +132,99 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onSidebarThreads: (threads?: SidebarThreads) => sidebar.setThreads(threads),
   };
 
+  const changesetReviewDeps = {
+    podStore,
+    secrets,
+    workspaceState: context.workspaceState,
+    globalState: context.globalState,
+    openSingle: (ref: { repoId: string; number: string }) => void ReviewFlowPanel.open(flowDeps, ref),
+    openDashboard: () => void openDashboard(),
+    onSubmitted: () => {
+      sidebar.refresh();
+      void DashboardPanel.refreshIfOpen();
+      ChangesetPanel.refreshIfOpen();
+      TuningPanel.refreshIfOpen();
+    },
+    onSidebarState: (state?: SidebarActiveReview) => {
+      sidebar.setActiveReview(state);
+      statusBar.setActiveReview(state);
+    },
+    onReviewReady: (info: { label: string; itemCount: number }) =>
+      notifier.reviewReady({ refLabel: info.label, itemCount: info.itemCount }),
+  };
+
+  const changesetPanelDeps = {
+    podStore,
+    secrets,
+    globalState: context.globalState,
+    workspaceState: context.workspaceState,
+    openCr: (ref: { repoId: string; number: string }) => void ReviewFlowPanel.open(flowDeps, ref),
+    openReview: (id: string, selectItemId?: string) => void ChangesetReviewPanel.open(changesetReviewDeps, id, selectItemId),
+    openDashboard: () => void openDashboard(),
+  };
+
+  const openChangeset = (changesetId: string): void => {
+    void ChangesetPanel.show(changesetPanelDeps, changesetId);
+  };
+
+  /**
+   * The manual detection route (handoff §16): pick MRs from the pod — or
+   * paste an MR URL, which the quick pick matches against each row's webUrl —
+   * then name the group. Stored per pod; detection stays a suggestion-maker.
+   */
+  const createManualChangeset = async (): Promise<void> => {
+    const pod = podStore.activePod;
+    if (!pod) {
+      void vscode.window.showInformationMessage('Verdict: connect first — run "Verdict: Sign in to GitLab".');
+      return;
+    }
+    try {
+      const connection = await connectionForPod(pod, secrets);
+      const data = await fetchPodData(connection, pod, Date.now());
+      const vocabulary = getProvider(pod.providerId).vocabulary;
+      const picked = await vscode.window.showQuickPick(
+        data.changeRequests.map((cr) => ({
+          label: `${vocabulary.formatCrRef(cr.ref.number)} · ${cr.title}`,
+          description: pod.repos?.find((repo) => repo.id === cr.ref.repoId)?.path ?? cr.ref.repoId,
+          detail: cr.webUrl,
+          ref: cr.ref,
+          crTitle: cr.title,
+        })),
+        {
+          canPickMany: true,
+          matchOnDetail: true,
+          title: 'New changeset — merge requests that ship together',
+          placeHolder: 'Pick two or more, or paste a merge request URL to find it',
+        },
+      );
+      if (!picked || picked.length === 0) return;
+      if (picked.length < 2) {
+        void vscode.window.showWarningMessage('Verdict: a changeset needs at least two merge requests.');
+        return;
+      }
+      const name = await vscode.window.showInputBox({
+        title: 'Name the changeset',
+        value: picked[0]?.crTitle ?? '',
+        prompt: 'Shown on the dashboard band and the changeset screen',
+      });
+      if (!name?.trim()) return;
+      const record = await new ManualChangesetStore(context.globalState).add(
+        pod.id,
+        name.trim(),
+        picked.map((item) => item.ref),
+      );
+      sidebar.refresh();
+      await DashboardPanel.refreshIfOpen();
+      openChangeset(record.id);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Verdict: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     onPodChanged: () => sidebar.refresh(),
+    changesetOptions,
     openCr: (ref, submitted) => {
       if (submitted) {
         void PostedReviewsPanel.show(postedDeps, ref);
@@ -114,28 +232,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       void ReviewFlowPanel.open(flowDeps, ref);
     },
-    openChangeset: (changesetId) => void ChangesetPanel.show({
-      podStore,
-      secrets,
-      globalState: context.globalState,
-      openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
-      openReview: (id) => void ChangesetReviewPanel.open({
-        podStore,
-        secrets,
-        workspaceState: context.workspaceState,
-        globalState: context.globalState,
-        openSingle: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
-        openDashboard: () => void openDashboard(),
-        onSubmitted: () => {
-          sidebar.refresh();
-          void DashboardPanel.refreshIfOpen();
-          TuningPanel.refreshIfOpen();
-        },
-        onSidebarState: (state) => sidebar.setActiveReview(state),
-        onReviewReady: (info) => notifier.reviewReady({ refLabel: info.label, itemCount: info.itemCount }),
-      }, id),
-      openDashboard: () => void openDashboard(),
-    }, changesetId),
+    openChangeset,
+    createChangeset: () => void createManualChangeset(),
   };
 
   const openDashboard = async (): Promise<void> => {
@@ -192,6 +290,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await podStore.setActive(picked.id);
     sidebar.refresh();
     await DashboardPanel.refreshIfOpen();
+    ChangesetPanel.refreshIfOpen();
     TuningPanel.refreshIfOpen();
   };
 
@@ -262,8 +361,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     [COMMANDS.addProject]: addProject,
     [COMMANDS.openReview]: () => {
       // Naming doc: "Verdict: Open review" is the triage tab for the
-      // active MR — Posted reviews has its own (internal) entry point.
-      if (!ReviewFlowPanel.revealIfOpen()) {
+      // active MR — or the changeset review when that is what's running.
+      if (!ReviewFlowPanel.revealIfOpen() && !ChangesetReviewPanel.revealIfOpen()) {
         void vscode.window.showInformationMessage(
           'Verdict: no active review — open a merge request from the dashboard first.',
         );
@@ -272,6 +371,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     [COMMANDS.refresh]: async () => {
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();
+      ChangesetPanel.refreshIfOpen();
       TuningPanel.refreshIfOpen();
     },
     [COMMANDS.signIn]: signIn,
@@ -286,8 +386,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       handlers[id] ??
       (() => {
         // Review-tab commands (A/R/S, J/K, generate, submit …) route to the
-        // active review panel first.
+        // active review panel first — single-CR or changeset, whichever holds
+        // the surface.
         if (ReviewFlowPanel.handleCommand(id)) return;
+        if (ChangesetReviewPanel.handleCommand(id)) return;
         void vscode.window.showInformationMessage(
           `Verdict: "${id}" is not implemented yet — the extension is under construction.`,
         );
@@ -316,7 +418,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(id, (arg?: unknown) => {
-        ReviewFlowPanel.handleCommand(id, arg);
+        if (!ReviewFlowPanel.handleCommand(id, arg)) ChangesetReviewPanel.handleCommand(id, arg);
       }),
     );
   }

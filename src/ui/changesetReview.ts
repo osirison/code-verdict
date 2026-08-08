@@ -5,7 +5,7 @@ import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
-import { runDemoChangesetAgent } from '../app/combinedAgent';
+import { changesetHeadSha, runDemoChangesetAgent } from '../app/combinedAgent';
 import { connectionForPod } from '../app/connections';
 import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
@@ -17,12 +17,14 @@ import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import { parseHunks } from '../domain/diffHunks';
+import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { composeSummary, type AgentVoice } from '../domain/summary';
 import { allDecided, clearVerdict, createReview, nextUndecided, setVerdict, verdictCounts } from '../domain/reviewState';
 import type { Category, Review, Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
+import { changesetDetectionOptions } from './changesetOptions';
+import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
@@ -52,11 +54,29 @@ export interface ChangesetReviewDeps {
 export class ChangesetReviewPanel {
   private static current: ChangesetReviewPanel | undefined;
 
-  static async open(deps: ChangesetReviewDeps, changesetId: string): Promise<void> {
+  static async open(deps: ChangesetReviewDeps, changesetId: string, selectItemId?: string): Promise<void> {
     const route = AppSurface.show(`changesetReview:${changesetId}`, 'Verdict: Review changeset', deps.openDashboard);
     const controller = new ChangesetReviewPanel(route, deps, changesetId);
+    controller.pendingSelectId = selectItemId;
     ChangesetReviewPanel.current = controller;
     await controller.load();
+  }
+
+  /** "Verdict: Open review" also means the changeset triage tab when that is the active review. */
+  static revealIfOpen(): boolean {
+    const panel = ChangesetReviewPanel.current;
+    if (!panel || panel.disposed) return false;
+    AppSurface.reveal();
+    return true;
+  }
+
+  static handleCommand(command: string, arg?: unknown): boolean {
+    const panel = ChangesetReviewPanel.current;
+    if (!panel || panel.disposed) return false;
+    const message = flowCommandMessage(command, arg, panel.selectedId);
+    if (!message) return false;
+    void panel.onMessage(message);
+    return true;
   }
 
   static selectItem(itemId: string): void {
@@ -68,6 +88,8 @@ export class ChangesetReviewPanel {
   }
 
   private disposed = false;
+  private pendingSelectId?: string;
+  private focusWatch?: vscode.Disposable;
   private changeset!: DetectedChangeset;
   private members: ChangesetAgentMember[] = [];
   private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
@@ -89,6 +111,7 @@ export class ChangesetReviewPanel {
   private requestChanges = true;
   private submitError?: string;
   private submitState?: ChangesetSubmitState;
+  private stale?: { newHead: string; affected: number; affectedAccepted: number };
   private doneSentence = '';
 
   private constructor(
@@ -99,10 +122,24 @@ export class ChangesetReviewPanel {
     route.onLeave(() => {
       this.disposed = true;
       this.runToken += 1;
+      this.focusWatch?.dispose();
+      this.focusWatch = undefined;
+      this.setReviewFocus(false);
       this.deps.onSidebarState?.();
       if (ChangesetReviewPanel.current === this) ChangesetReviewPanel.current = undefined;
     });
+    // The single-letter triage keys follow the tab's *active* state, never its
+    // existence — same rule as ReviewFlowPanel, or A/R/S would fire in
+    // whatever editor sits beside the review.
+    this.setReviewFocus(route.panel.active !== false);
+    this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
+      this.setReviewFocus(event.webviewPanel.active),
+    );
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
+  }
+
+  private setReviewFocus(active: boolean): void {
+    void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', active && !this.disposed);
   }
 
   private get panel(): vscode.WebviewPanel { return this.route.panel; }
@@ -122,7 +159,8 @@ export class ChangesetReviewPanel {
       const pod = this.pod();
       const connection = await connectionForPod(pod, this.deps.secrets);
       const data = await fetchPodData(connection, pod, Date.now());
-      const changeset = detectChangesets(pod, data.changeRequests, data.workItems).find((candidate) => candidate.id === this.changesetId);
+      const options = changesetDetectionOptions(this.deps.globalState, pod.id);
+      const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');
       this.changeset = changeset;
       const [members, agents] = await Promise.all([
@@ -146,12 +184,46 @@ export class ChangesetReviewPanel {
         this.submitState = draft.submitState;
         this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
         this.screen = 'triage';
+        this.markStaleMembers(draft.review);
       }
+      if (this.pendingSelectId && this.review?.items.some((item) => item.id === this.pendingSelectId)) {
+        this.selectedId = this.pendingSelectId;
+      }
+      this.pendingSelectId = undefined;
       this.render();
     } catch (error) {
       void vscode.window.showErrorMessage(`Verdict: ${error instanceof Error ? error.message : String(error)}`);
       this.deps.openDashboard();
     }
+  }
+
+  /**
+   * A restored draft was read against the heads recorded in its composite
+   * `headSha` — when members moved on since, say so rather than silently
+   * triaging against history. The banner's re-run is the changeset re-anchor.
+   */
+  private markStaleMembers(review: Review): void {
+    const previous = new Map(
+      review.headSha.split('|').flatMap((part) => {
+        const [key, sha] = [part.slice(0, part.lastIndexOf(':')), part.slice(part.lastIndexOf(':') + 1)];
+        return key && sha ? [[key, sha] as const] : [];
+      }),
+    );
+    const moved = new Set(
+      this.members
+        .filter((member) => previous.get(`${member.ref.repoId}!${member.ref.number}`) !== member.diff.headSha)
+        .map((member) => `${member.ref.repoId}!${member.ref.number}`),
+    );
+    if (moved.size === 0) {
+      this.stale = undefined;
+      return;
+    }
+    const affected = review.items.filter((item) => moved.has(`${item.repoId}!${item.crNumber}`));
+    this.stale = {
+      newHead: changesetHeadSha(this.members),
+      affected: affected.length,
+      affectedAccepted: affected.filter((item) => review.verdicts[item.id]?.verdict === 'accepted').length,
+    };
   }
 
   private async persist(): Promise<void> {
@@ -229,6 +301,7 @@ export class ChangesetReviewPanel {
     this.threads = {};
     this.submitState = undefined;
     this.submitError = undefined;
+    this.stale = undefined;
     this.selectedId = this.review.items[0]?.id;
     this.screen = 'triage';
     void this.persist();
@@ -314,6 +387,24 @@ export class ChangesetReviewPanel {
         this.screen = 'agent';
         break;
       }
+      case 'setCrossTarget': {
+        // Re-route a cross finding's comment to another of its sides — only
+        // to a side that resolves to an added line of that member's diff.
+        if (!this.review) return;
+        const item = this.review.items.find((candidate) => candidate.id === message.itemId);
+        const span = item?.spans?.find((candidate) => candidate.repoId === message.repoId && candidate.location === message.location);
+        const member = this.members.find((candidate) => candidate.ref.repoId === message.repoId);
+        const anchor = member && span ? spanAnchor(span.location, member) : undefined;
+        if (!item || !member || !anchor) return;
+        this.review = {
+          ...this.review,
+          items: this.review.items.map((candidate) => candidate.id === item.id
+            ? { ...candidate, repoId: member.ref.repoId, crNumber: member.ref.number, file: anchor.file, line: anchor.line, code: anchor.text }
+            : candidate),
+        };
+        await this.persist();
+        break;
+      }
       case 'reviewSingle': if (message.repoId && message.number) this.deps.openSingle({ repoId: message.repoId, number: message.number }); return;
       case 'backToDashboard': case 'approve': this.deps.openDashboard(); return;
       case 'openMr': {
@@ -340,7 +431,8 @@ export class ChangesetReviewPanel {
     if (!this.review || this.screen !== 'summary' || !allDecided(this.review)) return;
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
-    const footer = `Part of changeset “${this.changeset.name}” (${this.changeset.linkedIssue}) — reviewed together across ${this.members.length} repositories with ${this.agentLabel()}.`;
+    const issueRef = this.changeset.linkedIssue ? ` (${this.changeset.linkedIssue})` : '';
+    const footer = `Part of changeset “${this.changeset.name}”${issueRef} — reviewed together across ${this.members.length} repositories with ${this.agentLabel()}.`;
     const summary = `${composeSummaryBody(this.summaryText, this.finalNote)}\n\n---\n\n${footer}`;
     const plans = buildChangesetSubmitPlans(
       this.review,
@@ -378,7 +470,17 @@ export class ChangesetReviewPanel {
           const threadId = result.state.threadIds[item.id];
           return threadId ? [[item.id, threadId]] : [];
         })),
-        items: memberItems.filter((item) => this.review?.verdicts[item.id]?.verdict === 'accepted').map((item) => ({ id: item.id, title: item.title, severity: item.severity, file: item.file, line: item.line })),
+        items: memberItems.filter((item) => this.review?.verdicts[item.id]?.verdict === 'accepted').map((item) => ({
+          id: item.id,
+          title: item.title,
+          severity: item.severity,
+          file: item.file,
+          line: item.line,
+          // The changeset screen re-reads these after submit clears the draft.
+          cross: item.cross ?? false,
+          spans: item.spans,
+          confidence: item.confidence,
+        })),
         observations: memberItems.flatMap((item) => {
           const verdict = this.review?.verdicts[item.id]?.verdict;
           return verdict
@@ -401,6 +503,30 @@ export class ChangesetReviewPanel {
     return this.agents.find((agent) => agent.id === this.agentId)?.label ?? this.agentId;
   }
 
+  /**
+   * The sides of a cross finding the user may re-target the comment to
+   * (handoff §16: "spans[0] by convention, overridable in the UI"). A side
+   * qualifies only when its location is an added line of that member's diff —
+   * the same ownership rule `validateChangesetResponse` enforces on agents.
+   */
+  private crossTargets(item: Review['items'][number]): TriageItemView['crossTargets'] {
+    if (!item.cross || !item.spans) return undefined;
+    const targets = item.spans.flatMap((span) => {
+      const member = this.members.find((candidate) => candidate.ref.repoId === span.repoId);
+      const anchor = member && spanAnchor(span.location, member);
+      return member && anchor
+        ? [{
+            repoId: member.ref.repoId,
+            number: member.ref.number,
+            location: span.location,
+            active: item.repoId === member.ref.repoId && item.crNumber === member.ref.number
+              && item.file === anchor.file && item.line === anchor.line,
+          }]
+        : [];
+    });
+    return targets.length > 1 ? targets : undefined;
+  }
+
   private render(): void {
     if (this.disposed || !this.changeset) return;
     const pod = this.pod();
@@ -411,6 +537,7 @@ export class ChangesetReviewPanel {
       thread: this.threads[item.id] ?? [],
       projectLabel: pod.repos?.find((repository) => repository.id === item.repoId)?.name ?? item.repoId,
       refLabel: item.crNumber ? `!${item.crNumber}` : undefined,
+      crossTargets: this.crossTargets(item),
     }));
     const selected = items.find((view) => view.item.id === this.selectedId) ?? items[0];
     const selectedMember = this.members.find((member) => member.ref.repoId === selected?.item.repoId && member.ref.number === selected.item.crNumber);
@@ -421,6 +548,8 @@ export class ChangesetReviewPanel {
       : undefined;
     const counts = this.review ? verdictCounts(this.review) : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
     const totalFiles = this.members.reduce((count, member) => count + member.diff.files.length, 0);
+    // "The summed diff stat" (spec §15) — literal sums over the member diffs.
+    const memberStats = diffStats(this.members.flatMap((member) => member.diff.files.map((file) => file.diff)));
     const history = new ReviewHistory(this.deps.globalState).list().filter((record) => record.podId === pod.id);
     const produced = history.reduce((count, record) => count + record.counts.accepted + record.counts.rejected + record.counts.skipped, 0);
     const state: FlowViewState = {
@@ -437,10 +566,10 @@ export class ChangesetReviewPanel {
       header: {
         refLabel: this.members.map((member) => `!${member.ref.number}`).join(' · '),
         projectPath: `${this.members.length} projects`,
-        branch: this.changeset.linkedIssue,
+        branch: this.changeset.linkedIssue ?? this.changeset.detectionDetail,
         fileCount: totalFiles,
-        added: this.response?.stats?.linesAdded ?? 0,
-        removed: this.response?.stats?.linesRemoved ?? 0,
+        added: memberStats.added,
+        removed: memberStats.removed,
         title: this.changeset.name,
       },
       agents: this.agents,
@@ -456,6 +585,7 @@ export class ChangesetReviewPanel {
       selectedId: this.selectedId,
       diffLines,
       counts,
+      stale: this.stale,
       candidates: this.response?.candidates ?? [],
       filesRead: this.response?.stats?.filesRead ?? totalFiles,
       summaryText: this.summaryText,
@@ -471,9 +601,12 @@ export class ChangesetReviewPanel {
     this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${this.members.length} MRs` : `Verdict: Review · ${this.members.length} MRs`;
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), crypto.randomBytes(16).toString('hex'));
     this.deps.onSidebarState?.(this.review ? {
-      headline: this.changeset.name,
+      // Spec §15: the chrome names the changeset — `⧉ <name>` over
+      // "N MRs · N repos" with the summed diff stat.
+      headline: `⧉ ${this.changeset.name}`,
       refLabel: `${this.members.length} MRs`,
-      context: `${this.members.length} MRs · ${state.header.fileCount} files`,
+      changeset: true,
+      context: `${this.members.length} MRs · ${new Set(this.members.map((member) => member.ref.repoId)).size} repos`,
       agent: this.agentLabel(),
       added: state.header.added,
       removed: state.header.removed,
@@ -485,6 +618,7 @@ export class ChangesetReviewPanel {
         severity: item.severity,
         category: item.category,
         confidence: item.confidence,
+        cross: item.cross,
         verdict: this.review?.verdicts[item.id]?.verdict,
         selected: item.id === this.selectedId,
       })),
@@ -494,4 +628,19 @@ export class ChangesetReviewPanel {
 
 function providerCapabilities(providerId: string) {
   return getProvider(providerId).capabilities;
+}
+
+/** `path/to/file.ts:88` → a real added-line anchor in that member's diff, or nothing. */
+function spanAnchor(
+  location: string,
+  member: ChangesetAgentMember,
+): { file: string; line: number; text: string } | undefined {
+  const separator = location.lastIndexOf(':');
+  if (separator <= 0) return undefined;
+  const file = location.slice(0, separator);
+  const line = Number(location.slice(separator + 1));
+  if (!Number.isInteger(line)) return undefined;
+  const diffFile = member.diff.files.find((candidate) => candidate.newPath === file);
+  const added = diffFile ? addedLines(diffFile.diff).find((candidate) => candidate.line === line) : undefined;
+  return added ? { file, line, text: added.text.trim() } : undefined;
 }

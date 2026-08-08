@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ALL_COMMAND_IDS, ALL_INTERNAL_COMMAND_IDS, INTERNAL_COMMANDS } from './commands';
 import { DIGEST_CADENCES, NOTIFICATION_EVENTS, NOTIFICATION_MODES } from './domain/notifications';
+import { DEFAULT_TRAILER } from './app/changesets';
 
 interface PackageJson {
   contributes: {
@@ -122,5 +123,20 @@ describe('notification settings contributions', () => {
     expect(cadence?.enum).toEqual([...DIGEST_CADENCES]);
     expect(cadence?.default).toBe('End of day');
     expect(properties['codeVerdict.notifications.quietMode']?.default).toBe(false);
+  });
+});
+
+// Handoff §16: the trailer convention is a setting, with branch matching as
+// a fallback that can be switched off. The code reads these through
+// `changesetDetectionOptions` — the manifest must agree with its defaults.
+describe('changeset settings contributions', () => {
+  const properties = pkg.contributes.configuration.properties;
+
+  it('contributes the trailer convention with the DEFAULT_TRAILER default', () => {
+    expect(properties['codeVerdict.changesets.trailer']?.default).toBe(DEFAULT_TRAILER);
+  });
+
+  it('contributes the branch-fallback switch, on by default', () => {
+    expect(properties['codeVerdict.changesets.branchDetection']?.default).toBe(true);
   });
 });

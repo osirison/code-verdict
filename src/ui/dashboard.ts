@@ -77,6 +77,9 @@ export class DashboardPanel {
         case 'openChangeset':
           this.deps.openChangeset?.(message.changesetId);
           break;
+        case 'newChangeset':
+          this.deps.createChangeset?.();
+          break;
       }
     });
   }
@@ -113,7 +116,7 @@ export class DashboardPanel {
         meta: `${repoIdsOf(candidate).length} projects`,
       }));
       this.panel.webview.html = renderDashboardHtml(
-        toViewState({ ...data, podOptions }, Date.now(), submitted),
+        toViewState({ ...data, podOptions }, Date.now(), submitted, this.deps.changesetOptions?.()),
         nonce,
       );
     } catch (e) {

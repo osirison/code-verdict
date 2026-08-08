@@ -160,6 +160,78 @@ describe('changeset triage fidelity (spec §15)', () => {
     expect(html).toContain('Submit review across 4 merge requests');
     expect(html).toContain('console · token.ts:63');
     expect(html).toContain('Submit across 4 MRs');
-    expect(html).toContain('summary is posted to every member');
+    // README §15: the ⧉ note above the list states where everything lands.
+    expect(html).toContain('⧉ Posted to all 4 merge requests in this changeset, each comment landing in the repo it belongs to, cross-linked to');
+  });
+});
+describe('changeset scope additions (issue #15)', () => {
+  const changesetState: FlowViewState = {
+    ...state,
+    changeset: {
+      id: 'trailer:1180', name: 'Key rotation, end to end', linkedIssue: '#1180',
+      memberCount: 4, projectCount: 4, refs: ['!812', '!2841', '!381', '!1509'],
+    },
+    mode: 'split',
+    items: [{
+      ...state.items[0]!,
+      projectLabel: 'console',
+      refLabel: '!1509',
+      crossTargets: [
+        { repoId: '9103', number: '381', location: 'src/routes/session.ts:88', active: false },
+        { repoId: '9210', number: '1509', location: 'src/api/session.ts:41', active: true },
+      ],
+      item: {
+        ...state.items[0]!.item,
+        repoId: '9210', crNumber: '1509', cross: true,
+        spans: [
+          { repoId: '9103', location: 'src/routes/session.ts:88', role: 'renames the field' },
+          { repoId: '9210', location: 'src/api/session.ts:41', role: 'still reads the old name' },
+        ],
+      },
+    }],
+  };
+
+  it('marks the posting side and offers only resolvable sides as overrides', () => {
+    const html = renderReviewFlowHtml(changesetState, 'HVE Core / PR Review', 'n');
+
+    expect(html).toContain('comment posts here');
+    expect(html).toContain('data-cross-target=');
+    expect(html).toContain('data-target-repo="9103"');
+    expect(html).toContain('post here instead');
+    expect(html).toContain("type: 'setCrossTarget'");
+  });
+
+  it('prefixes rejected rows with their repo on the changeset summary screen', () => {
+    const html = renderReviewFlowHtml({
+      ...changesetState,
+      screen: 'summary',
+      items: changesetState.items.map((view) => ({ ...view, verdict: 'rejected' as const })),
+      counts: { accepted: 0, rejected: 1, skipped: 0, undecided: 0 },
+    }, 'HVE Core / PR Review', 'n');
+
+    expect(html).toMatch(/rejected-row">console · /);
+  });
+
+  it('falls back to the changeset name in the ⧉ note when there is no linked issue', () => {
+    const html = renderReviewFlowHtml({
+      ...changesetState,
+      changeset: { ...changesetState.changeset!, linkedIssue: undefined },
+      screen: 'summary',
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 1 },
+    }, 'HVE Core / PR Review', 'n');
+
+    expect(html).toContain('cross-linked to Key rotation, end to end.');
+  });
+
+  it('shows the member-of-changeset entry point on a single-CR run screen', () => {
+    const html = renderReviewFlowHtml({
+      ...state,
+      screen: 'agent',
+      memberOfChangeset: { id: 'trailer:1180', name: 'Key rotation, end to end', memberCount: 4 },
+    }, 'HVE Core / PR Review', 'n');
+
+    expect(html).toContain('⧉ Part of Key rotation, end to end · 4 MRs');
+    expect(html).toContain('open the changeset');
+    expect(html).toContain("type: 'openChangeset'");
   });
 });

@@ -5,6 +5,7 @@
 import { deriveStats, repoIdsOf, repoLabel } from '../app/podQuery';
 import type { PodData } from '../app/podQuery';
 import { detectChangesets } from '../app/changesets';
+import type { ChangesetDetectionOptions } from '../app/changesets';
 import { getProvider } from '../platform/registry';
 import type { ActivityEntry, DashboardViewState, RowScope } from './dashboardHtml';
 
@@ -23,6 +24,10 @@ export interface DashboardDeps {
   /** Row click: submitted rows open Posted reviews, others Run review (§2). */
   openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
   openChangeset?: (changesetId: string) => void;
+  /** The band's "+ new" — the manual detection route (handoff §16). */
+  createChangeset?: () => void;
+  /** Trailer/branch settings + manual groups, read at render time. */
+  changesetOptions?: () => ChangesetDetectionOptions;
   /** Notify sibling views after the dashboard changes the active pod. */
   onPodChanged?: () => void;
 }
@@ -41,11 +46,12 @@ export function toViewState(
   data: PodDataWithOptions,
   now: number,
   submittedRefs: ReadonlySet<string>,
+  changesetOptions?: ChangesetDetectionOptions,
 ): DashboardViewState {
   const pod = data.pod;
   const you = pod.username;
   const vocabulary = getProvider(pod.providerId).vocabulary;
-  const changesets = detectChangesets(pod, data.changeRequests, data.workItems);
+  const changesets = detectChangesets(pod, data.changeRequests, data.workItems, changesetOptions);
 
   const counts = new Map<string, number>();
   const scopeCounts = { you: 0, them: 0 };

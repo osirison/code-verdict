@@ -82,6 +82,7 @@ export type DashboardMessage =
   | { type: 'refresh' }
   | { type: 'openCr'; repoId: string; number: string; submitted: boolean }
   | { type: 'openChangeset'; changesetId: string }
+  | { type: 'newChangeset' }
   | { type: 'switchPod' }
   | { type: 'selectPod'; podId: string }
   | { type: 'addProjects' }
@@ -147,6 +148,9 @@ section { padding: 16px 0 6px; }
 .changeset-card:hover { border-color: var(--agent); background: var(--bg3); }
 .changeset-glyph { color: var(--agent); font-size: 16px; }
 .changeset-card .row-title, .changeset-card .row-meta { display: block; }
+.new-changeset { float: right; border: 0; background: none; color: var(--fg-dimmer); font: 10.5px/1 var(--font-mono); cursor: pointer; padding: 0; }
+.new-changeset:hover { color: var(--accent); }
+.changeset-empty { padding: 0 20px 12px; color: var(--fg-dimmer); font-size: 11.5px; }
 
 .thead, .mr-row, .issue-row { display: grid; grid-template-columns: minmax(0,1fr) 108px 104px 84px 58px; gap: 10px; padding: 0 20px; align-items: center; }
 .thead { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .09em; color: var(--fg-dimmer); padding-bottom: 6px; }
@@ -324,7 +328,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
        <div class="stats">${statCards}</div>
        <div class="split">
          <div>
-           ${changesetCards ? `<section><div class="section-label section-pad">Changesets <span class="dimmer">· merge requests that ship together</span></div><div class="changeset-grid">${changesetCards}</div></section>` : ''}
+           <section><div class="section-label section-pad">Changesets <span class="dimmer">· merge requests that ship together</span><button class="new-changeset" id="new-changeset">+ new</button></div>${changesetCards ? `<div class="changeset-grid">${changesetCards}</div>` : '<div class="changeset-empty">Nothing detected — group merge requests with a shared trailer or branch, or pick them by hand.</div>'}</section>
            <section>
              <div class="section-label section-pad">Merge requests</div>
              <div class="chips">${chips}</div>
@@ -427,6 +431,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') open(); });
     }
     document.querySelectorAll('[data-changeset]').forEach((card) => card.addEventListener('click', () => post({ type: 'openChangeset', changesetId: card.dataset.changeset })));
+    document.getElementById('new-changeset')?.addEventListener('click', () => post({ type: 'newChangeset' }));
   `;
 
   return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script });

@@ -25,15 +25,23 @@ export async function createDemoPod(podStore: PodStore): Promise<Pod> {
   // and the resolved ids are stored explicitly, never "all".
   const resolved = await connection.resolveSource(`group ${DEMO_GROUP_ID}`);
   const repositories = resolved.kind === 'group' ? resolved.repositories : [];
+  // The console lives outside the platform group but inside the demo
+  // changeset — an explicit repository source, so the cross-repo review
+  // spans a real group boundary the way the spec's story does.
+  const consoleRepo = await connection.resolveSource('hve/web/console');
+  const extraRepos = consoleRepo.kind === 'repository' ? [consoleRepo.repo] : [];
   const pod: Pod = {
     id: DEMO_POD_ID,
     name: 'Demo pod',
     providerId: 'fixture',
     instanceUrl: DEMO_INSTANCE_URL,
-    sources: [{ kind: 'group', groupId: DEMO_GROUP_ID, repoIds: repositories.map((repo) => repo.id) }],
+    sources: [
+      { kind: 'group', groupId: DEMO_GROUP_ID, repoIds: repositories.map((repo) => repo.id) },
+      ...extraRepos.map((repo) => ({ kind: 'repository', repoId: repo.id } as const)),
+    ],
     criteria: { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories] },
     agentId: '',
-    repos: repositories.map((repo) => ({ id: repo.id, path: repo.path, name: repo.name })),
+    repos: [...repositories, ...extraRepos].map((repo) => ({ id: repo.id, path: repo.path, name: repo.name })),
     username: status.username ?? 'you',
   };
   await podStore.upsert(pod);

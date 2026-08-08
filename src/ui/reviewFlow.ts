@@ -6,7 +6,7 @@
  */
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
+import { COMMANDS } from '../commands';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
@@ -31,11 +31,12 @@ import {
   setVerdict,
   verdictCounts,
 } from '../domain/reviewState';
-import type { Category, Review, Severity, Verdict } from '../domain/types';
+import type { Category, Review, Severity } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
+import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
@@ -70,6 +71,12 @@ export interface ReviewFlowDeps {
   onSidebarPending?: (state?: SidebarPendingReview) => void;
   /** The agent finished a run — the notification engine's local event. */
   onReviewReady?: (info: { ref: ChangeRequestRef; refLabel: string; itemCount: number }) => void;
+  /**
+   * Which detected changeset (if any) this MR belongs to — resolved lazily
+   * after first paint so the entry-point chip never slows a review open.
+   */
+  changesetForCr?: (ref: ChangeRequestRef) => Promise<{ id: string; name: string; memberCount: number } | undefined>;
+  openChangeset?: (changesetId: string) => void;
 }
 
 export class ReviewFlowPanel {
@@ -228,6 +235,7 @@ export class ReviewFlowPanel {
     this.staleHead = undefined;
     this.staleItemIds = new Set();
     this.agentOpen = false;
+    this.memberOfChangeset = undefined;
 
     const connection = await this.connection();
     const crs = await connection.listOpenChangeRequests([ref.repoId]);
@@ -266,6 +274,19 @@ export class ReviewFlowPanel {
     } else {
       this.screen = 'agent';
     }
+    this.render();
+    void this.resolveChangesetMembership(loadToken);
+  }
+
+  private memberOfChangeset?: { id: string; name: string; memberCount: number };
+
+  /** §15 entry point "a member MR" — enhance the header once membership is known. */
+  private async resolveChangesetMembership(loadToken: number): Promise<void> {
+    if (!this.deps.changesetForCr) return;
+    const membership = await this.deps.changesetForCr(this.ref).catch(() => undefined);
+    if (this.disposed || loadToken !== this.loadSeq) return;
+    if (membership?.id === this.memberOfChangeset?.id) return;
+    this.memberOfChangeset = membership;
     this.render();
   }
 
@@ -661,6 +682,12 @@ export class ReviewFlowPanel {
           number: this.ref.number,
         });
         return;
+      case 'openChangeset':
+        this.deps.openChangeset?.(m.changesetId);
+        return;
+      case 'setCrossTarget':
+        // Cross findings exist only in changeset scope — nothing to do here.
+        return;
     }
     this.render();
   }
@@ -768,44 +795,7 @@ export class ReviewFlowPanel {
   // ---- commands from the palette / keybindings -------------------------------------
 
   dispatchCommand(command: string, arg?: unknown): boolean {
-    if (command === INTERNAL_COMMANDS.jumpSeverity) {
-      // `1`–`4` carry their severity as the keybinding's `args`.
-      if (!SEVERITY_ORDER.includes(arg as Severity)) return false;
-      void this.onMessage({ type: 'jumpSeverity', severity: arg as Severity });
-      return true;
-    }
-    const simple: Record<string, FlowMessage | undefined> = {
-      'codeVerdict.acceptItem': this.selectedId
-        ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: true }
-        : undefined,
-      'codeVerdict.acceptItemApplyFix': this.selectedId
-        ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: true }
-        : undefined,
-      // `⇧A` — accept the finding, leave the author's code alone.
-      [INTERNAL_COMMANDS.acceptCommentOnly]: this.selectedId
-        ? { type: 'verdict', itemId: this.selectedId, verdict: 'accepted' as Verdict, applyFix: false }
-        : undefined,
-      [INTERNAL_COMMANDS.undoVerdict]: this.selectedId
-        ? { type: 'undo', itemId: this.selectedId }
-        : undefined,
-      // "Ask agent about this item" from the palette opens the deep dive on
-      // the selected finding; the presets stay idempotent per item.
-      'codeVerdict.askAgent': this.selectedId
-        ? { type: 'ask', itemId: this.selectedId, preset: 'explain' as const }
-        : undefined,
-      'codeVerdict.rejectItem': this.selectedId
-        ? { type: 'verdict', itemId: this.selectedId, verdict: 'rejected' as Verdict, applyFix: false }
-        : undefined,
-      'codeVerdict.skipItem': this.selectedId
-        ? { type: 'verdict', itemId: this.selectedId, verdict: 'skipped' as Verdict, applyFix: false }
-        : undefined,
-      'codeVerdict.nextItem': { type: 'move', delta: 1 },
-      'codeVerdict.prevItem': { type: 'move', delta: -1 },
-      'codeVerdict.generateSummary': { type: 'generateSummary' },
-      'codeVerdict.submitReview': { type: 'submit' },
-      'codeVerdict.runReview': { type: 'run' },
-    };
-    const message = simple[command];
+    const message = flowCommandMessage(command, arg, this.selectedId);
     if (!message) return false;
     void this.onMessage(message);
     return true;
@@ -847,6 +837,7 @@ export class ReviewFlowPanel {
     const state: FlowViewState = {
       screen: this.screen,
       acceptRate,
+      memberOfChangeset: this.memberOfChangeset,
       header: {
         refLabel: this.refLabel(),
         projectPath: pod.repos?.find((r) => r.id === this.ref.repoId)?.path ?? this.ref.repoId,

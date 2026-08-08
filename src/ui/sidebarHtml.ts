@@ -42,6 +42,8 @@ export interface SidebarReviewItem {
   selected: boolean;
   /** New commits moved this finding off the agent's line (spec §5). */
   lineMoved?: boolean;
+  /** The finding only exists between repos — ⧉ in the tree, "Cross-repo" pill (spec §15). */
+  cross?: boolean;
 }
 
 export interface SidebarActiveReview {
@@ -54,6 +56,8 @@ export interface SidebarActiveReview {
   removed: number;
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
   items: SidebarReviewItem[];
+  /** Changeset scope: ⧉ chrome and the Cross-repo filter pill (spec §15). */
+  changeset?: boolean;
 }
 
 /** Spec §1: the sidebar mirrors the wizard's three steps while it runs. */
@@ -102,6 +106,8 @@ export interface SidebarViewState {
   threads?: SidebarThreads;
   activeReview?: SidebarActiveReview;
   pendingReview?: SidebarPendingReview;
+  /** Detected changesets — the nav row shows "N open" and opens the first (spec §15). */
+  changesets?: Array<{ id: string; name: string }>;
   activeRoute?: string;
   codicons?: CodiconAssets;
 }
@@ -110,6 +116,7 @@ export type SidebarMessage =
   | { type: 'refresh' }
   | { type: 'selectPod'; podId: string }
   | { type: 'openDashboard' }
+  | { type: 'openChangesets'; firstId?: string }
   | { type: 'openPostedReviews' }
   | { type: 'openTuning' }
   | { type: 'openSettings' }
@@ -186,6 +193,11 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .finding-dot.blocker { background: var(--sev-blocker); }
 .finding-dot.major { background: var(--sev-major); }
 .finding-dot.minor { background: var(--sev-minor); }
+/* Cross-repo items: ⧉ in the severity's colour, in the dot's grid slot. */
+.finding-cross { color: var(--fg-dimmer); font: 10px/1.4 var(--font-mono); }
+.finding-cross.blocker { color: var(--sev-blocker); }
+.finding-cross.major { color: var(--sev-major); }
+.finding-cross.minor { color: var(--sev-minor); }
 .finding-title { display: block; overflow: hidden; color: var(--fg-hi); font: 500 11.5px/1.3 var(--font-ui); text-overflow: ellipsis; white-space: nowrap; }
 /* Decided items read as done — struck through and dimmed (spec §5). */
 .finding.decided .finding-title { color: var(--fg-dimmer); text-decoration: line-through; }
@@ -247,8 +259,14 @@ function renderReviewTree(items: readonly SidebarReviewItem[]): string {
         .map(
           (item) => `<button class="finding ${item.selected ? 'selected' : ''} ${
             item.verdict === 'accepted' || item.verdict === 'rejected' ? 'decided' : ''
-          }" data-finding="${e(item.id)}" data-file="${e(file)}" data-verdict="${e(item.verdict ?? 'undecided')}" data-category="${e(item.category ?? '')}" title="${e(item.title)}">
-        <span class="finding-dot ${item.severity}"></span>
+          }" data-finding="${e(item.id)}" data-file="${e(file)}" data-verdict="${e(item.verdict ?? 'undecided')}" data-category="${e(item.category ?? '')}" data-cross="${item.cross ? 'true' : ''}" title="${e(item.title)}">
+        ${
+          // Spec §15: cross-repo items swap the dot for ⧉ but keep the
+          // severity colour — the glyph, not a colour change, is the signal.
+          item.cross
+            ? `<span class="finding-cross ${item.severity}">⧉</span>`
+            : `<span class="finding-dot ${item.severity}"></span>`
+        }
         <span><span class="finding-title">${e(item.title)}</span>${
           item.lineMoved ? '<span class="finding-moved">⚠ line moved</span>' : ''
         }</span>
@@ -261,16 +279,26 @@ function renderReviewTree(items: readonly SidebarReviewItem[]): string {
     .join('');
 }
 
-/** "All 8 / Open 5 / Security 3" — every pill carries its own count (spec §5). */
-function renderFilterPills(items: readonly SidebarReviewItem[]): string {
+/**
+ * "All 8 / Open 5 / Security 3" — every pill carries its own count (spec §5).
+ * In changeset scope the third pill becomes "Cross-repo N" instead of
+ * Security (spec §15): the queue's special population is the findings that
+ * only exist between the repos.
+ */
+function renderFilterPills(items: readonly SidebarReviewItem[], changesetScope: boolean): string {
   const e = escapeHtml;
   const open = items.filter((item) => !item.verdict).length;
-  const security = items.filter((item) => item.category === 'security').length;
   const pills: Array<{ key: string; label: string; count: number }> = [
     { key: 'all', label: 'All', count: items.length },
     { key: 'undecided', label: 'Open', count: open },
   ];
-  if (security > 0) pills.push({ key: 'category:security', label: 'Security', count: security });
+  if (changesetScope) {
+    const cross = items.filter((item) => item.cross).length;
+    if (cross > 0) pills.push({ key: 'cross', label: 'Cross-repo', count: cross });
+  } else {
+    const security = items.filter((item) => item.category === 'security').length;
+    if (security > 0) pills.push({ key: 'category:security', label: 'Security', count: security });
+  }
   return pills
     .map(
       (pill, index) => `<button class="review-filter ${index === 0 ? 'active' : ''}" data-review-filter="${e(pill.key)}">${e(pill.label)} ${pill.count}</button>`,
@@ -348,7 +376,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
   const decided = activeReview ? activeReview.items.length - activeReview.counts.undecided : 0;
   const progressWidth = (count: number) => activeReview?.items.length ? (count / activeReview.items.length) * 100 : 0;
   const reviewTree = activeReview ? renderReviewTree(activeReview.items) : '';
-  const filterPills = activeReview ? renderFilterPills(activeReview.items) : '';
+  const filterPills = activeReview ? renderFilterPills(activeReview.items, activeReview.changeset ?? false) : '';
   const reviewSection = activeReview ? `<section>
     <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(activeReview.headline)}</span><span class="review-context-meta">${e(activeReview.context)} · <span class="ok">+${activeReview.added}</span> · <span class="bad">−${activeReview.removed}</span></span></span></div>
     <div class="review-agent"><span>Agent · <span class="agent-fg">${e(activeReview.agent)}</span></span><span>${decided}/${activeReview.items.length}</span></div>
@@ -371,6 +399,9 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
 
   const navRows = [
     { id: 'dashboard', route: 'dashboard', icon: 'dashboard', label: 'Pod dashboard', count: `${state.mergeRequests.length}` },
+    // ⧉ is spec-named changeset content (README §15), not chrome — it stays a
+    // character while the other rows use codicons.
+    { id: 'changesets', route: 'changeset', glyph: '⧉', label: 'Changesets', count: `${(state.changesets ?? []).length} open` },
     { id: 'posted-reviews', route: 'posted', icon: 'comment-discussion', label: 'Posted reviews', count: `${state.waitingOnYou}` },
     { id: 'tuning', route: 'tuning', icon: 'graph', label: 'Agent tuning' },
     { id: 'settings', route: 'settings', icon: 'gear', label: 'Settings' },
@@ -378,7 +409,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     // Spec §1: the later rows are hidden until setup completes — there is
     // nothing behind them yet.
     .filter((row) => screen !== 'setup' || row.id === 'dashboard')
-    .map((row) => `<button class="nav-row ${state.activeRoute === row.route ? 'active' : ''}" id="${row.id}"><span class="nav-glyph">${icon(row.icon)}</span><span class="nav-label">${e(row.label)}</span>${row.count === undefined ? '' : `<span class="nav-count">${e(row.count)}</span>`}</button>`)
+    .map((row) => `<button class="nav-row ${state.activeRoute === row.route ? 'active' : ''}" id="${row.id}"><span class="nav-glyph">${'glyph' in row && row.glyph ? e(row.glyph) : icon(row.icon ?? '')}</span><span class="nav-label">${e(row.label)}</span>${row.count === undefined ? '' : `<span class="nav-count">${e(row.count)}</span>`}</button>`)
     .join('');
 
   const main =
@@ -414,6 +445,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     const post = (message) => vscode.postMessage(message);
     document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
     document.getElementById('dashboard')?.addEventListener('click', () => post({ type: 'openDashboard' }));
+    document.getElementById('changesets')?.addEventListener('click', () => post({ type: 'openChangesets', firstId: ${JSON.stringify(state.changesets?.[0]?.id)} }));
     document.getElementById('posted-reviews')?.addEventListener('click', () => post({ type: 'openPostedReviews' }));
     document.getElementById('tuning')?.addEventListener('click', () => post({ type: 'openTuning' }));
     document.getElementById('settings')?.addEventListener('click', () => post({ type: 'openSettings' }));
@@ -426,6 +458,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     document.querySelectorAll('[data-thread]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectThread', threadId: row.dataset.thread })));
     const matches = (row, filter) => {
       if (filter === 'all') return true;
+      if (filter === 'cross') return row.dataset.cross === 'true';
       if (filter.startsWith('category:')) return row.dataset.category === filter.slice('category:'.length);
       return row.dataset.verdict === filter;
     };

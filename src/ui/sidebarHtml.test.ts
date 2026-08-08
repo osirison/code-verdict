@@ -309,3 +309,61 @@ describe('codicon chrome (issue #6)', () => {
     expect(html).not.toContain('<link rel="stylesheet"');
   });
 });
+describe('changeset scope in the sidebar (spec §15)', () => {
+  const crossItems: NonNullable<SidebarViewState['activeReview']>['items'] = [
+    { id: 'a', title: 'Cross finding', file: 'api-gateway · src/routes/session.ts', severity: 'blocker', category: 'apiContract', cross: true, selected: true },
+    { id: 'b', title: 'Local finding', file: 'console · src/api/session.ts', severity: 'major', category: 'security', selected: false },
+  ];
+  const scoped = renderSidebarHtml({
+    ...state,
+    activeReview: {
+      headline: '⧉ Key rotation, end to end',
+      refLabel: '4 MRs',
+      changeset: true,
+      context: '4 MRs · 4 repos',
+      agent: 'HVE Core / PR Review',
+      added: 812,
+      removed: 247,
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 2 },
+      items: crossItems,
+    },
+  }, 'n');
+
+  it('renders the Changesets nav row with its open count and ⧉ glyph', () => {
+    const html = renderSidebarHtml({ ...state, changesets: [{ id: 'trailer:1180', name: 'Key rotation, end to end' }] }, 'n');
+    expect(html).toContain('id="changesets"');
+    expect(html).toContain('1 open');
+    expect(html).toContain('⧉');
+    expect(html).toContain("type: 'openChangesets', firstId: \"trailer:1180\"");
+  });
+
+  it('replaces the Security pill with Cross-repo in changeset scope', () => {
+    expect(scoped).toContain('data-review-filter="cross"');
+    expect(scoped).toContain('Cross-repo 1');
+    expect(scoped).not.toContain('Security 1');
+  });
+
+  it('keeps the Security pill outside changeset scope', () => {
+    const single = renderSidebarHtml({
+      ...state,
+      activeReview: {
+        headline: 'Refactor token refresh',
+        context: 'core · !2841',
+        agent: 'HVE Core / PR Review',
+        added: 284,
+        removed: 91,
+        counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 2 },
+        items: crossItems.map((item) => ({ ...item, cross: false })),
+      },
+    }, 'n');
+    expect(single).toContain('Security 1');
+    expect(single).not.toContain('data-review-filter="cross"');
+  });
+
+  it('swaps the severity dot for a severity-coloured ⧉ on cross items', () => {
+    expect(scoped).toContain('finding-cross blocker');
+    expect(scoped).toContain('data-cross="true"');
+    // The non-cross item keeps its dot.
+    expect(scoped).toContain('finding-dot major');
+  });
+});
