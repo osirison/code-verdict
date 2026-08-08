@@ -99,14 +99,15 @@ export class VerdictNotifier implements vscode.Disposable {
 
   /** The 🔔 segment was clicked: list, jump on pick, clear on close. */
   async showPending(): Promise<void> {
-    const pending = this.center.pending();
+    const pending = [...this.center.pending()];
     if (pending.length === 0) {
       void vscode.window.showInformationMessage('Verdict: nothing is waiting on you.');
       return;
     }
     await this.pickAndJump(pending, `${pending.length} waiting`);
-    // Viewed is acknowledged — Esc counts; the list was on screen.
-    this.center.acknowledge();
+    // Viewed is acknowledged — Esc counts; the list was on screen. Scoped
+    // to what was shown: an item arriving mid-pick keeps its badge.
+    this.center.acknowledge(pending.length);
   }
 
   dispose(): void {
@@ -185,6 +186,13 @@ export class VerdictNotifier implements vscode.Disposable {
 
   // ---- detection --------------------------------------------------------------------
 
+  /**
+   * The last good thread list per submitted review — a dropped
+   * `listThreads` call must not shrink the snapshot, or the next good poll
+   * would see every thread as new.
+   */
+  private readonly threadCache = new Map<string, ReviewThread[]>();
+
   private async poll(): Promise<void> {
     if (this.polling || this.disposed) return;
     const pod = this.deps.podStore.activePod;
@@ -194,21 +202,32 @@ export class VerdictNotifier implements vscode.Disposable {
     try {
       const connection = await connectionForPod(pod, this.deps.secrets);
       const data = await fetchPodData(connection, pod, Date.now());
-      const submitted = this.deps.reviewHistory.list().filter((review) => review.podId === pod.id);
+      // Reply polling is per submitted review (handoff §16), scoped to CRs
+      // still open — merged and closed ones leave the live set, which also
+      // bounds the fan-out as history accumulates.
+      const openRefs = new Set(data.changeRequests.map((cr) => `${cr.ref.repoId}!${cr.ref.number}`));
+      const submitted = this.deps.reviewHistory
+        .list()
+        .filter((review) => review.podId === pod.id && openRefs.has(`${review.repoId}!${review.crNumber}`));
       const threads: ReviewThread[] = (
         await Promise.all(
-          submitted.map((review) =>
-            connection
-              .listThreads({ repoId: review.repoId, number: review.crNumber })
-              .catch(() => [] as ReviewThread[]),
-          ),
+          submitted.map(async (review) => {
+            const key = `${pod.id}/${review.repoId}!${review.crNumber}`;
+            try {
+              const fetched = await connection.listThreads({ repoId: review.repoId, number: review.crNumber });
+              this.threadCache.set(key, fetched);
+              return fetched;
+            } catch {
+              return this.threadCache.get(key) ?? [];
+            }
+          }),
         )
       ).flat();
       if (this.disposed) return;
       const vocabulary = getProvider(pod.providerId).vocabulary;
       this.center.observe(
         pod.id,
-        { changeRequests: data.changeRequests, ciRuns: data.ciRuns, threads },
+        { fetchedAt: data.fetchedAt, changeRequests: data.changeRequests, ciRuns: data.ciRuns, threads },
         {
           you: pod.username,
           submittedRefs: this.deps.reviewHistory.submittedRefs(),

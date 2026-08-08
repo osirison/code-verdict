@@ -329,12 +329,13 @@ function renderKeysOverlay(): string {
 }
 
 /**
- * Capture-phase on window so an open overlay swallows Esc before any
- * screen-level keydown map, and `?` works on screens that bind no keys.
+ * Capture-phase on window so the open overlay swallows every key before any
+ * screen-level keydown map — a triage verdict must not fire invisibly
+ * behind the scrim — and `?` works on screens that bind no keys.
  * A scrim click closes; clicks on the panel itself do not.
  */
 const KEYS_SCRIPT = `
-(() => {
+;(() => {
   const overlay = document.getElementById('verdict-keys');
   if (!overlay) return;
   const show = () => { overlay.hidden = false; };
@@ -343,8 +344,13 @@ const KEYS_SCRIPT = `
   overlay.addEventListener('click', (ev) => { if (ev.target === overlay) hide(); });
   window.addEventListener('message', (ev) => { if (ev.data && ev.data.type === 'verdict:showKeys') show(); });
   window.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && !overlay.hidden) { ev.preventDefault(); ev.stopPropagation(); hide(); return; }
-    if (ev.key !== '?' || !overlay.hidden || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (!overlay.hidden) {
+      if (ev.key === 'Escape') hide();
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
+    if (ev.key !== '?' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     const t = ev.target;
     if (t instanceof HTMLElement && t.closest('input, textarea, select, [contenteditable]')) return;
     ev.preventDefault();

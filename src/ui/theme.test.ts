@@ -36,6 +36,16 @@ describe('keyboard overlay (spec §12)', () => {
     expect(html).toContain("t.closest('input, textarea, select, [contenteditable]')");
   });
 
+  it('swallows every key while open — triage verdicts must not fire behind the scrim', () => {
+    const html = page();
+    const handler = html.slice(html.indexOf('!overlay.hidden) {'));
+    // The open-overlay branch stops propagation before any screen keydown
+    // map (capture phase), for every key, not just Esc and ?.
+    expect(handler).toContain('ev.preventDefault();');
+    expect(handler).toContain('ev.stopPropagation();');
+    expect(html).toContain('}, true);');
+  });
+
   it('keeps the overlay out of the embedded sidebar', () => {
     const html = page(true);
     expect(html).not.toContain('verdict-keys');

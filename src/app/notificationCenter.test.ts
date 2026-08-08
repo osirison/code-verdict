@@ -27,7 +27,7 @@ const event = (overrides?: Partial<VerdictNotification>): VerdictNotification =>
   ...overrides,
 });
 
-const snapshot = () => ({ changeRequests: [], ciRuns: [], threads: [] });
+const snapshot = (fetchedAt = Date.now()) => ({ fetchedAt, changeRequests: [], ciRuns: [], threads: [] });
 const ctx = { you: 'you', submittedRefs: new Set<string>(), formatRef: (n: string) => `!${n}` };
 
 beforeEach(() => {
@@ -124,11 +124,38 @@ describe('NotificationCenter', () => {
     };
     center.observe('pod-1', withFailure, ctx); // baseline — the failure predates us
     expect(got.interrupts).toHaveLength(0);
-    center.observe('pod-1', { ...snapshot(), ciRuns: [{ id: '90413', repoId: '9101', status: 'failed' as const }] }, ctx);
+    center.observe('pod-1', { ...snapshot(Date.now() + 60_000), ciRuns: [{ id: '90413', repoId: '9101', status: 'failed' as const }] }, ctx);
     expect(got.digests).toHaveLength(0); // digest-mode default: queued, not toasted
     expect(center.pending()).toHaveLength(0);
     vi.advanceTimersByTime(60 * 60 * 1000);
     expect(got.digests).toHaveLength(1);
+  });
+
+  it('re-baselines silently across a long gap — switching back to a pod never bursts the backlog', () => {
+    const { center, got } = makeCenter();
+    center.observe('pod-1', snapshot(), ctx);
+    // Days pass while another pod is active (or the laptop sleeps) …
+    const later = Date.now() + 2 * 24 * 60 * 60 * 1000;
+    center.observe(
+      'pod-1',
+      { ...snapshot(later), ciRuns: [{ id: '90413', repoId: '9101', status: 'failed' as const }] },
+      ctx,
+    );
+    vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+    expect(got.digests).toHaveLength(0);
+    expect(got.interrupts).toHaveLength(0);
+  });
+
+  it('acknowledge(count) keeps items that arrived after the list was shown', () => {
+    const { center, got } = makeCenter();
+    center.notify(event({ key: 'authorPushed' }));
+    center.notify(event({ key: 'mentioned' }));
+    // The user opened the quick pick showing two items; a third landed
+    // while it was open.
+    center.notify(event({ key: 'authorPushed', title: 'Author pushed to !2900' }));
+    center.acknowledge(2);
+    expect(center.pending().map((n) => n.title)).toEqual(['Author pushed to !2900']);
+    expect(got.badges.map((q) => q.length)).toEqual([1, 2, 3, 1]);
   });
 
   it('keeps baselines per pod — a pod switch never floods', () => {

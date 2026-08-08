@@ -35,6 +35,13 @@ export interface NotificationCenterDeps {
   now?(): Date;
 }
 
+/**
+ * A diff across a gap this long is stale news, not a live signal — the
+ * pod was inactive (switched away, laptop asleep) and bursting the whole
+ * backlog as toasts would be a flood. Re-baseline silently instead.
+ */
+const STALE_SNAPSHOT_MS = 10 * 60_000;
+
 export class NotificationCenter {
   private readonly snapshots = new Map<string, NotificationSnapshot>();
   private badgeQueue: PendingNotification[] = [];
@@ -51,12 +58,13 @@ export class NotificationCenter {
   /**
    * One poll result for one pod. The first snapshot per pod is a baseline
    * and emits nothing — otherwise activation (or a pod switch) would toast
-   * the entire backlog at once.
+   * the entire backlog at once. A snapshot far newer than its predecessor
+   * re-baselines the same way: only continuously-observed pods diff.
    */
   observe(podId: string, snapshot: NotificationSnapshot, ctx: DeriveContext): void {
     const prev = this.snapshots.get(podId);
     this.snapshots.set(podId, snapshot);
-    if (!prev) return;
+    if (!prev || snapshot.fetchedAt - prev.fetchedAt > STALE_SNAPSHOT_MS) return;
     for (const event of deriveEvents(prev, snapshot, ctx)) this.notify(event);
   }
 
@@ -90,10 +98,15 @@ export class NotificationCenter {
     return this.badgeQueue;
   }
 
-  /** The user looked at the list — the badge resets. */
-  acknowledge(): void {
-    if (this.badgeQueue.length === 0) return;
-    this.badgeQueue = [];
+  /**
+   * The user looked at the list — drop what they saw. `count` scopes the
+   * clear to the items that were actually on screen, so a notification
+   * arriving while the quick pick was open keeps its badge.
+   */
+  acknowledge(count?: number): void {
+    const seen = Math.min(count ?? this.badgeQueue.length, this.badgeQueue.length);
+    if (seen === 0) return;
+    this.badgeQueue = this.badgeQueue.slice(seen);
     this.deps.sinks.badgeChanged(this.badgeQueue);
   }
 

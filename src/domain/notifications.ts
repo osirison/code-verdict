@@ -124,6 +124,8 @@ export interface VerdictNotification {
 
 /** What one poll of a pod sees — the engine diffs consecutive ones. */
 export interface NotificationSnapshot {
+  /** Epoch ms of the poll — gates notes on threads the diff has never seen. */
+  fetchedAt: number;
   changeRequests: ChangeRequest[];
   ciRuns: CiRun[];
   /** Threads of this pod's submitted reviews — all `listThreads` reaches. */
@@ -141,15 +143,14 @@ export interface DeriveContext {
 
 const refKey = (ref: ChangeRequestRef): string => `${ref.repoId}!${ref.number}`;
 
+/**
+ * A word-bounded, case-insensitive `@you` — `mail@you.com` and `@youssef`
+ * are not mentions of `you`; `@You` is (platforms match handles
+ * case-insensitively).
+ */
 function mentions(body: string, you: string): boolean {
-  const at = `@${you}`;
-  let from = 0;
-  for (let i = body.indexOf(at, from); i !== -1; i = body.indexOf(at, from)) {
-    const after = body[i + at.length];
-    if (after === undefined || !/[\w-]/.test(after)) return true;
-    from = i + 1;
-  }
-  return false;
+  const escaped = you.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\w-])@${escaped}(?=$|[^\\w-])`, 'i').test(body);
 }
 
 const excerpt = (body: string): string =>
@@ -170,7 +171,7 @@ export function deriveEvents(
   return [
     ...deriveChangeRequestEvents(prev.changeRequests, next.changeRequests, ctx),
     ...deriveCiEvents(prev.ciRuns, next.ciRuns),
-    ...deriveThreadEvents(prev.threads, next.threads, ctx),
+    ...deriveThreadEvents(prev.threads, next.threads, ctx, prev.fetchedAt),
   ];
 }
 
@@ -229,6 +230,7 @@ function deriveThreadEvents(
   prev: ReviewThread[],
   next: ReviewThread[],
   ctx: DeriveContext,
+  sinceMs: number,
 ): VerdictNotification[] {
   const events: VerdictNotification[] = [];
   const before = new Map(prev.map((thread) => [thread.id, thread]));
@@ -244,9 +246,15 @@ function deriveThreadEvents(
       });
     }
     if (!ctx.you) continue;
+    // Known threads diff by note id. A thread the diff has never seen gates
+    // by note time instead — its backlog predates us, and treating it as
+    // all-new would flood interrupts (e.g. right after a dropped
+    // `listThreads` poll re-fills the snapshot).
     const seen = new Set(was?.notes.map((note) => note.id));
     const fresh = thread.notes.filter(
-      (note) => !seen.has(note.id) && note.author.username !== ctx.you,
+      (note) =>
+        note.author.username !== ctx.you &&
+        (was ? !seen.has(note.id) : Date.parse(note.createdAt) > sinceMs),
     );
     const yours = thread.notes[0]?.author.username === ctx.you;
     for (const note of fresh) {

@@ -129,6 +129,7 @@ const thread = (overrides?: Partial<ReviewThread>): ReviewThread => ({
 });
 
 const snapshot = (overrides?: Partial<NotificationSnapshot>): NotificationSnapshot => ({
+  fetchedAt: Date.parse('2026-08-07T10:30:00Z'),
   changeRequests: [],
   ciRuns: [],
   threads: [],
@@ -250,6 +251,33 @@ describe('deriveEvents', () => {
       ],
     });
     expect(deriveEvents(before, after, ctx())).toEqual([]);
+  });
+
+  it('gates first-seen threads by note time — a re-filled snapshot cannot flood', () => {
+    // The thread is new to the diff (e.g. the previous listThreads poll
+    // dropped and the snapshot re-filled): only notes newer than the
+    // previous poll may fire, never the backlog.
+    const refilled = thread({
+      notes: [
+        ...thread().notes,
+        { id: 'old', author: { username: 'mira' }, body: 'Old reply.', createdAt: '2026-08-07T09:00:00Z' },
+        { id: 'new', author: { username: 'mira' }, body: 'Fresh reply.', createdAt: '2026-08-07T10:45:00Z' },
+      ],
+    });
+    const events = deriveEvents(snapshot(), snapshot({ threads: [refilled] }), ctx());
+    expect(events).toEqual([
+      expect.objectContaining({ key: 'replyPosted', detail: 'Fresh reply.' }),
+    ]);
+  });
+
+  it('matches mentions case-insensitively, never inside emails', () => {
+    const theirs = thread({ id: 't2', notes: [{ id: 'm1', author: { username: 'mira' }, body: 'Opening.', createdAt: '2026-08-06T10:00:00Z' }] });
+    const note = (body: string) =>
+      thread({ id: 't2', notes: [...theirs.notes, { id: 'm2', author: { username: 'ravi' }, body, createdAt: '2026-08-07T11:00:00Z' }] });
+    const derive = (body: string) =>
+      deriveEvents(snapshot({ threads: [theirs] }), snapshot({ threads: [note(body)] }), ctx());
+    expect(derive('Agree with @You here.').map((e) => e.key)).toEqual(['mentioned']);
+    expect(derive('Send it to mail@you.com please.')).toEqual([]);
   });
 
   it('emits threadStale when the anchor drops, once', () => {
