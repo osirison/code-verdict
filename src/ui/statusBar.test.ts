@@ -38,9 +38,9 @@ vi.mock('vscode', () => ({
   commands: { executeCommand: vi.fn() },
 }));
 
-/** The three segments in the order they were created: verdict, agent, keys. */
-function segments(): [FakeItem, FakeItem, FakeItem] {
-  return items.slice(-3) as unknown as [FakeItem, FakeItem, FakeItem];
+/** The four segments in the order they were created: verdict, agent, keys, bell. */
+function segments(): [FakeItem, FakeItem, FakeItem, FakeItem] {
+  return items.slice(-4) as unknown as [FakeItem, FakeItem, FakeItem, FakeItem];
 }
 
 const review = {
@@ -100,11 +100,31 @@ describe('status bar segments (spec §14)', () => {
   it('keeps the segments in spec order, left to right', async () => {
     const { VerdictStatusBar } = await import('./sidebar.js');
     const bar = new VerdictStatusBar();
-    const [verdict, agent, keys] = segments();
+    const [verdict, agent, keys, bell] = segments();
 
     // Higher priority sorts further left within the same alignment.
     expect(verdict.priority).toBeGreaterThan(agent.priority);
     expect(agent.priority).toBeGreaterThan(keys.priority);
+    expect(keys.priority).toBeGreaterThan(bell.priority);
+    bar.dispose();
+  });
+
+  it('shows the 🔔 count independent of any review, hidden at zero', async () => {
+    const { VerdictStatusBar } = await import('./sidebar.js');
+    const bar = new VerdictStatusBar();
+    const [, , , bell] = segments();
+
+    // Notifications arrive with no review open (a pipeline fails, a reply
+    // lands) — the bell must not depend on setActiveReview.
+    expect(bell.visible).toBe(false);
+    bar.setNotifications(2);
+    expect(bell.text).toBe('$(bell) 2');
+    expect(bell.command).toBe('codeVerdict.internal.showNotifications');
+    expect(bell.visible).toBe(true);
+    bar.setActiveReview(undefined);
+    expect(bell.visible).toBe(true);
+    bar.setNotifications(0);
+    expect(bell.visible).toBe(false);
     bar.dispose();
   });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { renderSettingsHtml, type SettingsViewState } from './settingsHtml';
+import { formatConnectionStatus, renderSettingsHtml, type SettingsViewState } from './settingsHtml';
 
 const state: SettingsViewState = {
   instanceUrl: 'http://127.0.0.1:8971',
@@ -43,5 +43,24 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('let quietMode = false');
     expect(html).toContain('quietMode = !quietMode');
     expect(html).toContain('shareRates = !shareRates');
+  });
+});
+
+describe('formatConnectionStatus', () => {
+  it('composes the spec §11 status line, expiry included', () => {
+    expect(
+      formatConnectionStatus({ username: 'you', scopes: ['api'], tokenExpiresInDays: 42 }),
+    ).toBe('connected as @you · api scope · token expires in 42 days');
+  });
+
+  it('omits the expiry segment when the provider does not report one', () => {
+    expect(formatConnectionStatus({ username: 'you', scopes: ['api'] })).toBe(
+      'connected as @you · api scope',
+    );
+  });
+
+  it('falls back to the pod username, then "you"', () => {
+    expect(formatConnectionStatus({}, 'mira')).toBe('connected as @mira · unknown scope');
+    expect(formatConnectionStatus({})).toBe('connected as @you · unknown scope');
   });
 });

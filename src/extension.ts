@@ -21,6 +21,7 @@ import type { SidebarActiveReview, SidebarPendingReview, SidebarThreads } from '
 import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
+import { VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
@@ -42,9 +43,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       statusBar.setActiveReview(state);
     },
     onSidebarPending: (state?: SidebarPendingReview) => sidebar.setPendingReview(state),
+    onReviewReady: (info: { ref: { repoId: string; number: string }; refLabel: string; itemCount: number }) =>
+      notifier.reviewReady(info),
   };
 
   const statusBar = new VerdictStatusBar();
+
+  const notifier = new VerdictNotifier({
+    podStore,
+    secrets,
+    reviewHistory,
+    onBadgeCount: (count) => statusBar.setNotifications(count),
+    openReview: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
+    openPostedReviews: (ref) => void PostedReviewsPanel.show(postedDeps, ref),
+  });
 
   const useDemoPod = async (): Promise<void> => {
     try {
@@ -115,6 +127,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           void DashboardPanel.refreshIfOpen();
         },
         onSidebarState: (state) => sidebar.setActiveReview(state),
+        onReviewReady: (info) => notifier.reviewReady({ refLabel: info.label, itemCount: info.itemCount }),
       }, id),
       openDashboard: () => void openDashboard(),
     }, changesetId),
@@ -286,14 +299,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   );
 
-  // The rest of the triage keyboard map (handoff §6: ⇧A, U, 1–4, ?). These
+  // The rest of the triage keyboard map (handoff §6: ⇧A, U, 1–4). These
   // are keys, not palette entries, so they stay out of contributes.commands
   // and route to whichever review panel currently holds verdict.reviewFocus.
   for (const id of [
     INTERNAL_COMMANDS.acceptCommentOnly,
     INTERNAL_COMMANDS.undoVerdict,
     INTERNAL_COMMANDS.jumpSeverity,
-    INTERNAL_COMMANDS.keyboardHelp,
   ]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(id, (arg?: unknown) => {
@@ -301,6 +313,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }),
     );
   }
+
+  // `?` / the status bar's "? keys" — the keyboard overlay lives in whatever
+  // screen the app surface shows (spec §12: "triggered by ? anywhere").
+  context.subscriptions.push(
+    vscode.commands.registerCommand(INTERNAL_COMMANDS.keyboardHelp, () => {
+      if (!AppSurface.postToActive({ type: 'verdict:showKeys' })) {
+        void vscode.window.showInformationMessage(
+          'Verdict keys — A accept · ⇧A comment-only · R reject · S skip · J/K move · 1–4 severity · U undo. Open any Verdict screen for the full map.',
+        );
+      }
+    }),
+    vscode.commands.registerCommand(INTERNAL_COMMANDS.showNotifications, () =>
+      void notifier.showPending(),
+    ),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      // A cadence change re-aims the pending digest flush; per-event modes
+      // and quiet hours are read at delivery time and need no push.
+      if (event.affectsConfiguration('codeVerdict.notifications.digestCadence')) {
+        notifier.center.reschedule();
+      }
+    }),
+    notifier,
+  );
+  notifier.start();
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and

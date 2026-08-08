@@ -68,6 +68,8 @@ export interface ReviewFlowDeps {
   onSidebarState?: (state?: SidebarActiveReview) => void;
   /** Spec §3: identity and agent, before any findings exist. */
   onSidebarPending?: (state?: SidebarPendingReview) => void;
+  /** The agent finished a run — the notification engine's local event. */
+  onReviewReady?: (info: { ref: ChangeRequestRef; refLabel: string; itemCount: number }) => void;
 }
 
 export class ReviewFlowPanel {
@@ -399,6 +401,11 @@ export class ReviewFlowPanel {
   private finishRun(response: AgentReviewResponse): void {
     const pod = this.pod();
     this.response = response;
+    this.deps.onReviewReady?.({
+      ref: this.ref,
+      refLabel: this.refLabel(),
+      itemCount: response.items.length,
+    });
     if (response.items.length === 0) {
       // The superseded draft must not resurrect a dead review on next open.
       void this.deps.workspaceState.update(this.draftKey(), undefined);
@@ -654,11 +661,6 @@ export class ReviewFlowPanel {
           number: this.ref.number,
         });
         return;
-      case 'help':
-        void vscode.window.showInformationMessage(
-          'Verdict keys — A accept · ⇧A accept comment-only · R reject · S skip · J/K move · 1–4 jump to severity · U undo · ⌘↩ ask. Full overlay arrives with issue #14.',
-        );
-        return;
     }
     this.render();
   }
@@ -784,7 +786,6 @@ export class ReviewFlowPanel {
       [INTERNAL_COMMANDS.undoVerdict]: this.selectedId
         ? { type: 'undo', itemId: this.selectedId }
         : undefined,
-      [INTERNAL_COMMANDS.keyboardHelp]: { type: 'help' },
       // "Ask agent about this item" from the palette opens the deep dive on
       // the selected finding; the presets stay idempotent per item.
       'codeVerdict.askAgent': this.selectedId
