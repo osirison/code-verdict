@@ -1,4 +1,4 @@
-import type { SubmittedReview } from '../app/reviewHistory';
+import type { SubmittedObservation, SubmittedReview } from '../app/reviewHistory';
 import type { Criteria } from '../domain/criteria';
 import { ALL_CATEGORIES, type Category } from '../domain/types';
 
@@ -17,15 +17,26 @@ export interface TuningRate {
   enabled?: boolean;
 }
 
+interface TuningSuggestionBase {
+  id: string;
+  title: string;
+  body: string;
+  action: string;
+  /** Set by the panel, never by derivation — an applied card stays visible with a disabled "✓ applied" button. */
+  applied?: boolean;
+}
+
 export type TuningSuggestion =
-  | { id: string; kind: 'category'; category: Category; title: string; body: string; action: string }
-  | { id: string; kind: 'confidence'; value: number; title: string; body: string; action: string }
-  | { id: string; kind: 'severity'; title: string; body: string; action: string };
+  | (TuningSuggestionBase & { kind: 'category'; category: Category })
+  | (TuningSuggestionBase & { kind: 'confidence'; value: number })
+  | (TuningSuggestionBase & { kind: 'severity' });
 
 export interface TuningViewState {
   agentLabel: string;
   headline: string;
   subline: string;
+  /** Nothing submitted in the window — render the explicit empty scorecard instead of 0-of-0 charts. */
+  empty: boolean;
   categories: TuningRate[];
   confidence: TuningRate[];
   suggestions: TuningSuggestion[];
@@ -33,6 +44,61 @@ export interface TuningViewState {
 
 function rate(accepted: number, produced: number): number {
   return produced === 0 ? 0 : Math.round((accepted / produced) * 100);
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+function acceptedCount(observations: readonly SubmittedObservation[]): number {
+  return observations.filter((observation) => observation.verdict === 'accepted').length;
+}
+
+function deriveSuggestions(
+  observations: readonly SubmittedObservation[],
+  categories: readonly TuningRate[],
+  criteria: Criteria,
+): TuningSuggestion[] {
+  // Every suggestion quotes the history it derives from — with no observations
+  // there is no evidence to change anything, however the criteria are set.
+  if (observations.length === 0) return [];
+  const suggestions: TuningSuggestion[] = categories
+    .filter((category) => category.enabled && category.produced > 0 && category.rate < 25)
+    .map((category) => ({
+      id: `category:${category.key}`,
+      kind: 'category' as const,
+      category: category.key as Category,
+      title: `Turn off ${category.label}`,
+      body: `${category.label} produced ${plural(category.produced, 'finding')} and you accepted ${category.accepted}. That is ${plural(category.produced - category.accepted, 'item')} of triage for ${category.accepted} useful one${category.accepted === 1 ? '' : 's'}.`,
+      action: `Turn off ${category.label}`,
+    }));
+  if (criteria.minConfidence < 80) {
+    const below = observations.filter((observation) => observation.confidence < 80);
+    const above = observations.filter((observation) => observation.confidence >= 80);
+    const parts = [
+      below.length > 0 ? `Below 80% confidence you accepted ${acceptedCount(below)} of ${below.length}.` : '',
+      above.length > 0 ? `At 80% or above you accepted ${acceptedCount(above)} of ${above.length}.` : '',
+      `The floor is currently ${criteria.minConfidence}%.`,
+    ];
+    suggestions.push({
+      id: 'confidence:80', kind: 'confidence', value: 80,
+      title: 'Raise minimum confidence to 80%',
+      body: parts.filter(Boolean).join(' '),
+      action: 'Set 80% floor',
+    });
+  }
+  if (criteria.severityFloor === 'nit') {
+    const nits = observations.filter((observation) => observation.severity === 'nit');
+    suggestions.push({
+      id: 'severity:minor', kind: 'severity',
+      title: 'Stop reporting nits',
+      body: nits.length > 0
+        ? `You accepted ${acceptedCount(nits)} of ${plural(nits.length, 'nit')} — ${rate(nits.length, observations.length)}% of your triage. Start at minor severity.`
+        : 'Nits add review volume without changing merge decisions. Start at minor severity.',
+      action: 'Raise floor to minor',
+    });
+  }
+  return suggestions;
 }
 
 export function deriveTuningState(
@@ -45,7 +111,7 @@ export function deriveTuningState(
   const totalAccepted = history.reduce((sum, review) => sum + review.counts.accepted, 0);
   const categories = ALL_CATEGORIES.map((category) => {
     const matching = observations.filter((observation) => observation.category === category);
-    const accepted = matching.filter((observation) => observation.verdict === 'accepted').length;
+    const accepted = acceptedCount(matching);
     return {
       key: category,
       label: LABELS[category],
@@ -63,37 +129,19 @@ export function deriveTuningState(
   ];
   const confidence = bands.map((band) => {
     const matching = observations.filter((observation) => observation.confidence >= band.min && observation.confidence <= band.max);
-    const accepted = matching.filter((observation) => observation.verdict === 'accepted').length;
+    const accepted = acceptedCount(matching);
     return { key: band.key, label: band.label, accepted, produced: matching.length, rate: rate(accepted, matching.length) };
   });
-  const suggestions: TuningSuggestion[] = categories
-    .filter((category) => category.enabled && category.produced > 0 && category.rate < 25)
-    .map((category) => ({
-      id: `category:${category.key}`,
-      kind: 'category' as const,
-      category: category.key as Category,
-      title: `Turn off ${category.label}`,
-      body: `${category.label} produced ${category.produced} findings and you accepted ${category.accepted}. That is ${category.produced - category.accepted} items of triage for ${category.accepted} useful ones.`,
-      action: 'Turn off',
-    }));
-  if (criteria.minConfidence < 80) {
-    suggestions.push({
-      id: 'confidence:80', kind: 'confidence', value: 80, title: 'Raise confidence to 80%',
-      body: 'Lower-confidence findings create more triage than accepted feedback. Start the next run at 80%.', action: 'Raise floor',
-    });
-  }
-  if (criteria.severityFloor === 'nit') {
-    suggestions.push({
-      id: 'severity:minor', kind: 'severity', title: 'Stop reporting nits',
-      body: 'Nits add review volume without changing merge decisions. Start at minor severity.', action: 'Use minor',
-    });
-  }
+  const empty = history.length === 0;
   return {
     agentLabel,
-    headline: `${rate(totalAccepted, totalProduced)}% accepted`,
-    subline: `${totalAccepted} of ${totalProduced} findings across ${history.length} reviews in this pod · last 30 days`,
+    headline: empty ? 'No reviews yet' : `${rate(totalAccepted, totalProduced)}% accepted`,
+    subline: empty
+      ? 'Nothing has been submitted from this pod in the last 30 days.'
+      : `${totalAccepted} of ${plural(totalProduced, 'finding')} across ${plural(history.length, 'review')} in this pod · last 30 days`,
+    empty,
     categories,
     confidence,
-    suggestions,
+    suggestions: deriveSuggestions(observations, categories, criteria),
   };
 }

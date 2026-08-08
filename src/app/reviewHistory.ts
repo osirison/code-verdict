@@ -19,6 +19,8 @@ export interface SubmittedObservation {
   category: Category;
   confidence: number;
   verdict: Verdict;
+  /** Absent on records written before the tuning scorecard quoted nit rates. */
+  severity?: Severity;
 }
 
 export interface SubmittedReview {
