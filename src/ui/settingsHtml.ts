@@ -35,12 +35,12 @@ export function formatConnectionStatus(status: {
   scopes?: string[];
   tokenExpiresInDays?: number;
 }, fallbackUsername?: string): string {
+  const scopes = status.scopes ?? ['unknown'];
+  const days = status.tokenExpiresInDays;
   return [
     `connected as @${status.username ?? fallbackUsername ?? 'you'}`,
-    `${(status.scopes ?? ['unknown']).join(', ')} scope`,
-    ...(status.tokenExpiresInDays !== undefined
-      ? [`token expires in ${status.tokenExpiresInDays} days`]
-      : []),
+    `${scopes.join(', ')} scope${scopes.length === 1 ? '' : 's'}`,
+    ...(days !== undefined ? [`token expires in ${days} day${days === 1 ? '' : 's'}`] : []),
   ].join(' · ');
 }
 

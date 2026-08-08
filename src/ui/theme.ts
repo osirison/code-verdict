@@ -320,8 +320,8 @@ function renderKeysOverlay(): string {
       )
       .join('')}</section>`,
   ).join('');
-  return `<div class="keys-overlay" id="verdict-keys" hidden role="dialog" aria-label="Keyboard shortcuts">
-    <div class="keys-panel">
+  return `<div class="keys-overlay" id="verdict-keys" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="keys-panel" id="verdict-keys-panel" tabindex="-1">
       <header class="keys-head"><span class="keys-title">Keyboard</span><span class="keys-note">shortcuts apply when the review tab has focus</span><span class="kbd">Esc</span></header>
       <div class="keys-grid">${groups}</div>
     </div>
@@ -338,7 +338,7 @@ const KEYS_SCRIPT = `
 ;(() => {
   const overlay = document.getElementById('verdict-keys');
   if (!overlay) return;
-  const show = () => { overlay.hidden = false; };
+  const show = () => { overlay.hidden = false; document.getElementById('verdict-keys-panel')?.focus(); };
   const hide = () => { overlay.hidden = true; };
   window.verdictKeysShow = show;
   overlay.addEventListener('click', (ev) => { if (ev.target === overlay) hide(); });

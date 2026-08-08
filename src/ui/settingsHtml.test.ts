@@ -63,4 +63,10 @@ describe('formatConnectionStatus', () => {
     expect(formatConnectionStatus({}, 'mira')).toBe('connected as @mira · unknown scope');
     expect(formatConnectionStatus({})).toBe('connected as @you · unknown scope');
   });
+
+  it('pluralizes scopes and days', () => {
+    expect(
+      formatConnectionStatus({ username: 'you', scopes: ['api', 'read_user'], tokenExpiresInDays: 1 }),
+    ).toBe('connected as @you · api, read_user scopes · token expires in 1 day');
+  });
 });

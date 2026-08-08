@@ -10,6 +10,9 @@ describe('keyboard overlay (spec §12)', () => {
     expect(html).toContain('id="verdict-keys"');
     expect(html).toContain('hidden');
     expect(html).toContain('role="dialog"');
+    // A modal dialog for assistive tech, with a focusable panel.
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toContain('tabindex="-1"');
   });
 
   it('renders the four groups and their headline shortcuts', () => {
