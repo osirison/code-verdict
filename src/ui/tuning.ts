@@ -98,10 +98,11 @@ export class TuningPanel {
   }
 
   private async onMessage(message: TuningMessage): Promise<void> {
-    if (this.applied.has(message.suggestionId)) return;
     // Capture before state() — it re-targets this.podId when the active pod
     // changed under an open panel. Suggestion ids are pod-independent, so a
     // click rendered against pod A must never tune pod B: repaint instead.
+    // The applied check comes after: state() clears the map on re-target, and
+    // checking a pre-switch map could swallow a click meant for the new pod.
     const renderedPodId = this.podId;
     const state = this.state();
     if (!state) return;
@@ -109,6 +110,7 @@ export class TuningPanel {
       this.render();
       return;
     }
+    if (this.applied.has(message.suggestionId)) return;
     const suggestion = state.view.suggestions.find((candidate) => candidate.id === message.suggestionId);
     if (!suggestion) {
       this.render();
