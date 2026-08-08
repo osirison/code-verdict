@@ -1,6 +1,12 @@
+import {
+  DIGEST_CADENCES,
+  NOTIFICATION_MODES,
+  type DigestCadence,
+  type NotificationMode,
+} from '../domain/notifications';
 import { escapeHtml, renderPage } from './theme';
 
-export type NotificationMode = 'Interrupt' | 'Badge' | 'Digest' | 'Off';
+export type { DigestCadence, NotificationMode };
 
 export interface NotificationSettingView {
   key: string;
@@ -15,21 +21,36 @@ export interface SettingsViewState {
   connected: boolean;
   hasToken: boolean;
   quietMode: boolean;
-  digestCadence: 'Hourly' | 'Twice a day' | 'End of day';
+  digestCadence: DigestCadence;
   shareRates: boolean;
   notifications: NotificationSettingView[];
+}
+
+/**
+ * Spec §11's status line: "connected as @you · api scope · token expires in
+ * 42 days" — the expiry segment only when the provider reports one.
+ */
+export function formatConnectionStatus(status: {
+  username?: string;
+  scopes?: string[];
+  tokenExpiresInDays?: number;
+}, fallbackUsername?: string): string {
+  const scopes = status.scopes ?? ['unknown'];
+  const days = status.tokenExpiresInDays;
+  return [
+    `connected as @${status.username ?? fallbackUsername ?? 'you'}`,
+    `${scopes.join(', ')} scope${scopes.length === 1 ? '' : 's'}`,
+    ...(days !== undefined ? [`token expires in ${days} day${days === 1 ? '' : 's'}`] : []),
+  ].join(' · ');
 }
 
 export type SettingsMessage =
   | { type: 'rotateToken' }
   | { type: 'setNotification'; key: string; mode: NotificationMode }
   | { type: 'setQuietMode'; value: boolean }
-  | { type: 'setDigestCadence'; value: SettingsViewState['digestCadence'] }
+  | { type: 'setDigestCadence'; value: DigestCadence }
   | { type: 'setShareRates'; value: boolean }
   | { type: 'openSettingsJson' };
-
-const MODES: readonly NotificationMode[] = ['Interrupt', 'Badge', 'Digest', 'Off'];
-const CADENCES: readonly SettingsViewState['digestCadence'][] = ['Hourly', 'Twice a day', 'End of day'];
 
 const CSS = `
 .wrap { max-width: 820px; padding: 26px 30px; display: flex; flex-direction: column; gap: 26px; }
@@ -67,7 +88,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
   const e = escapeHtml;
   const notifications = state.notifications.map((setting) => `<div class="notification">
     <div class="notification-copy"><span class="notification-name">${e(setting.label)}</span><span class="hint">${e(setting.hint)}</span></div>
-    <div class="segments">${MODES.map((mode) => `<button class="${setting.mode === mode ? `active ${mode === 'Off' ? 'off' : ''}` : ''}" data-notification="${e(setting.key)}" data-mode="${mode}">${mode}</button>`).join('')}</div>
+    <div class="segments">${NOTIFICATION_MODES.map((mode) => `<button class="${setting.mode === mode ? `active ${mode === 'Off' ? 'off' : ''}` : ''}" data-notification="${e(setting.key)}" data-mode="${mode}">${mode}</button>`).join('')}</div>
   </div>`).join('');
   const preview = JSON.stringify({
     'codeVerdict.notifications': Object.fromEntries(state.notifications.map((setting) => [setting.key, setting.mode])),
@@ -85,7 +106,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     <section class="section"><div class="label">Notifications</div>${notifications}
       <button class="toggle" id="quiet"><span class="box">${state.quietMode ? '☑' : '☐'}</span><span>Quiet hours</span></button>
       <span class="subnote">${state.quietMode ? 'Only blockers and direct mentions interrupt you.' : 'All events use their selected delivery mode.'}</span>
-      <div class="cadence"><span class="cadence-label">Digest arrives</span>${CADENCES.map((cadence) => `<button class="chip compact ${state.digestCadence === cadence ? 'active' : ''}" data-cadence="${cadence}">${cadence}</button>`).join('')}</div>
+      <div class="cadence"><span class="cadence-label">Digest arrives</span>${DIGEST_CADENCES.map((cadence) => `<button class="chip compact ${state.digestCadence === cadence ? 'active' : ''}" data-cadence="${cadence}">${cadence}</button>`).join('')}</div>
     </section>
     <section class="section"><div class="label">Data &amp; privacy</div>
       <p class="note">Diff hunks, file paths and your criteria go to the Copilot agent you selected. Nothing reaches GitLab until you press Submit — rejected findings and their rationale never leave this machine.</p>

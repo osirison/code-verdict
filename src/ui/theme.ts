@@ -244,6 +244,122 @@ a { color: var(--link); text-decoration: none; }
 }
 `;
 
+/**
+ * The `?` keyboard overlay (spec §12): scrim over the whole window, a 720px
+ * panel, four groups in a 2-column grid. Shared by every full-page screen via
+ * renderPage — `?` opens it anywhere, Esc or a scrim click dismisses it, and
+ * the status bar's "? keys" segment reaches it with a `verdict:showKeys`
+ * message. Key caps stay the spec's glyphs (⌘, ⇧, ↩) verbatim — the
+ * prototype is canonical.
+ */
+const KEYS_CSS = `
+.keys-overlay { position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-start; justify-content: center; padding: 36px; background: rgba(0,0,0,.58); }
+.keys-overlay[hidden] { display: none; }
+.keys-panel { width: 720px; max-width: 100%; max-height: 100%; overflow-y: auto; background: var(--bg3); border: 1px solid var(--line2); border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,.6); animation: tin .18s ease-out; }
+.keys-head { display: flex; align-items: baseline; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line2); }
+.keys-title { color: var(--fg-max); font-size: 13px; font-weight: 600; }
+.keys-note { flex: 1; color: var(--fg-dim); font-size: 11.5px; }
+.keys-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 28px; padding: 16px 18px 20px; }
+.keys-group { display: flex; flex-direction: column; gap: 7px; }
+.keys-row { display: flex; align-items: center; gap: 10px; }
+.keys-cap { flex: none; min-width: 74px; text-align: center; font: 500 11px/1 var(--font-mono); background: var(--bg2); border: 1px solid var(--line2); border-radius: 4px; padding: 5px 8px; color: var(--fg2); }
+.keys-label { font-size: 12px; color: var(--fg); }
+.keys-hint { font-size: 10.5px; color: var(--fg-dimmer); }
+`;
+
+const KEYS_GROUPS: ReadonlyArray<{
+  group: string;
+  rows: ReadonlyArray<{ cap: string; label: string; hint?: string }>;
+}> = [
+  {
+    group: 'Triage',
+    rows: [
+      { cap: 'A', label: 'Accept', hint: 'applies the suggested fix when there is one' },
+      { cap: '⇧A', label: 'Accept comment-only' },
+      { cap: 'R', label: 'Reject' },
+      { cap: 'S', label: 'Skip' },
+      { cap: 'J / K', label: 'Next / previous' },
+      { cap: '1–4', label: 'Jump to severity' },
+      { cap: 'U', label: 'Undo' },
+    ],
+  },
+  {
+    group: 'Agent',
+    rows: [
+      { cap: '⌘↩', label: 'Ask' },
+      { cap: 'E', label: 'Explain' },
+      { cap: 'F', label: 'Show fix' },
+      { cap: '⇧F', label: 'Find similar' },
+    ],
+  },
+  {
+    group: 'Navigation',
+    rows: [
+      { cap: '⌘1 ⌘2 ⌘3', label: 'Mode' },
+      { cap: 'O', label: 'Open in editor' },
+      { cap: 'G then D', label: 'Dashboard' },
+      { cap: 'G then P', label: 'Posted reviews' },
+      { cap: '⌘↵', label: 'Generate summary' },
+    ],
+  },
+  {
+    group: 'Everywhere',
+    rows: [
+      { cap: '?', label: 'Help' },
+      { cap: '⌘⇧P', label: 'Palette' },
+      { cap: 'Esc', label: 'Close' },
+    ],
+  },
+];
+
+function renderKeysOverlay(): string {
+  const groups = KEYS_GROUPS.map(
+    ({ group, rows }) => `<section class="keys-group"><div class="section-label">${escapeHtml(group)}</div>${rows
+      .map(
+        (row) => `<div class="keys-row"><span class="keys-cap">${escapeHtml(row.cap)}</span><span class="keys-label">${escapeHtml(row.label)}</span>${row.hint ? `<span class="keys-hint">${escapeHtml(row.hint)}</span>` : ''}</div>`,
+      )
+      .join('')}</section>`,
+  ).join('');
+  return `<div class="keys-overlay" id="verdict-keys" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="keys-panel" id="verdict-keys-panel" tabindex="-1">
+      <header class="keys-head"><span class="keys-title">Keyboard</span><span class="keys-note">shortcuts apply when the review tab has focus</span><span class="kbd">Esc</span></header>
+      <div class="keys-grid">${groups}</div>
+    </div>
+  </div>`;
+}
+
+/**
+ * Capture-phase on window so the open overlay swallows every key before any
+ * screen-level keydown map — a triage verdict must not fire invisibly
+ * behind the scrim — and `?` works on screens that bind no keys.
+ * A scrim click closes; clicks on the panel itself do not.
+ */
+const KEYS_SCRIPT = `
+;(() => {
+  const overlay = document.getElementById('verdict-keys');
+  if (!overlay) return;
+  const show = () => { overlay.hidden = false; document.getElementById('verdict-keys-panel')?.focus(); };
+  const hide = () => { overlay.hidden = true; };
+  window.verdictKeysShow = show;
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) hide(); });
+  window.addEventListener('message', (ev) => { if (ev.data && ev.data.type === 'verdict:showKeys') show(); });
+  window.addEventListener('keydown', (ev) => {
+    if (!overlay.hidden) {
+      if (ev.key === 'Escape') hide();
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
+    if (ev.key !== '?' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const t = ev.target;
+    if (t instanceof HTMLElement && t.closest('input, textarea, select, [contenteditable]')) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    show();
+  }, true);
+})();
+`;
+
 export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -277,10 +393,13 @@ export function renderPage(opts: {
   const breadcrumb = opts.breadcrumb
     ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
     : '';
-  const body = opts.embedded ? opts.body : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>`;
+  const body = opts.embedded
+    ? opts.body
+    : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>${renderKeysOverlay()}`;
+  const keysScript = opts.embedded ? '' : KEYS_SCRIPT;
   const bootstrap = opts.script || opts.breadcrumb
-    ? `window.verdictVscode=acquireVsCodeApi();document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));${opts.script ?? ''}`
-    : '';
+    ? `window.verdictVscode=acquireVsCodeApi();document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));${opts.script ?? ''}${keysScript}`
+    : keysScript;
   const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';
   const codicons = opts.codicons;
   const styleSrc = codicons ? `'nonce-${opts.nonce}' ${codicons.cspSource}` : `'nonce-${opts.nonce}'`;
@@ -293,7 +412,7 @@ export function renderPage(opts: {
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${styleSrc}; script-src 'nonce-${opts.nonce}';${fontSrc}">${codiconLink}
-<style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.css}</style>
+<style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.embedded ? '' : KEYS_CSS}${opts.css}</style>
 <title>${escapeHtml(opts.title)}</title>
 </head>
 <body>

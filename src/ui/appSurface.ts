@@ -35,6 +35,19 @@ export class AppSurface {
     return true;
   }
 
+  /**
+   * Reveal the surface and post into whatever screen is active (the `? keys`
+   * status-bar segment reaches the keyboard overlay this way). Reveal first —
+   * posting into a hidden panel would open nothing the user can see.
+   */
+  static postToActive(message: unknown): boolean {
+    const surface = AppSurface.current;
+    if (!surface) return false;
+    surface.panel.reveal();
+    void surface.panel.webview.postMessage(message);
+    return true;
+  }
+
   static onDidChangeRoute(listener: (route?: string) => void): vscode.Disposable {
     AppSurface.routeListeners.add(listener);
     return { dispose: () => AppSurface.routeListeners.delete(listener) };

@@ -43,8 +43,10 @@ export const INTERNAL_COMMANDS = {
   undoVerdict: 'codeVerdict.internal.undoVerdict',
   /** `1`–`4` — jump to the first undecided item of a severity. */
   jumpSeverity: 'codeVerdict.internal.jumpSeverity',
-  /** `?` — the keyboard map (the full overlay is issue #14). */
+  /** `?` — the keyboard overlay, from the status bar or the keybinding. */
   keyboardHelp: 'codeVerdict.internal.keyboardHelp',
+  /** The status bar's `🔔 n` segment — list what is waiting, then clear it. */
+  showNotifications: 'codeVerdict.internal.showNotifications',
 } as const;
 
 export type InternalCommandId = (typeof INTERNAL_COMMANDS)[keyof typeof INTERNAL_COMMANDS];

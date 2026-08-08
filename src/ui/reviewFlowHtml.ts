@@ -117,8 +117,7 @@ export type FlowMessage =
   | { type: 'openMr' }
   | { type: 'trackReplies' }
   | { type: 'openTuning' }
-  | { type: 'reviewSingle'; repoId: string; number: string }
-  | { type: 'help' };
+  | { type: 'reviewSingle'; repoId: string; number: string };
 
 export const SEVERITIES: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
 
@@ -834,7 +833,7 @@ document.getElementById('review-single')?.addEventListener('click', (ev) => { ev
 document.addEventListener('keydown', (ev) => {
   if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // never hijack Cmd/Ctrl chords
-  const map = { a: () => verdict('accepted', !ev.shiftKey ? true : false), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); }, '?': () => post({ type: 'help' }) };
+  const map = { a: () => verdict('accepted', !ev.shiftKey ? true : false), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); } };
   const jump = { '1': 'blocker', '2': 'major', '3': 'minor', '4': 'nit' };
   const key = ev.key.toLowerCase();
   if (map[key]) { ev.preventDefault(); map[key](); }

@@ -4,10 +4,10 @@ import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { tokenSecretKey, type SecretStore } from '../app/storage';
 import { COMMANDS } from '../commands';
+import { NOTIFICATION_EVENTS, type NotificationMode } from '../domain/notifications';
 import {
+  formatConnectionStatus,
   renderSettingsHtml,
-  type NotificationMode,
-  type NotificationSettingView,
   type SettingsMessage,
   type SettingsViewState,
 } from './settingsHtml';
@@ -17,16 +17,6 @@ export interface SettingsPanelDeps {
   podStore: PodStore;
   secrets: SecretStore;
 }
-
-const EVENTS: ReadonlyArray<Omit<NotificationSettingView, 'mode'>> = [
-  { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.' },
-  { key: 'replyPosted', label: 'Reply on a comment you posted', hint: 'An author replied to your review.' },
-  { key: 'authorPushed', label: 'Author pushed a fix', hint: 'The merge request changed after review.' },
-  { key: 'pipelineFailed', label: 'Pipeline failed', hint: 'A watched pipeline needs attention.' },
-  { key: 'reviewRequested', label: 'Review requested from you', hint: 'A merge request is waiting on you.' },
-  { key: 'mentioned', label: 'You were mentioned', hint: 'A discussion mentioned your username.' },
-  { key: 'threadStale', label: 'A posted thread went stale', hint: 'New commits moved a reviewed line.' },
-];
 
 export class SettingsPanel {
   private static current: SettingsPanel | undefined;
@@ -68,16 +58,12 @@ export class SettingsPanel {
       const status = await (await connectionForPod(pod, this.deps.secrets)).testConnection();
       connected = status.ok;
       connectionStatus = status.ok
-        ? `connected as @${status.username ?? pod.username ?? 'you'} · ${(status.scopes ?? ['unknown scope']).join(', ')}`
+        ? formatConnectionStatus(status, pod.username)
         : status.error?.message ?? 'connection failed';
     } catch (error) {
       connectionStatus = error instanceof Error ? error.message : String(error);
     }
     if (this.disposed) return;
-    const defaults: Record<string, NotificationMode> = {
-      agentFinished: 'Interrupt', replyPosted: 'Interrupt', authorPushed: 'Badge',
-      pipelineFailed: 'Digest', reviewRequested: 'Interrupt', mentioned: 'Badge', threadStale: 'Digest',
-    };
     const state: SettingsViewState = {
       instanceUrl: pod.instanceUrl,
       connectionStatus,
@@ -86,9 +72,11 @@ export class SettingsPanel {
       quietMode: config.get<boolean>('notifications.quietMode', false),
       digestCadence: config.get<SettingsViewState['digestCadence']>('notifications.digestCadence', 'End of day'),
       shareRates: config.get<boolean>('shareAcceptRejectRates', false),
-      notifications: EVENTS.map((event) => ({
-        ...event,
-        mode: config.get<NotificationMode>(`notifications.events.${event.key}`, defaults[event.key] ?? 'Off'),
+      notifications: NOTIFICATION_EVENTS.map((event) => ({
+        key: event.key,
+        label: event.label,
+        hint: event.hint,
+        mode: config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
       })),
     };
     this.panel.webview.html = renderSettingsHtml(state, crypto.randomBytes(16).toString('hex'));

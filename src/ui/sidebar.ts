@@ -211,25 +211,43 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
  * window — its `⎇ branch` and `✕ 1 ⚠ 0` segments are the editor's own git and
  * problems indicators, and duplicating them would put two branch names on one
  * bar. Verdict therefore contributes the three segments that are actually its
- * own: the review state, the agent doing the reviewing, and the keys hint.
- * The `🔔` notifications segment belongs to issue #14.
+ * own: the review state, the agent doing the reviewing, the keys hint, and
+ * the `🔔` notifications count.
  */
 export class VerdictStatusBar {
   private readonly verdict: vscode.StatusBarItem;
   private readonly agent: vscode.StatusBarItem;
   private readonly keys: vscode.StatusBarItem;
+  private readonly bell: vscode.StatusBarItem;
 
   constructor() {
-    // Descending priority keeps the three in spec order, left to right.
+    // Descending priority keeps the segments in spec order, left to right.
     this.verdict = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
     this.agent = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
     this.keys = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
+    this.bell = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 87);
     this.keys.text = '$(keyboard) ? keys';
     this.keys.tooltip = 'Verdict keyboard map';
     this.keys.command = INTERNAL_COMMANDS.keyboardHelp;
     this.agent.command = COMMANDS.selectAgent;
+    this.bell.command = INTERNAL_COMMANDS.showNotifications;
     this.setActiveReview(undefined);
     this.verdict.show();
+  }
+
+  /**
+   * The badge queue count. Independent of the review segments —
+   * notifications arrive with no review open. Hidden at zero: an empty
+   * bell is noise, not information.
+   */
+  setNotifications(count: number): void {
+    if (count === 0) {
+      this.bell.hide();
+      return;
+    }
+    this.bell.text = `$(bell) ${count}`;
+    this.bell.tooltip = `${count} Verdict notification${count === 1 ? '' : 's'} waiting — click to view`;
+    this.bell.show();
   }
 
   setActiveReview(review?: SidebarActiveReview): void {
@@ -259,5 +277,6 @@ export class VerdictStatusBar {
     this.verdict.dispose();
     this.agent.dispose();
     this.keys.dispose();
+    this.bell.dispose();
   }
 }

@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ALL_COMMAND_IDS, ALL_INTERNAL_COMMAND_IDS, INTERNAL_COMMANDS } from './commands';
+import { DIGEST_CADENCES, NOTIFICATION_EVENTS, NOTIFICATION_MODES } from './domain/notifications';
 
 interface PackageJson {
   contributes: {
@@ -9,6 +10,7 @@ interface PackageJson {
     keybindings: Array<{ command: string; key: string; args?: unknown; when?: string }>;
     views: Record<string, Array<{ id: string; name: string; type?: string }>>;
     menus: Record<string, Array<{ command: string; when?: string }>>;
+    configuration: { properties: Record<string, { enum?: string[]; default?: unknown }> };
   };
 }
 
@@ -91,5 +93,34 @@ describe('package.json contributions', () => {
       name: 'Verdict',
       type: 'webview',
     });
+  });
+});
+
+// package.json cannot import the domain module, so agreement is enforced
+// here — the same mechanism that pins the 19 commands above.
+describe('notification settings contributions', () => {
+  const properties = pkg.contributes.configuration.properties;
+
+  it('contributes every event with the spec §11 default and the four modes', () => {
+    for (const event of NOTIFICATION_EVENTS) {
+      const setting = properties[`codeVerdict.notifications.events.${event.key}`];
+      expect(setting, event.key).toBeDefined();
+      expect(setting?.enum).toEqual([...NOTIFICATION_MODES]);
+      expect(setting?.default, event.key).toBe(event.defaultMode);
+    }
+  });
+
+  it('contributes no event settings beyond the seven', () => {
+    const contributed = Object.keys(properties).filter((key) =>
+      key.startsWith('codeVerdict.notifications.events.'),
+    );
+    expect(contributed).toHaveLength(NOTIFICATION_EVENTS.length);
+  });
+
+  it('contributes the digest cadence and quiet mode with their defaults', () => {
+    const cadence = properties['codeVerdict.notifications.digestCadence'];
+    expect(cadence?.enum).toEqual([...DIGEST_CADENCES]);
+    expect(cadence?.default).toBe('End of day');
+    expect(properties['codeVerdict.notifications.quietMode']?.default).toBe(false);
   });
 });

@@ -45,6 +45,8 @@ export interface ChangesetReviewDeps {
   openDashboard: () => void;
   onSubmitted?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
+  /** The combined agent finished — the notification engine's local event. */
+  onReviewReady?: (info: { label: string; itemCount: number }) => void;
 }
 
 export class ChangesetReviewPanel {
@@ -210,6 +212,7 @@ export class ChangesetReviewPanel {
 
   private finishRun(response: AgentReviewResponse): void {
     this.response = response;
+    this.deps.onReviewReady?.({ label: this.changeset.name, itemCount: response.items.length });
     if (response.items.length === 0) {
       this.review = undefined;
       this.screen = 'clean';
@@ -323,7 +326,6 @@ export class ChangesetReviewPanel {
       case 'openTuning': await vscode.commands.executeCommand('codeVerdict.selectAgent'); return;
       case 'reconnect': await vscode.commands.executeCommand('codeVerdict.signIn'); return;
       case 'reanchor': void this.run(); return;
-      case 'help': void vscode.window.showInformationMessage('Verdict changeset keys: A accept · R reject · S skip · J/K move · U undo.'); return;
     }
     this.render();
   }
