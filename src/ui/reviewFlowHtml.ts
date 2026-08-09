@@ -31,12 +31,19 @@ export interface TriageItemView {
   refLabel?: string;
   /** New commits moved this finding off the line the agent read (spec §5). */
   lineMoved?: boolean;
+  /**
+   * The sides of a cross finding its comment may be re-targeted to
+   * (handoff §16: "spans[0] by convention, overridable in the UI").
+   * Only sides that resolve to a real added-line anchor appear here.
+   */
+  crossTargets?: Array<{ repoId: string; number: string; location: string; active: boolean }>;
 }
 
 export interface ChangesetReviewScope {
   id: string;
   name: string;
-  linkedIssue: string;
+  /** Branch- and manual-detected changesets have no linked issue. */
+  linkedIssue?: string;
   memberCount: number;
   projectCount: number;
   refs: string[];
@@ -64,6 +71,8 @@ export interface FlowViewState {
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
   stale?: { newHead: string; affected: number; affectedAccepted?: number };
   changeset?: ChangesetReviewScope;
+  /** Set on a single-CR review whose MR belongs to a detected changeset (§15 entry point "a member MR"). */
+  memberOfChangeset?: { id: string; name: string; memberCount: number };
   // clean
   candidates: CandidateBucket[];
   filesRead: number;
@@ -117,7 +126,9 @@ export type FlowMessage =
   | { type: 'openMr' }
   | { type: 'trackReplies' }
   | { type: 'openTuning' }
-  | { type: 'reviewSingle'; repoId: string; number: string };
+  | { type: 'reviewSingle'; repoId: string; number: string }
+  | { type: 'setCrossTarget'; itemId: string; repoId: string; location: string }
+  | { type: 'openChangeset'; changesetId: string };
 
 export const SEVERITIES: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
 
@@ -231,10 +242,14 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .thread-text { font-size: 12.5px; line-height: 1.6; color: var(--fg); }
 .cross-card { border: 1px solid var(--agent-b); border-left: 3px solid var(--agent); border-radius: 6px; background: var(--agent-f); overflow: hidden; }
 .cross-head { padding: 8px 12px; color: var(--agent); font: 600 10px/1.2 var(--font-mono); text-transform: uppercase; }
-.cross-side { display: grid; grid-template-columns: 90px 190px minmax(0,1fr); gap: 8px; padding: 7px 12px; border-top: 1px solid var(--agent-b); font-size: 11.5px; }
+.cross-side { display: grid; grid-template-columns: 90px 190px minmax(0,1fr) auto; gap: 8px; padding: 7px 12px; border-top: 1px solid var(--agent-b); font-size: 11.5px; align-items: baseline; }
 .cross-repo { color: var(--agent); font-family: var(--font-mono); }
 .cross-location { color: var(--fg); font-family: var(--font-mono); }
 .cross-role { color: var(--fg-dimmer); }
+.cross-target { border: 1px solid var(--agent-b); border-radius: 10px; background: none; color: var(--agent); font: 10px/1 var(--font-ui); padding: 3px 8px; cursor: pointer; }
+.cross-target:hover { border-color: var(--agent); }
+.cross-target-active { white-space: nowrap; }
+.cs-note { color: var(--agent); font-size: 11.5px; line-height: 1.5; }
 .ask-row { display: flex; gap: 8px; align-items: center; }
 .ask-row .prompt { color: var(--fg-dimmer); font-family: var(--font-mono); }
 .action-bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 10px; padding: 13px 22px; background: var(--bg2); border-top: 1px solid var(--line); }
@@ -328,6 +343,11 @@ function renderRunReview(s: FlowViewState): string {
 
   return `<div class="wrap">
     ${subline(s.header)}
+    ${
+      s.memberOfChangeset
+        ? `<div class="cs-note">⧉ Part of ${e(s.memberOfChangeset.name)} · ${s.memberOfChangeset.memberCount} MRs ship together — <a href="#" id="open-changeset" data-changeset="${e(s.memberOfChangeset.id)}">open the changeset</a></div>`
+        : ''
+    }
     <div>
       <h1>Run an AI review</h1>
       <p class="lede">Agents come from your Copilot workspace. Criteria are saved per project and follow every run.</p>
@@ -492,8 +512,15 @@ function movedChip(view?: TriageItemView): string {
 function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Record<string, string>): string {
   const item = view.item;
   const owner = view.projectLabel && view.refLabel ? `<span class="agent-fg">${e(view.projectLabel)} · ${e(view.refLabel)}</span> · ` : '';
+  const targetControl = (span: NonNullable<ReviewItem['spans']>[number]): string => {
+    const target = view.crossTargets?.find((candidate) => candidate.repoId === span.repoId && candidate.location === span.location);
+    if (!target) return '';
+    return target.active
+      ? '<span class="pill pill-agent cross-target-active">comment posts here</span>'
+      : `<button class="cross-target" data-cross-target="${e(item.id)}" data-target-repo="${e(target.repoId)}" data-target-location="${e(target.location)}">post here instead</button>`;
+  };
   const cross = item.cross && item.spans?.length
-    ? `<div class="cross-card"><div class="cross-head">⧉ spans two repositories</div>${item.spans.map((span) => `<div class="cross-side"><span class="cross-repo">${e(repoLabels?.[span.repoId] ?? span.repoId)}</span><span class="cross-location">${e(span.location)}</span><span class="cross-role">${e(span.role)}</span></div>`).join('')}</div>`
+    ? `<div class="cross-card"><div class="cross-head">⧉ spans two repositories</div>${item.spans.map((span) => `<div class="cross-side"><span class="cross-repo">${e(repoLabels?.[span.repoId] ?? span.repoId)}</span><span class="cross-location">${e(span.location)}</span><span class="cross-role">${e(span.role)}</span>${targetControl(span)}</div>`).join('')}</div>`
     : '';
   return `
     <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${movedChip(view)}</div>
@@ -703,6 +730,7 @@ function renderSummary(s: FlowViewState): string {
       <div class="sum-card-head"><span>Summary comment · editable</span><a href="#" id="regenerate">Regenerate</a></div>
       <textarea class="summary" id="summary-text">${e(s.summaryText)}</textarea>
     </div>
+    ${s.changeset ? `<div class="cs-note">⧉ Posted to all ${s.changeset.memberCount} merge requests in this changeset, each comment landing in the repo it belongs to, cross-linked to ${e(s.changeset.linkedIssue ?? s.changeset.name)}.</div>` : ''}
     <div class="card">
       <div class="sum-card-head"><span>Line comments to post (${s.counts.accepted})</span></div>
       ${
@@ -724,7 +752,7 @@ function renderSummary(s: FlowViewState): string {
       rejected.length > 0
         ? `<div class="card">
       <div class="sum-card-head"><span>Rejected findings · rationale stays local</span></div>
-      ${rejected.map((v) => `<div class="rejected-row">${e(v.item.title)} — false positive</div>`).join('')}
+      ${rejected.map((v) => `<div class="rejected-row">${v.projectLabel ? `${e(v.projectLabel)} · ` : ''}${e(v.item.title)} — false positive</div>`).join('')}
     </div>`
         : ''
     }
@@ -746,7 +774,6 @@ function renderSummary(s: FlowViewState): string {
           : ''
       }
     </div>
-    ${s.changeset ? `<div class="hint">Accepted comments route to their owning MR; the summary is posted to every member and cross-linked to ${e(s.changeset.linkedIssue)}.</div>` : ''}
     ${
       s.submitError
         ? `<div class="submit-fail">
@@ -828,6 +855,8 @@ on('submit', 'submit'); on('retry-submit', 'retrySubmit'); on('reconnect', 'reco
 on('approve', 'approve'); on('lower-bar', 'lowerBar'); on('back-dash', 'backToDashboard');
 on('track-replies', 'trackReplies'); on('open-mr', 'openMr'); on('tuning-link', 'openTuning');
 document.getElementById('review-single')?.addEventListener('click', (ev) => { ev.preventDefault(); const el = document.querySelector('[data-item]'); if (el) post({ type: 'reviewSingle', repoId: el.dataset.repoId, number: el.dataset.crNumber }); });
+document.getElementById('open-changeset')?.addEventListener('click', (ev) => { ev.preventDefault(); post({ type: 'openChangeset', changesetId: ev.currentTarget.dataset.changeset }); });
+document.querySelectorAll('[data-cross-target]').forEach((b) => b.addEventListener('click', () => post({ type: 'setCrossTarget', itemId: b.dataset.crossTarget, repoId: b.dataset.targetRepo, location: b.dataset.targetLocation })));
 
 // Keyboard (spec §12 Triage group) — active while the review tab has focus.
 document.addEventListener('keydown', (ev) => {

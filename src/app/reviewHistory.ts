@@ -13,6 +13,14 @@ export interface SubmittedItemSnapshot {
   severity: Severity;
   file: string;
   line: number;
+  /**
+   * Cross-repo findings keep their spans so the changeset screen can show
+   * them after submit clears the draft. Records from before issue #15 omit
+   * all three — treat absence as "not cross", never as "unknown".
+   */
+  cross?: boolean;
+  spans?: Array<{ repoId: string; location: string; role: string }>;
+  confidence?: number;
 }
 
 export interface SubmittedObservation {

@@ -290,6 +290,11 @@
           "default": "Part-of:",
           "description": "Commit-message / MR-description trailer used to detect changesets. Branch-name matching is the fallback."
         },
+        "codeVerdict.changesets.branchDetection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suggest a changeset when merge requests across projects share a source branch name. Trailer detection takes precedence; switch this off if reused branch names make it noisy."
+        },
         "codeVerdict.pods": {
           "type": "array",
           "default": [],

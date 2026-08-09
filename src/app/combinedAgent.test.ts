@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Criteria } from '../domain/types';
-import { runDemoChangesetAgent, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
+import { changesetHeadSha, parseChangesetHeadSha, runDemoChangesetAgent, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
 
 const criteria: Criteria = {
   severityFloor: 'nit',
@@ -45,5 +45,18 @@ describe('combined changeset agent', () => {
     result.response.items[0] = { ...result.response.items[0]!, repoId: '9999', crNumber: '1' };
 
     expect(() => validateChangesetResponse(result.response, members)).toThrow(/unknown changeset member/);
+  });
+
+  it('round-trips the composite head and drops segments that carry no separator', () => {
+    expect(parseChangesetHeadSha(changesetHeadSha(members))).toEqual(
+      new Map([['9103!381', 'gateway-head'], ['9210!1509', 'console-head']]),
+    );
+
+    // One malformed segment must not cost the well-formed ones their entry —
+    // an empty map here reads as "every member moved" and fires a false
+    // stale banner over a draft that is perfectly current.
+    expect(parseChangesetHeadSha('9103!381:gateway-head|corrupted')).toEqual(
+      new Map([['9103!381', 'gateway-head']]),
+    );
   });
 });

@@ -17,8 +17,8 @@ export const GROUP: RepoGroup = { id: '4821', path: 'hve/platform', name: 'Platf
 
 export const REPOSITORIES: Repository[] = [
   { id: '9101', path: 'hve/platform/core', name: 'core', webUrl: 'https://gitlab.example/hve/platform/core', openChangeRequestCount: 1 },
-  { id: '9102', path: 'hve/platform/auth-service', name: 'auth-service', webUrl: 'https://gitlab.example/hve/platform/auth-service', openChangeRequestCount: 1 },
-  { id: '9103', path: 'hve/platform/api-gateway', name: 'api-gateway', webUrl: 'https://gitlab.example/hve/platform/api-gateway', openChangeRequestCount: 1 },
+  { id: '9102', path: 'hve/platform/auth-service', name: 'auth-service', webUrl: 'https://gitlab.example/hve/platform/auth-service', openChangeRequestCount: 2 },
+  { id: '9103', path: 'hve/platform/api-gateway', name: 'api-gateway', webUrl: 'https://gitlab.example/hve/platform/api-gateway', openChangeRequestCount: 2 },
   { id: '9104', path: 'hve/platform/billing', name: 'billing', webUrl: 'https://gitlab.example/hve/platform/billing', openChangeRequestCount: 0 },
   { id: '9105', path: 'hve/platform/notifications', name: 'notifications', webUrl: 'https://gitlab.example/hve/platform/notifications', openChangeRequestCount: 0 },
   { id: '9210', path: 'hve/web/console', name: 'console', webUrl: 'https://gitlab.example/hve/web/console', openChangeRequestCount: 1 },
@@ -93,6 +93,38 @@ export const CHANGE_REQUESTS: ChangeRequest[] = [
     changedFileCount: 3,
     ci: { runId: '90344', status: 'success' },
   },
+  // The second demo changeset (prototype cs2) has no trailer — its members
+  // share a source branch, exercising the branch-fallback detection route.
+  {
+    ref: { repoId: '9102', number: '804' },
+    title: 'Drop legacy /v1 endpoints',
+    description: 'No more callers since 24.6.\n\nRemoves the handlers once nothing routes to them.',
+    state: 'open',
+    sourceBranch: 'chore/v1-sunset',
+    targetBranch: 'main',
+    author: { username: 'kai', name: 'Kai' },
+    reviewers: [],
+    webUrl: 'https://gitlab.example/hve/platform/auth-service/-/merge_requests/804',
+    updatedAt: '2026-07-28T07:20:00.000Z',
+    headSha: 'e5f60718293a4b5c6d7e8f9012345678a1b2c3d4',
+    changedFileCount: 2,
+    ci: { runId: '90422', status: 'failed' },
+  },
+  {
+    ref: { repoId: '9103', number: '385' },
+    title: 'Retire /v1 gateway routes',
+    description: 'Pairs with the auth-service removal.\n\nStops routing /v1 first.',
+    state: 'open',
+    sourceBranch: 'chore/v1-sunset',
+    targetBranch: 'main',
+    author: { username: 'kai', name: 'Kai' },
+    reviewers: [{ username: 'you' }],
+    webUrl: 'https://gitlab.example/hve/platform/api-gateway/-/merge_requests/385',
+    updatedAt: '2026-07-28T07:24:00.000Z',
+    headSha: 'f60718293a4b5c6d7e8f9012345678a1b2c3d4e5',
+    changedFileCount: 1,
+    ci: { runId: '90423', status: 'success' },
+  },
 ];
 
 const TOKEN_TS_DIFF = `@@ -60,6 +60,6 @@ export class TokenStore {
@@ -124,6 +156,89 @@ export const DIFFS: ChangeRequestDiff[] = [
       },
     ],
     anchorRefs: DIFF_REFS,
+  },
+  {
+    ref: { repoId: '9102', number: '812' },
+    headSha: 'b2c3d4e5f60718293a4b5c6d7e8f9012345678a1',
+    files: [
+      {
+        oldPath: 'src/rotation/config.ts',
+        newPath: 'src/rotation/config.ts',
+        diff: `@@ -12,3 +12,5 @@ export const rotation = {\n   schedule: '0 3 * * *',\n+  ttlHours: 24,\n+  keyIds: ['kr-2026-08a', 'kr-2026-08b'],\n   algorithm: 'RS256',\n`,
+      },
+    ],
+    anchorRefs: {
+      base_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a2',
+      head_sha: 'b2c3d4e5f60718293a4b5c6d7e8f9012345678a1',
+      start_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a2',
+    },
+  },
+  {
+    // The producer half of the seeded cross-repo mismatch: the gateway
+    // renames the response field to `expires_at`.
+    ref: { repoId: '9103', number: '381' },
+    headSha: 'c3d4e5f60718293a4b5c6d7e8f9012345678a1b2',
+    files: [
+      {
+        oldPath: 'src/routes/session.ts',
+        newPath: 'src/routes/session.ts',
+        diff: `@@ -85,4 +85,4 @@ router.get('/session', async (req, res) => {\n   const session = await sessions.load(req.token)\n   if (!session) return res.status(401).end()\n   const payload = serialize(session)\n-  return { expiry: session.expiresAt }\n+  return { expires_at: session.expiresAt }\n`,
+      },
+    ],
+    anchorRefs: {
+      base_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a3',
+      head_sha: 'c3d4e5f60718293a4b5c6d7e8f9012345678a1b2',
+      start_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a3',
+    },
+  },
+  {
+    // …and the consumer half: the console still reads `.expiry`.
+    ref: { repoId: '9210', number: '1509' },
+    headSha: 'd4e5f60718293a4b5c6d7e8f9012345678a1b2c3',
+    files: [
+      {
+        oldPath: 'src/banner/SessionBanner.tsx',
+        newPath: 'src/banner/SessionBanner.tsx',
+        diff: `@@ -38,3 +38,5 @@ export function SessionBanner() {\n   const res = useSession()\n   if (!res.data) return null\n+  const expiry = res.data.expiry\n+  const days = daysUntil(expiry)\n   return renderBanner(days)\n`,
+      },
+    ],
+    anchorRefs: {
+      base_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a4',
+      head_sha: 'd4e5f60718293a4b5c6d7e8f9012345678a1b2c3',
+      start_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a4',
+    },
+  },
+  {
+    ref: { repoId: '9102', number: '804' },
+    headSha: 'e5f60718293a4b5c6d7e8f9012345678a1b2c3d4',
+    files: [
+      {
+        oldPath: 'src/http/v1.ts',
+        newPath: 'src/http/v1.ts',
+        diff: `@@ -4,4 +4,2 @@ export function mountV1(app) {\n-  app.use('/v1/tokens', legacyTokens)\n-  app.use('/v1/keys', legacyKeys)\n   app.use('/health', health)\n   return app\n`,
+      },
+    ],
+    anchorRefs: {
+      base_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a5',
+      head_sha: 'e5f60718293a4b5c6d7e8f9012345678a1b2c3d4',
+      start_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a5',
+    },
+  },
+  {
+    ref: { repoId: '9103', number: '385' },
+    headSha: 'f60718293a4b5c6d7e8f9012345678a1b2c3d4e5',
+    files: [
+      {
+        oldPath: 'src/routes/index.ts',
+        newPath: 'src/routes/index.ts',
+        diff: `@@ -9,3 +9,3 @@ export function register(router) {\n-  router.mount('/v1', v1Routes)\n+  router.gone('/v1')\n   router.mount('/v2', v2Routes)\n`,
+      },
+    ],
+    anchorRefs: {
+      base_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a6',
+      head_sha: 'f60718293a4b5c6d7e8f9012345678a1b2c3d4e5',
+      start_sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a6',
+    },
   },
 ];
 
@@ -209,5 +324,6 @@ export const WORK_ITEMS: WorkItem[] = [
 export const CI_RUNS: CiRun[] = [
   { id: '90412', repoId: '9101', status: 'success', ref: 'feat/auth-refresh', createdAt: '2026-07-28T09:30:00.000Z' },
   { id: '90398', repoId: '9102', status: 'running', ref: 'feat/key-rotation', createdAt: '2026-07-28T08:10:00.000Z' },
+  { id: '90422', repoId: '9102', status: 'failed', failedJobName: 'compat:v1', ref: 'chore/v1-sunset', createdAt: '2026-07-28T07:18:00.000Z' },
   { id: '90371', repoId: '9103', status: 'failed', failedJobName: 'e2e:chrome', ref: 'feat/key-rotation', createdAt: '2026-07-27T16:35:00.000Z' },
 ];

@@ -31,11 +31,11 @@ describe('pod query', () => {
 
     const stats = deriveStats(data);
     expect(stats.projectsInPod).toBe(6);
-    // Fixture data: !812 and !1509 name you as reviewer and are authored by
-    // others; !2841 is yours.
-    expect(stats.waitingOnYou).toBe(2);
-    // !381 has a failed pipeline.
-    expect(stats.pipelinesFailing).toBe(1);
+    // Fixture data: !812, !1509 and !385 name you as reviewer and are
+    // authored by others; !2841 is yours.
+    expect(stats.waitingOnYou).toBe(3);
+    // !381 and !804 have failed pipelines.
+    expect(stats.pipelinesFailing).toBe(2);
     expect(stats.aiCoverage).toEqual({ reviewed: 0, total: data.changeRequests.length });
   });
 

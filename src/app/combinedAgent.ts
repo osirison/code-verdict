@@ -126,3 +126,20 @@ export function runDemoChangesetAgent(
 export function changesetHeadSha(members: readonly ChangesetAgentMember[]): string {
   return compositeHead(members);
 }
+
+/**
+ * The inverse of {@link changesetHeadSha}, kept beside it so the two formats
+ * cannot drift. A segment is `<repoId>!<number>:<sha>`; anything without the
+ * separator is not a composite head and is dropped rather than parsed into a
+ * bogus key, which would read as "every member moved".
+ */
+export function parseChangesetHeadSha(headSha: string): Map<string, string> {
+  return new Map(
+    headSha.split('|').flatMap((part) => {
+      const separator = part.lastIndexOf(':');
+      if (separator < 0) return [];
+      const [key, sha] = [part.slice(0, separator), part.slice(separator + 1)];
+      return key && sha ? [[key, sha] as const] : [];
+    }),
+  );
+}
