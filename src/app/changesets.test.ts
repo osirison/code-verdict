@@ -81,6 +81,17 @@ describe('changeset detection — trailer route', () => {
     expect(detectChangesets(pod, dependsOn, [], { trailer: 'Part.of', branchFallback: false })).toEqual([]);
   });
 
+  it('detects the trailer whether or not the description writes the colon', () => {
+    const noColon = CHANGE_REQUESTS.map((changeRequest) => ({
+      ...changeRequest,
+      description: 'Part-of #1180\n\nBody.',
+    }));
+
+    expect(detectChangesets(pod, noColon, [])[0]?.members).toHaveLength(4);
+    // Optional-colon must not let a shorter setting swallow a longer trailer.
+    expect(detectChangesets(pod, noColon, [], { trailer: 'Part', branchFallback: false })).toEqual([]);
+  });
+
   it('prefers a work item living in a member repository when issue numbers collide', () => {
     const collision = [
       {

@@ -5,7 +5,7 @@ import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
-import { changesetHeadSha, runDemoChangesetAgent } from '../app/combinedAgent';
+import { changesetHeadSha, parseChangesetHeadSha, runDemoChangesetAgent } from '../app/combinedAgent';
 import { connectionForPod } from '../app/connections';
 import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
@@ -203,12 +203,7 @@ export class ChangesetReviewPanel {
    * triaging against history. The banner's re-run is the changeset re-anchor.
    */
   private markStaleMembers(review: Review): void {
-    const previous = new Map(
-      review.headSha.split('|').flatMap((part) => {
-        const [key, sha] = [part.slice(0, part.lastIndexOf(':')), part.slice(part.lastIndexOf(':') + 1)];
-        return key && sha ? [[key, sha] as const] : [];
-      }),
-    );
+    const previous = parseChangesetHeadSha(review.headSha);
     const moved = new Set(
       this.members
         .filter((member) => previous.get(`${member.ref.repoId}!${member.ref.number}`) !== member.diff.headSha)

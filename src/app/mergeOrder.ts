@@ -45,7 +45,12 @@ export function deriveMergeOrder<M extends MemberShape>(
       const reader = indexOfRepo(readerSpan.repoId);
       if (reader < 0 || reader === writer) continue;
       if (!roles.has(reader)) roles.set(reader, readerSpan.role);
-      (edges.get(writer) ?? edges.set(writer, new Set()).get(writer))?.add(reader);
+      let readers = edges.get(writer);
+      if (!readers) {
+        readers = new Set<number>();
+        edges.set(writer, readers);
+      }
+      readers.add(reader);
     }
   }
 

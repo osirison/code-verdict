@@ -102,6 +102,15 @@ describe('changeset fidelity (spec §15)', () => {
     expect(noRun).toContain('No combined review has run yet');
   });
 
+  it('keeps the spec label past tense only once a run has read the diffs', () => {
+    // Spec §15 copy, verbatim, whenever findings exist — including a clean run.
+    expect(renderChangesetHtml({ ...state, findings: [] }, 'n')).toContain('agent read all 4 diffs together');
+    // Before any run the same label would claim one happened.
+    const noRun = renderChangesetHtml(state, 'n');
+    expect(noRun).toContain('agent reads all 4 diffs together');
+    expect(noRun).not.toContain('agent read all 4 diffs together');
+  });
+
   it('omits the reason line when there is no signal behind it', () => {
     const html = renderChangesetHtml({
       ...state,

@@ -29,10 +29,15 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** `Part-of` and `Part-of:` configure the same convention. */
+/**
+ * `Part-of` and `Part-of:` configure the same convention, and the colon is
+ * optional in the description too — the spec's form is `Part-of: #1180`
+ * (handoff §16), but a team writing `Part-of #1180` means the same thing and
+ * silently detecting nothing is the worst way to tell them otherwise.
+ */
 function trailerPattern(trailer: string): RegExp {
   const key = (trailer.trim() || DEFAULT_TRAILER).replace(/:$/, '');
-  return new RegExp(`^${escapeRegExp(key)}:\\s*#(\\d+)\\s*$`, 'gim');
+  return new RegExp(`^${escapeRegExp(key)}:?\\s*#(\\d+)\\s*$`, 'gim');
 }
 
 function memberKey(ref: { repoId: string; number: string }): string {
