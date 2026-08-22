@@ -207,7 +207,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
         nodes {
           id isResolved isOutdated path line
           resolvedBy { login }
-          comments(first: 100) { nodes { id body createdAt author { login } } }
+          comments(first: 100) { nodes { id databaseId body createdAt author { login } } }
         }
       }
     }
@@ -440,15 +440,21 @@ export class GitHubConnection implements Connection {
       return { comments: [], summaryPosted: false };
     }
 
-    await this.http.post(`${this.prPath(ref)}/reviews`, {
+    const review = await this.http.post<{ id: number }>(`${this.prPath(ref)}/reviews`, {
       event,
       body: reviewBody(event, submission.summary),
       comments,
       commit_id: commitIdOf(submission.comments[0]?.anchor),
     });
 
+    const threadIds = await this.threadIdsForReview(ref, review?.id, submission.comments.length);
+
     return {
-      comments: submission.comments.map((comment) => ({ key: comment.key, ok: true })),
+      comments: submission.comments.map((comment, index) => ({
+        key: comment.key,
+        ok: true,
+        threadId: threadIds[index],
+      })),
       // Only the user's own summary counts as posted. A verdict-only review
       // carries canned text because GitHub demands a body — reporting that as
       // "your summary landed" would be a lie the UI then repeats.
@@ -488,6 +494,18 @@ export class GitHubConnection implements Connection {
       }
     }
 
+    // The REST ids just collected are not thread ids; resolve them before
+    // they are stored, or the Posted reviews panel matches nothing later.
+    if (outcomes.some((outcome) => outcome.ok)) {
+      const byCommentId = await this.threadIdsByCommentId(ref);
+      for (const outcome of outcomes) {
+        const commentId = outcome.threadId === undefined ? undefined : Number(outcome.threadId);
+        outcome.threadId = commentId !== undefined && Number.isFinite(commentId)
+          ? byCommentId.get(commentId)
+          : undefined;
+      }
+    }
+
     const result: SubmitResult = { comments: outcomes, summaryPosted: false };
     const allOk = outcomes.length > 0 && outcomes.every((outcome) => outcome.ok);
     const summaryToPost = hasSummary(submission.summary) && allOk;
@@ -519,9 +537,59 @@ export class GitHubConnection implements Connection {
     return result;
   }
 
-  async listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]> {
+  /**
+   * Thread ids for the comments a batched review just created, in the order
+   * they were submitted. GitHub returns them from the review's own comments
+   * endpoint in creation order, which is the order they were sent.
+   */
+  private async threadIdsForReview(
+    ref: ChangeRequestRef,
+    reviewId: number | undefined,
+    expected: number,
+  ): Promise<Array<string | undefined>> {
+    if (reviewId === undefined || expected === 0) return [];
+    try {
+      const posted = await this.http.getAll<{ id: number }>(
+        `${this.prPath(ref)}/reviews/${reviewId}/comments`,
+      );
+      const byCommentId = await this.threadIdsByCommentId(ref);
+      return posted.slice(0, expected).map((comment) => byCommentId.get(comment.id));
+    } catch {
+      // Degraded, never wrong: an absent thread id makes the panel fall back to
+      // "threads you started" rather than matching against a bogus id.
+      return [];
+    }
+  }
+
+  /**
+   * Map each posted REST comment id to the GraphQL review-thread id it landed
+   * in.
+   *
+   * `CommentOutcome.threadId` is stored by the app and later compared against
+   * what `listThreads` returns (see the invariant on `ThreadFlags` in
+   * `app/postedReviews.ts`). On GitHub those are different identifier spaces:
+   * posting returns a REST comment id, while threads are GraphQL nodes. Handing
+   * back the REST id would store an id that matches nothing, and the Posted
+   * reviews panel would show the review with zero threads.
+   */
+  private async threadIdsByCommentId(ref: ChangeRequestRef): Promise<Map<number, string>> {
+    const byCommentId = new Map<number, string>();
+    try {
+      for (const thread of await this.fetchThreads(ref)) {
+        for (const note of thread.comments.nodes) {
+          if (note.databaseId != null) byCommentId.set(note.databaseId, thread.id);
+        }
+      }
+    } catch {
+      // Best effort: an unresolved id is stored as absent, and the panel falls
+      // back to "threads you started" — degraded, never wrong.
+    }
+    return byCommentId;
+  }
+
+  private async fetchThreads(ref: ChangeRequestRef): Promise<GqlThread[]> {
     const { owner, repo } = splitRepoId(ref.repoId);
-    const threads: ReviewThread[] = [];
+    const all: GqlThread[] = [];
     let cursor: string | null = null;
 
     for (let page = 0; page < 10; page += 1) {
@@ -540,14 +608,17 @@ export class GitHubConnection implements Connection {
         number: Number(ref.number),
         cursor,
       });
-
       const reviewThreads = data.repository?.pullRequest?.reviewThreads;
       if (!reviewThreads) break;
-      threads.push(...reviewThreads.nodes.map((node) => toReviewThread(ref, node)));
+      all.push(...reviewThreads.nodes);
       if (!reviewThreads.pageInfo.hasNextPage) break;
       cursor = reviewThreads.pageInfo.endCursor;
     }
-    return threads;
+    return all;
+  }
+
+  async listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]> {
+    return (await this.fetchThreads(ref)).map((node) => toReviewThread(ref, node));
   }
 
   async resolveThread(_ref: ChangeRequestRef, threadId: string, resolved: boolean): Promise<void> {

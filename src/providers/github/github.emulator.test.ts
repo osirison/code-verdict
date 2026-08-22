@@ -497,6 +497,53 @@ describe('a summary the user cleared is not a summary', () => {
       summary: 'See the inline comments.',
     });
     expect(result.summaryPosted).toBe(true);
-    expect(result.comments).toEqual([{ key: 'a', ok: true }]);
+    expect(result.comments).toEqual([{ key: 'a', ok: true, threadId: 'PRRT_live' }]);
+  });
+});
+
+describe('threadId is a thread id, in both submit paths', () => {
+  it('resolves the GraphQL thread id after a batched review', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }],
+      summary: 's',
+    });
+    // Comment 8001 lives in thread PRRT_live — not the REST comment id.
+    expect(result.comments[0]?.threadId).toBe('PRRT_live');
+  });
+
+  it('resolves it after the per-comment fallback too', async () => {
+    // The fallback posts to /comments, whose ids are NOT thread ids; storing
+    // one would make the Posted reviews panel match nothing.
+    const { conn, anchor } = await draft({ failReviewPositionOnBatch: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }],
+      summary: 's',
+    });
+    const threadId = result.comments[0]?.threadId;
+    expect(threadId).toBe('PRRT_outdated');
+    expect(threadId).not.toMatch(/^\d+$/);
+  });
+
+  it('stores nothing rather than something wrong when resolution fails', async () => {
+    const conn = createGitHubProvider(async (url, init) => {
+      const i = init as { body?: string } | undefined;
+      if (new URL(url).pathname === '/graphql' && /reviewThreads/.test(i?.body ?? '')) {
+        return {
+          ok: false, status: 500,
+          headers: { get: () => null },
+          json: () => Promise.resolve({ message: 'boom' }),
+          text: () => Promise.resolve('{"message":"boom"}'),
+        };
+      }
+      return makeFakeGitHubFetch()(url, init);
+    }).connect(CONFIG);
+    const diff = await conn.getChangeRequestDiff(CR);
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 12, refs: diff.anchorRefs } }],
+      summary: 's',
+    });
+    expect(result.comments[0]?.ok).toBe(true);
+    expect(result.comments[0]?.threadId).toBeUndefined();
   });
 });

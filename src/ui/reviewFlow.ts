@@ -748,9 +748,13 @@ export class ReviewFlowPanel {
       }
       if (result.summaryPosted) this.summaryPosted = true;
       if (result.requestChangesApplied) this.verdictApplied = true;
-      if (failed.length > 0 || (!this.summaryPosted && result.summaryError)) {
+      // A verdict that did not land is a failure like any other: without this
+      // the comments post, the draft is cleared, and the request for changes is
+      // lost with nothing to retry. `performChangesetSubmit` already surfaces it.
+      const verdictFailed = !this.verdictApplied && result.requestChangesError !== undefined;
+      if (failed.length > 0 || (!this.summaryPosted && result.summaryError) || verdictFailed) {
         this.failedKeys = new Set(failed.map((c) => c.key));
-        const first = failed[0]?.error ?? result.summaryError;
+        const first = failed[0]?.error ?? result.summaryError ?? result.requestChangesError;
         this.submitError = first?.message ?? 'submit failed';
         this.screen = 'summary';
         // The ledger must survive a reload — a later retry may only post
@@ -783,13 +787,22 @@ export class ReviewFlowPanel {
             ? [{ category: item.category, confidence: item.confidence, verdict, severity: item.severity }]
             : [];
         }),
-        requestedChanges: result.requestChangesApplied === true,
+        // From the ledger, not this attempt: a retry deliberately withholds a
+        // verdict that already landed, so its result carries no flag.
+        requestedChanges: this.verdictApplied,
       });
       await this.deps.workspaceState.update(this.draftKey(), undefined);
       this.submitError = undefined;
       this.failedKeys = undefined;
+      // "as one review thread" only when a single review really was created:
+      // a submit with no summary, and every per-comment fallback, post
+      // standalone comments instead.
+      const postedAsOneReview = provider.capabilities.batchedReview
+        && this.postThread
+        && result.summaryPosted
+        && result.comments.every((outcome) => outcome.ok);
       this.doneSentence = [
-        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${this.postThread && provider.capabilities.batchedReview ? ' as one review thread' : ''}${result.requestChangesApplied ? ', changes requested' : ''}.`,
+        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
         counts.rejected > 0 ? `${counts.rejected} dismissed findings stayed local.` : '',
       ]
         .filter(Boolean)

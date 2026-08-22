@@ -220,6 +220,11 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
       }
       if (rest === '/files' && method === 'GET') return json(FILES, extraHeaders);
 
+      // A batched review's own comments, in creation order.
+      if (/^\/reviews\/\d+\/comments$/.test(rest) && method === 'GET') {
+        return json([{ id: 8001 }, { id: 8002 }, { id: 8003 }], extraHeaders);
+      }
+
       if (rest === '/reviews' && method === 'POST') {
         const body = JSON.parse(init.body ?? '{}') as {
           comments?: Array<Record<string, unknown>>;
@@ -334,8 +339,8 @@ function graphqlResponse(body: string): unknown {
                 resolvedBy: null,
                 comments: {
                   nodes: [
-                    { id: 'C_1', body: 'Bound this by tenant.', createdAt: '2026-08-20T11:00:00Z', author: { login: 'you' } },
-                    { id: 'C_2', body: 'Good catch — fixing.', createdAt: '2026-08-20T12:00:00Z', author: { login: 'dana' } },
+                    { id: 'C_1', databaseId: 8001, body: 'Bound this by tenant.', createdAt: '2026-08-20T11:00:00Z', author: { login: 'you' } },
+                    { id: 'C_2', databaseId: 8002, body: 'Good catch — fixing.', createdAt: '2026-08-20T12:00:00Z', author: { login: 'dana' } },
                   ],
                 },
               },
@@ -349,7 +354,7 @@ function graphqlResponse(body: string): unknown {
                 resolvedBy: null,
                 comments: {
                   nodes: [
-                    { id: 'C_3', body: 'This moved.', createdAt: '2026-08-20T11:30:00Z', author: { login: 'you' } },
+                    { id: 'C_3', databaseId: 9001, body: 'This moved.', createdAt: '2026-08-20T11:30:00Z', author: { login: 'you' } },
                   ],
                 },
               },

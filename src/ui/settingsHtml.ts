@@ -104,7 +104,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     <h1>Settings</h1>
     <section class="section"><div class="label">Connection</div><div class="connection">
       <div class="connection-copy"><span class="instance">${e(state.instanceUrl)}</span><span class="status ${state.connected ? 'ok' : ''}">${e(state.connectionStatus)}</span></div>
-      <div class="connection-actions"><span class="masked">${state.hasToken ? 'glpat-••••••••' : 'no token'}</span><button class="btn" id="rotate-token">Rotate token</button></div>
+      <div class="connection-actions"><span class="masked">${state.hasToken ? '••••••••' : 'no token'}</span><button class="btn" id="rotate-token">Rotate token</button></div>
     </div></section>
     <section class="section"><div class="label">Notifications</div>${notifications}
       <button class="toggle" id="quiet"><span class="box">${state.quietMode ? '☑' : '☐'}</span><span>Quiet hours</span></button>

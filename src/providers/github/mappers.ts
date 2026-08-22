@@ -284,6 +284,8 @@ export interface GqlThread {
   comments: {
     nodes: Array<{
       id: string;
+      /** The REST comment id, so a posted comment can be found in its thread. */
+      databaseId?: number | null;
       body: string;
       createdAt: string;
       author?: { login?: string } | null;

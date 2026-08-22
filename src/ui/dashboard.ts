@@ -10,7 +10,8 @@ import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboard
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
 import { AppSurface, type AppRoute } from './appSurface';
-import { getProvider } from '../platform/registry';
+import { tryGetProvider } from '../platform/registry';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { repoCountOf } from './vocab';
 
 export class DashboardPanel {
@@ -115,7 +116,10 @@ export class DashboardPanel {
         id: candidate.id,
         name: candidate.name,
         active: candidate.id === pod.id,
-        meta: repoCountOf(getProvider(candidate.providerId).vocabulary, repoIdsOf(candidate).length),
+        meta: repoCountOf(
+          tryGetProvider(candidate.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY,
+          repoIdsOf(candidate).length,
+        ),
       }));
       this.panel.webview.html = renderDashboardHtml(
         toViewState({ ...data, podOptions }, Date.now(), submitted, this.deps.changesetOptions?.()),

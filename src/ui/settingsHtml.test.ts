@@ -33,7 +33,7 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('Agent finished a review');
     expect(html).toContain('A posted thread went stale');
     expect(html).toContain('Rotate token');
-    expect(html).toContain('glpat-••••••••');
+    expect(html).toContain('••••••••');
   });
 
   it('wires controls through typed CSP-safe messages', () => {
