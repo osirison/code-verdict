@@ -58,6 +58,7 @@ interface SessionDraft {
   /** Partial-failure ledger — must survive reloads so a retry never re-posts what already landed (spec §7). */
   failedKeys?: string[];
   summaryPosted?: boolean;
+  verdictApplied?: boolean;
 }
 
 export interface ReviewFlowDeps {
@@ -144,6 +145,8 @@ export class ReviewFlowPanel {
   private submitError?: string;
   private failedKeys?: Set<string>;
   private summaryPosted = false;
+  /** The request-changes verdict landed — never send it twice (spec §7 ledger). */
+  private verdictApplied = false;
   private doneSentence = '';
   private staleHead?: string;
   /** Items whose anchor no longer resolves against the branch's new head. */
@@ -230,6 +233,7 @@ export class ReviewFlowPanel {
     this.submitError = undefined;
     this.failedKeys = undefined;
     this.summaryPosted = false;
+    this.verdictApplied = false;
     this.threadsAccum = {};
     this.doneSentence = '';
     this.staleHead = undefined;
@@ -265,6 +269,7 @@ export class ReviewFlowPanel {
       this.finalNote = draft.finalNote;
       this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
       this.summaryPosted = draft.summaryPosted ?? false;
+      this.verdictApplied = draft.verdictApplied ?? false;
       this.screen = 'triage';
       this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
       // The diff just fetched is the branch as it stands now, so the same
@@ -362,6 +367,7 @@ export class ReviewFlowPanel {
       finalNote: this.finalNote,
       failedKeys: this.failedKeys ? [...this.failedKeys] : undefined,
       summaryPosted: this.summaryPosted || undefined,
+      verdictApplied: this.verdictApplied || undefined,
     } satisfies SessionDraft);
   }
 
@@ -447,6 +453,7 @@ export class ReviewFlowPanel {
     this.submitError = undefined;
     this.failedKeys = undefined;
     this.summaryPosted = false;
+    this.verdictApplied = false;
     this.threadsAccum = {};
     this.selectedId = this.review.items[0]?.id;
     this.staleHead = undefined;
@@ -728,7 +735,11 @@ export class ReviewFlowPanel {
           requestChanges: this.requestChanges && provider.capabilities.requestChanges,
           asSingleThread: this.postThread && provider.capabilities.batchedReview,
         },
-        { retryKeys: this.failedKeys, summaryAlreadyPosted: this.summaryPosted },
+        {
+          retryKeys: this.failedKeys,
+          summaryAlreadyPosted: this.summaryPosted,
+          verdictAlreadyApplied: this.verdictApplied,
+        },
       );
 
       const failed = result.comments.filter((c) => !c.ok);
@@ -736,6 +747,7 @@ export class ReviewFlowPanel {
         if (outcome.threadId) this.threadsAccum[outcome.key] = outcome.threadId;
       }
       if (result.summaryPosted) this.summaryPosted = true;
+      if (result.requestChangesApplied) this.verdictApplied = true;
       if (failed.length > 0 || (!this.summaryPosted && result.summaryError)) {
         this.failedKeys = new Set(failed.map((c) => c.key));
         const first = failed[0]?.error ?? result.summaryError;

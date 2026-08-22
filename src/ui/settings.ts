@@ -13,6 +13,7 @@ import {
 } from './settingsHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { getProvider } from '../platform/registry';
+import { cap } from './vocab';
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -79,7 +80,8 @@ export class SettingsPanel {
         key: event.key,
         // The static table stays neutral ("CI run"); the settings list can name
         // the active pod's platform, so it does.
-        label: event.label.replace(/\bCI run\b/, vocabulary.ciNoun),
+        // Capitalized: it opens the label, and every other row is sentence-cased.
+        label: event.label.replace(/\bCI run\b/, cap(vocabulary.ciNoun)),
         hint: event.hint.replace(/\bCI run\b/, vocabulary.ciNoun),
         mode: config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
       })),

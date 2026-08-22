@@ -3,7 +3,7 @@ import { parseAgentReviewResponse } from '../domain/agentResponse';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { createReview, setVerdict } from '../domain/reviewState';
 import { loadSpecFixtures } from '../testing/specFixtures';
-import { composeCommentDrafts, composeSummaryBody } from './submit';
+import { composeCommentDrafts, composeSummaryBody, performSubmit } from './submit';
 
 const fixtures = loadSpecFixtures();
 const { response } = parseAgentReviewResponse(fixtures.agentReviewResponse);
@@ -39,5 +39,27 @@ describe('composeCommentDrafts (spec §7)', () => {
   it('appends the final note after a divider', () => {
     expect(composeSummaryBody('Summary.', 'Note.')).toBe('Summary.\n\n---\n\nNote.');
     expect(composeSummaryBody('Summary.', '  ')).toBe('Summary.');
+  });
+});
+
+describe('the verdict is sent once, however many times submit is retried', () => {
+  it('withholds request-changes on a retry that already landed it', async () => {
+    const sent: Array<{ requestChanges?: boolean }> = [];
+    const connection = {
+      submitReview: (_ref: unknown, submission: { requestChanges?: boolean }) => {
+        sent.push({ requestChanges: submission.requestChanges });
+        return Promise.resolve({ comments: [], summaryPosted: true });
+      },
+    } as unknown as Parameters<typeof performSubmit>[0];
+
+    const plan = { drafts: [], summary: 's', requestChanges: true, asSingleThread: false };
+    await performSubmit(connection, { repoId: 'r', number: '1' }, plan as never, {});
+    await performSubmit(connection, { repoId: 'r', number: '1' }, plan as never, {
+      verdictAlreadyApplied: true,
+    });
+
+    // GitHub creates a NEW review per call, so re-sending would stack a second
+    // "changes requested" and re-notify the author.
+    expect(sent.map((s) => s.requestChanges)).toEqual([true, false]);
   });
 });

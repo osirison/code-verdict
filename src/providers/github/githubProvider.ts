@@ -151,8 +151,13 @@ const VERDICT_BODY: Record<ReviewEvent, string> = {
   COMMENT: 'See the inline comments.',
 };
 
+/** A summary the user actually wrote. Cleared or whitespace is not one. */
+function hasSummary(summary: string | undefined): boolean {
+  return summary !== undefined && summary.trim() !== '';
+}
+
 function reviewBody(event: ReviewEvent, summary: string | undefined): string | undefined {
-  if (summary !== undefined && summary.trim() !== '') return summary;
+  if (hasSummary(summary)) return summary;
   return event === 'APPROVE' ? undefined : VERDICT_BODY[event];
 }
 
@@ -409,7 +414,7 @@ export class GitHubConnection implements Connection {
     // comments to add. This is the shape `submit.ts` retries with once the
     // summary has already been posted; creating a second bodiless COMMENT
     // review for it would 422, because GitHub requires a body for that event.
-    if (event === 'COMMENT' && reviewBody(event, submission.summary) === VERDICT_BODY.COMMENT) {
+    if (event === 'COMMENT' && !hasSummary(submission.summary)) {
       return this.submitCommentByComment(ref, submission, event);
     }
 
@@ -444,7 +449,10 @@ export class GitHubConnection implements Connection {
 
     return {
       comments: submission.comments.map((comment) => ({ key: comment.key, ok: true })),
-      summaryPosted: submission.summary !== undefined,
+      // Only the user's own summary counts as posted. A verdict-only review
+      // carries canned text because GitHub demands a body — reporting that as
+      // "your summary landed" would be a lie the UI then repeats.
+      summaryPosted: hasSummary(submission.summary),
       // Reported from the event actually sent, never from the request flags —
       // only one verdict goes out, so only one may be reported applied.
       approvalApplied: event === 'APPROVE' ? true : undefined,
@@ -482,25 +490,26 @@ export class GitHubConnection implements Connection {
 
     const result: SubmitResult = { comments: outcomes, summaryPosted: false };
     const allOk = outcomes.length > 0 && outcomes.every((outcome) => outcome.ok);
+    const summaryToPost = hasSummary(submission.summary) && allOk;
 
     // The summary is withheld over an incomplete review, but the verdict is
     // not: a request for changes still has to land.
     const needsVerdictReview = event !== 'COMMENT';
-    if ((submission.summary !== undefined && allOk) || needsVerdictReview) {
+    if (summaryToPost || needsVerdictReview) {
       try {
         await this.http.post(`${this.prPath(ref)}/reviews`, {
           event,
           // Withholding the summary must not mean sending no body at all:
           // GitHub rejects a bodiless COMMENT/REQUEST_CHANGES review, which
           // would drop the very verdict this call exists to land.
-          body: reviewBody(event, allOk ? submission.summary : undefined),
+          body: reviewBody(event, summaryToPost ? submission.summary : undefined),
         });
-        if (submission.summary !== undefined && allOk) result.summaryPosted = true;
+        if (summaryToPost) result.summaryPosted = true;
         if (event === 'APPROVE') result.approvalApplied = true;
         if (event === 'REQUEST_CHANGES') result.requestChangesApplied = true;
       } catch (e) {
         const error = toScmError(e);
-        if (submission.summary !== undefined && allOk) result.summaryError = error;
+        if (summaryToPost) result.summaryError = error;
         // GitHub refuses to let an author approve or request changes on their
         // own pull request. That is a verdict outcome, never a comment failure.
         if (event === 'APPROVE') result.approvalError = error;

@@ -471,3 +471,32 @@ describe('list calls are batched per repository, never per change request', () =
     expect(crs[0]?.ci).toBeUndefined();
   });
 });
+
+describe('a summary the user cleared is not a summary', () => {
+  it('never reports canned verdict text as the user\'s summary', async () => {
+    const { conn, anchor } = await draft();
+    for (const summary of ['', '   ', undefined]) {
+      const result = await conn.submitReview(CR, {
+        comments: [{ key: 'a', body: 'x', anchor }],
+        summary,
+        requestChanges: true,
+      });
+      // The review still lands (GitHub demands a body), but the UI must not be
+      // told the user's summary was posted when canned text was.
+      expect(result.requestChangesApplied).toBe(true);
+      expect(result.summaryPosted).toBe(false);
+    }
+  });
+
+  it('routes on whether a summary exists, not on what it says', async () => {
+    // A real summary that happens to read like the canned text must still take
+    // the batched-review path.
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }],
+      summary: 'See the inline comments.',
+    });
+    expect(result.summaryPosted).toBe(true);
+    expect(result.comments).toEqual([{ key: 'a', ok: true }]);
+  });
+});
