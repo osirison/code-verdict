@@ -49,7 +49,10 @@ export function sessionAvailableFor(providerId: string, instanceUrl: string): bo
  * an error when the mode that needs one is the mode in play.
  */
 async function credentialForPod(pod: Pod, secrets: SecretStore): Promise<Credential> {
-  const modes: readonly AuthMode[] = getProvider(pod.providerId).authModesFor(pod.instanceUrl);
+  const declared: readonly AuthMode[] = getProvider(pod.providerId).authModesFor(pod.instanceUrl);
+  // A pod that recorded its mode uses that one only. Falling through to another
+  // would change which identity the pod runs as.
+  const modes = pod.authMode && declared.includes(pod.authMode) ? [pod.authMode] : declared;
 
   for (const mode of modes) {
     if (mode === 'none') return { kind: 'none' };

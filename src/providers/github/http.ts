@@ -58,7 +58,7 @@ export function graphqlUrl(instanceUrl: string): string {
   return `${trimmed}/api/graphql`;
 }
 
-function hostOf(url: string): string {
+export function hostOf(url: string): string {
   try {
     return new URL(url).host;
   } catch {

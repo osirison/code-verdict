@@ -187,15 +187,23 @@ describe('deriveEvents', () => {
     ]);
   });
 
-  it('emits pipelineFailed on transition to failed, with the spec title shape', () => {
+  it('emits pipelineFailed on transition to failed, naming the platform CI noun', () => {
     const events = deriveEvents(
       snapshot({ ciRuns: [run()] }),
       snapshot({ ciRuns: [run({ status: 'failed', failedJobName: 'e2e:chrome' })] }),
-      ctx(),
+      { ...ctx(), ciNoun: 'pipeline' },
     );
     expect(events).toEqual([
       expect.objectContaining({ key: 'pipelineFailed', title: 'Pipeline #90412 failed · e2e:chrome' }),
     ]);
+
+    // The same transition on GitHub reads in GitHub's words.
+    const onGitHub = deriveEvents(
+      snapshot({ ciRuns: [run()] }),
+      snapshot({ ciRuns: [run({ status: 'failed', failedJobName: 'e2e:chrome' })] }),
+      { ...ctx(), ciNoun: 'check' },
+    );
+    expect(onGitHub[0]?.title).toBe('Check #90412 failed · e2e:chrome');
   });
 
   it('does not repeat pipelineFailed while the run stays failed', () => {

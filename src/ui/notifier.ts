@@ -235,6 +235,7 @@ export class VerdictNotifier implements vscode.Disposable {
           you: pod.username,
           submittedRefs: this.deps.reviewHistory.submittedRefs(),
           formatRef: (number) => vocabulary.formatCrRef(number),
+          ciNoun: vocabulary.ciNoun,
         },
       );
     } catch {

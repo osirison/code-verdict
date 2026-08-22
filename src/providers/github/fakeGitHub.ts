@@ -13,7 +13,14 @@
  */
 import type { FetchLike, FetchResponseLike } from './http';
 
+export interface RequestLog {
+  /** Every path requested, in order. GraphQL appears as `/graphql`. */
+  paths: string[];
+}
+
 export interface FakeGitHubOptions {
+  /** Collects every request, so a test can assert the call count. */
+  log?: RequestLog;
   /** The batched review endpoint rejects with a position 422. */
   failReviewPositionOnBatch?: boolean;
   /** In the per-comment fallback, the Nth comment (1-based) fails with a position 422. */
@@ -167,6 +174,7 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
     const method = init.method ?? 'GET';
     const url = new URL(rawUrl);
     const path = url.pathname.replace(/^\/api\/v3/, '');
+    options.log?.paths.push(path);
     const isWrite = method !== 'GET';
 
     if (isWrite && options.failAllWrites) {
@@ -213,16 +221,37 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
       if (rest === '/files' && method === 'GET') return json(FILES, extraHeaders);
 
       if (rest === '/reviews' && method === 'POST') {
-        const body = JSON.parse(init.body ?? '{}') as { comments?: unknown[] };
+        const body = JSON.parse(init.body ?? '{}') as {
+          comments?: Array<Record<string, unknown>>;
+          body?: string;
+          event?: string;
+        };
         const hasComments = Array.isArray(body.comments) && body.comments.length > 0;
-        // Real GitHub rejects the whole batch when one position is bad.
+
+        // Real GitHub: "Required when using REQUEST_CHANGES or COMMENT for the
+        // event parameter." Modelling it is what stops the suite from blessing
+        // a request the live API rejects.
+        if ((body.event === 'REQUEST_CHANGES' || body.event === 'COMMENT')
+          && (body.body === undefined || body.body === '')) {
+          return error(422, 'Validation Failed — body is required', extraHeaders);
+        }
+        // Real GitHub: comments[] items take no commit_id (it is top-level).
+        const stray = (body.comments ?? []).find((c) => c.commit_id !== undefined);
+        if (stray) {
+          return error(422, 'Validation Failed — commit_id is not a valid comment field', extraHeaders);
+        }
         if (options.failReviewPositionOnBatch && hasComments) {
           return error(422, 'Unprocessable Entity — line must be part of the diff', extraHeaders);
         }
-        return json({ id: 555, state: 'COMMENTED', commit_id: HEAD_SHA }, extraHeaders);
+        return json({ id: 555, state: body.event ?? 'COMMENTED', commit_id: HEAD_SHA }, extraHeaders);
       }
 
       if (rest === '/comments' && method === 'POST') {
+        const body = JSON.parse(init.body ?? '{}') as { commit_id?: string };
+        // Real GitHub requires commit_id on THIS endpoint, unlike the review one.
+        if (body.commit_id === undefined) {
+          return error(422, 'Validation Failed — commit_id is required', extraHeaders);
+        }
         commentAttempt += 1;
         const fatal = options.failCommentAtWith;
         if (fatal !== undefined && commentAttempt === fatal.at) {
@@ -253,6 +282,41 @@ function graphqlResponse(body: string): unknown {
   }
   if (/addPullRequestReviewThreadReply/.test(query)) {
     return { data: { addPullRequestReviewThreadReply: { comment: { id: 'C_reply' } } } };
+  }
+  if (/statusCheckRollup/.test(query)) {
+    const repoId = `${parsed.variables?.owner as string}/${parsed.variables?.repo as string}`;
+    const pulls = (PULLS[repoId] ?? []) as Array<{ number: number }>;
+    return {
+      data: {
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: pulls.map((pull) => ({
+              number: pull.number,
+              commits: {
+                nodes: [{
+                  commit: {
+                    statusCheckRollup: {
+                      state: 'SUCCESS',
+                      contexts: {
+                        nodes: [{
+                          __typename: 'CheckRun',
+                          databaseId: 93178061854,
+                          name: 'ci',
+                          conclusion: 'SUCCESS',
+                          status: 'COMPLETED',
+                          permalink: 'https://github.com/acme/core/actions/runs/1/job/1',
+                        }],
+                      },
+                    },
+                  },
+                }],
+              },
+            })),
+          },
+        },
+      },
+    };
   }
   return {
     data: {

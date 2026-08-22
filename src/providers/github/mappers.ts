@@ -127,17 +127,6 @@ export function toCiStatus(run: Pick<GhCheckRun, 'status' | 'conclusion'>): CiSt
   }
 }
 
-/** A pull request's overall CI: the worst state among its check runs. */
-export function aggregateCiStatus(runs: readonly GhCheckRun[]): CiStatus {
-  if (runs.length === 0) return 'none';
-  const statuses = runs.map(toCiStatus);
-  if (statuses.includes('failed')) return 'failed';
-  if (statuses.includes('running')) return 'running';
-  if (statuses.includes('pending')) return 'pending';
-  if (statuses.includes('canceled')) return 'canceled';
-  return statuses.every((s) => s === 'success') ? 'success' : 'none';
-}
-
 export function toChangeRequest(
   repoId: string,
   pull: GhPull,
@@ -206,6 +195,81 @@ export function toFileDiff(file: GhFile): FileDiff {
     isNew: file.status === 'added' || undefined,
     isDeleted: file.status === 'removed' || undefined,
     isRenamed: isRenamed || undefined,
+  };
+}
+
+/** What the neutral `ChangeRequest.ci` needs, however it was fetched. */
+export interface CiSummary {
+  runId: string;
+  status: CiStatus;
+  webUrl?: string;
+}
+
+/** GraphQL `statusCheckRollup` — the batched equivalent of the REST check-runs call. */
+export interface GqlRollup {
+  state?: string | null;
+  contexts?: {
+    nodes?: Array<{
+      __typename?: string;
+      databaseId?: number | null;
+      name?: string | null;
+      conclusion?: string | null;
+      status?: string | null;
+      permalink?: string | null;
+      context?: string | null;
+      state?: string | null;
+      targetUrl?: string | null;
+    } | null>;
+  } | null;
+}
+
+export interface GqlChecksResponse {
+  repository?: {
+    pullRequests: {
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      nodes: Array<{
+        number: number;
+        commits?: { nodes?: Array<{ commit?: { statusCheckRollup?: GqlRollup | null } } | null> | null } | null;
+      }>;
+    };
+  } | null;
+}
+
+/** The rollup enum GitHub shows on the pull request itself. */
+function rollupState(state: string | null | undefined): CiStatus {
+  switch (state) {
+    case 'SUCCESS':
+      return 'success';
+    case 'FAILURE':
+    case 'ERROR':
+      return 'failed';
+    case 'PENDING':
+    case 'EXPECTED':
+      return 'pending';
+    default:
+      return 'none';
+  }
+}
+
+/**
+ * Pick the run worth linking to: the failing one if there is a failing one,
+ * otherwise the first. `runId` falls back to the context name, because a
+ * StatusContext has no numeric id.
+ */
+export function toCiSummary(rollup: GqlRollup | null | undefined): CiSummary | undefined {
+  if (!rollup) return undefined;
+  const status = rollupState(rollup.state);
+  if (status === 'none') return undefined;
+  const contexts = (rollup.contexts?.nodes ?? []).filter((node): node is NonNullable<typeof node> => node != null);
+  const failing = contexts.find(
+    (node) => node.conclusion === 'FAILURE' || node.conclusion === 'TIMED_OUT'
+      || node.conclusion === 'STARTUP_FAILURE' || node.state === 'FAILURE' || node.state === 'ERROR',
+  );
+  const lead = failing ?? contexts[0];
+  return {
+    runId: lead?.databaseId != null ? String(lead.databaseId) : lead?.name ?? lead?.context ?? 'checks',
+    status,
+    webUrl: lead?.permalink ?? lead?.targetUrl ?? undefined,
   };
 }
 

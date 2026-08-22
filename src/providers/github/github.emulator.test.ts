@@ -7,10 +7,10 @@ import { describe, expect, it } from 'vitest';
 import type { ConnectionConfig } from '../../platform/provider';
 import { isScmError } from '../../platform/errors';
 import { createGitHubProvider, githubProvider } from './githubProvider';
-import { makeFakeGitHubFetch, type FakeGitHubOptions } from './fakeGitHub';
+import { makeFakeGitHubFetch, type FakeGitHubOptions, type RequestLog } from './fakeGitHub';
 import { mapGitHubError } from './errors';
 import { hasNextLink, restBaseUrl, graphqlUrl, isDotCom, splitRepoId } from './http';
-import { aggregateCiStatus, toCiStatus, toFileDiff } from './mappers';
+import { toCiStatus, toCiSummary, toFileDiff } from './mappers';
 
 const CONFIG: ConnectionConfig = {
   instanceUrl: 'https://github.com',
@@ -308,16 +308,24 @@ describe('pagination and status aggregation', () => {
     expect(hasNextLink(null)).toBe(false);
   });
 
-  it('takes the worst check state as the pull request state', () => {
-    expect(aggregateCiStatus([])).toBe('none');
-    expect(aggregateCiStatus([
-      { id: 1, name: 'a', status: 'completed', conclusion: 'success' },
-      { id: 2, name: 'b', status: 'completed', conclusion: 'failure' },
-    ])).toBe('failed');
-    expect(aggregateCiStatus([
-      { id: 1, name: 'a', status: 'completed', conclusion: 'success' },
-      { id: 2, name: 'b', status: 'in_progress' },
-    ])).toBe('running');
+  it('reads the pull request check state from the rollup, in one query per repo', () => {
+    expect(toCiSummary(null)).toBeUndefined();
+    expect(toCiSummary({ state: 'SUCCESS', contexts: { nodes: [{ databaseId: 7, permalink: 'u' }] } }))
+      .toEqual({ runId: '7', status: 'success', webUrl: 'u' });
+    expect(toCiSummary({ state: 'FAILURE', contexts: { nodes: [
+      { databaseId: 1, name: 'a', conclusion: 'SUCCESS', permalink: 'ok' },
+      { databaseId: 2, name: 'b', conclusion: 'FAILURE', permalink: 'bad' },
+    ] } })).toEqual({ runId: '2', status: 'failed', webUrl: 'bad' });
+    expect(toCiSummary({ state: 'PENDING', contexts: { nodes: [] } }))
+      .toMatchObject({ status: 'pending' });
+    // A rollup GitHub reports as absent is no CI, not a failed one.
+    expect(toCiSummary({ state: null })).toBeUndefined();
+  });
+
+  it('falls back to a status context name when there is no numeric run id', () => {
+    expect(toCiSummary({ state: 'FAILURE', contexts: { nodes: [
+      { context: 'ci/jenkins', state: 'FAILURE', targetUrl: 'https://ci.example/1' },
+    ] } })).toEqual({ runId: 'ci/jenkins', status: 'failed', webUrl: 'https://ci.example/1' });
   });
 
   it('reads non-blocking conclusions as success, and cancellation as canceled', () => {
@@ -330,5 +338,136 @@ describe('pagination and status aggregation', () => {
 
   it('keeps a file with no patch listable, with no hunks to anchor to', () => {
     expect(toFileDiff({ filename: 'assets/logo.png', status: 'modified' }).diff).toBe('');
+  });
+});
+
+describe("GitHub requires a review body — the shapes the app actually retries with", () => {
+  it('retries the remainder as plain comments once the summary already posted', async () => {
+    // submit.ts sends { comments: [...remaining], summary: undefined } on retry.
+    // Creating a second bodiless COMMENT review for that would 422.
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'redo', body: 'Retried.', anchor }],
+      summary: undefined,
+    });
+    expect(result.comments).toEqual([{ key: 'redo', ok: true, threadId: expect.any(String) }]);
+    expect(result.summaryPosted).toBe(false);
+  });
+
+  it('lands a verdict-only review with no comments and no summary', async () => {
+    // changesetSubmit.ts retries the verdict with { comments: [], summary: undefined }.
+    const conn = connect();
+    const result = await conn.submitReview(CR, {
+      comments: [],
+      summary: undefined,
+      requestChanges: true,
+    });
+    expect(result.requestChangesApplied).toBe(true);
+    expect(result.requestChangesError).toBeUndefined();
+  });
+
+  it('still lands the verdict when the summary is withheld after a partial failure', async () => {
+    const { conn, anchor } = await draft({ failReviewPositionOnBatch: true, failCommentAt: 1 });
+    const result = await conn.submitReview(CR, {
+      comments: [
+        { key: 'stale', body: 'a', anchor },
+        { key: 'ok', body: 'b', anchor },
+      ],
+      summary: 'Withheld over an incomplete review.',
+      requestChanges: true,
+    });
+    expect(result.summaryPosted).toBe(false);
+    expect(result.requestChangesApplied).toBe(true);
+    expect(result.requestChangesError).toBeUndefined();
+  });
+
+  it('sends commit_id top-level on the review and per-comment on the comment endpoint', async () => {
+    // The emulator rejects a commit_id inside comments[] and a missing one on
+    // /comments, so both passing proves the placement.
+    const { conn, anchor } = await draft();
+    await expect(conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }],
+      summary: 's',
+    })).resolves.toMatchObject({ summaryPosted: true });
+
+    const fallback = await draft({ failReviewPositionOnBatch: true });
+    await expect(fallback.conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor: fallback.anchor }],
+      summary: 's',
+    })).resolves.toMatchObject({ comments: [{ key: 'a', ok: true, threadId: expect.any(String) }] });
+  });
+
+  it('reports only the verdict it actually sent when both flags are set', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }],
+      summary: 's',
+      approve: true,
+      requestChanges: true,
+    });
+    // One event goes out; claiming both would record a verdict never made.
+    expect(result.approvalApplied).toBe(true);
+    expect(result.requestChangesApplied).toBeUndefined();
+  });
+});
+
+describe('source input is validated against the connected host', () => {
+  it('refuses a URL for another platform or host', async () => {
+    const conn = connect();
+    await expect(conn.resolveSource('https://gitlab.com/hve/platform/core')).resolves.toEqual({ kind: 'noMatch' });
+    await expect(conn.resolveSource('https://ghe.acme.test/acme/core')).resolves.toEqual({ kind: 'noMatch' });
+  });
+
+  it("refuses GitHub's own site pages", async () => {
+    await expect(connect().resolveSource('https://github.com/settings/tokens')).resolves.toEqual({ kind: 'noMatch' });
+  });
+});
+
+describe('list calls are batched per repository, never per change request', () => {
+  it('costs the same number of requests whatever the pull-request count', async () => {
+    const log: RequestLog = { paths: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.listOpenChangeRequests(['acme/core']);
+    const oneRepo = log.paths.length;
+    // One REST list + one GraphQL rollup. The contract in
+    // src/platform/provider.ts forbids one request per change request.
+    expect(log.paths.filter((p) => p.endsWith('/pulls'))).toHaveLength(1);
+    expect(log.paths.filter((p) => p === '/graphql')).toHaveLength(1);
+    expect(log.paths.some((p) => p.includes('/check-runs'))).toBe(false);
+    expect(oneRepo).toBe(2);
+
+    log.paths.length = 0;
+    await conn.listOpenChangeRequests(['acme/core', 'acme/auth-service', 'acme/api-gateway']);
+    // Scales with repositories, not with pull requests.
+    expect(log.paths).toHaveLength(6);
+  });
+
+  it('still fills CI status from the batched rollup', async () => {
+    const crs = await connect().listOpenChangeRequests(['acme/core']);
+    expect(crs[0]?.ci).toEqual({
+      runId: '93178061854',
+      status: 'success',
+      webUrl: 'https://github.com/acme/core/actions/runs/1/job/1',
+    });
+  });
+
+  it('lists pull requests even when the checks query fails outright', async () => {
+    // Checks are decoration: a token without the scope must not empty the list.
+    const conn = createGitHubProvider(async (url, init) => {
+      if (new URL(url).pathname === '/graphql' && /statusCheckRollup/.test(init?.body ?? '')) {
+        return {
+          ok: false, status: 403,
+          headers: { get: () => null },
+          json: () => Promise.resolve({ message: 'Forbidden' }),
+          text: () => Promise.resolve('{"message":"Forbidden"}'),
+        };
+      }
+      return makeFakeGitHubFetch()(url, init);
+    }).connect(CONFIG);
+
+    const crs = await conn.listOpenChangeRequests(['acme/core']);
+    expect(crs).toHaveLength(1);
+    expect(crs[0]?.ci).toBeUndefined();
   });
 });

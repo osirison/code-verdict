@@ -27,7 +27,11 @@ function hostOf(instanceUrl: string): string {
  * same host cannot read or overwrite each other's credential.
  */
 export function tokenSecretKey(providerId: string, instanceUrl: string): string {
-  return `codeVerdict.token.${providerId}.${hostOf(instanceUrl)}`;
+  // `|` cannot appear in a provider id or a hostname, so a scoped key can never
+  // collide with a legacy one. Joining with `.` did collide:
+  // scoped('gitlab', 'acme.com') and legacy('gitlab.acme.com') were the same
+  // string, and readToken would migrate one pod's token onto another's key.
+  return `codeVerdict.token.${providerId}|${hostOf(instanceUrl)}`;
 }
 
 /**

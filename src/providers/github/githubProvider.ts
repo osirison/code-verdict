@@ -31,11 +31,11 @@ import type {
 import type { ScmError } from '../../platform/errors';
 import { toScmError } from '../../platform/errors';
 import type { FetchLike } from './http';
-import { GitHubHttp, isDotCom, splitRepoId } from './http';
+import { GitHubHttp, hostOf, isDotCom, splitRepoId } from './http';
 import { parseGitHubSourceInput } from './sourceInput';
 import {
-  aggregateCiStatus,
   isRealIssue,
+  toCiSummary,
   toChangeRequest,
   toCiRun,
   toFileDiff,
@@ -49,7 +49,9 @@ import {
   type GhOrg,
   type GhPull,
   type GhRepo,
+  type GqlChecksResponse,
   type GqlThread,
+  type CiSummary,
 } from './mappers';
 
 const CAPABILITIES: ProviderCapabilities = {
@@ -109,8 +111,14 @@ interface GitHubAnchorRefs {
   commitId: string;
 }
 
+/**
+ * Where a comment lands. `commit_id` is deliberately NOT included: GitHub
+ * documents it as a top-level parameter of the review endpoint, and the
+ * `comments[]` items accept only path/position/body/line/side/start_line/
+ * start_side. The single-comment endpoint is the one that takes it per comment,
+ * so that path adds it explicitly.
+ */
 function anchorPayload(anchor: DiffAnchor): Record<string, unknown> {
-  const refs = anchor.refs as GitHubAnchorRefs | undefined;
   const side = anchor.side === 'old' ? 'LEFT' : 'RIGHT';
   const payload: Record<string, unknown> = {
     path: anchor.filePath,
@@ -121,9 +129,69 @@ function anchorPayload(anchor: DiffAnchor): Record<string, unknown> {
     payload.start_line = Math.min(anchor.line, anchor.endLine);
     payload.start_side = side;
   }
-  if (refs?.commitId) payload.commit_id = refs.commitId;
   return payload;
 }
+
+function commitIdOf(anchor: DiffAnchor | undefined): string | undefined {
+  return (anchor?.refs as GitHubAnchorRefs | undefined)?.commitId;
+}
+
+type ReviewEvent = 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
+
+/**
+ * GitHub requires a review body for REQUEST_CHANGES and COMMENT (it is optional
+ * only for APPROVE). A verdict-only review — the changeset retry, and the
+ * fallback's "the summary is withheld but the verdict must still land" path —
+ * has no summary to send, so it carries a minimal one rather than 422ing and
+ * dropping the verdict entirely.
+ */
+const VERDICT_BODY: Record<ReviewEvent, string> = {
+  APPROVE: 'Approved.',
+  REQUEST_CHANGES: 'Changes requested — see the inline comments.',
+  COMMENT: 'See the inline comments.',
+};
+
+function reviewBody(event: ReviewEvent, summary: string | undefined): string | undefined {
+  if (summary !== undefined && summary.trim() !== '') return summary;
+  return event === 'APPROVE' ? undefined : VERDICT_BODY[event];
+}
+
+/**
+ * One query per repository for the check state of every open pull request.
+ *
+ * This exists because the contract says list calls are batched per repository,
+ * never one request per change request — and GitHub's REST check-runs endpoint
+ * is per-ref, so the REST version cost 1 + N requests per repo and burned the
+ * hourly rate limit on a 60s poll. `statusCheckRollup` is the same aggregate
+ * GitHub shows on the PR itself.
+ */
+const CHECKS_QUERY = `
+query($owner: String!, $repo: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(states: OPEN, first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+                contexts(first: 20) {
+                  nodes {
+                    __typename
+                    ... on CheckRun { databaseId name conclusion status permalink }
+                    ... on StatusContext { context state targetUrl }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
 
 const THREADS_QUERY = `
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
@@ -142,7 +210,11 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
 }`;
 
 export class GitHubConnection implements Connection {
-  constructor(private readonly http: GitHubHttp) {}
+  constructor(
+    private readonly http: GitHubHttp,
+    /** The connected instance's host, for validating pasted source URLs. */
+    private readonly instanceHost: string,
+  ) {}
 
   private repoPath(repoId: string): string {
     const { owner, repo } = splitRepoId(repoId);
@@ -163,7 +235,9 @@ export class GitHubConnection implements Connection {
   }
 
   async resolveSource(input: string): Promise<SourceResolution> {
-    const parsed = parseGitHubSourceInput(input);
+    // Host-checked: a URL for another platform or host must not resolve
+    // against this instance just because its path happens to fit.
+    const parsed = parseGitHubSourceInput(input, this.instanceHost);
     switch (parsed.shape) {
       case 'repo': {
         const repoId = `${parsed.owner}/${parsed.repo}`;
@@ -213,44 +287,46 @@ export class GitHubConnection implements Connection {
   async listOpenChangeRequests(repoIds: readonly string[]): Promise<ChangeRequest[]> {
     const perRepo = await Promise.all(
       repoIds.map(async (repoId) => {
-        const pulls = await this.http.getAll<GhPull>(`${this.repoPath(repoId)}/pulls`, {
-          state: 'open',
-          sort: 'updated',
-          direction: 'desc',
-        });
-        return Promise.all(
-          pulls.map(async (pull) => {
-            const ci = await this.ciForSha(repoId, pull.head.sha);
-            return toChangeRequest(repoId, pull, ci);
+        // Two requests per repository, whatever the pull-request count: the
+        // REST list, and one GraphQL query for every rollup. Never one per PR.
+        const [pulls, checks] = await Promise.all([
+          this.http.getAll<GhPull>(`${this.repoPath(repoId)}/pulls`, {
+            state: 'open',
+            sort: 'updated',
+            direction: 'desc',
           }),
-        );
+          this.checksByPullNumber(repoId),
+        ]);
+        return pulls.map((pull) => toChangeRequest(repoId, pull, checks.get(pull.number)));
       }),
     );
     return perRepo.flat();
   }
 
-  /** Check runs for one commit, aggregated into the neutral CI shape. */
-  private async ciForSha(
-    repoId: string,
-    sha: string,
-  ): Promise<{ runId: string; status: ReturnType<typeof aggregateCiStatus>; webUrl?: string } | undefined> {
+  /** Every open pull request's check state for one repository, in one query. */
+  private async checksByPullNumber(repoId: string): Promise<Map<number, CiSummary>> {
+    const { owner, repo } = splitRepoId(repoId);
+    const byNumber = new Map<number, CiSummary>();
+    let cursor: string | null = null;
+
     try {
-      const payload = await this.http.get<{ check_runs?: GhCheckRun[] }>(
-        `${this.repoPath(repoId)}/commits/${encodeURIComponent(sha)}/check-runs`,
-        { per_page: 100 },
-      );
-      const runs = payload.check_runs ?? [];
-      if (runs.length === 0) return undefined;
-      const status = aggregateCiStatus(runs);
-      const lead = runs.find((run) => run.conclusion === 'failure') ?? runs[0];
-      return lead
-        ? { runId: String(lead.id), status, webUrl: lead.html_url ?? undefined }
-        : undefined;
+      for (let page = 0; page < 10; page += 1) {
+        const data: GqlChecksResponse = await this.http.graphql(CHECKS_QUERY, { owner, repo, cursor });
+        const pulls = data.repository?.pullRequests;
+        if (!pulls) break;
+        for (const node of pulls.nodes) {
+          const rollup = node.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+          const summary = toCiSummary(rollup);
+          if (summary) byNumber.set(node.number, summary);
+        }
+        if (!pulls.pageInfo.hasNextPage) break;
+        cursor = pulls.pageInfo.endCursor;
+      }
     } catch {
-      // Checks are decoration on the list — a repository with the Checks API
-      // disabled must still list its pull requests.
-      return undefined;
+      // Checks are decoration on the list — a repository whose checks cannot be
+      // read (or a token without the scope) must still list its pull requests.
     }
+    return byNumber;
   }
 
   async listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]> {
@@ -321,11 +397,21 @@ export class GitHubConnection implements Connection {
    * is thrown rather than returned — which is what the contract specifies.
    */
   async submitReview(ref: ChangeRequestRef, submission: ReviewSubmission): Promise<SubmitResult> {
-    const event = submission.approve
+    // approve wins over requestChanges: GitHub has one event, and reporting
+    // both as applied would claim a verdict that was never sent.
+    const event: ReviewEvent = submission.approve
       ? 'APPROVE'
       : submission.requestChanges
         ? 'REQUEST_CHANGES'
         : 'COMMENT';
+
+    // Comments with no summary and no verdict are not a review — they are
+    // comments to add. This is the shape `submit.ts` retries with once the
+    // summary has already been posted; creating a second bodiless COMMENT
+    // review for it would 422, because GitHub requires a body for that event.
+    if (event === 'COMMENT' && reviewBody(event, submission.summary) === VERDICT_BODY.COMMENT) {
+      return this.submitCommentByComment(ref, submission, event);
+    }
 
     try {
       return await this.submitAsOneReview(ref, submission, event);
@@ -339,37 +425,37 @@ export class GitHubConnection implements Connection {
   private async submitAsOneReview(
     ref: ChangeRequestRef,
     submission: ReviewSubmission,
-    event: string,
+    event: ReviewEvent,
   ): Promise<SubmitResult> {
     const comments = submission.comments.map((comment) => ({
       ...anchorPayload(comment.anchor),
       body: buildCommentBody(comment),
     }));
-    // A review with no body, no comments and event COMMENT is rejected by
-    // GitHub; there is nothing to post in that case either.
     if (comments.length === 0 && submission.summary === undefined && event === 'COMMENT') {
       return { comments: [], summaryPosted: false };
     }
 
     await this.http.post(`${this.prPath(ref)}/reviews`, {
       event,
-      body: submission.summary,
+      body: reviewBody(event, submission.summary),
       comments,
-      commit_id: (submission.comments[0]?.anchor.refs as GitHubAnchorRefs | undefined)?.commitId,
+      commit_id: commitIdOf(submission.comments[0]?.anchor),
     });
 
     return {
       comments: submission.comments.map((comment) => ({ key: comment.key, ok: true })),
       summaryPosted: submission.summary !== undefined,
-      approvalApplied: submission.approve === true ? true : undefined,
-      requestChangesApplied: submission.requestChanges === true ? true : undefined,
+      // Reported from the event actually sent, never from the request flags —
+      // only one verdict goes out, so only one may be reported applied.
+      approvalApplied: event === 'APPROVE' ? true : undefined,
+      requestChangesApplied: event === 'REQUEST_CHANGES' ? true : undefined,
     };
   }
 
   private async submitCommentByComment(
     ref: ChangeRequestRef,
     submission: ReviewSubmission,
-    event: string,
+    event: ReviewEvent,
   ): Promise<SubmitResult> {
     const outcomes: CommentOutcome[] = [];
     let abort: ScmError | undefined;
@@ -382,6 +468,8 @@ export class GitHubConnection implements Connection {
       try {
         const posted = await this.http.post<{ id: number }>(`${this.prPath(ref)}/comments`, {
           ...anchorPayload(comment.anchor),
+          // Required per comment on this endpoint, unlike the review endpoint.
+          commit_id: commitIdOf(comment.anchor),
           body: buildCommentBody(comment),
         });
         outcomes.push({ key: comment.key, ok: true, threadId: String(posted.id) });
@@ -402,18 +490,21 @@ export class GitHubConnection implements Connection {
       try {
         await this.http.post(`${this.prPath(ref)}/reviews`, {
           event,
-          body: allOk ? submission.summary : undefined,
+          // Withholding the summary must not mean sending no body at all:
+          // GitHub rejects a bodiless COMMENT/REQUEST_CHANGES review, which
+          // would drop the very verdict this call exists to land.
+          body: reviewBody(event, allOk ? submission.summary : undefined),
         });
         if (submission.summary !== undefined && allOk) result.summaryPosted = true;
-        if (submission.approve) result.approvalApplied = true;
-        if (submission.requestChanges) result.requestChangesApplied = true;
+        if (event === 'APPROVE') result.approvalApplied = true;
+        if (event === 'REQUEST_CHANGES') result.requestChangesApplied = true;
       } catch (e) {
         const error = toScmError(e);
         if (submission.summary !== undefined && allOk) result.summaryError = error;
         // GitHub refuses to let an author approve or request changes on their
         // own pull request. That is a verdict outcome, never a comment failure.
-        if (submission.approve) result.approvalError = error;
-        if (submission.requestChanges) result.requestChangesError = error;
+        if (event === 'APPROVE') result.approvalError = error;
+        if (event === 'REQUEST_CHANGES') result.requestChangesError = error;
       }
     }
     return result;
@@ -494,6 +585,7 @@ export function createGitHubProvider(fetchImpl?: FetchLike, now?: () => number):
     connect(config: ConnectionConfig): Connection {
       return new GitHubConnection(
         new GitHubHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl, now),
+        hostOf(config.instanceUrl),
       );
     },
   };

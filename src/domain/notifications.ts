@@ -37,7 +37,7 @@ export const NOTIFICATION_EVENTS: readonly NotificationEventDef[] = [
   { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', defaultMode: 'Interrupt' },
   { key: 'replyPosted', label: 'Reply on a comment you posted', hint: 'An author replied to your review.', defaultMode: 'Interrupt' },
   { key: 'authorPushed', label: 'Author pushed a fix', hint: 'The code changed after review.', defaultMode: 'Badge' },
-  { key: 'pipelineFailed', label: 'Pipeline failed', hint: 'A watched pipeline needs attention.', defaultMode: 'Digest' },
+  { key: 'pipelineFailed', label: 'CI run failed', hint: 'A watched CI run needs attention.', defaultMode: 'Digest' },
   { key: 'reviewRequested', label: 'Review requested from you', hint: 'A change request is waiting on you.', defaultMode: 'Interrupt' },
   { key: 'mentioned', label: 'You were mentioned', hint: 'A discussion mentioned your username.', defaultMode: 'Badge' },
   { key: 'threadStale', label: 'A posted thread went stale', hint: 'New commits moved a reviewed line.', defaultMode: 'Digest' },
@@ -139,6 +139,8 @@ export interface DeriveContext {
   submittedRefs: ReadonlySet<string>;
   /** Provider vocabulary — "!2841" on GitLab, "#123" elsewhere. */
   formatRef(number: string): string;
+  /** Provider vocabulary — "pipeline" on GitLab, "check" on GitHub. */
+  ciNoun?: string;
 }
 
 const refKey = (ref: ChangeRequestRef): string => `${ref.repoId}!${ref.number}`;
@@ -170,7 +172,7 @@ export function deriveEvents(
 ): VerdictNotification[] {
   return [
     ...deriveChangeRequestEvents(prev.changeRequests, next.changeRequests, ctx),
-    ...deriveCiEvents(prev.ciRuns, next.ciRuns),
+    ...deriveCiEvents(prev.ciRuns, next.ciRuns, ctx.ciNoun ?? 'CI run'),
     ...deriveThreadEvents(prev.threads, next.threads, ctx, prev.fetchedAt),
   ];
 }
@@ -214,13 +216,14 @@ function deriveChangeRequestEvents(
   return events;
 }
 
-function deriveCiEvents(prev: CiRun[], next: CiRun[]): VerdictNotification[] {
+function deriveCiEvents(prev: CiRun[], next: CiRun[], ciNoun: string): VerdictNotification[] {
   const before = new Map(prev.map((run) => [run.id, run]));
+  const noun = ciNoun.charAt(0).toUpperCase() + ciNoun.slice(1);
   return next
     .filter((run) => run.status === 'failed' && before.get(run.id)?.status !== 'failed')
     .map((run) => ({
       key: 'pipelineFailed' as const,
-      title: `Pipeline #${run.id} failed${run.failedJobName ? ` · ${run.failedJobName}` : ''}`,
+      title: `${noun} #${run.id} failed${run.failedJobName ? ` · ${run.failedJobName}` : ''}`,
       detail: run.ref,
       webUrl: run.webUrl,
     }));

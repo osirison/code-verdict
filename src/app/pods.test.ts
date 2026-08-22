@@ -56,8 +56,17 @@ describe('PodStore', () => {
 
 describe('tokenSecretKey', () => {
   it('keys tokens per provider and instance host', () => {
-    expect(tokenSecretKey('gitlab', 'http://127.0.0.1:8971')).toBe('codeVerdict.token.gitlab.127.0.0.1:8971');
-    expect(tokenSecretKey('gitlab', 'https://gitlab.com/')).toBe('codeVerdict.token.gitlab.gitlab.com');
+    expect(tokenSecretKey('gitlab', 'http://127.0.0.1:8971')).toBe('codeVerdict.token.gitlab|127.0.0.1:8971');
+    expect(tokenSecretKey('gitlab', 'https://gitlab.com/')).toBe('codeVerdict.token.gitlab|gitlab.com');
+  });
+
+  it('cannot collide with a legacy key, whatever the host is named', () => {
+    // Joining with "." made these the same string, so readToken would hand one
+    // pod's token to another and then persist the substitution.
+    expect(tokenSecretKey('gitlab', 'https://acme.com'))
+      .not.toBe(legacyTokenSecretKey('https://gitlab.acme.com'));
+    expect(tokenSecretKey('github', 'https://acme.com'))
+      .not.toBe(legacyTokenSecretKey('https://github.acme.com'));
   });
 
   it('keeps two providers on one host apart', () => {

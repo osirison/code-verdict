@@ -65,8 +65,9 @@ export class SettingsPanel {
       connectionStatus = error instanceof Error ? error.message : String(error);
     }
     if (this.disposed) return;
+    const vocabulary = getProvider(pod.providerId).vocabulary;
     const state: SettingsViewState = {
-      vocabulary: getProvider(pod.providerId).vocabulary,
+      vocabulary,
       instanceUrl: pod.instanceUrl,
       connectionStatus,
       connected,
@@ -76,8 +77,10 @@ export class SettingsPanel {
       shareRates: config.get<boolean>('shareAcceptRejectRates', false),
       notifications: NOTIFICATION_EVENTS.map((event) => ({
         key: event.key,
-        label: event.label,
-        hint: event.hint,
+        // The static table stays neutral ("CI run"); the settings list can name
+        // the active pod's platform, so it does.
+        label: event.label.replace(/\bCI run\b/, vocabulary.ciNoun),
+        hint: event.hint.replace(/\bCI run\b/, vocabulary.ciNoun),
         mode: config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
       })),
     };

@@ -54,6 +54,8 @@ export class OnboardingPanel {
   private step: 1 | 2 | 3 = 1;
   /** Which platform this pod targets — from the sign-in chooser. */
   private readonly providerId: string;
+  /** Which credential actually connected, recorded on the pod. */
+  private authMode: 'token' | 'session' | 'none' | undefined;
   private instanceUrl: string;
   private token = '';
   private connection: Connection | undefined;
@@ -69,12 +71,16 @@ export class OnboardingPanel {
     private readonly deps: OnboardingDeps,
   ) {
     this.providerId = deps.providerId ?? defaultProviderId();
-    // An explicit setting wins; otherwise the chosen provider's own default host.
+    // `codeVerdict.instanceUrl` is one global setting serving N providers, so
+    // it only prefills the default provider — the single-provider case it was
+    // written for. Picking GitHub must not inherit a GitLab URL someone set
+    // before this build, which would route the API at <gitlab host>/api/v3.
     const configured = vscode.workspace.getConfiguration('codeVerdict').get<string>('instanceUrl');
+    const provider = getProvider(this.providerId);
     this.instanceUrl =
-      configured !== undefined && configured !== ''
+      configured !== undefined && configured !== '' && this.providerId === defaultProviderId()
         ? configured
-        : getProvider(this.providerId).host.defaultInstanceUrl;
+        : provider.host.defaultInstanceUrl;
     route.onLeave(() => {
       this.disposed = true;
       this.deps.onSetupState?.(undefined);
@@ -175,6 +181,7 @@ export class OnboardingPanel {
       return;
     }
     this.token = '';
+    this.authMode = 'session';
     this.connection = provider.connect({
       instanceUrl: this.instanceUrl,
       credential: { kind: 'session', accessToken },
@@ -208,6 +215,7 @@ export class OnboardingPanel {
     const credential: Credential = modes.includes('none')
       ? { kind: 'none' }
       : { kind: 'token', token };
+    this.authMode = credential.kind;
     this.connection = provider.connect({ instanceUrl: this.instanceUrl, credential });
     try {
       const status = await this.connection.testConnection();
@@ -271,6 +279,7 @@ export class OnboardingPanel {
       id: `pod_${crypto.randomUUID()}`,
       name: this.podName,
       providerId: this.providerId,
+      authMode: this.authMode,
       instanceUrl: this.instanceUrl,
       sources: podSources,
       criteria: { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories] },

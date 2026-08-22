@@ -21,9 +21,10 @@ function secretsWith(entries: Record<string, string> = {}): SecretStore & { seen
   };
 }
 
-function pod(providerId: string, instanceUrl: string): Pod {
+function pod(providerId: string, instanceUrl: string, authMode?: Pod['authMode']): Pod {
   return {
     id: 'p1',
+    authMode,
     name: 'Pod',
     providerId,
     instanceUrl,
@@ -113,5 +114,57 @@ describe('registry hygiene', () => {
     registerBuiltInProviders();
     const clone = { id: 'github' } as never;
     expect(() => registerProvider(clone)).toThrow(/already registered/i);
+  });
+});
+
+describe('a pod that recorded its auth mode is not re-authenticated as someone else', () => {
+  it('uses the pasted token even when the editor holds a GitHub session', async () => {
+    registerBuiltInProviders();
+    let sessionAsked = false;
+    setSessionProvider(() => {
+      sessionAsked = true;
+      return Promise.resolve('gho_someone_elses_account');
+    });
+    const secrets = secretsWith({
+      [tokenSecretKey('github', 'https://github.com')]: 'ghp_mine',
+    });
+
+    await expect(connectionForPod(pod('github', 'https://github.com', 'token'), secrets))
+      .resolves.toBeDefined();
+    // The whole point: the editor account is never consulted for a token pod.
+    expect(sessionAsked).toBe(false);
+  });
+
+  it('uses the session for a pod that recorded one, ignoring any stored token', async () => {
+    registerBuiltInProviders();
+    setSessionProvider(() => Promise.resolve('gho_session'));
+    const secrets = secretsWith({
+      [tokenSecretKey('github', 'https://github.com')]: 'ghp_stale',
+    });
+    await expect(connectionForPod(pod('github', 'https://github.com', 'session'), secrets))
+      .resolves.toBeDefined();
+  });
+
+  it('falls back to the declared order for a pod created before authMode existed', async () => {
+    registerBuiltInProviders();
+    let sessionAsked = false;
+    setSessionProvider(() => {
+      sessionAsked = true;
+      return Promise.resolve('gho_session');
+    });
+    await expect(connectionForPod(pod('github', 'https://github.com'), secretsWith()))
+      .resolves.toBeDefined();
+    expect(sessionAsked).toBe(true);
+  });
+
+  it('ignores a recorded mode the provider no longer offers for that host', async () => {
+    registerBuiltInProviders();
+    setSessionProvider(() => Promise.resolve('gho_session'));
+    // Enterprise hosts declare token only; a stale 'session' must not strand the pod.
+    const secrets = secretsWith({
+      [tokenSecretKey('github', 'https://ghe.example.test')]: 'ghp_ghes',
+    });
+    await expect(connectionForPod(pod('github', 'https://ghe.example.test', 'session'), secrets))
+      .resolves.toBeDefined();
   });
 });

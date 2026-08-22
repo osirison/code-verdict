@@ -42,9 +42,21 @@ function isRateLimited(status: number, message: string, headers?: HeaderReader):
   return /rate limit|abuse detection|secondary rate/i.test(message);
 }
 
-/** The 422 messages GitHub returns when a comment's diff position no longer applies. */
+/**
+ * The 422 messages GitHub returns when a comment's diff position no longer
+ * applies.
+ *
+ * Deliberately phrase-based, not field-name-based. Matching a bare `commit_id`
+ * or `outdated` swept up ordinary validation failures ("Validation Failed —
+ * commit_id invalid"), which then triggered the expensive per-comment fallback
+ * and re-posted every comment with the same bad commit id. `path` is included
+ * because GitHub rejects a bad file anchor with "path ... diff" rather than
+ * naming a position.
+ */
 function isStalePosition(message: string): boolean {
-  return /position|line must be part of the diff|diff_hunk|commit_id|outdated/i.test(message);
+  return /(position is (invalid|outdated))|((line|path|pull request review thread) .{0,40}part of the diff)|(not part of the diff)|(diff_hunk)|(outdated (diff|line|position))/i.test(
+    message,
+  );
 }
 
 export function mapGitHubError(
