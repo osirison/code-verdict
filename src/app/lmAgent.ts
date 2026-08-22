@@ -71,6 +71,7 @@ export async function runLmChangesetAgent(
     `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
     ...members.flatMap((member) => member.diff.files.map((file) => [
+      // vocab-ok: the agent prompt's wire format — the response parser reads these exact field names back
       `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${file.newPath}`,
       file.diff,
     ].join('\n'))),

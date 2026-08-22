@@ -7,9 +7,12 @@ import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
 import { fetchPodData, repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
-import { getProvider } from './platform/registry';
+import { getProvider, listRealProviders } from './platform/registry';
+import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { getDebugAuthBypass } from './debugAuth';
+import { setSessionProvider } from './app/connections';
+import { getSignInOptions, needsSignInChoice, type SignInOption } from './signInFlow';
 import { registerBuiltInProviders } from './registry';
 import { DashboardPanel } from './ui/dashboard';
 import { ChangesetPanel } from './ui/changeset';
@@ -29,6 +32,26 @@ import { VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
+
+  // The session bridge: `connections.ts` stays vscode-free, so the editor's
+  // account API is injected here. A provider that declares the 'session' mode
+  // for a host gets its token from whichever account VS Code holds for it.
+  setSessionProvider(async (providerId) => {
+    const declared = getProvider(providerId).host.session;
+    if (!declared) return undefined;
+    try {
+      const session = await vscode.authentication.getSession(
+        declared.editorProviderId,
+        [...declared.scopes],
+        { createIfNone: false },
+      );
+      return session?.accessToken;
+    } catch {
+      // No account, or the user dismissed the prompt: fall through to the
+      // provider's next declared mode rather than failing the connection here.
+      return undefined;
+    }
+  });
   const podStore = new PodStore(context.globalState);
   const secrets = context.secrets;
   const reviewHistory = new ReviewHistory(context.globalState);
@@ -88,7 +111,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const pod = await createDemoPod(podStore);
       sidebar.refresh();
       void vscode.window.showInformationMessage(
-        `Verdict: "${pod.name}" runs on built-in sample data — connect GitLab whenever you are ready.`,
+        `Verdict: "${pod.name}" runs on built-in sample data — connect a real platform whenever you are ready.`,
       );
       await openDashboard();
     } catch (e) {
@@ -175,7 +198,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const createManualChangeset = async (): Promise<void> => {
     const pod = podStore.activePod;
     if (!pod) {
-      void vscode.window.showInformationMessage('Verdict: connect first — run "Verdict: Sign in to GitLab".');
+      void vscode.window.showInformationMessage('Verdict: connect first — run "Verdict: Sign in".');
       return;
     }
     try {
@@ -193,13 +216,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         {
           canPickMany: true,
           matchOnDetail: true,
-          title: 'New changeset — merge requests that ship together',
-          placeHolder: 'Pick two or more, or paste a merge request URL to find it',
+          title: `New changeset — ${vocabulary.changeRequestNounPlural} that ship together`,
+          placeHolder: `Pick two or more, or paste a ${vocabulary.changeRequestNoun} URL to find it`,
         },
       );
       if (!picked || picked.length === 0) return;
       if (picked.length < 2) {
-        void vscode.window.showWarningMessage('Verdict: a changeset needs at least two merge requests.');
+        void vscode.window.showWarningMessage(`Verdict: a changeset needs at least two ${vocabulary.changeRequestNounPlural}.`);
         return;
       }
       const name = await vscode.window.showInputBox({
@@ -239,7 +262,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const openDashboard = async (): Promise<void> => {
     if (!podStore.activePod) {
       void vscode.window.showInformationMessage(
-        'Verdict: connect first — run "Verdict: Sign in to GitLab".',
+        'Verdict: connect first — run "Verdict: Sign in".',
       );
       return;
     }
@@ -256,7 +279,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const pod = await runDebugBootstrap(bypass, podStore, secrets);
       sidebar.refresh();
       void vscode.window.showInformationMessage(
-        `Verdict: connected to ${bypass.instanceUrl} as @${pod.username ?? 'you'} — "${pod.name}" watches ${pod.repos?.length ?? 0} projects.`,
+        `Verdict: connected to ${bypass.instanceUrl} as @${pod.username ?? 'you'} — "${pod.name}" watches ${repoCountOf(getProvider(pod.providerId).vocabulary, pod.repos?.length ?? 0)}.`,
       );
       await openDashboard();
     } catch (e) {
@@ -266,9 +289,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const signIn = async (): Promise<void> => {
+    const options = getSignInOptions(getDebugAuthBypass(context.extensionMode) !== null, listRealProviders());
+    let chosen: SignInOption | undefined = options[0];
+    if (needsSignInChoice(options)) {
+      const picked = await vscode.window.showQuickPick(
+        options.map((option) => ({ label: option.label, detail: option.description, option })),
+        { title: 'Verdict: sign in', placeHolder: 'Which platform does this pod watch?' },
+      );
+      if (!picked) return;
+      chosen = picked.option;
+    }
+    if (chosen?.flow === 'debug') {
+      await bootstrapFromDebugBypass();
+      return;
+    }
     OnboardingPanel.show({
       podStore,
       secrets,
+      providerId: chosen?.providerId,
       onComplete: () => {
         sidebar.refresh();
         void openDashboard();
@@ -305,10 +343,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void vscode.window.showInformationMessage('Verdict: no pod yet — sign in first.');
       return;
     }
+    const provider = getProvider(pod.providerId);
     const input = await vscode.window.showInputBox({
-      title: `Add a project to "${pod.name}"`,
-      prompt: 'Project URL, numeric project id, or "group <id>"',
-      placeHolder: 'https://gitlab.com/hve/platform/core · 9102 · group 4821',
+      title: `Add a ${provider.vocabulary.repoNoun} to "${pod.name}"`,
+      prompt: provider.host.sourceInputHint,
+      placeHolder: provider.host.sourceInputPlaceholder,
     });
     if (!input?.trim()) return;
     try {
@@ -330,7 +369,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const known = new Set(repoIdsOf(pod));
       const added = repositories.filter((repo) => !known.has(repo.id));
       if (added.length === 0) {
-        void vscode.window.showInformationMessage('Verdict: that project is already in this pod.');
+        void vscode.window.showInformationMessage(
+          `Verdict: that ${provider.vocabulary.repoNoun} is already in this pod.`,
+        );
         return;
       }
       // A new Pod, not a mutation: `list()` copies the array but not the pods
@@ -347,7 +388,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.refresh();
       await DashboardPanel.refreshIfOpen();
       void vscode.window.showInformationMessage(
-        `Verdict: added ${added.length === 1 ? added[0]?.path ?? 'one project' : `${added.length} projects`} to "${pod.name}".`,
+        `Verdict: added ${added.length === 1 ? added[0]?.path ?? repoCountOf(provider.vocabulary, 1) : repoCountOf(provider.vocabulary, added.length)} to "${pod.name}".`,
       );
     } catch (e) {
       void vscode.window.showErrorMessage(
@@ -364,7 +405,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // active MR — or the changeset review when that is what's running.
       if (!ReviewFlowPanel.revealIfOpen() && !ChangesetReviewPanel.revealIfOpen()) {
         void vscode.window.showInformationMessage(
-          'Verdict: no active review — open a merge request from the dashboard first.',
+          'Verdict: no active review — open a change request from the dashboard first.',
         );
       }
     },

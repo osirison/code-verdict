@@ -1,0 +1,502 @@
+/**
+ * The GitHub provider: REST for everything except what only GraphQL can do
+ * (review-thread resolution and outdated state). See docs/ARCHITECTURE.md.
+ */
+import type {
+  AuthMode,
+  Connection,
+  ConnectionConfig,
+  HostDescriptor,
+  ProviderCapabilities,
+  ScmProvider,
+  Vocabulary,
+} from '../../platform/provider';
+import { bearerToken } from '../../platform/provider';
+import type {
+  ChangeRequest,
+  ChangeRequestDiff,
+  ChangeRequestRef,
+  CiRun,
+  CommentOutcome,
+  ConnectionStatus,
+  DiffAnchor,
+  Repository,
+  ReviewCommentDraft,
+  ReviewSubmission,
+  ReviewThread,
+  SourceResolution,
+  SubmitResult,
+  WorkItem,
+} from '../../platform/types';
+import type { ScmError } from '../../platform/errors';
+import { toScmError } from '../../platform/errors';
+import type { FetchLike } from './http';
+import { GitHubHttp, isDotCom, splitRepoId } from './http';
+import { parseGitHubSourceInput } from './sourceInput';
+import {
+  aggregateCiStatus,
+  isRealIssue,
+  toChangeRequest,
+  toCiRun,
+  toFileDiff,
+  toRepoGroup,
+  toRepository,
+  toReviewThread,
+  toWorkItem,
+  type GhCheckRun,
+  type GhFile,
+  type GhIssue,
+  type GhOrg,
+  type GhPull,
+  type GhRepo,
+  type GqlThread,
+} from './mappers';
+
+const CAPABILITIES: ProviderCapabilities = {
+  // ```suggestion blocks render as an applyable "Commit suggestion".
+  suggestions: true,
+  approvals: true,
+  requestChanges: true,
+  // GraphQL resolveReviewThread / unresolveReviewThread — no REST equivalent.
+  threadResolution: true,
+  groupHierarchy: true,
+  // POST /pulls/{n}/reviews carries the whole review at once.
+  batchedReview: true,
+};
+
+const VOCABULARY: Vocabulary = {
+  platformName: 'GitHub',
+  changeRequestNoun: 'pull request',
+  changeRequestNounPlural: 'pull requests',
+  changeRequestAbbrev: 'PR',
+  repoNoun: 'repository',
+  repoNounPlural: 'repositories',
+  groupNoun: 'organization',
+  ciNoun: 'check',
+  ciNounPlural: 'checks',
+  formatCrRef: (number) => `#${number}`,
+};
+
+const HOST: HostDescriptor = {
+  instanceUrlLabel: 'GitHub host',
+  defaultInstanceUrl: 'https://github.com',
+  tokenPlaceholder: 'ghp_… / github_pat_…',
+  tokenHint: 'a personal access token with `repo` scope',
+  sourceInputPlaceholder: 'https://github.com/acme/core · acme/core · acme',
+  sourceInputHint: 'Accepts a repository URL, an owner/repo path, or an organization.',
+  sourceSamples: [
+    { label: 'repository URL', value: 'https://github.com/acme/core' },
+    { label: 'owner/repo', value: 'acme/core' },
+    { label: 'organization', value: 'acme' },
+  ],
+  session: { editorProviderId: 'github', scopes: ['repo', 'read:org'] },
+};
+
+/** Errors after which posting the remaining comments cannot succeed. */
+const ABORT_KINDS = new Set(['auth', 'insufficientScope', 'rateLimited', 'network']);
+
+/** GitHub renders a suggestion from a fenced block, same syntax as GitLab. */
+function buildCommentBody(comment: ReviewCommentDraft): string {
+  const parts = [comment.body];
+  if (comment.suggestion) {
+    parts.push(['```suggestion', comment.suggestion.new, '```'].join('\n'));
+  }
+  if (comment.footer) parts.push(comment.footer);
+  return parts.join('\n\n');
+}
+
+interface GitHubAnchorRefs {
+  commitId: string;
+}
+
+function anchorPayload(anchor: DiffAnchor): Record<string, unknown> {
+  const refs = anchor.refs as GitHubAnchorRefs | undefined;
+  const side = anchor.side === 'old' ? 'LEFT' : 'RIGHT';
+  const payload: Record<string, unknown> = {
+    path: anchor.filePath,
+    line: anchor.endLine ?? anchor.line,
+    side,
+  };
+  if (anchor.endLine !== undefined && anchor.endLine !== anchor.line) {
+    payload.start_line = Math.min(anchor.line, anchor.endLine);
+    payload.start_side = side;
+  }
+  if (refs?.commitId) payload.commit_id = refs.commitId;
+  return payload;
+}
+
+const THREADS_QUERY = `
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line
+          resolvedBy { login }
+          comments(first: 100) { nodes { id body createdAt author { login } } }
+        }
+      }
+    }
+  }
+}`;
+
+export class GitHubConnection implements Connection {
+  constructor(private readonly http: GitHubHttp) {}
+
+  private repoPath(repoId: string): string {
+    const { owner, repo } = splitRepoId(repoId);
+    return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  }
+
+  private prPath(ref: ChangeRequestRef): string {
+    return `${this.repoPath(ref.repoId)}/pulls/${encodeURIComponent(ref.number)}`;
+  }
+
+  async testConnection(): Promise<ConnectionStatus> {
+    try {
+      const user = await this.http.get<{ login: string; name?: string | null }>('/user');
+      return { ok: true, username: user.login };
+    } catch (e) {
+      return { ok: false, error: toScmError(e) };
+    }
+  }
+
+  async resolveSource(input: string): Promise<SourceResolution> {
+    const parsed = parseGitHubSourceInput(input);
+    switch (parsed.shape) {
+      case 'repo': {
+        const repoId = `${parsed.owner}/${parsed.repo}`;
+        try {
+          return { kind: 'repository', repo: await this.getRepository(repoId) };
+        } catch (e) {
+          // GitHub answers 404 for "absent" and "invisible" alike. A
+          // well-formed reference is reported notVisible: that is the
+          // actionable message, and either way nothing is added to the pod.
+          if (toScmError(e).kind === 'notFound') return { kind: 'notVisible', id: repoId };
+          throw e;
+        }
+      }
+      case 'org':
+      case 'orgCandidate': {
+        try {
+          const org = await this.http.get<GhOrg>(`/orgs/${encodeURIComponent(parsed.org)}`);
+          return {
+            kind: 'group',
+            group: toRepoGroup(org),
+            repositories: await this.listGroupRepositories(parsed.org),
+          };
+        } catch (e) {
+          if (toScmError(e).kind !== 'notFound') throw e;
+          // An explicit /orgs/ URL that 404s is invisible; a bare name might
+          // simply not be an organization at all.
+          return parsed.shape === 'org' ? { kind: 'notVisible', id: parsed.org } : { kind: 'noMatch' };
+        }
+      }
+      case 'invalid':
+        return { kind: 'noMatch' };
+    }
+  }
+
+  async listGroupRepositories(groupId: string): Promise<Repository[]> {
+    const repos = await this.http.getAll<GhRepo>(`/orgs/${encodeURIComponent(groupId)}/repos`, {
+      type: 'all',
+      sort: 'full_name',
+    });
+    return repos.map(toRepository);
+  }
+
+  async getRepository(repoId: string): Promise<Repository> {
+    return toRepository(await this.http.get<GhRepo>(this.repoPath(repoId)));
+  }
+
+  async listOpenChangeRequests(repoIds: readonly string[]): Promise<ChangeRequest[]> {
+    const perRepo = await Promise.all(
+      repoIds.map(async (repoId) => {
+        const pulls = await this.http.getAll<GhPull>(`${this.repoPath(repoId)}/pulls`, {
+          state: 'open',
+          sort: 'updated',
+          direction: 'desc',
+        });
+        return Promise.all(
+          pulls.map(async (pull) => {
+            const ci = await this.ciForSha(repoId, pull.head.sha);
+            return toChangeRequest(repoId, pull, ci);
+          }),
+        );
+      }),
+    );
+    return perRepo.flat();
+  }
+
+  /** Check runs for one commit, aggregated into the neutral CI shape. */
+  private async ciForSha(
+    repoId: string,
+    sha: string,
+  ): Promise<{ runId: string; status: ReturnType<typeof aggregateCiStatus>; webUrl?: string } | undefined> {
+    try {
+      const payload = await this.http.get<{ check_runs?: GhCheckRun[] }>(
+        `${this.repoPath(repoId)}/commits/${encodeURIComponent(sha)}/check-runs`,
+        { per_page: 100 },
+      );
+      const runs = payload.check_runs ?? [];
+      if (runs.length === 0) return undefined;
+      const status = aggregateCiStatus(runs);
+      const lead = runs.find((run) => run.conclusion === 'failure') ?? runs[0];
+      return lead
+        ? { runId: String(lead.id), status, webUrl: lead.html_url ?? undefined }
+        : undefined;
+    } catch {
+      // Checks are decoration on the list — a repository with the Checks API
+      // disabled must still list its pull requests.
+      return undefined;
+    }
+  }
+
+  async listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]> {
+    const perRepo = await Promise.all(
+      repoIds.map(async (repoId) => {
+        const issues = await this.http.getAll<GhIssue>(`${this.repoPath(repoId)}/issues`, {
+          state: 'open',
+          sort: 'updated',
+          direction: 'desc',
+        });
+        // The issues endpoint returns pull requests too; those are not work items.
+        return issues.filter(isRealIssue).map((issue) => toWorkItem(repoId, issue));
+      }),
+    );
+    return perRepo.flat();
+  }
+
+  async listCiRuns(repoIds: readonly string[], limitPerRepo = 20): Promise<CiRun[]> {
+    const perRepo = await Promise.all(
+      repoIds.map(async (repoId) => {
+        try {
+          const commits = await this.http.get<Array<{ sha: string }>>(
+            `${this.repoPath(repoId)}/commits`,
+            { per_page: Math.min(limitPerRepo, 30) },
+          );
+          const runs = await Promise.all(
+            commits.slice(0, limitPerRepo).map(async (commit) => {
+              const payload = await this.http.get<{ check_runs?: GhCheckRun[] }>(
+                `${this.repoPath(repoId)}/commits/${encodeURIComponent(commit.sha)}/check-runs`,
+                { per_page: 100 },
+              );
+              return (payload.check_runs ?? []).map((run) => toCiRun(repoId, run));
+            }),
+          );
+          return runs.flat().slice(0, limitPerRepo);
+        } catch {
+          return [] as CiRun[];
+        }
+      }),
+    );
+    return perRepo.flat();
+  }
+
+  async getChangeRequestDiff(ref: ChangeRequestRef): Promise<ChangeRequestDiff> {
+    const pull = await this.http.get<GhPull>(this.prPath(ref));
+    const files = await this.http.getAll<GhFile>(`${this.prPath(ref)}/files`);
+    return {
+      ref,
+      headSha: pull.head.sha,
+      files: files.map(toFileDiff),
+      // Opaque to the platform layer: GitHub needs one commit id where GitLab
+      // needs a diff_refs triple.
+      anchorRefs: { commitId: pull.head.sha } satisfies GitHubAnchorRefs,
+    };
+  }
+
+  /**
+   * Two-phase, and this is the design's central decision.
+   *
+   * GitHub's batched review endpoint is all-or-nothing: one bad position
+   * rejects the whole POST. The neutral contract promises an outcome per
+   * comment. So: try the batch (the normal path, and the one that produces the
+   * right artifact — a single review on the pull request); on a
+   * *position-related* rejection fall back to posting comments individually for
+   * real per-comment outcomes, then post the summary and verdict as a
+   * comment-free review so a partial comment failure never drops the verdict.
+   * On a non-position rejection nothing was attempted, so the normalized error
+   * is thrown rather than returned — which is what the contract specifies.
+   */
+  async submitReview(ref: ChangeRequestRef, submission: ReviewSubmission): Promise<SubmitResult> {
+    const event = submission.approve
+      ? 'APPROVE'
+      : submission.requestChanges
+        ? 'REQUEST_CHANGES'
+        : 'COMMENT';
+
+    try {
+      return await this.submitAsOneReview(ref, submission, event);
+    } catch (e) {
+      const error = toScmError(e);
+      if (error.kind !== 'staleAnchor') throw error;
+      return this.submitCommentByComment(ref, submission, event);
+    }
+  }
+
+  private async submitAsOneReview(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+    event: string,
+  ): Promise<SubmitResult> {
+    const comments = submission.comments.map((comment) => ({
+      ...anchorPayload(comment.anchor),
+      body: buildCommentBody(comment),
+    }));
+    // A review with no body, no comments and event COMMENT is rejected by
+    // GitHub; there is nothing to post in that case either.
+    if (comments.length === 0 && submission.summary === undefined && event === 'COMMENT') {
+      return { comments: [], summaryPosted: false };
+    }
+
+    await this.http.post(`${this.prPath(ref)}/reviews`, {
+      event,
+      body: submission.summary,
+      comments,
+      commit_id: (submission.comments[0]?.anchor.refs as GitHubAnchorRefs | undefined)?.commitId,
+    });
+
+    return {
+      comments: submission.comments.map((comment) => ({ key: comment.key, ok: true })),
+      summaryPosted: submission.summary !== undefined,
+      approvalApplied: submission.approve === true ? true : undefined,
+      requestChangesApplied: submission.requestChanges === true ? true : undefined,
+    };
+  }
+
+  private async submitCommentByComment(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+    event: string,
+  ): Promise<SubmitResult> {
+    const outcomes: CommentOutcome[] = [];
+    let abort: ScmError | undefined;
+
+    for (const comment of submission.comments) {
+      if (abort) {
+        outcomes.push({ key: comment.key, ok: false, error: abort });
+        continue;
+      }
+      try {
+        const posted = await this.http.post<{ id: number }>(`${this.prPath(ref)}/comments`, {
+          ...anchorPayload(comment.anchor),
+          body: buildCommentBody(comment),
+        });
+        outcomes.push({ key: comment.key, ok: true, threadId: String(posted.id) });
+      } catch (e) {
+        const error = toScmError(e);
+        outcomes.push({ key: comment.key, ok: false, error });
+        if (ABORT_KINDS.has(error.kind)) abort = error;
+      }
+    }
+
+    const result: SubmitResult = { comments: outcomes, summaryPosted: false };
+    const allOk = outcomes.length > 0 && outcomes.every((outcome) => outcome.ok);
+
+    // The summary is withheld over an incomplete review, but the verdict is
+    // not: a request for changes still has to land.
+    const needsVerdictReview = event !== 'COMMENT';
+    if ((submission.summary !== undefined && allOk) || needsVerdictReview) {
+      try {
+        await this.http.post(`${this.prPath(ref)}/reviews`, {
+          event,
+          body: allOk ? submission.summary : undefined,
+        });
+        if (submission.summary !== undefined && allOk) result.summaryPosted = true;
+        if (submission.approve) result.approvalApplied = true;
+        if (submission.requestChanges) result.requestChangesApplied = true;
+      } catch (e) {
+        const error = toScmError(e);
+        if (submission.summary !== undefined && allOk) result.summaryError = error;
+        // GitHub refuses to let an author approve or request changes on their
+        // own pull request. That is a verdict outcome, never a comment failure.
+        if (submission.approve) result.approvalError = error;
+        if (submission.requestChanges) result.requestChangesError = error;
+      }
+    }
+    return result;
+  }
+
+  async listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]> {
+    const { owner, repo } = splitRepoId(ref.repoId);
+    const threads: ReviewThread[] = [];
+    let cursor: string | null = null;
+
+    for (let page = 0; page < 10; page += 1) {
+      const data: {
+        repository?: {
+          pullRequest?: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: boolean; endCursor: string | null };
+              nodes: GqlThread[];
+            };
+          } | null;
+        } | null;
+      } = await this.http.graphql(THREADS_QUERY, {
+        owner,
+        repo,
+        number: Number(ref.number),
+        cursor,
+      });
+
+      const reviewThreads = data.repository?.pullRequest?.reviewThreads;
+      if (!reviewThreads) break;
+      threads.push(...reviewThreads.nodes.map((node) => toReviewThread(ref, node)));
+      if (!reviewThreads.pageInfo.hasNextPage) break;
+      cursor = reviewThreads.pageInfo.endCursor;
+    }
+    return threads;
+  }
+
+  async resolveThread(_ref: ChangeRequestRef, threadId: string, resolved: boolean): Promise<void> {
+    const mutation = resolved ? 'resolveReviewThread' : 'unresolveReviewThread';
+    await this.http.graphql(
+      `mutation($threadId: ID!) { ${mutation}(input: { threadId: $threadId }) { thread { id isResolved } } }`,
+      { threadId },
+    );
+  }
+
+  async replyToThread(_ref: ChangeRequestRef, threadId: string, body: string): Promise<void> {
+    // Thread ids are GraphQL node ids, so the reply goes the same way — a REST
+    // reply would need the numeric comment id, which is a different identifier.
+    await this.http.graphql(
+      `mutation($threadId: ID!, $body: String!) {
+        addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
+          comment { id }
+        }
+      }`,
+      { threadId, body },
+    );
+  }
+
+  async approve(ref: ChangeRequestRef): Promise<void> {
+    await this.http.post(`${this.prPath(ref)}/reviews`, { event: 'APPROVE' });
+  }
+}
+
+export function createGitHubProvider(fetchImpl?: FetchLike, now?: () => number): ScmProvider {
+  return {
+    id: 'github',
+    displayName: 'GitHub',
+    capabilities: CAPABILITIES,
+    vocabulary: VOCABULARY,
+    host: HOST,
+    /**
+     * github.com can use the editor's account; an enterprise host has no such
+     * session, so it is token only. One provider, two hosts, different auth —
+     * which is why this is a method and not a static list.
+     */
+    authModesFor(instanceUrl: string): readonly AuthMode[] {
+      return isDotCom(instanceUrl) ? ['session', 'token'] : ['token'];
+    },
+    connect(config: ConnectionConfig): Connection {
+      return new GitHubConnection(
+        new GitHubHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl, now),
+      );
+    },
+  };
+}
+
+export const githubProvider: ScmProvider = createGitHubProvider();

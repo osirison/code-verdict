@@ -7,6 +7,7 @@ import type { CandidateBucket } from '../domain/agentResponse';
 import type { Category, Criteria, ReviewItem, Severity, Verdict } from '../domain/types';
 import type { AgentDescriptor } from '../app/agents';
 import type { HunkLine } from '../domain/diffHunks';
+import type { Vocabulary } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
 
@@ -51,6 +52,8 @@ export interface ChangesetReviewScope {
 }
 
 export interface FlowViewState {
+  /** Platform nouns for the active pod's provider — never hardcoded here. */
+  vocabulary: Vocabulary;
   screen: FlowScreen;
   header: FlowHeaderInfo;
   agents: AgentDescriptor[];
@@ -157,7 +160,7 @@ const CATEGORY_COLOR: Record<Category, string> = {
 };
 
 const FLOOR_HINTS: Record<Severity, string> = {
-  nit: 'Everything, nits included — noisy on large MRs.',
+  nit: 'Everything, nits included — noisy on large diffs.',
   minor: 'Balanced: minor, major, blocker.',
   major: 'Major and blocker only — quieter, misses smaller gaps.',
   blocker: 'Blockers only — fastest pass, misses test gaps.',
@@ -345,12 +348,12 @@ function renderRunReview(s: FlowViewState): string {
     ${subline(s.header)}
     ${
       s.memberOfChangeset
-        ? `<div class="cs-note">⧉ Part of ${e(s.memberOfChangeset.name)} · ${s.memberOfChangeset.memberCount} MRs ship together — <a href="#" id="open-changeset" data-changeset="${e(s.memberOfChangeset.id)}">open the changeset</a></div>`
+        ? `<div class="cs-note">⧉ Part of ${e(s.memberOfChangeset.name)} · ${s.memberOfChangeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s ship together — <a href="#" id="open-changeset" data-changeset="${e(s.memberOfChangeset.id)}">open the changeset</a></div>`
         : ''
     }
     <div>
       <h1>Run an AI review</h1>
-      <p class="lede">Agents come from your Copilot workspace. Criteria are saved per project and follow every run.</p>
+      <p class="lede">Agents come from your Copilot workspace. Criteria are saved per ${e(s.vocabulary.repoNoun)} and follow every run.</p>
     </div>
     <div class="agent-select">
       <button class="agent-row" id="agent-toggle">
@@ -466,7 +469,7 @@ function triageHeader(s: FlowViewState): string {
     .map((sev) => `<span class="sev sev-${sev}">${bySev(sev)} ${sev}</span>`)
     .join('');
   const scope = s.changeset
-    ? `<div class="changeset-scope"><span class="glyph">⧉</span><span><strong>Reviewing ${e(s.changeset.name)} · ${s.changeset.memberCount} MRs</strong> · findings are labelled with the repo they land in</span><a href="#" id="review-single">Review this MR alone</a></div>`
+    ? `<div class="changeset-scope"><span class="glyph">⧉</span><span><strong>Reviewing ${e(s.changeset.name)} · ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s</strong> · findings are labelled with the repo they land in</span><a href="#" id="review-single">Review this ${e(s.vocabulary.changeRequestAbbrev)} alone</a></div>`
     : '';
   return `${scope}<div class="tri-head">
     <div>
@@ -509,7 +512,7 @@ function movedChip(view?: TriageItemView): string {
   return view?.lineMoved ? '<span class="pill pill-warn">⚠ line moved</span>' : '';
 }
 
-function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Record<string, string>): string {
+function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabulary, repoLabels?: Record<string, string>): string {
   const item = view.item;
   const owner = view.projectLabel && view.refLabel ? `<span class="agent-fg">${e(view.projectLabel)} · ${e(view.refLabel)}</span> · ` : '';
   const targetControl = (span: NonNullable<ReviewItem['spans']>[number]): string => {
@@ -535,7 +538,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, repoLabels?: Recor
     ${
       item.suggestion
         ? `<div class="code-card">
-        <div class="sugg-head">Suggested change · posts as a GitLab suggestion</div>
+        <div class="sugg-head">Suggested change · posts as a ${e(vocabulary.platformName)} suggestion</div>
         <div class="sugg-del">- ${e(item.suggestion.old)}</div>
         <div class="sugg-add">+ ${e(item.suggestion.new)}</div>
       </div>`
@@ -565,7 +568,7 @@ function renderTriageSplit(s: FlowViewState, agentLabel: string): string {
   const all = s.counts.undecided === 0;
   return `${triageHeader(s)}
   <div class="detail" data-item="${e(selected?.item.id ?? '')}" data-repo-id="${e(selected?.item.repoId ?? '')}" data-cr-number="${e(selected?.item.crNumber ?? '')}">
-    ${selected ? itemDetail(selected, agentLabel, s.changeset?.repoLabels) : '<p class="prose">No review items.</p>'}
+    ${selected ? itemDetail(selected, agentLabel, s.vocabulary, s.changeset?.repoLabels) : '<p class="prose">No review items.</p>'}
   </div>
   <div class="action-bar">
     <button class="btn btn-ok" id="accept">Accept<span class="key">A</span></button>
@@ -640,7 +643,7 @@ function renderTriageDiff(s: FlowViewState): string {
   const item = selected.item;
   const severityColor = item.severity === 'nit' ? 'var(--fg-dim)' : `var(--sev-${item.severity})`;
   const suggestion = item.suggestion
-    ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a GitLab suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
+    ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a ${e(s.vocabulary.platformName)} suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
     : '';
   const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text">${e(entry.text)}</div></div>`).join('');
   const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
@@ -703,7 +706,7 @@ function renderClean(s: FlowViewState): string {
         : ''
     }
     <div class="actions-row" style="justify-content:center">
-      <button class="btn btn-ok" id="approve">Approve merge request</button>
+      <button class="btn btn-ok" id="approve">Approve ${e(s.vocabulary.changeRequestNoun)}</button>
       <button class="btn" id="lower-bar">Lower the bar and re-run</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
     </div>
@@ -718,7 +721,7 @@ function renderSummary(s: FlowViewState): string {
   return `<div class="wrap wrap-wide">
     ${subline(s.header)}
     <div>
-      <h1>${s.changeset ? `Submit review across ${s.changeset.memberCount} merge requests` : 'Submit review to GitLab'}</h1>
+      <h1>${s.changeset ? `Submit review across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestNounPlural)}` : `Submit review to ${e(s.vocabulary.platformName)}`}</h1>
       <p class="lede">${s.items.length} findings triaged — ${s.counts.accepted} accepted, ${s.counts.rejected} rejected, ${s.counts.skipped} skipped.</p>
     </div>
     <div class="tally-blocks">
@@ -730,7 +733,7 @@ function renderSummary(s: FlowViewState): string {
       <div class="sum-card-head"><span>Summary comment · editable</span><a href="#" id="regenerate">Regenerate</a></div>
       <textarea class="summary" id="summary-text">${e(s.summaryText)}</textarea>
     </div>
-    ${s.changeset ? `<div class="cs-note">⧉ Posted to all ${s.changeset.memberCount} merge requests in this changeset, each comment landing in the repo it belongs to, cross-linked to ${e(s.changeset.linkedIssue ?? s.changeset.name)}.</div>` : ''}
+    ${s.changeset ? `<div class="cs-note">⧉ Posted to all ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestNounPlural)} in this changeset, each comment landing in the repo it belongs to, cross-linked to ${e(s.changeset.linkedIssue ?? s.changeset.name)}.</div>` : ''}
     <div class="card">
       <div class="sum-card-head"><span>Line comments to post (${s.counts.accepted})</span></div>
       ${
@@ -777,17 +780,17 @@ function renderSummary(s: FlowViewState): string {
     ${
       s.submitError
         ? `<div class="submit-fail">
-        <div class="fail-title">GitLab rejected the request · ${e(s.submitError)}</div>
+        <div class="fail-title">${e(s.vocabulary.platformName)} rejected the request · ${e(s.submitError)}</div>
         <div class="lede">Nothing is lost — the summary, the ${s.counts.accepted} line comments and your final note are still here.</div>
         <div class="actions-row">
-          <button class="btn btn-accent" id="reconnect">Reconnect GitLab</button>
+          <button class="btn btn-accent" id="reconnect">Reconnect ${e(s.vocabulary.platformName)}</button>
           <button class="btn" id="retry-submit">Retry submit</button>
         </div>
       </div>`
         : ''
     }
     <div class="actions-row">
-      <button class="btn btn-brand" id="submit">${s.changeset ? `Submit across ${s.changeset.memberCount} MRs` : 'Submit to GitLab'}</button>
+      <button class="btn btn-brand" id="submit">${s.changeset ? `Submit across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s` : `Submit to ${e(s.vocabulary.platformName)}`}</button>
       <button class="btn" id="copy-md">Copy as markdown</button>
       <button class="btn" id="back-triage">Back to triage</button>
       <span class="posts-as">posts as @${e(s.username)}</span>
@@ -800,12 +803,12 @@ function renderSummary(s: FlowViewState): string {
 function renderDone(s: FlowViewState): string {
   return `<div class="done-col">
     <div class="ok-circle">✓</div>
-    <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} MRs` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
+    <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
     <p class="lede">${e(s.doneSentence)}</p>
     <div class="actions-row" style="justify-content:center">
       <button class="btn btn-accent" id="track-replies">Track replies</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
-      <button class="btn" id="open-mr">Open MR in GitLab</button>
+      <button class="btn" id="open-mr">Open ${e(s.vocabulary.changeRequestAbbrev)} in ${e(s.vocabulary.platformName)}</button>
     </div>
   </div>`;
 }
@@ -889,7 +892,7 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
               : renderDone(s);
   const title =
     s.changeset && s.screen !== 'done'
-      ? `Verdict: Review · ${s.changeset.memberCount} MRs`
+      ? `Verdict: Review · ${s.changeset.memberCount} ${s.vocabulary.changeRequestAbbrev}s`
       : s.screen === 'agent'
       ? `Verdict: Run review · ${s.header.refLabel}`
       : s.screen === 'done'

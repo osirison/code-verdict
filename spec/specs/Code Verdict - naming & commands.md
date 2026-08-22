@@ -18,7 +18,11 @@ Rules:
   user selected (e.g. `HVE Core / PR Review`). Keep that attribution visible — it's what makes the
   findings trustworthy.
 - The tagline used in the marketplace listing and step 1 of onboarding:
-  *Judge the AI's review, then ship it to GitLab.*
+  *Judge the AI's review, then ship it to your code platform.*
+- Command titles name no platform. `package.json` titles are fixed at package time, so they cannot
+  vary per pod the way vocabulary-rendered chrome does — the palette must read correctly whether the
+  active pod watches GitLab or GitHub. `src/commands.test.ts` fails the build if a platform name
+  appears in any static product-surface string.
 
 ## Command palette
 
@@ -37,14 +41,14 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Skip item | `codeVerdict.skipItem` | `S` |
 | Verdict: Ask agent about this item | `codeVerdict.askAgent` | `⌘↩` / `Ctrl+Enter` |
 | Verdict: Generate summary | `codeVerdict.generateSummary` | Enabled once every item is triaged |
-| Verdict: Submit review to GitLab | `codeVerdict.submitReview` | |
+| Verdict: Submit review | `codeVerdict.submitReview` | |
 | Verdict: Select review agent | `codeVerdict.selectAgent` | Lists Copilot workspace agents |
 | Verdict: Edit review criteria | `codeVerdict.editCriteria` | Severity floor, categories, confidence |
 | Verdict: New pod | `codeVerdict.newPod` | |
 | Verdict: Switch pod | `codeVerdict.switchPod` | Quick pick |
 | Verdict: Add project to pod | `codeVerdict.addProject` | Accepts URL, project id, or group id |
 | Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
-| Verdict: Sign in to GitLab | `codeVerdict.signIn` | |
+| Verdict: Sign in | `codeVerdict.signIn` | |
 
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.

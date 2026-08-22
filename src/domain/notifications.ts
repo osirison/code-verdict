@@ -36,9 +36,9 @@ export interface NotificationEventDef {
 export const NOTIFICATION_EVENTS: readonly NotificationEventDef[] = [
   { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', defaultMode: 'Interrupt' },
   { key: 'replyPosted', label: 'Reply on a comment you posted', hint: 'An author replied to your review.', defaultMode: 'Interrupt' },
-  { key: 'authorPushed', label: 'Author pushed a fix', hint: 'The merge request changed after review.', defaultMode: 'Badge' },
+  { key: 'authorPushed', label: 'Author pushed a fix', hint: 'The code changed after review.', defaultMode: 'Badge' },
   { key: 'pipelineFailed', label: 'Pipeline failed', hint: 'A watched pipeline needs attention.', defaultMode: 'Digest' },
-  { key: 'reviewRequested', label: 'Review requested from you', hint: 'A merge request is waiting on you.', defaultMode: 'Interrupt' },
+  { key: 'reviewRequested', label: 'Review requested from you', hint: 'A change request is waiting on you.', defaultMode: 'Interrupt' },
   { key: 'mentioned', label: 'You were mentioned', hint: 'A discussion mentioned your username.', defaultMode: 'Badge' },
   { key: 'threadStale', label: 'A posted thread went stale', hint: 'New commits moved a reviewed line.', defaultMode: 'Digest' },
 ];

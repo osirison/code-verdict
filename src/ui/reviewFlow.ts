@@ -397,7 +397,7 @@ export class ReviewFlowPanel {
       'Resolving agent from Copilot workspace…',
       `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
       'Cross-referencing module history…',
-      'Scoring findings against project criteria…',
+      `Scoring findings against ${getProvider(this.pod().providerId).vocabulary.repoNoun} criteria…`,
       'Items ready',
     ];
     this.runStep = 2;
@@ -835,6 +835,7 @@ export class ReviewFlowPanel {
         ? Math.round((history.reduce((n, r) => n + r.counts.accepted, 0) / produced) * 100)
         : undefined;
     const state: FlowViewState = {
+      vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
       acceptRate,
       memberOfChangeset: this.memberOfChangeset,

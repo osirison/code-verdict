@@ -3,7 +3,7 @@ import { FixtureConnection, fixtureProvider } from './fixtureProvider';
 
 describeProviderContract('fixture', {
   capabilities: fixtureProvider.capabilities,
-  makeConnection: () => fixtureProvider.connect({ instanceUrl: 'https://gitlab.example', token: 'demo' }),
+  makeConnection: () => fixtureProvider.connect({ instanceUrl: 'https://gitlab.example', credential: { kind: 'token', token: 'demo'  } }),
   makeFailingConnection: () => {
     const conn = new FixtureConnection();
     conn.simulate.staleAnchorKeys = new Set(['fails']);

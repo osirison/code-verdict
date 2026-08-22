@@ -19,6 +19,21 @@ export function listProviders(): ScmProvider[] {
   return [...providers.values()];
 }
 
+/** Providers a user can actually connect to — demo providers excluded. */
+export function listRealProviders(): ScmProvider[] {
+  return listProviders().filter((p) => p.demo !== true);
+}
+
+/**
+ * The provider onboarding starts on: the only real one when there is a single
+ * choice, otherwise the first registered. The chooser overrides it.
+ */
+export function defaultProviderId(): string {
+  const first = listRealProviders()[0] ?? listProviders()[0];
+  if (!first) throw new Error('No providers registered');
+  return first.id;
+}
+
 /** Test hook — the registry is module-global state. */
 export function clearProviders(): void {
   providers.clear();

@@ -2,17 +2,20 @@ import { deriveStats, repoIdsOf, repoLabel, type PodData } from '../app/podQuery
 import type { Pod } from '../domain/types';
 import { getProvider } from '../platform/registry';
 import type { SidebarViewState } from './sidebarHtml';
+import { repoCountOf } from './vocab';
 
 export function toSidebarViewState(data: PodData, pods: readonly Pod[]): SidebarViewState {
   const pod = data.pod;
   const vocabulary = getProvider(pod.providerId).vocabulary;
   return {
+    vocabulary,
     podName: pod.name,
-    podMeta: `${repoIdsOf(pod).length} ${vocabulary.repoNoun}s`,
+    podMeta: repoCountOf(vocabulary, repoIdsOf(pod).length),
     pods: pods.map((candidate) => ({
       id: candidate.id,
       name: candidate.name,
-      meta: `${repoIdsOf(candidate).length} projects`,
+      // A pod in the switcher names its own provider's nouns, not the active one's.
+      meta: repoCountOf(getProvider(candidate.providerId).vocabulary, repoIdsOf(candidate).length),
       active: candidate.id === pod.id,
     })),
     mergeRequests: data.changeRequests.slice(0, 8).map((cr) => ({

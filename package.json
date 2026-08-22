@@ -1,7 +1,7 @@
 {
   "name": "code-verdict",
   "displayName": "Code Verdict",
-  "description": "Judge the AI's review, then ship it to GitLab.",
+  "description": "Judge the AI's review, then ship it to your code platform.",
   "version": "0.0.1",
   "publisher": "osirison",
   "license": "MIT",
@@ -64,7 +64,7 @@
       },
       {
         "command": "codeVerdict.submitReview",
-        "title": "Verdict: Submit review to GitLab"
+        "title": "Verdict: Submit review"
       },
       {
         "command": "codeVerdict.selectAgent",
@@ -92,7 +92,7 @@
       },
       {
         "command": "codeVerdict.signIn",
-        "title": "Verdict: Sign in to GitLab"
+        "title": "Verdict: Sign in"
       }
     ],
     "viewsContainers": {
@@ -116,7 +116,7 @@
     "viewsWelcome": [
       {
         "view": "codeVerdict.sidebar",
-        "contents": "Judge the AI's review, then ship it to GitLab.\n[Sign in to GitLab](command:codeVerdict.signIn)"
+        "contents": "Judge the AI's review, then ship it to your code platform.\n[Sign in](command:codeVerdict.signIn)"
       }
     ],
     "configuration": {
@@ -124,8 +124,8 @@
       "properties": {
         "codeVerdict.instanceUrl": {
           "type": "string",
-          "default": "https://gitlab.com",
-          "description": "Base URL of the GitLab instance. The access token is never a setting — it lives in the VS Code secret store."
+          "default": "",
+          "description": "Base URL of the platform instance this pod connects to. Empty uses the chosen provider's default host. The access token is never a setting — it lives in the VS Code secret store."
         },
         "codeVerdict.agent": {
           "type": "string",
@@ -293,12 +293,12 @@
         "codeVerdict.changesets.branchDetection": {
           "type": "boolean",
           "default": true,
-          "description": "Suggest a changeset when merge requests across projects share a source branch name. Trailer detection takes precedence; switch this off if reused branch names make it noisy."
+          "description": "Suggest a changeset when change requests across repositories share a source branch name. Trailer detection takes precedence; switch this off if reused branch names make it noisy."
         },
         "codeVerdict.pods": {
           "type": "array",
           "default": [],
-          "description": "Pods (named sets of watched projects). Managed by the extension; edit through the UI."
+          "description": "Pods (named sets of watched repositories). Managed by the extension; edit through the UI."
         }
       }
     },

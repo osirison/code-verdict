@@ -8,6 +8,7 @@ import { deriveMergeOrder } from '../app/mergeOrder';
 import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
+import { getProvider } from '../platform/registry';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { diffStats } from '../domain/diffHunks';
 import type { Review } from '../domain/types';
@@ -93,6 +94,7 @@ export class ChangesetPanel {
       const order = deriveMergeOrder(changeset.members, findings ?? []);
       this.route.panel.title = `Verdict: Changeset · ${changeset.name}`;
       this.route.panel.webview.html = renderChangesetHtml({
+        vocabulary: getProvider(pod.providerId).vocabulary,
         id: changeset.id,
         name: changeset.name,
         linkedIssue: changeset.linkedIssue,
@@ -150,8 +152,9 @@ export class ChangesetPanel {
   private async removeManual(): Promise<void> {
     const pod = this.deps.podStore.activePod;
     if (!pod) return;
+    const vocabulary = getProvider(pod.providerId).vocabulary;
     const picked = await vscode.window.showWarningMessage(
-      'Remove this changeset? The merge requests stay open — only the grouping goes away.',
+      `Remove this changeset? The ${vocabulary.changeRequestNounPlural} stay open — only the grouping goes away.`,
       { modal: true },
       'Remove',
     );

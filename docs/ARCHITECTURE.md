@@ -1,9 +1,14 @@
 # Code Verdict — architecture
 
 The product spec lives in [`spec/`](../spec/README.md). This document covers the one decision that
-shapes the whole codebase: **the data layer is provider-agnostic.** GitLab is the primary
-integration, but GitHub, Bitbucket/Atlassian and any other source-repo platform must be addable by
-writing a single new provider module, with no changes above the data layer.
+shapes the whole codebase: **the data layer is provider-agnostic.** GitLab and GitHub are both
+implemented; Bitbucket/Atlassian and any other source-repo platform must be addable by writing a
+single new provider module, with no changes above the data layer.
+
+Adding GitHub was the test of that claim, and it held: `src/domain/**` and the review, triage,
+changeset and notification logic were not touched. The contract itself changed in exactly one place
+(`ConnectionConfig` gaining a credential union). Everything else was closing four leaks that had
+gone unnoticed while GitLab was the only implementation — see "What leaked, and what now stops it".
 
 ## Layers
 
@@ -21,8 +26,8 @@ writing a single new provider module, with no changes above the data layer.
 │ platform/    the neutral SCM contract: types, provider  │
 │              interface, capabilities, error taxonomy    │
 ├─────────────────────────────────────────────────────────┤
-│ providers/   gitlab/ (primary) · fixture/ (demo, tests) │
-│              later: github/, bitbucket/, …              │
+│ providers/   gitlab/ · github/ · fixture/ (demo, tests) │
+│              later: bitbucket/, …                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -45,16 +50,43 @@ they are, and each provider maps its own nouns onto them:
 | `CiRun`          | pipeline          | check run / run  | pipeline         |
 | `ReviewThread`   | discussion        | review thread    | comment thread   |
 
-UI strings still say "merge request" and "!2841" when the pod points at GitLab — each provider
-exposes a `Vocabulary` (nouns + ref formatting such as `!2841` vs `#123`) that the chrome renders.
-The *logic* never branches on provider identity.
+UI strings still say "merge request" and "!2841" when the pod points at GitLab, and "pull request"
+and "#123" when it points at GitHub. Each provider exposes a `Vocabulary` — `platformName`, singular
+and plural nouns for change requests, repositories and CI, plus `formatCrRef` — and the chrome
+renders from it. The *logic* never branches on provider identity.
+
+Renderers are pure functions over a state object, so they take `vocabulary` **as part of that
+state**; they never import the registry, which would couple pure rendering to module-global state
+and break the renderer tests. The state builders (`ui/sidebarState.ts`, `ui/dashboardState.ts`, the
+panel classes) look the vocabulary up once and pass it down. `NEUTRAL_VOCABULARY` covers the chrome
+before any pod exists — the neutral contract's own words, "change request" and "repository", because
+with no pod there is no platform to name.
+
+Plurals are explicit fields, not `noun + "s"`. English happens to work for today's nouns; encoding
+that assumption in shared code is what a fifth provider breaks.
+
+### The rule is a test, not a paragraph
+
+`src/ui/vocabulary.test.ts` parses `src/ui`, `src/app` and the `src` root with the TypeScript AST and
+inspects **string and template literals only** — never comments, identifiers or type names, so
+`mergeOrder.ts` and doc comments do not false-positive. A banned noun in a literal fails the build.
+The escape is `// vocab-ok: <reason>` on the preceding line and it **requires a reason**; there are
+three in the codebase (a provider id default, the registry's wiring imports, and "log pipeline" as
+ordinary English in demo copy).
+
+Precision is the point. A rule that needs a growing ignore list reads as enforcement while enforcing
+nothing — which is exactly how these nouns leaked into ~40 sites in the first place.
+
+Static strings that cannot vary per pod — the extension description, `viewsWelcome`, setting
+descriptions, and the palette titles — must name no platform at all. `src/commands.test.ts` enforces
+that half.
 
 ## Provider contract
 
 `src/platform/provider.ts` defines two interfaces:
 
-- **`ScmProvider`** — static identity: `id`, `displayName`, `capabilities`, `vocabulary`, and
-  `connect(config, secrets)` returning a `Connection`.
+- **`ScmProvider`** — static identity: `id`, `displayName`, `capabilities`, `vocabulary`, `host`,
+  `authModesFor(instanceUrl)`, and `connect(config)` returning a `Connection`.
 - **`Connection`** — everything the product needs from a platform: `testConnection`,
   `resolveSource` (URL / repo id / group id — the onboarding rules in handoff §4),
   `listGroupRepositories`, `listOpenChangeRequests` (batched per repository, never per CR),
@@ -145,18 +177,76 @@ carrying those refs until the reviewer explicitly re-anchors.
 ## Adding a provider — the checklist
 
 1. Create `src/providers/<name>/` implementing `ScmProvider` + `Connection`.
-2. Map errors onto the `ScmError` taxonomy; declare honest `capabilities` and a `Vocabulary`.
-3. Make the shared **provider contract test suite** (`src/platform/contract`) pass against it.
-4. Register it in `src/registry.ts`.
+2. Map errors onto the `ScmError` taxonomy; declare honest `capabilities`, a `Vocabulary`, a
+   `HostDescriptor` and `authModesFor(instanceUrl)`.
+3. Own your platform's **source-input grammar** inside the module. `resolveSource` takes the raw
+   string, so no neutral code parses platform-specific URL shapes or id formats. GitLab's `/-/`
+   separator, `groups/` prefix and numeric ids live in `providers/gitlab/sourceInput.ts`; GitHub's
+   `owner/repo` and org forms live in `providers/github/sourceInput.ts`.
+4. Write a `fake<Name>.ts` emulator over the same injected `FetchLike` seam, including a failing
+   mode, so the tests need no network.
+5. Make the shared **provider contract test suite** (`src/platform/contract`) pass against it,
+   including `makeFailingConnection`. That suite passing *is* the definition of "provider added".
+6. Register it in `src/registry.ts`.
 
-Nothing else changes. If step 4 is not the only edit outside the new directory, the abstraction
+Nothing else changes. If step 6 is not the only edit outside the new directory, the abstraction
 has leaked — fix the leak, not the caller.
+
+### When the platform's API and the contract disagree
+
+They will. GitHub's batched review endpoint is all-or-nothing — one bad comment position rejects the
+whole POST — while `SubmitResult` promises an outcome per comment. The provider absorbs the
+mismatch; it does not push it upward and it does not lie about its capabilities:
+
+1. Try the batch. This is the normal path and it produces the right artifact — one review on the
+   pull request, not N loose comments.
+2. On a **position-related** rejection, fall back to posting each comment individually for real
+   per-comment outcomes, then post the summary and the approve/request-changes verdict as a
+   comment-free review. A partial comment failure withholds the summary but never drops the verdict.
+3. On a non-position rejection (auth, rate limit), nothing was attempted — throw the normalized
+   error rather than returning a result of failures, which is what the contract specifies.
+
+Declaring `batchedReview: false` would have been easier and would have been a lie. Always posting
+individually would have been easier and would have produced the wrong artifact on the pull request.
+
+The fallback only runs when something is already wrong, which makes it the path most likely to rot.
+`makeFailingConnection` in the shared harness drives it on every test run for exactly that reason.
+
+## What leaked, and what now stops it
+
+Four things escaped the contract while GitLab was the only implementation. Each now has a mechanism,
+not a convention:
+
+| Leak | Mechanism |
+| --- | --- |
+| ~40 hardcoded nouns in user-visible strings | `src/ui/vocabulary.test.ts` (AST literal scan) |
+| GitLab's URL grammar sitting in `platform/` | grammar owned by the provider; ESLint dependency rule |
+| `{ instanceUrl, token }` assuming one auth shape | `Credential` union + `authModesFor` per host |
+| Onboarding and the palette naming GitLab | `HostDescriptor` + `src/commands.test.ts` neutrality test |
+
+### Credentials
+
+`ConnectionConfig` carries a `Credential` union (`token` / `session` / `none`) rather than a bare
+string, because recovery differs: a session token can be re-acquired silently after a 401, a personal
+access token cannot — the user must reconnect. `authModesFor(instanceUrl)` is a method, not a static
+list, because github.com and GitHub Enterprise Server are one provider with different auth available.
+
+Secrets are keyed `codeVerdict.token.<providerId>.<host>` so two providers on one host cannot
+overwrite each other. `readToken` falls back to the pre-provider key once and rewrites under the
+scoped one, so existing pods are not silently signed out.
+
+`app/connections.ts` stays free of `vscode`: the editor's account API is injected at activation via
+`setSessionProvider`, and each provider declares its own `host.session.editorProviderId` and scopes.
 
 ## Testing strategy
 
 - **Unit** (vitest): pure logic — thread-status derivation, summary composition, source-string
   parsing, criteria filtering.
-- **Contract**: one reusable suite run against every provider; the fixture provider keeps it
-  honest offline, the GitLab provider runs it against a fake `fetch` serving
-  `spec/specs/Code Verdict - API fixtures.json`.
+- **Contract**: one reusable suite run against every provider. The fixture provider keeps it honest
+  offline; the GitLab provider runs it against a fake `fetch` serving
+  `spec/specs/Code Verdict - API fixtures.json`; the GitHub provider runs it against `fakeGitHub.ts`,
+  whose payload shapes were captured from the live API rather than written from memory.
+- **Enforcement**: `src/ui/vocabulary.test.ts` (no hardcoded platform nouns), `src/commands.test.ts`
+  (the palette set, and no platform named in any static product-surface string), and the ESLint
+  `no-restricted-imports` rule (only `src/registry.ts` imports a concrete provider).
 - **Extension host** (later): smoke tests via `@vscode/test-electron`.

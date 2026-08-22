@@ -16,14 +16,17 @@ import {
   type SidebarViewState,
 } from './sidebarHtml';
 import { toSidebarViewState } from './sidebarState';
+import { getProvider } from '../platform/registry';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
+import { repoCountOf } from './vocab';
 import type { CodiconAssets } from './theme';
 
 /** The checklist before the wizard is open — nothing done, everything ahead. */
 const IDLE_SETUP: SidebarSetup = {
   steps: [
-    { label: 'Connect GitLab', done: false },
+    { label: `Connect ${NEUTRAL_VOCABULARY.platformName}`, done: false },
     { label: 'Name the pod', done: false },
-    { label: 'Add projects', done: false },
+    { label: `Add ${NEUTRAL_VOCABULARY.repoNounPlural}`, done: false },
   ],
 };
 
@@ -135,8 +138,9 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       // No pod yet: the sidebar *is* the setup checklist (spec §1), including
       // the demo-pod escape hatch, whether or not the wizard is open.
       this.paint(view, {
+        vocabulary: NEUTRAL_VOCABULARY,
         podName: 'No active pod',
-        podMeta: 'Connect GitLab to begin',
+        podMeta: 'Connect to begin',
         pods: [],
         mergeRequests: [],
         issues: [],
@@ -159,13 +163,15 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       this.paint(view, { ...toSidebarViewState(data, this.podStore.list()), changesets });
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
+      const provider = getProvider(pod.providerId);
       this.paint(view, {
+        vocabulary: provider.vocabulary,
         podName: pod.name,
-        podMeta: 'Could not reach GitLab',
+        podMeta: `Could not reach ${provider.displayName}`,
         pods: this.podStore.list().map((candidate) => ({
           id: candidate.id,
           name: candidate.name,
-          meta: `${repoIdsOf(candidate).length} projects`,
+          meta: repoCountOf(getProvider(candidate.providerId).vocabulary, repoIdsOf(candidate).length),
           active: candidate.id === pod.id,
         })),
         mergeRequests: [],

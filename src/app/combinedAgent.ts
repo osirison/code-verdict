@@ -2,6 +2,7 @@ import type { AgentReviewResponse, CandidateBucket } from '../domain/agentRespon
 import { AgentResponseError } from '../domain/agentResponse';
 import { filterReason } from '../domain/criteria';
 import { addedLines, diffStats } from '../domain/diffHunks';
+import { NEUTRAL_VOCABULARY, type Vocabulary } from '../platform/provider';
 import type { Criteria, ReviewItem } from '../domain/types';
 import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { DEMO_AGENT_ID, DEMO_AGENT_LABEL, runDemoAgent, type DemoAgentResult } from './demoAgent';
@@ -80,6 +81,8 @@ export function validateChangesetResponse(
 export function runDemoChangesetAgent(
   members: readonly ChangesetAgentMember[],
   criteria: Criteria,
+  /** Nouns for the run-step copy; neutral when no pod context is supplied. */
+  vocabulary: Vocabulary = NEUTRAL_VOCABULARY,
 ): DemoAgentResult {
   const items: ReviewItem[] = [];
   const candidates: CandidateBucket[] = [];
@@ -115,9 +118,9 @@ export function runDemoChangesetAgent(
   };
   const finalSteps = [
     'Resolving agent from Copilot workspace…',
-    `Indexing ${response.stats?.filesRead ?? 0} changed files across ${members.length} merge requests (+${stats.added} −${stats.removed})…`,
+    `Indexing ${response.stats?.filesRead ?? 0} changed files across ${members.length} ${vocabulary.changeRequestNounPlural} (+${stats.added} −${stats.removed})…`,
     'Cross-referencing contracts between repositories…',
-    'Scoring findings against project criteria…',
+    `Scoring findings against ${vocabulary.repoNoun} criteria…`,
     `${items.length} items ready`,
   ];
   return { response: validateChangesetResponse(response, members), steps: finalSteps };

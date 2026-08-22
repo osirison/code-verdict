@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_HOST, GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { renderOnboardingHtml, type OnboardingViewState } from './onboardingHtml';
 
 const base: OnboardingViewState = {
+  vocabulary: GITLAB_VOCABULARY,
+  host: GITLAB_HOST,
   step: 1,
   instanceUrl: 'http://127.0.0.1:8971',
   connectionStatus: 'Not tested yet',

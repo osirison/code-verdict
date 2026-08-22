@@ -8,6 +8,7 @@
  */
 import type { CiStatus } from '../platform/types';
 import { escapeHtml, renderPage } from './theme';
+import { cap, repoCountOf, type Vocabulary } from './vocab';
 
 export { escapeHtml };
 
@@ -51,6 +52,8 @@ export interface DashboardPipelineRow {
 }
 
 export interface DashboardViewState {
+  /** Platform nouns for the active pod's provider — never hardcoded here. */
+  vocabulary: Vocabulary;
   podName: string;
   meta: string;
   scopeCounts: { you: number; them: number };
@@ -85,7 +88,7 @@ export type DashboardMessage =
   | { type: 'newChangeset' }
   | { type: 'switchPod' }
   | { type: 'selectPod'; podId: string }
-  | { type: 'addProjects' }
+  | { type: 'addRepos' }
   | { type: 'filters' };
 
 /** Script-free page for error / no-pod states, with the same strict CSP. */
@@ -161,7 +164,7 @@ section { padding: 16px 0 6px; }
 .issue-empty { color: var(--fg-dim); font-size: 12px; }
 .row-title { font-size: 12.5px; font-weight: 500; color: var(--fg-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); margin-top: 3px; }
-.cell-project { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-repo { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cell-ci { font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 .cell-age { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
 
@@ -179,6 +182,7 @@ section { padding: 16px 0 6px; }
 
 export function renderDashboardHtml(state: DashboardViewState, nonce: string): string {
   const e = escapeHtml;
+  const v = state.vocabulary;
   const empty = state.rows.length === 0;
 
   const podOptions = (state.podOptions ?? []).map((pod) => `
@@ -227,17 +231,17 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       label: 'AI review coverage',
       value: `${state.stats.aiCoverage.reviewed}/${state.stats.aiCoverage.total}`,
       valueCls: 'ok',
-      note: 'open MRs reviewed',
+      note: `open ${v.changeRequestAbbrev}s reviewed`,
       noteCls: 'dimmer',
     },
     {
-      label: 'Pipelines failing',
+      label: `${cap(v.ciNounPlural)} failing`,
       value: String(state.stats.pipelinesFailing),
       valueCls: state.stats.pipelinesFailing > 0 ? 'bad' : '',
       note: state.stats.pipelinesFailing > 0 ? 'blocking merges' : 'all green',
       noteCls: state.stats.pipelinesFailing > 0 ? 'bad' : 'dimmer',
     },
-    { label: 'Projects in pod', value: String(state.stats.projectsInPod), valueCls: '', note: 'watched', noteCls: 'dimmer' },
+    { label: `${cap(v.repoNounPlural)} in pod`, value: String(state.stats.projectsInPod), valueCls: '', note: 'watched', noteCls: 'dimmer' },
   ]
     .map(
       (c) => `<div class="stat">
@@ -249,28 +253,28 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     .join('');
 
   const chips = [
-    `<button class="chip active" data-project="*">All projects · ${state.rows.length}</button>`,
+    `<button class="chip active" data-repo="*">All ${e(v.repoNounPlural)} · ${state.rows.length}</button>`,
     ...state.projects
       .filter((p) => p.count > 0)
-      .map((p) => `<button class="chip" data-project="${e(p.id)}">${e(p.label)} · ${p.count}</button>`),
+      .map((p) => `<button class="chip" data-repo="${e(p.id)}">${e(p.label)} · ${p.count}</button>`),
   ].join('');
 
   const changesetCards = (state.changesets ?? []).map((changeset) => `
     <button class="changeset-card" data-changeset="${e(changeset.id)}">
       <span class="changeset-glyph">⧉</span>
-      <span><span class="row-title">${e(changeset.name)}</span><span class="row-meta">${changeset.memberCount} MRs · ${changeset.projectCount} projects</span></span>
+      <span><span class="row-title">${e(changeset.name)}</span><span class="row-meta">${changeset.memberCount} ${e(v.changeRequestAbbrev)}s · ${e(repoCountOf(v, changeset.projectCount))}</span></span>
       <span class="pill ${changeset.stateClass}">${e(changeset.state)}</span>
     </button>`).join('');
 
   const mrRows = state.rows
     .map(
       (r) => `
-      <div class="mr-row" data-project="${e(r.repoId)}" data-scope="${r.scope}" data-number="${e(r.number)}" data-submitted="${r.submitted}" tabindex="0">
+      <div class="mr-row" data-repo="${e(r.repoId)}" data-scope="${r.scope}" data-number="${e(r.number)}" data-submitted="${r.submitted}" tabindex="0">
         <div>
           <div class="row-title">${e(r.title)}</div>
           <div class="row-meta">${e(r.refLabel)} · @${e(r.author)} · ${e(r.branch)}</div>
         </div>
-        <div class="cell-project">${e(r.project)}</div>
+        <div class="cell-repo">${e(r.project)}</div>
         <div><span class="pill ${r.ai.cls}">${e(r.ai.label)}</span></div>
         <div class="cell-ci ${r.ciStatus ? CI_TEXT[r.ciStatus].cls : 'dimmer'}">${r.ciStatus ? CI_TEXT[r.ciStatus].label : '—'}</div>
         <div class="cell-age">${e(r.age)}</div>
@@ -283,9 +287,9 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       (i) => `
       <div class="issue-row">
         <div class="row-title">${e(i.title)}</div>
-        <div class="cell-project">${e(i.project)}</div>
-        <div class="cell-project">${e(i.assignee)}</div>
-        <div class="cell-project">${e(i.milestone)}</div>
+        <div class="cell-repo">${e(i.project)}</div>
+        <div class="cell-repo">${e(i.assignee)}</div>
+        <div class="cell-repo">${e(i.milestone)}</div>
         <div class="cell-age">${e(i.age)}</div>
       </div>`,
     )
@@ -320,19 +324,19 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     ? `${header}
        <div class="empty">
          <h2>Nothing waiting on you</h2>
-         <p>${e(state.podName)} watches ${state.stats.projectsInPod} projects and none of them have open merge requests.</p>
-         <button class="btn btn-accent" id="add-projects">Add projects to this pod</button>
+         <p>${e(state.podName)} watches ${e(repoCountOf(v, state.stats.projectsInPod))} and none of them have open ${e(v.changeRequestNounPlural)}.</p>
+         <button class="btn btn-accent" id="add-repos">Add ${e(v.repoNounPlural)} to this pod</button>
          <button class="btn" id="switch-pod-empty">Switch pod</button>
        </div>`
     : `${header}
        <div class="stats">${statCards}</div>
        <div class="split">
          <div>
-           <section><div class="section-label section-pad">Changesets <span class="dimmer">· merge requests that ship together</span><button class="new-changeset" id="new-changeset">+ new</button></div>${changesetCards ? `<div class="changeset-grid">${changesetCards}</div>` : '<div class="changeset-empty">Nothing detected — group merge requests with a shared trailer or branch, or pick them by hand.</div>'}</section>
+           <section><div class="section-label section-pad">Changesets <span class="dimmer">· ${e(v.changeRequestNounPlural)} that ship together</span><button class="new-changeset" id="new-changeset">+ new</button></div>${changesetCards ? `<div class="changeset-grid">${changesetCards}</div>` : `<div class="changeset-empty">Nothing detected — group ${e(v.changeRequestNounPlural)} with a shared trailer or branch, or pick them by hand.</div>`}</section>
            <section>
-             <div class="section-label section-pad">Merge requests</div>
+             <div class="section-label section-pad">${e(cap(v.changeRequestNounPlural))}</div>
              <div class="chips">${chips}</div>
-             <div class="thead"><div>Title</div><div>Project</div><div>AI review</div><div>Pipeline</div><div>Age</div></div>
+             <div class="thead"><div>Title</div><div>${e(cap(v.repoNoun))}</div><div>AI review</div><div>${e(cap(v.ciNoun))}</div><div>Age</div></div>
              ${mrRows}
            </section>
            <section>
@@ -348,7 +352,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
            }
            ${
              state.pipelines.length > 0
-               ? `<section><div class="section-label section-pad">Pipelines · last 3</div>${pipelineRows}</section>`
+               ? `<section><div class="section-label section-pad">${e(cap(v.ciNounPlural))} · last 3</div>${pipelineRows}</section>`
                : ''
            }
          </div>
@@ -371,7 +375,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       togglePodMenu();
     });
     document.getElementById('switch-pod-empty')?.addEventListener('click', () => post({ type: 'switchPod' }));
-    document.getElementById('add-projects')?.addEventListener('click', () => post({ type: 'addProjects' }));
+    document.getElementById('add-repos')?.addEventListener('click', () => post({ type: 'addRepos' }));
     document.querySelectorAll('[data-pod-id]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const podId = btn.dataset.podId;
@@ -387,17 +391,17 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     });
 
     let scopeSel = 'all';
-    let projectSel = '*';
+    let repoSel = '*';
     const applyFilters = () => {
       const counts = new Map();
       for (const row of document.querySelectorAll('.mr-row')) {
         const scopeOk = scopeSel === 'all' || row.dataset.scope === scopeSel;
-        if (scopeOk) counts.set(row.dataset.project, (counts.get(row.dataset.project) ?? 0) + 1);
-        row.hidden = !(scopeOk && (projectSel === '*' || row.dataset.project === projectSel));
+        if (scopeOk) counts.set(row.dataset.repo, (counts.get(row.dataset.repo) ?? 0) + 1);
+        row.hidden = !(scopeOk && (repoSel === '*' || row.dataset.repo === repoSel));
       }
-      for (const chip of document.querySelectorAll('.chip[data-project]')) {
-        if (chip.dataset.project === '*') continue;
-        chip.hidden = scopeSel !== 'all' && !counts.has(chip.dataset.project);
+      for (const chip of document.querySelectorAll('.chip[data-repo]')) {
+        if (chip.dataset.repo === '*') continue;
+        chip.hidden = scopeSel !== 'all' && !counts.has(chip.dataset.repo);
       }
     };
     document.getElementById('scope')?.addEventListener('click', (ev) => {
@@ -407,26 +411,26 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
       btn.classList.add('active');
       scopeSel = btn.dataset.scope;
       applyFilters();
-      // If the selected project has no rows under the new scope, fall back
-      // to All projects instead of leaving the table blank.
-      const activeChip = document.querySelector('.chip[data-project="' + projectSel + '"]');
-      if (projectSel !== '*' && activeChip?.hidden) {
-        projectSel = '*';
-        document.querySelectorAll('.chip[data-project]').forEach((c) => c.classList.remove('active'));
-        document.querySelector('.chip[data-project="*"]')?.classList.add('active');
+      // If the selected repo has no rows under the new scope, fall back
+      // to the all-repos chip instead of leaving the table blank.
+      const activeChip = document.querySelector('.chip[data-repo="' + repoSel + '"]');
+      if (repoSel !== '*' && activeChip?.hidden) {
+        repoSel = '*';
+        document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
+        document.querySelector('.chip[data-repo="*"]')?.classList.add('active');
         applyFilters();
       }
     });
-    for (const chip of document.querySelectorAll('.chip[data-project]')) {
+    for (const chip of document.querySelectorAll('.chip[data-repo]')) {
       chip.addEventListener('click', () => {
-        document.querySelectorAll('.chip[data-project]').forEach((c) => c.classList.remove('active'));
+        document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
         chip.classList.add('active');
-        projectSel = chip.dataset.project;
+        repoSel = chip.dataset.repo;
         applyFilters();
       });
     }
     for (const row of document.querySelectorAll('.mr-row')) {
-      const open = () => post({ type: 'openCr', repoId: row.dataset.project, number: row.dataset.number, submitted: row.dataset.submitted === 'true' });
+      const open = () => post({ type: 'openCr', repoId: row.dataset.repo, number: row.dataset.number, submitted: row.dataset.submitted === 'true' });
       row.addEventListener('click', open);
       row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') open(); });
     }

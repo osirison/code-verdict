@@ -56,7 +56,7 @@ afterAll(async () => {
 });
 
 function connect() {
-  return getProvider('gitlab').connect({ instanceUrl: baseUrl, token: 'glpat-emulator' });
+  return getProvider('gitlab').connect({ instanceUrl: baseUrl, credential: { kind: 'token', token: 'glpat-emulator'  } });
 }
 
 const REF = { repoId: '9101', number: '2833' };

@@ -1,4 +1,5 @@
 import { renderPage, escapeHtml, type CodiconAssets } from './theme';
+import { cap, type Vocabulary } from './vocab';
 
 /**
  * Chrome icons are codicons (issue #6). Glyphs the spec names in prose —
@@ -95,6 +96,8 @@ export interface SidebarThreads {
 }
 
 export interface SidebarViewState {
+  /** Platform nouns for the active pod's provider — never hardcoded here. */
+  vocabulary: Vocabulary;
   podName: string;
   podMeta: string;
   pods: SidebarPod[];
@@ -161,7 +164,7 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .issue { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; padding: 7px 12px; color: var(--fg-dim); }
 .issue-label { color: var(--agent); font: 10.5px/1.3 var(--font-mono); }
 .issue-title { font: 400 11.5px/1.3 var(--font-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.issue-project { grid-column: 2; color: var(--fg-dimmer); font: 10px/1.3 var(--font-mono); }
+.issue-repo { grid-column: 2; color: var(--fg-dimmer); font: 10px/1.3 var(--font-mono); }
 .empty { padding: 7px 12px 10px; color: var(--fg-dimmer); font: 11.5px/1.4 var(--font-ui); }
 .review-context { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 12px; }
 .review-context-head { display: flex; align-items: flex-start; gap: 8px; }
@@ -365,11 +368,11 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
         <span class="review-dot ${mr.waiting ? 'waiting' : ''}"></span>
         <span><span class="review-title">${e(mr.title)}</span><span class="review-meta">${e(mr.label)} · ${e(mr.project)}</span></span>
       </button>`).join('')
-    : '<div class="empty">No open merge requests</div>';
+    : `<div class="empty">No open ${e(state.vocabulary.changeRequestNounPlural)}</div>`;
   const issueRows = state.issues.length > 0
     ? state.issues.map((issue) => `<div class="issue">
         <span class="issue-label">${e(issue.label)}</span><span class="issue-title">${e(issue.title)}</span>
-        <span class="issue-project">${e(issue.project)}</span>
+        <span class="issue-repo">${e(issue.project)}</span>
       </div>`).join('')
     : '<div class="empty">No issues in progress</div>';
   const activeReview = state.activeReview;
@@ -421,7 +424,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
           ? reviewSection
           : screen === 'pending'
             ? renderPending(state.pendingReview as SidebarPendingReview)
-            : `<div class="divider"></div><div class="section">Merge requests</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`;
+            : `<div class="divider"></div><div class="section">${e(cap(state.vocabulary.changeRequestNounPlural))}</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`;
 
   const footer =
     screen === 'setup'

@@ -7,6 +7,7 @@ describe('getDebugAuthBypass', () => {
   it('requires BOTH the env opt-in and an Extension Development Host (mode 2)', () => {
     expect(getDebugAuthBypass(2, FLAG)).toEqual({
       enabled: true,
+      providerId: 'gitlab',
       instanceUrl: 'http://127.0.0.1:8971',
       token: 'glpat-emulator',
       reason: 'development',
@@ -30,6 +31,7 @@ describe('getDebugAuthBypass', () => {
       }),
     ).toEqual({
       enabled: true,
+      providerId: 'gitlab',
       instanceUrl: 'http://127.0.0.1:9000',
       token: 'glpat-debug',
       reason: 'override',

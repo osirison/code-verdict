@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { ConnectionConfig } from '../../platform/provider';
 import { loadSpecFixtures } from '../../testing/specFixtures';
 import { mapGitLabError } from './errors';
 import { buildCommentBody, buildPosition, toReviewThread } from './mappers';
@@ -98,7 +99,7 @@ describe('pagination', () => {
   it('follows x-next-page so large groups are not silently truncated', async () => {
     const conn = createGitLabProvider(makeFakeGitLabFetch()).connect({
       instanceUrl: 'https://gitlab.example',
-      token: 'glpat-test',
+      credential: { kind: 'token', token: 'glpat-test' },
     });
     const repos = await conn.listGroupRepositories('4821');
     expect(repos.map((r) => r.id)).toEqual(['9101', '9102', '9103', '9104', '9105']);
@@ -113,7 +114,7 @@ describe('CI status join', () => {
     // populated ci proves the SHA join against /pipelines.
     const conn = createGitLabProvider(makeFakeGitLabFetch()).connect({
       instanceUrl: 'https://gitlab.example',
-      token: 'glpat-test',
+      credential: { kind: 'token', token: 'glpat-test' },
     });
     const [cr] = await conn.listOpenChangeRequests(['9101']);
     expect(cr?.ci).toEqual({
@@ -125,7 +126,10 @@ describe('CI status join', () => {
 });
 
 describe('submitReview against the fake instance', () => {
-  const CONFIG = { instanceUrl: 'https://gitlab.example', token: 'glpat-test' };
+  const CONFIG: ConnectionConfig = {
+    instanceUrl: 'https://gitlab.example',
+    credential: { kind: 'token', token: 'glpat-test' },
+  };
 
   it('requests changes through the GraphQL reviewer-state mutation', async () => {
     const conn = createGitLabProvider(makeFakeGitLabFetch()).connect(CONFIG);

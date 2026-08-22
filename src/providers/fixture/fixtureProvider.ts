@@ -9,6 +9,7 @@ import type {
   ProviderCapabilities,
   ScmProvider,
   Vocabulary,
+  HostDescriptor,
 } from '../../platform/provider';
 import type {
   ChangeRequest,
@@ -24,7 +25,9 @@ import type {
   WorkItem,
 } from '../../platform/types';
 import { ScmError } from '../../platform/errors';
-import { parseSourceInput } from '../../platform/sourceInput';
+// The demo data is GitLab-shaped by design (numeric ids, `!2841` refs), so it
+// shares that grammar. A pure parser, not the GitLab provider itself.
+import { parseSourceInput } from '../gitlab/sourceInput';
 import * as data from './data';
 
 const CAPABILITIES: ProviderCapabilities = {
@@ -37,12 +40,26 @@ const CAPABILITIES: ProviderCapabilities = {
 };
 
 const VOCABULARY: Vocabulary = {
+  platformName: 'the demo data',
   changeRequestNoun: 'merge request',
+  changeRequestNounPlural: 'merge requests',
   changeRequestAbbrev: 'MR',
   repoNoun: 'project',
+  repoNounPlural: 'projects',
   groupNoun: 'group',
   ciNoun: 'pipeline',
+  ciNounPlural: 'pipelines',
   formatCrRef: (number) => `!${number}`,
+};
+
+const HOST: HostDescriptor = {
+  instanceUrlLabel: 'Demo host',
+  defaultInstanceUrl: 'https://demo.invalid',
+  tokenPlaceholder: 'not needed',
+  tokenHint: 'no credential — this provider serves built-in sample data',
+  sourceInputPlaceholder: '9102 · group 4821',
+  sourceInputHint: 'Sample data only.',
+  sourceSamples: [{ label: 'sample project', value: '9102' }],
 };
 
 export interface FixtureSimulation {
@@ -227,6 +244,9 @@ export const fixtureProvider: ScmProvider = {
   displayName: 'Demo pod (fixtures)',
   capabilities: CAPABILITIES,
   vocabulary: VOCABULARY,
+  host: HOST,
+  demo: true,
+  authModesFor: () => ['none'],
   connect(_config: ConnectionConfig): Connection {
     return new FixtureConnection();
   },

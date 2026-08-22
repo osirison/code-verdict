@@ -2,7 +2,7 @@ import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
-import { tokenSecretKey, type SecretStore } from '../app/storage';
+import { readToken, type SecretStore } from '../app/storage';
 import { COMMANDS } from '../commands';
 import { NOTIFICATION_EVENTS, type NotificationMode } from '../domain/notifications';
 import {
@@ -12,6 +12,7 @@ import {
   type SettingsViewState,
 } from './settingsHtml';
 import { AppSurface, type AppRoute } from './appSurface';
+import { getProvider } from '../platform/registry';
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -51,7 +52,7 @@ export class SettingsPanel {
     const pod = this.deps.podStore.activePod;
     if (!pod || this.disposed) return;
     const config = vscode.workspace.getConfiguration('codeVerdict');
-    const token = await this.deps.secrets.get(tokenSecretKey(pod.instanceUrl));
+    const token = await readToken(this.deps.secrets, pod.providerId, pod.instanceUrl);
     let connected = false;
     let connectionStatus = 'not connected';
     try {
@@ -65,6 +66,7 @@ export class SettingsPanel {
     }
     if (this.disposed) return;
     const state: SettingsViewState = {
+      vocabulary: getProvider(pod.providerId).vocabulary,
       instanceUrl: pod.instanceUrl,
       connectionStatus,
       connected,

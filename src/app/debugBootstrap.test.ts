@@ -82,7 +82,8 @@ describe('debug bootstrap against a live emulator', () => {
     const secrets = memorySecrets();
 
     const pod = await runDebugBootstrap(
-      { enabled: true, instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
+      { enabled: true,
+    providerId: 'gitlab', instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
       podStore,
       secrets,
       {},
@@ -96,7 +97,8 @@ describe('debug bootstrap against a live emulator', () => {
 
     // Re-running is idempotent — the existing pod is reused.
     const again = await runDebugBootstrap(
-      { enabled: true, instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
+      { enabled: true,
+    providerId: 'gitlab', instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
       podStore,
       secrets,
       {},
@@ -131,7 +133,8 @@ describe('debug bootstrap against a live emulator', () => {
     const podStore = new PodStore(memoryStore());
     const secrets = memorySecrets();
     const pod = await runDebugBootstrap(
-      { enabled: true, instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
+      { enabled: true,
+    providerId: 'gitlab', instanceUrl: baseUrl, token: 'glpat-emulator', reason: 'override' },
       podStore,
       secrets,
       {},

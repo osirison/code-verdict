@@ -11,6 +11,7 @@ import { ThreadFlags, buildPostedReview, composeSecondOpinion, crKey } from '../
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { getProvider } from '../platform/registry';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { formatAge } from './dashboardState';
 import { escapeHtml, renderFallbackHtml } from './dashboardHtml';
 import type { PostedMessage, PostedRow } from './postedReviewsHtml';
@@ -280,9 +281,11 @@ export class PostedReviewsPanel {
     if (this.disposed) return;
     this.publishSidebarThreads();
     const nonce = crypto.randomBytes(16).toString('hex');
+    const renderPod = this.pod ?? this.deps.podStore.activePod;
     this.panel.webview.html = renderPostedReviewsHtml(
       {
-        podName: this.pod?.name ?? this.deps.podStore.activePod?.name ?? '',
+        vocabulary: renderPod ? getProvider(renderPod.providerId).vocabulary : NEUTRAL_VOCABULARY,
+        podName: renderPod?.name ?? '',
         now: Date.now(),
         waitingOnYouTotal: this.rows.reduce((n, r) => n + r.view.counts.you, 0),
         rows: this.rows,

@@ -1,6 +1,9 @@
 /**
- * Syntactic classification of the onboarding source input (handoff §4).
- * Pure string parsing — visibility lookups are the provider's job.
+ * GitLab's onboarding source-input grammar (handoff §4): its `/-/` path
+ * separator, its `groups/` URL prefix and its numeric project ids. This lives
+ * inside the provider because it is GitLab's grammar, not a neutral one —
+ * GitHub has none of these forms. Pure string parsing; visibility lookups are
+ * the connection's job.
  *
  * | Input                                  | Result                       |
  * | -------------------------------------- | ---------------------------- |

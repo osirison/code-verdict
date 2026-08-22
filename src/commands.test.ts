@@ -6,12 +6,14 @@ import { DIGEST_CADENCES, NOTIFICATION_EVENTS, NOTIFICATION_MODES } from './doma
 import { DEFAULT_TRAILER } from './app/changesets';
 
 interface PackageJson {
+  description: string;
   contributes: {
     commands: Array<{ command: string; title: string }>;
     keybindings: Array<{ command: string; key: string; args?: unknown; when?: string }>;
     views: Record<string, Array<{ id: string; name: string; type?: string }>>;
     menus: Record<string, Array<{ command: string; when?: string }>>;
-    configuration: { properties: Record<string, { enum?: string[]; default?: unknown }> };
+    viewsWelcome: Array<{ view: string; contents: string }>;
+    configuration: { properties: Record<string, { enum?: string[]; default?: unknown; description?: string }> };
   };
 }
 
@@ -30,6 +32,19 @@ describe('package.json contributions', () => {
     for (const c of pkg.contributes.commands) {
       expect(c.title).toMatch(/^Verdict: /);
     }
+  });
+
+  it('names no platform in any static product-surface string', () => {
+    // package.json strings are fixed at package time, so they cannot vary per
+    // pod the way vocabulary-rendered chrome does. They must stay neutral.
+    const banned = /gitlab|github|bitbucket|merge request|pull request/i;
+    const surface: string[] = [
+      pkg.description,
+      ...pkg.contributes.commands.map((c) => c.title),
+      ...pkg.contributes.viewsWelcome.map((w) => w.contents),
+      ...Object.values(pkg.contributes.configuration.properties).map((v) => v.description ?? ''),
+    ];
+    for (const text of surface) expect(text).not.toMatch(banned);
   });
 
   it('scopes every keybinding under verdict.reviewFocus', () => {
