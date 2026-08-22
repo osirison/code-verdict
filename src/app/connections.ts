@@ -1,4 +1,4 @@
-import { getProvider } from '../platform/registry';
+import { getProvider, tryGetProvider } from '../platform/registry';
 import type { AuthMode, Connection, Credential } from '../platform/provider';
 import { ScmError } from '../platform/errors';
 import type { Pod } from '../domain/types';
@@ -12,6 +12,7 @@ import { readToken } from './storage';
 export type SessionProvider = (
   providerId: string,
   instanceUrl: string,
+  opts?: { createIfNone?: boolean },
 ) => Promise<string | undefined>;
 
 let acquireSession: SessionProvider | undefined;
@@ -19,6 +20,27 @@ let acquireSession: SessionProvider | undefined;
 /** Wired once at activation; absent in tests, which use token pods. */
 export function setSessionProvider(provider: SessionProvider | undefined): void {
   acquireSession = provider;
+}
+
+/**
+ * Acquire a session through the same bridge `connectionForPod` uses. Onboarding
+ * calls this with `createIfNone` so the editor may prompt for an account;
+ * connecting an existing pod never prompts.
+ */
+export async function acquireSessionFor(
+  providerId: string,
+  instanceUrl: string,
+  opts: { createIfNone?: boolean } = {},
+): Promise<string | undefined> {
+  return acquireSession?.(providerId, instanceUrl, opts);
+}
+
+/** Whether a provider offers the editor-session path for this host. */
+export function sessionAvailableFor(providerId: string, instanceUrl: string): boolean {
+  return (
+    acquireSession !== undefined
+    && getProvider(providerId).authModesFor(instanceUrl).includes('session')
+  );
 }
 
 /**
@@ -50,7 +72,12 @@ async function credentialForPod(pod: Pod, secrets: SecretStore): Promise<Credent
 }
 
 export async function connectionForPod(pod: Pod, secrets: SecretStore): Promise<Connection> {
-  const provider = getProvider(pod.providerId);
+  const provider = tryGetProvider(pod.providerId);
+  // A pod naming a provider this build does not have is reported, never
+  // silently redirected to a different one.
+  if (!provider) {
+    throw new ScmError('notFound', `Provider "${pod.providerId}" is not available in this build.`);
+  }
   return provider.connect({
     instanceUrl: pod.instanceUrl,
     credential: await credentialForPod(pod, secrets),

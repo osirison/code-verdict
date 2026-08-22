@@ -16,7 +16,7 @@ import {
   type SidebarViewState,
 } from './sidebarHtml';
 import { toSidebarViewState } from './sidebarState';
-import { getProvider } from '../platform/registry';
+import { tryGetProvider } from '../platform/registry';
 import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { repoCountOf } from './vocab';
 import type { CodiconAssets } from './theme';
@@ -163,15 +163,22 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       this.paint(view, { ...toSidebarViewState(data, this.podStore.list()), changesets });
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
-      const provider = getProvider(pod.providerId);
+      // Looked up without throwing: this is the error path, and a pod naming
+      // an unregistered provider must be reported here, not crash the handler.
+      const provider = tryGetProvider(pod.providerId);
       this.paint(view, {
-        vocabulary: provider.vocabulary,
+        vocabulary: provider?.vocabulary ?? NEUTRAL_VOCABULARY,
         podName: pod.name,
-        podMeta: `Could not reach ${provider.displayName}`,
+        podMeta: provider
+          ? `Could not reach ${provider.displayName}`
+          : `Provider "${pod.providerId}" is not available`,
         pods: this.podStore.list().map((candidate) => ({
           id: candidate.id,
           name: candidate.name,
-          meta: repoCountOf(getProvider(candidate.providerId).vocabulary, repoIdsOf(candidate).length),
+          meta: repoCountOf(
+            tryGetProvider(candidate.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY,
+            repoIdsOf(candidate).length,
+          ),
           active: candidate.id === pod.id,
         })),
         mergeRequests: [],

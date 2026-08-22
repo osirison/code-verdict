@@ -15,6 +15,15 @@ export function getProvider(id: string): ScmProvider {
   return p;
 }
 
+/**
+ * The registry lookup that does not throw — for chrome that must still render
+ * when a stored pod names a provider this build does not have. Feature code
+ * uses `getProvider`; error paths use this.
+ */
+export function tryGetProvider(id: string): ScmProvider | undefined {
+  return providers.get(id);
+}
+
 export function listProviders(): ScmProvider[] {
   return [...providers.values()];
 }

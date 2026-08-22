@@ -36,3 +36,23 @@ describe('onboarding fidelity (spec §1)', () => {
     expect(projects).toContain("type: 'createPod'");
   });
 });
+describe('the session path (spec: a provider that authenticates by host-supplied session)', () => {
+  it('offers the account as the default and marks the token optional', () => {
+    const html = renderOnboardingHtml({ ...base, sessionAvailable: true }, 'n');
+    expect(html).toContain('Use my GitLab account');
+    expect(html).toContain('optional');
+    // The token field stays as the fallback — offered, not required.
+    expect(html).toContain('id="token"');
+    expect(html).toContain("post({ type: 'useSession'");
+  });
+
+  it('asks only for a token when the provider declares no session for the host', () => {
+    const html = renderOnboardingHtml(base, 'n');
+    // The listener line is always present and `?.`-guarded; the button is the
+    // thing that must be absent.
+    expect(html).not.toContain('Use my GitLab account');
+    expect(html).not.toContain('id="use-session"');
+    expect(html).not.toContain('optional');
+    expect(html).toContain('id="token"');
+  });
+});

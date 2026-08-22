@@ -36,14 +36,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The session bridge: `connections.ts` stays vscode-free, so the editor's
   // account API is injected here. A provider that declares the 'session' mode
   // for a host gets its token from whichever account VS Code holds for it.
-  setSessionProvider(async (providerId) => {
+  setSessionProvider(async (providerId, _instanceUrl, opts = {}) => {
     const declared = getProvider(providerId).host.session;
     if (!declared) return undefined;
     try {
       const session = await vscode.authentication.getSession(
         declared.editorProviderId,
         [...declared.scopes],
-        { createIfNone: false },
+        // Onboarding may prompt for an account; a later connection may not.
+        { createIfNone: opts.createIfNone === true },
       );
       return session?.accessToken;
     } catch {

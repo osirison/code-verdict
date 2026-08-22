@@ -14,6 +14,11 @@ export interface OnboardingViewState {
   /** Nouns and onboarding prose for the provider being connected. */
   vocabulary: Vocabulary;
   host: HostDescriptor;
+  /**
+   * The provider offers the editor's account for this host. When it does, that
+   * is the default path and the token field is the fallback, not the gate.
+   */
+  sessionAvailable?: boolean;
   step: 1 | 2 | 3;
   instanceUrl: string;
   connectionStatus: string;
@@ -25,6 +30,7 @@ export interface OnboardingViewState {
 
 export type OnboardingMessage =
   | { type: 'testConnection'; instanceUrl: string; token: string }
+  | { type: 'useSession'; instanceUrl: string }
   | { type: 'setName'; name: string }
   | { type: 'goStep'; step: 1 | 2 | 3 }
   | { type: 'addSource'; input: string }
@@ -79,7 +85,7 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
   }).join('');
   const sourceCards = state.sources.map((source) => `<div class="source"><div class="source-head"><span class="kind">${e(source.kind === 'group' ? v.groupNoun : v.repoNoun)}</span><span class="source-path">${e(source.path)}</span><span class="source-id">${source.kind === 'group' ? 'group' : 'id'} ${e(source.id)}</span><button class="remove" data-remove="${e(source.key)}">✕</button></div>${source.projects.map((project) => `<div class="repo ${project.selected ? 'selected' : ''}" data-source="${e(source.key)}" data-repo="${e(project.id)}"><span>${project.selected ? '☑' : '☐'}</span><span class="repo-path">${e(project.path)}</span><span class="repo-meta">${project.openMergeRequests ? `${project.openMergeRequests} open ${e(v.changeRequestAbbrev)}s` : `no open ${e(v.changeRequestAbbrev)}s`}</span></div>`).join('')}</div>`).join('');
   const content = state.step === 1
-    ? `<section class="content"><h1>Welcome to Code Verdict</h1><p class="lede">Connect ${e(v.platformName)} to get started. Use ${e(h.tokenHint)} — stored in the VS Code secret store, never in settings.json.</p><div class="fields"><div class="field"><label>${e(h.instanceUrlLabel)}</label><input class="input" id="instance" value="${e(state.instanceUrl)}"></div><div class="field"><label>Access token</label><input class="input" id="token" type="password" placeholder="${e(h.tokenPlaceholder)}"></div></div><div><button class="btn" id="test">Test connection</button></div><span class="status ${state.connected ? 'ok' : ''}">${e(state.connectionStatus)}</span></section>`
+    ? `<section class="content"><h1>Welcome to Code Verdict</h1><p class="lede">Connect ${e(v.platformName)} to get started.${state.sessionAvailable ? ` Use the ${e(v.platformName)} account you are already signed in to, or ${e(h.tokenHint)}.` : ` Use ${e(h.tokenHint)}.`} Nothing is written to settings.json — a token lives in the VS Code secret store.</p><div class="fields"><div class="field"><label>${e(h.instanceUrlLabel)}</label><input class="input" id="instance" value="${e(state.instanceUrl)}"></div>${state.sessionAvailable ? `<div class="field"><label>Account</label><button class="btn btn-accent" id="use-session">Use my ${e(v.platformName)} account</button></div>` : ''}<div class="field"><label>Access token${state.sessionAvailable ? ' <span class="dimmer">· optional</span>' : ''}</label><input class="input" id="token" type="password" placeholder="${e(h.tokenPlaceholder)}"></div></div><div><button class="btn" id="test">Test connection</button></div><span class="status ${state.connected ? 'ok' : ''}">${e(state.connectionStatus)}</span></section>`
     : state.step === 2
       ? `<section class="content"><h1>Name your pod</h1><p class="lede">A pod is a named set of ${e(v.platformName)} ${e(v.repoNounPlural)} you review together.</p><input class="input name" id="pod-name" value="${e(state.podName)}" placeholder="Platform squad"><div class="suggestions">${['Platform squad', 'Payments', 'My work'].map((name) => `<button class="chip" data-name="${name}">${name}</button>`).join('')}</div></section>`
       : `<section class="content"><h1>Add ${e(v.repoNounPlural)} to ${e(state.podName)}</h1><p class="lede">${e(h.sourceInputHint)} Choose which ${e(v.repoNounPlural)} the pod watches.</p><div class="source-input"><input class="input" id="source" placeholder="${e(h.sourceInputPlaceholder)}"><button class="btn btn-accent" id="add">Add</button></div><span class="status">${e(h.sourceInputHint)}</span><div class="samples">${h.sourceSamples.map((sample) => `<button class="chip" data-sample="${e(sample.value)}">${e(sample.label)}</button>`).join('')}</div><div class="sources">${sourceCards}</div></section>`;
@@ -88,6 +94,7 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
     const vscode = window.verdictVscode; const post = (message) => vscode.postMessage(message);
     document.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => post({ type: 'goStep', step: Number(button.dataset.step) })));
     document.getElementById('test')?.addEventListener('click', () => post({ type: 'testConnection', instanceUrl: document.getElementById('instance').value, token: document.getElementById('token').value }));
+    document.getElementById('use-session')?.addEventListener('click', () => post({ type: 'useSession', instanceUrl: document.getElementById('instance').value }));
     document.getElementById('pod-name')?.addEventListener('change', (event) => post({ type: 'setName', name: event.target.value }));
     document.querySelectorAll('[data-name]').forEach((button) => button.addEventListener('click', () => post({ type: 'setName', name: button.dataset.name })));
     document.querySelectorAll('[data-sample]').forEach((button) => button.addEventListener('click', () => { document.getElementById('source').value = button.dataset.sample; }));

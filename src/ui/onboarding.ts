@@ -7,6 +7,7 @@ import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Pod, PodSource } from '../domain/types';
 import type { Connection } from '../platform/provider';
 import { defaultProviderId, getProvider } from '../platform/registry';
+import { acquireSessionFor, sessionAvailableFor } from '../app/connections';
 import { cap } from './vocab';
 import type { Repository } from '../platform/types';
 import { renderOnboardingHtml, type OnboardingMessage, type OnboardingSourceView } from './onboardingHtml';
@@ -94,6 +95,7 @@ export class OnboardingPanel {
     this.panel.webview.html = renderOnboardingHtml({
       vocabulary: provider.vocabulary,
       host: provider.host,
+      sessionAvailable: sessionAvailableFor(this.providerId, this.instanceUrl),
       step: this.step,
       instanceUrl: this.instanceUrl,
       connectionStatus: this.connectionStatus,
@@ -145,11 +147,55 @@ export class OnboardingPanel {
         if (project) project.selected = !project.selected;
         break;
       }
+      case 'useSession':
+        await this.connectWithSession(message.instanceUrl);
+        break;
       case 'createPod':
         await this.createPod();
         return;
     }
     this.render();
+  }
+
+  /**
+   * The editor-account path (spec: "does not require a pasted token"). Nothing
+   * is written to the secret store — `connectionForPod` re-acquires the session
+   * from the editor whenever the pod is used.
+   */
+  private async connectWithSession(instanceUrl: string): Promise<void> {
+    this.instanceUrl = instanceUrl.trim().replace(/\/$/, '');
+    const provider = getProvider(this.providerId);
+    const accessToken = await acquireSessionFor(this.providerId, this.instanceUrl, {
+      createIfNone: true,
+    });
+    if (accessToken === undefined) {
+      this.connected = false;
+      this.connectionStatus = `No ${provider.vocabulary.platformName} account available — paste a token instead.`;
+      this.render();
+      return;
+    }
+    this.token = '';
+    this.connection = provider.connect({
+      instanceUrl: this.instanceUrl,
+      credential: { kind: 'session', accessToken },
+    });
+    await this.applyStatus();
+    this.render();
+  }
+
+  /** Shared by both credential paths: read the status and describe it. */
+  private async applyStatus(): Promise<void> {
+    try {
+      const status = await this.connection!.testConnection();
+      this.connected = status.ok;
+      this.username = status.username;
+      this.connectionStatus = status.ok
+        ? `✓ Connected as @${status.username ?? 'you'} · ${(status.scopes ?? ['unknown scope']).join(', ')}`
+        : status.error?.message ?? 'Connection failed';
+    } catch (e) {
+      this.connected = false;
+      this.connectionStatus = e instanceof Error ? e.message : String(e);
+    }
   }
 
   private async testConnection(instanceUrl: string, token: string): Promise<void> {
