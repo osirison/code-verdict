@@ -131,7 +131,11 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
         <button class="btn btn-agent" data-opinion="${e(t.threadId)}">Ask the agent</button>
         <button class="btn btn-ok" data-resolve="${e(t.threadId)}">Resolve thread</button>
         <button class="btn" data-concede="${e(t.threadId)}">Concede — they're right</button>
-        <div class="reply-row"><input class="input" data-reply="${e(t.threadId)}" placeholder="Reply…"><span class="kbd">⌘↩</span></div>
+        <div class="reply-row">
+          <input class="input" data-reply="${e(t.threadId)}" placeholder="Reply…">
+          <button class="btn" data-reply-send="${e(t.threadId)}">Send</button>
+          <span class="kbd">↩</span>
+        </div>
       </div>`
           : `<div class="closed-note">✓ ${e(t.closedBy ?? 'closed')}<button class="btn" data-reopen="${e(t.threadId)}">Re-open thread</button></div>`
       }
@@ -209,12 +213,25 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'concede', threadId: el.dataset.concede }); }));
     document.querySelectorAll('[data-opinion]').forEach((el) =>
       el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'secondOpinion', threadId: el.dataset.opinion }); }));
+    // One submit path for the key and the button — a single-line input has no
+    // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
+    // an Enter keydown, so plain 'Enter' keeps both working with one check.
+    // The input is never cleared here: on success 'reply' round-trips into a
+    // refresh(), which replaces this whole document and so blanks the field
+    // as a side effect; on failure nothing re-renders and the typed text
+    // stays put for a retry, instead of vanishing with the failed send.
+    function submitReply(input) {
+      const text = input.value.trim();
+      if (!text) return;
+      post({ type: 'reply', threadId: input.dataset.reply, text });
+    }
     document.querySelectorAll('[data-reply]').forEach((el) =>
-      el.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey) && el.value.trim()) {
-          post({ type: 'reply', threadId: el.dataset.reply, text: el.value });
-          el.value = '';
-        }
+      el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitReply(el); }));
+    document.querySelectorAll('[data-reply-send]').forEach((btn) =>
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const input = btn.closest('.reply-row')?.querySelector('[data-reply]');
+        if (input) submitReply(input);
       }));
   `;
 

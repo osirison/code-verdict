@@ -27,6 +27,10 @@ export interface SidebarMergeRequest {
 }
 
 export interface SidebarIssue {
+  repoId: string;
+  number: string;
+  /** Navigation target (issue #40) — opened with `vscode.env.openExternal`. */
+  webUrl: string;
   label: string;
   title: string;
   project: string;
@@ -128,7 +132,8 @@ export type SidebarMessage =
   | { type: 'openPostedReviewTab' }
   | { type: 'useDemoPod' }
   | { type: 'openReviewTab' }
-  | { type: 'openCr'; repoId: string; number: string };
+  | { type: 'openCr'; repoId: string; number: string }
+  | { type: 'openIssue'; webUrl: string };
 
 const CSS = `
 body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 12.5px; }
@@ -161,7 +166,8 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .review-dot.waiting { background: var(--sev-major); }
 .review-title { color: var(--fg-hi); font: 500 12px/1.3 var(--font-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .review-meta { margin-top: 2px; color: var(--fg-dimmer); font: 10.5px/1.3 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.issue { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; padding: 7px 12px; color: var(--fg-dim); }
+.issue { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; width: 100%; border: none; background: none; padding: 7px 12px; color: var(--fg-dim); cursor: pointer; text-align: left; }
+.issue:hover { background: var(--hover); }
 .issue-label { color: var(--agent); font: 10.5px/1.3 var(--font-mono); }
 .issue-title { font: 400 11.5px/1.3 var(--font-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .issue-repo { grid-column: 2; color: var(--fg-dimmer); font: 10px/1.3 var(--font-mono); }
@@ -370,10 +376,10 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
       </button>`).join('')
     : `<div class="empty">No open ${e(state.vocabulary.changeRequestNounPlural)}</div>`;
   const issueRows = state.issues.length > 0
-    ? state.issues.map((issue) => `<div class="issue">
+    ? state.issues.map((issue) => `<button class="issue" data-issue-repo="${e(issue.repoId)}" data-issue-number="${e(issue.number)}" data-issue-url="${e(issue.webUrl)}">
         <span class="issue-label">${e(issue.label)}</span><span class="issue-title">${e(issue.title)}</span>
         <span class="issue-repo">${e(issue.project)}</span>
-      </div>`).join('')
+      </button>`).join('')
     : '<div class="empty">No issues in progress</div>';
   const activeReview = state.activeReview;
   const decided = activeReview ? activeReview.items.length - activeReview.counts.undecided : 0;
@@ -454,6 +460,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     document.getElementById('settings')?.addEventListener('click', () => post({ type: 'openSettings' }));
     document.querySelectorAll('[data-pod]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectPod', podId: row.dataset.pod })));
     document.querySelectorAll('[data-cr-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'openCr', repoId: row.dataset.crRepo, number: row.dataset.crNumber })));
+    document.querySelectorAll('[data-issue-url]').forEach((row) => row.addEventListener('click', () => post({ type: 'openIssue', webUrl: row.dataset.issueUrl })));
     document.querySelectorAll('[data-finding]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectFinding', itemId: row.dataset.finding })));
     document.getElementById('open-review-tab')?.addEventListener('click', () => post({ type: 'openReviewTab' }));
     document.getElementById('open-posted-tab')?.addEventListener('click', () => post({ type: 'openPostedReviewTab' }));

@@ -140,6 +140,23 @@ export interface ReviewSubmission {
   asSingleThread?: boolean;
 }
 
+/**
+ * What a submit is doing right now. Submitting is the longest operation in the
+ * product — one round trip per comment on the per-comment path, plus the
+ * summary and the verdict — and without this the UI can only sit silent until
+ * it finishes (#42). Providers report it best-effort; a caller that does not
+ * pass a callback costs nothing.
+ */
+export interface SubmitProgress {
+  stage: 'comments' | 'summary' | 'verdict';
+  /** Comments finished so far. Zero for the summary and verdict stages. */
+  posted: number;
+  /** Comments in this submit — the retry remainder, not the whole review. */
+  total: number;
+}
+
+export type SubmitProgressFn = (progress: SubmitProgress) => void;
+
 export interface CommentOutcome {
   key: string;
   ok: boolean;

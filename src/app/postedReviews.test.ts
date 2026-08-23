@@ -133,6 +133,79 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     expect(view.threads.find((t) => t.threadId === replied?.id)?.status).toBe('awaiting');
   });
 
+  // #33's contract gap: resolveThread/replyToThread claimed by every provider,
+  // covered by nothing. The shared contract suite (providerContract.ts) is
+  // where this belongs long-term, but every describeProviderContract() call
+  // site lives under src/providers/**, out of reach here — see the report.
+  // This exercises the same connection.resolveThread the panel's 'resolve'
+  // and 'reopen' messages call, live against the emulator, both directions.
+  it('resolveThread reverses cleanly: resolve(true) then resolve(false) restores unresolved', async () => {
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const target = threads.find((t) => !t.resolved);
+    expect(target).toBeDefined();
+
+    await connection.resolveThread(REF, target?.id as string, true);
+    const resolvedThreads = await connection.listThreads(REF);
+    expect(resolvedThreads.find((t) => t.id === target?.id)?.resolved).toBe(true);
+    const resolvedView = await buildPostedReview(
+      connection,
+      entryFor(threads.map((t) => t.id)),
+      'you',
+      new Set(),
+    );
+    expect(resolvedView.threads.find((t) => t.threadId === target?.id)?.status).toBe('resolved');
+
+    await connection.resolveThread(REF, target?.id as string, false);
+    const reopenedThreads = await connection.listThreads(REF);
+    expect(reopenedThreads.find((t) => t.id === target?.id)?.resolved).toBe(false);
+    const reopenedView = await buildPostedReview(
+      connection,
+      entryFor(threads.map((t) => t.id)),
+      'you',
+      new Set(),
+    );
+    // Not necessarily back to the exact prior status (that depends on who
+    // spoke last), but definitely not still resolved.
+    expect(reopenedView.threads.find((t) => t.threadId === target?.id)?.status).not.toBe('resolved');
+  });
+
+  // #34's discriminating test: a note that lands through a channel other than
+  // this extension's own reply box (the platform's own web UI, another
+  // reviewer, a bot) — never through connection.replyToThread. The emulator's
+  // `/reply` control route posts as the MR author directly against the world
+  // state, bypassing the provider client entirely, which is the closest this
+  // suite can get to "someone else posted it". A second buildPostedReview()
+  // call — the exact thing PostedReviewsPanel.refresh() does, no cache, no
+  // memo of the earlier call — must show it. If it does, "refresh brings in
+  // nothing" cannot be a data-layer or render-layer bug; it can only be #33
+  // (nothing was ever posted to begin with).
+  it('a note posted through another channel shows up on the next buildPostedReview call (#34)', async () => {
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const awaiting = threads.find(
+      (t) => !t.resolved && t.notes[t.notes.length - 1]?.author.username === 'you',
+    );
+    expect(awaiting).toBeDefined();
+
+    const before = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const beforeThread = before.threads.find((t) => t.threadId === awaiting?.id);
+    expect(beforeThread?.status).toBe('awaiting');
+    const marker = 'Posted from the web UI directly.';
+    expect(beforeThread?.replies.some((r) => r.body === marker)).toBe(false);
+
+    const res = await fetch(`${baseUrl}/_emulator/mrs/${REF.repoId}/${REF.number}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ discussionId: awaiting?.id, body: marker }),
+    });
+    expect(res.status).toBe(200);
+
+    const after = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const afterThread = after.threads.find((t) => t.threadId === awaiting?.id);
+    expect(afterThread?.replies.some((r) => r.body === marker)).toBe(true);
+    expect(afterThread?.status).toBe('replied');
+  });
+
   it('legacy entries without thread ids only show threads you started — never the whole MR', async () => {
     const connection = connect();
     // 2841 starts with no discussions; post one as you, then have the

@@ -61,6 +61,73 @@ const state: FlowViewState = {
   crWebUrl: 'https://gitlab.example/hve/platform/core/-/merge_requests/2841',
 };
 
+describe('follow-up answers patch in place (#37, #38)', () => {
+  const html = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n');
+
+  it('gives each finding a thread container the client can target', () => {
+    // Without a container the only way to show an answer is to re-render the
+    // document, which rebuilds the ask box and drops focus mid-question.
+    expect(html).toContain('data-thread-for=');
+  });
+
+  it('patches the thread rather than replacing the document', () => {
+    expect(html).toContain("data.type !== 'verdict:thread'");
+    expect(html).toContain('replaceChildren');
+  });
+
+  it('escapes the item id for the thread selector instead of stripping quotes', () => {
+    const id = 'itm"a\\';
+    const base = state.items[0]!;
+    const html = renderReviewFlowHtml({
+      ...state,
+      mode: 'split',
+      items: [{ ...base, thread: base.thread ?? [], item: { ...base.item, id } }],
+      selectedId: id,
+    }, 'HVE Core / PR Review', 'n');
+
+    // The attribute carries the id verbatim (HTML-escaped only), so any lookup
+    // that alters the value cannot match its own element.
+    expect(html).toContain('data-thread-for="itm&quot;a\\"');
+    // Stripping quotes broke that match, and a trailing backslash escaped the
+    // selector's closing quote so querySelector threw and the agent's answer
+    // never arrived.
+    expect(html).toContain('CSS.escape(String(data.itemId))');
+    expect(html).not.toContain("String(data.itemId).replace(");
+  });
+
+  it('renders model output as text, never as markup', () => {
+    // The answer is whatever the model returned; innerHTML here would be an
+    // injection sink fed by an external system.
+    expect(html).toContain('text.textContent = t.text');
+    expect(html).not.toContain('innerHTML = t.text');
+  });
+});
+
+describe('the submitting screen (#42)', () => {
+  const submitting = (submitProgress: FlowViewState['submitProgress']): string =>
+    renderReviewFlowHtml({ ...state, screen: 'submitting', submitProgress }, 'HVE Core / PR Review', 'n');
+
+  it('says what it is doing before the first outcome is known', () => {
+    // The whole point: something renders immediately, before any round trip.
+    expect(submitting(undefined)).toContain('Starting…');
+  });
+
+  it('counts comments as they post', () => {
+    const html = submitting({ stage: 'comments', posted: 3, total: 12 });
+    expect(html).toContain('Posting 3 of 12 inline comments…');
+    expect(html).toContain('width:25%');
+  });
+
+  it('names the summary and verdict stages, which have nothing to count', () => {
+    expect(submitting({ stage: 'summary', posted: 0, total: 0 })).toContain('Posting the summary…');
+    expect(submitting({ stage: 'verdict', posted: 0, total: 0 })).toContain('Applying the verdict…');
+  });
+
+  it('reads naturally for a single comment', () => {
+    expect(submitting({ stage: 'comments', posted: 0, total: 1 })).toContain('0 of 1 inline comment…');
+  });
+});
+
 describe('in-diff triage fidelity (spec §5)', () => {
   it('renders the third mode with a numbered diff and inline finding widget', () => {
     const html = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'nonce123');

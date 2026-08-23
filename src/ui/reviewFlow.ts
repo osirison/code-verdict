@@ -7,11 +7,12 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
+import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, discoverLmAgents, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
@@ -31,13 +32,13 @@ import {
   setVerdict,
   verdictCounts,
 } from '../domain/reviewState';
-import type { Category, Review, Severity } from '../domain/types';
+import type { Category, Review, ReviewItem, Severity } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
-import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
+import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
@@ -49,6 +50,43 @@ import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
  * enough that a push lands in the banner while the reviewer is still reading.
  */
 const HEAD_POLL_MS = 45_000;
+
+type AskPreset = 'explain' | 'fix' | 'similar' | 'why' | 'freeform';
+
+/**
+ * What each chip actually asks. These used to read a pre-baked `answers` map
+ * that no agent is required to supply, so they almost always answered "the
+ * agent has nothing further on this" (#37).
+ */
+const PRESET_QUESTION: Record<Exclude<AskPreset, 'freeform'>, string> = {
+  explain: 'Explain the concrete risk this finding describes. What goes wrong, and under what conditions?',
+  fix: 'Show the smallest change that removes this problem. Give the code, and say what it changes.',
+  similar: 'Where else in this diff does the same problem appear? Quote each occurrence, or say none.',
+  why: 'Why was this flagged at this severity and confidence? Say what would make it more or less serious.',
+};
+
+/**
+ * A follow-up asks about ONE finding, so it carries that finding and the hunk
+ * it sits in — never the whole diff, which is the review run's job and a much
+ * larger request.
+ */
+function followUpPrompt(item: ReviewItem, question: string, hunk: string | undefined): string {
+  return [
+    'You are answering a reviewer\'s follow-up question about a single code review finding.',
+    'Answer in plain prose, at most two short paragraphs. No JSON, no preamble.',
+    '',
+    `Finding: ${item.title}`,
+    `Severity: ${item.severity} · confidence ${item.confidence}`,
+    `Location: ${item.file}:${item.line}`,
+    `Detail: ${item.body}`,
+    item.code ? `Flagged code:\n${item.code}` : '',
+    hunk ? `Surrounding diff:\n${hunk}` : '',
+    '',
+    `Question: ${question}`,
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+}
 
 interface SessionDraft {
   review: Review;
@@ -435,7 +473,7 @@ export class ReviewFlowPanel {
         message: err.message,
         requestId: err.requestId,
         partialCount: 0,
-        code: err.timedOut ? 'copilot.request.timeout · 90000ms' : 'copilot.request.error',
+        code: err.timedOut ? `copilot.request.timeout · ${err.timeoutReason === 'ceiling' ? CEILING_TIMEOUT_MS : INACTIVITY_TIMEOUT_MS}ms` : 'copilot.request.error',
       };
       this.render();
     }
@@ -482,7 +520,30 @@ export class ReviewFlowPanel {
 
   // ---- messages ------------------------------------------------------------------
 
+  /**
+   * Every message goes through here so a rejection cannot vanish. The panel
+   * dispatches with `void this.onMessage(...)`, so an unhandled rejection went
+   * to the extension-host console and the user saw nothing at all — a button
+   * that simply did nothing (#41). `approve` was the reported case, but every
+   * branch of the switch had the same exposure.
+   */
   private async onMessage(m: FlowMessage): Promise<void> {
+    try {
+      await this.handleMessage(m);
+    } catch (e) {
+      const error = toScmError(e);
+      // A refused verdict is an explanation, not a failure: the platform will
+      // never accept it, and there is nothing for the user to retry.
+      void (error.kind === 'verdictRefused'
+        ? vscode.window.showInformationMessage(`Verdict: ${error.message}`)
+        : vscode.window.showErrorMessage(`Verdict: ${error.message}`));
+      // The switch may have mutated state before throwing, and the screen it
+      // was heading for never rendered.
+      this.render();
+    }
+  }
+
+  private async handleMessage(m: FlowMessage): Promise<void> {
     const pod = this.pod();
     switch (m.type) {
       case 'toggleAgentOpen':
@@ -571,18 +632,8 @@ export class ReviewFlowPanel {
         if (!this.review) return;
         const item = this.review.items.find((i) => i.id === m.itemId);
         if (!item) return;
-        const list = (this.threads[m.itemId] ??= []);
-        if (m.preset === 'freeform') {
-          list.push({ label: 'agent · reply', text: this.freeformAnswer(m.text ?? '') });
-        } else {
-          const label = `agent · ${m.preset}`;
-          // Idempotent — asking twice does not duplicate (spec).
-          if (!list.some((t) => t.label === label)) {
-            list.push({ label, text: item.answers?.[m.preset] ?? 'The agent has nothing further on this.' });
-          }
-        }
-        await this.persistDraft();
-        break;
+        await this.ask(item, m.preset, m.text);
+        return;
       }
       case 'openInEditor': {
         // Land on the flagged line, not just the file — and only when this
@@ -717,8 +768,69 @@ export class ReviewFlowPanel {
     this.render();
   }
 
-  private freeformAnswer(question: string): string {
-    return `On "${question.trim()}": the finding stands as written — the flagged line is the concrete risk, and the suggested change (where present) is the smallest fix that removes it.`;
+  /** True from the first request until the last one settles — see submit(). */
+  private submitting = false;
+  private submitProgress?: SubmitProgressView;
+
+  /**
+   * Ask the agent about one finding, for real.
+   *
+   * Both follow-up paths used to be fiction (#37): the preset chips read an
+   * `answers` map no agent is required to supply, so they almost always said
+   * "the agent has nothing further on this", and the freeform box returned a
+   * fixed sentence with the question interpolated into it — the question was
+   * never read, let alone answered.
+   *
+   * The answer is appended through a targeted message rather than a re-render.
+   * A full render replaces the document, which drops focus out of the ask box
+   * and sends the next keystroke to the triage handler as a verdict (#38).
+   */
+  private async ask(item: ReviewItem, preset: AskPreset, text?: string): Promise<void> {
+    const question = preset === 'freeform' ? (text ?? '').trim() : PRESET_QUESTION[preset];
+    if (question === '') return;
+    const label = preset === 'freeform' ? 'agent · reply' : `agent · ${preset}`;
+    const list = (this.threads[item.id] ??= []);
+
+    // A pre-baked answer, when an agent did supply one, still beats a request.
+    const canned = preset === 'freeform' ? undefined : item.answers?.[preset];
+    if (canned !== undefined) {
+      this.appendAnswer(item.id, list, label, canned);
+      await this.persistDraft();
+      return;
+    }
+    if (!this.agentId.startsWith('lm:')) {
+      this.appendAnswer(item.id, list, label, 'This agent does not answer follow-up questions.');
+      await this.persistDraft();
+      return;
+    }
+
+    this.appendAnswer(item.id, list, label, 'Thinking…');
+    const entry = list[list.length - 1] as { label: string; text: string };
+    try {
+      const hunk = this.diff?.files.find((f) => f.newPath === item.file)?.diff;
+      entry.text = await runFollowUpPrompt(this.agentId, followUpPrompt(item, question, hunk));
+    } catch (e) {
+      const error = e instanceof AgentRunError ? e.message : toScmError(e).message;
+      entry.text = `The agent could not answer: ${error}`;
+    }
+    this.postThreadUpdate(item.id, list);
+    await this.persistDraft();
+  }
+
+  /** Appends and pushes it to the webview without rebuilding the document. */
+  private appendAnswer(
+    itemId: string,
+    list: Array<{ label: string; text: string }>,
+    label: string,
+    text: string,
+  ): void {
+    list.push({ label, text });
+    this.postThreadUpdate(itemId, list);
+  }
+
+  private postThreadUpdate(itemId: string, list: Array<{ label: string; text: string }>): void {
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({ type: 'verdict:thread', itemId, thread: list });
   }
 
   private generateSummaryText(): string {
@@ -742,6 +854,15 @@ export class ReviewFlowPanel {
     // Palette-invoked submits must obey the same gate as the button: a
     // fully-triaged review, from the summary screen.
     if (this.screen !== 'summary' || !allDecided(this.review)) return;
+    // The screen is NOT the guard. It stayed 'summary' for the whole submit,
+    // so a second click — which a panel that looks frozen invites — passed the
+    // check above and started a concurrent submit with the same drafts,
+    // posting every comment twice (#42).
+    if (this.submitting) return;
+    this.submitting = true;
+    this.submitProgress = undefined;
+    this.screen = 'submitting';
+    this.render();
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
     const you = pod.username ?? 'you';
@@ -761,6 +882,11 @@ export class ReviewFlowPanel {
           retryKeys: this.failedKeys,
           summaryAlreadyPosted: this.summaryPosted,
           verdictAlreadyApplied: this.verdictApplied,
+        },
+        (progress) => {
+          if (this.disposed || !this.submitting) return;
+          this.submitProgress = progress;
+          this.render();
         },
       );
 
@@ -855,6 +981,12 @@ export class ReviewFlowPanel {
       this.submitError = isScmError(e) ? e.message : e instanceof Error ? e.message : String(e);
       this.screen = 'summary';
       this.render();
+    } finally {
+      // In a finally, so a throw cannot wedge the panel: with the flag left
+      // set, every later submit would return at the guard and the review
+      // could never be sent again.
+      this.submitting = false;
+      this.submitProgress = undefined;
     }
   }
 
@@ -903,6 +1035,7 @@ export class ReviewFlowPanel {
     const state: FlowViewState = {
       vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
+      submitProgress: this.submitProgress,
       acceptRate,
       memberOfChangeset: this.memberOfChangeset,
       header: {

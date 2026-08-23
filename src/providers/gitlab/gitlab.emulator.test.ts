@@ -45,6 +45,8 @@ describeProviderContract('gitlab provider against the emulator', {
     repoPath: 'hve/platform/core',
     groupId: '4821',
   },
+  // A real emulator behind this one — it records what was written.
+  threadMutationsPersist: true,
   crRef: { repoId: '9101', number: '2833' },
   anchor: { filePath: 'src/ui/banner.ts', line: 14 },
 });

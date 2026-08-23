@@ -11,7 +11,18 @@ import type { Vocabulary } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
 
-export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'done';
+export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'submitting' | 'done';
+
+/**
+ * What the submit is doing, mirrored from the provider. Submitting is the
+ * longest operation in the product and used to run behind an unchanged summary
+ * screen, so it looked like the panel had frozen (#42).
+ */
+export interface SubmitProgressView {
+  stage: 'comments' | 'summary' | 'verdict';
+  posted: number;
+  total: number;
+}
 
 export interface FlowHeaderInfo {
   refLabel: string;
@@ -55,6 +66,8 @@ export interface FlowViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
   screen: FlowScreen;
+  /** Set only while `screen` is 'submitting'. */
+  submitProgress?: SubmitProgressView;
   header: FlowHeaderInfo;
   agents: AgentDescriptor[];
   agentId: string;
@@ -424,6 +437,31 @@ function renderRunReview(s: FlowViewState): string {
 
 // ---- §4 Running -------------------------------------------------------------
 
+function renderSubmitting(s: FlowViewState): string {
+  const p = s.submitProgress;
+  const total = p?.total ?? 0;
+  // The verdict and summary are single requests with nothing to count, so the
+  // bar only tracks comments; it holds at full while the last two go out.
+  const pct = p?.stage === 'comments' && total > 0
+    ? Math.round((p.posted / total) * 100)
+    : total > 0 ? 100 : 0;
+  const line = p === undefined
+    ? 'Starting…'
+    : p.stage === 'comments'
+      ? `Posting ${p.posted} of ${total} inline ${total === 1 ? 'comment' : 'comments'}…`
+      : p.stage === 'summary'
+        ? 'Posting the summary…'
+        : 'Applying the verdict…';
+  return `<div class="run-col">
+    <div class="spinner"></div>
+    <div class="agent-name">Submitting your review</div>
+    <div class="dim">${pct}%</div>
+    <div class="progress"><div style="width:${pct}%"></div></div>
+    <div class="runlog"><div class="now">· ${e(line)}</div></div>
+    <div class="dim">Leave this open — closing it will not stop what has already been posted.</div>
+  </div>`;
+}
+
 function renderRunning(s: FlowViewState): string {
   const agent = s.agents.find((a) => a.id === s.agentId);
   const pct = Math.round((Math.min(s.runStep, s.runSteps.length) / Math.max(1, s.runSteps.length)) * 100);
@@ -550,11 +588,11 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
       <button class="chip preset" data-preset="similar">Find similar in repo</button>
       <button class="chip preset" data-preset="why">Why flagged?</button>
     </div>
-    ${view.thread
+    <div class="thread-list" data-thread-for="${e(view.item.id)}">${view.thread
       .map(
         (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
       )
-      .join('')}
+      .join('')}</div>
     <div class="ask-row">
       <span class="prompt">▸</span>
       <input class="input" id="ask" placeholder="Ask the agent about this finding…">
@@ -616,11 +654,11 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
           <button class="chip preset" data-preset="similar">Find similar in repo</button>
           <button class="chip preset" data-preset="why">Why flagged?</button>
         </div>
-        ${selected.thread
+        <div class="thread-list" data-thread-for="${e(selected.item.id)}">${selected.thread
           .map(
             (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
           )
-          .join('')}`
+          .join('')}</div>`
           : ''
       }
     </div>
@@ -841,6 +879,33 @@ document.getElementById('skip')?.addEventListener('click', () => verdict('skippe
 on('prev-item', 'move', { delta: -1 }); on('next-item', 'move', { delta: 1 });
 document.querySelectorAll('.pip[data-select]').forEach((p) => p.addEventListener('click', () => post({ type: 'select', itemId: p.dataset.select })));
 document.querySelectorAll('.preset').forEach((p) => p.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset }); }));
+// The agent's answer arrives as a message and is patched into place. Rendering
+// the whole document instead would rebuild the ask box mid-question: focus
+// falls back to <body>, and A/R/S then land on the triage handler as verdicts.
+window.addEventListener('message', (ev) => {
+  const data = ev.data;
+  if (!data || data.type !== 'verdict:thread') return;
+  // CSS.escape, not a hand-rolled strip: item ids come straight from the
+  // agent's JSON. Stripping quotes changed the value, so an id containing one
+  // stopped matching its own element, and an id ending in a backslash escaped
+  // the closing quote and made querySelector throw — killing the very handler
+  // that delivers the answer.
+  const host = document.querySelector('[data-thread-for="' + CSS.escape(String(data.itemId)) + '"]');
+  if (!host) return;
+  host.replaceChildren(...(data.thread || []).map((t) => {
+    const entry = document.createElement('div');
+    entry.className = 'thread-entry';
+    const label = document.createElement('div');
+    label.className = 'thread-label';
+    label.textContent = t.label;
+    const text = document.createElement('div');
+    text.className = 'thread-text';
+    // textContent, not innerHTML: this is model output.
+    text.textContent = t.text;
+    entry.append(label, text);
+    return entry;
+  }));
+});
 document.getElementById('ask')?.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { const id = itemId(); if (id && ev.target.value.trim()) { post({ type: 'ask', itemId: id, preset: 'freeform', text: ev.target.value }); ev.target.value = ''; } }
 });
@@ -879,6 +944,8 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
       ? renderRunReview(s)
       : s.screen === 'running'
         ? renderRunning(s)
+      : s.screen === 'submitting'
+        ? renderSubmitting(s)
         : s.screen === 'triage'
           ? s.mode === 'queue'
             ? renderTriageQueue(s, agentLabel)

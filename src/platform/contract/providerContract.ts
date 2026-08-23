@@ -16,6 +16,20 @@ export interface ProviderContractHarness {
    * error while the first succeeds — exercises partial-failure reporting.
    */
   makeFailingConnection?(): Connection | Promise<Connection>;
+  /**
+   * Whether THIS HARNESS's backing store actually remembers a
+   * replyToThread/resolveThread write and plays it back on the next
+   * listThreads — never a statement about the provider. Every provider must
+   * implement both calls correctly; this only says whether the double behind
+   * a given harness can observe that. A harness backed by a real emulator or
+   * an in-memory fake can say true; one backed by a fixed, static response
+   * table (as GitHub's and GitLab's REST fakes are today — see
+   * fakeGitHub.ts's `graphqlResponse()` and fakeGitLab.ts's discussions
+   * route, both of which hand back the same canned payload no matter what
+   * was just posted) must leave it unset, or the case would fail for a
+   * reason that has nothing to do with the provider under test.
+   */
+  threadMutationsPersist?: boolean;
   inputs: {
     /** Resolves to a repository (URL or path form). */
     repository: string;
@@ -133,6 +147,50 @@ export function describeProviderContract(label: string, harness: ProviderContrac
         expect(typeof t.anchorPresent).toBe('boolean');
       }
     });
+
+    // Closes the gap named in issue #33: every provider declares
+    // replyToThread/resolveThread, and until now nothing in the shared suite
+    // called either one. Gated on threadMutationsPersist — see that field's
+    // comment for why a harness may legitimately sit this out.
+    if (harness.threadMutationsPersist) {
+      it('replyToThread posts a note that a subsequent listThreads returns on the same thread', async () => {
+        const conn = await harness.makeConnection();
+        const before = await conn.listThreads(harness.crRef);
+        const target = before[0];
+        expect(target).toBeDefined();
+        // Captured as a number, not read off `target` afterwards: a provider
+        // backed by an in-memory store may hand out live references, so the
+        // object in `before` is the very one the reply mutates and comparing
+        // against it compares a value with itself.
+        const notesBefore = target?.notes.length ?? 0;
+        const marker = 'Contract test reply — round trip check.';
+
+        await conn.replyToThread(harness.crRef, target?.id as string, marker);
+
+        const after = await conn.listThreads(harness.crRef);
+        const updated = after.find((t) => t.id === target?.id);
+        expect(updated?.notes.some((n) => n.body === marker)).toBe(true);
+        expect(updated?.notes.length).toBe(notesBefore + 1);
+      });
+
+      it('resolveThread(true) marks a thread resolved, and resolveThread(false) reverses it', async () => {
+        const conn = await harness.makeConnection();
+        const threads = await conn.listThreads(harness.crRef);
+        // Not threads[0]: a seeded fixture can start with its first thread
+        // already resolved, which would make the "marks resolved" half of
+        // this case pass trivially — it never toggled anything.
+        const target = threads.find((t) => !t.resolved) ?? threads[0];
+        expect(target).toBeDefined();
+
+        await conn.resolveThread(harness.crRef, target?.id as string, true);
+        const resolved = (await conn.listThreads(harness.crRef)).find((t) => t.id === target?.id);
+        expect(resolved?.resolved).toBe(true);
+
+        await conn.resolveThread(harness.crRef, target?.id as string, false);
+        const reopened = (await conn.listThreads(harness.crRef)).find((t) => t.id === target?.id);
+        expect(reopened?.resolved).toBe(false);
+      });
+    }
 
     if (harness.makeFailingConnection) {
       it('reports per-comment outcomes on partial failure and withholds the summary', async () => {

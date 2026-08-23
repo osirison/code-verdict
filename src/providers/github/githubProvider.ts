@@ -25,6 +25,7 @@ import type {
   ReviewSubmission,
   ReviewThread,
   SourceResolution,
+  SubmitProgressFn,
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
@@ -422,7 +423,11 @@ export class GitHubConnection implements Connection {
    * On a non-position rejection nothing was attempted, so the normalized error
    * is thrown rather than returned — which is what the contract specifies.
    */
-  async submitReview(ref: ChangeRequestRef, submission: ReviewSubmission): Promise<SubmitResult> {
+  async submitReview(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+    onProgress?: SubmitProgressFn,
+  ): Promise<SubmitResult> {
     // approve wins over requestChanges: GitHub has one event, and reporting
     // both as applied would claim a verdict that was never sent.
     const event: ReviewEvent = submission.approve
@@ -435,12 +440,17 @@ export class GitHubConnection implements Connection {
     // comments to add. This is the shape `submit.ts` retries with once the
     // summary has already been posted; creating a second bodiless COMMENT
     // review for it would 422, because GitHub requires a body for that event.
+    // Announced once, here, rather than in each path: the batch may reject and
+    // hand over to the per-comment fallback, and two openings both claiming
+    // "0 of N" read as a stall rather than a start.
+    onProgress?.({ stage: 'comments', posted: 0, total: submission.comments.length });
+
     if (event === 'COMMENT' && !hasSummary(submission.summary)) {
-      return this.submitCommentByComment(ref, submission, event);
+      return this.submitCommentByComment(ref, submission, event, onProgress);
     }
 
     try {
-      return await this.submitAsOneReview(ref, submission, event);
+      return await this.submitAsOneReview(ref, submission, event, onProgress);
     } catch (e) {
       const error = toScmError(e);
       // GitHub refused the verdict, not the review — an author cannot approve
@@ -449,10 +459,10 @@ export class GitHubConnection implements Connection {
       // COMMENT and report the verdict through its own field. Throwing here
       // would lose the whole review to a refusal of one field (task 5.7).
       if (isVerdictRefused(error)) {
-        return { ...(await this.submitDowngraded(ref, submission)), ...verdictFailure(event, error) };
+        return { ...(await this.submitDowngraded(ref, submission, onProgress)), ...verdictFailure(event, error) };
       }
       if (error.kind !== 'staleAnchor') throw error;
-      return this.submitCommentByComment(ref, submission, event);
+      return this.submitCommentByComment(ref, submission, event, onProgress);
     }
   }
 
@@ -465,18 +475,23 @@ export class GitHubConnection implements Connection {
   private async submitDowngraded(
     ref: ChangeRequestRef,
     submission: ReviewSubmission,
+    onProgress?: SubmitProgressFn,
   ): Promise<SubmitResult> {
     // A bodiless COMMENT review is itself a 422, so a submission with no
     // summary posts its comments standalone instead.
     if (!hasSummary(submission.summary)) {
-      return this.submitCommentByComment(ref, submission, 'COMMENT');
+      return this.submitCommentByComment(ref, submission, 'COMMENT', onProgress);
     }
     try {
-      return await this.submitAsOneReview(ref, submission, 'COMMENT');
+      return await this.submitAsOneReview(ref, submission, 'COMMENT', onProgress);
     } catch (e) {
       const error = toScmError(e);
+      // Anything else means nothing was posted, so this throws and the caller
+      // keeps its draft to retry. Returning the refusal instead would report an
+      // empty submit as a success, and would carry *this* error rather than the
+      // refusal anyway — `asVerdictError` rewrites only refusals.
       if (error.kind !== 'staleAnchor') throw error;
-      return this.submitCommentByComment(ref, submission, 'COMMENT');
+      return this.submitCommentByComment(ref, submission, 'COMMENT', onProgress);
     }
   }
 
@@ -484,6 +499,7 @@ export class GitHubConnection implements Connection {
     ref: ChangeRequestRef,
     submission: ReviewSubmission,
     event: ReviewEvent,
+    _onProgress?: SubmitProgressFn,
   ): Promise<SubmitResult> {
     const comments = submission.comments.map((comment) => ({
       ...anchorPayload(comment.anchor),
@@ -527,9 +543,14 @@ export class GitHubConnection implements Connection {
     ref: ChangeRequestRef,
     submission: ReviewSubmission,
     event: ReviewEvent,
+    onProgress?: SubmitProgressFn,
   ): Promise<SubmitResult> {
     const outcomes: CommentOutcome[] = [];
     let abort: ScmError | undefined;
+    // This is the slow path — one round trip per comment — so it is the one
+    // that reports where it has got to. The opening 0/N came from
+    // submitReview, which cannot know yet whether this path will be taken.
+    const total = submission.comments.length;
 
     for (const comment of submission.comments) {
       if (abort) {
@@ -549,6 +570,7 @@ export class GitHubConnection implements Connection {
         outcomes.push({ key: comment.key, ok: false, error });
         if (ABORT_KINDS.has(error.kind)) abort = error;
       }
+      onProgress?.({ stage: 'comments', posted: outcomes.length, total });
     }
 
     // The REST ids just collected are not thread ids; resolve them before
@@ -576,6 +598,7 @@ export class GitHubConnection implements Connection {
     // not: a request for changes still has to land.
     const needsVerdictReview = event !== 'COMMENT';
     if (summaryToPost || needsVerdictReview) {
+      onProgress?.({ stage: needsVerdictReview ? 'verdict' : 'summary', posted: 0, total: 0 });
       try {
         await this.http.post(`${this.prPath(ref)}/reviews`, {
           event,
@@ -704,7 +727,14 @@ export class GitHubConnection implements Connection {
   }
 
   async approve(ref: ChangeRequestRef): Promise<void> {
-    await this.http.post(`${this.prPath(ref)}/reviews`, { event: 'APPROVE' });
+    try {
+      await this.http.post(`${this.prPath(ref)}/reviews`, { event: 'APPROVE' });
+    } catch (e) {
+      // Same refusal `submitReview` already classifies — an author cannot
+      // approve their own pull request. Left as a bare 422 it reached the UI
+      // as a generic error, which is not what it is.
+      throw asVerdictError(toScmError(e));
+    }
   }
 }
 

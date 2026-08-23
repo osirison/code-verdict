@@ -33,6 +33,12 @@ export function toSidebarViewState(data: PodData, pods: readonly Pod[]): Sidebar
         && cr.reviewers.some((reviewer) => reviewer.username === pod.username),
     })),
     issues: data.workItems.slice(0, 6).map((issue) => ({
+      // Carried, not discarded (issue #40): a row with nothing to open is not
+      // a fix. No `formatIssueRef` exists on `Vocabulary` — GitLab and GitHub
+      // both use `#` today, so the literal stays until a platform disagrees.
+      repoId: issue.repoId,
+      number: issue.number,
+      webUrl: issue.webUrl,
       label: `#${issue.number}`,
       title: issue.title,
       project: repoLabel(pod, issue.repoId),

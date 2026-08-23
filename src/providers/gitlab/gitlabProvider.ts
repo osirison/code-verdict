@@ -22,6 +22,7 @@ import type {
   ReviewSubmission,
   ReviewThread,
   SourceResolution,
+  SubmitProgressFn,
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
@@ -295,9 +296,17 @@ export class GitLabConnection implements Connection {
     return toChangeRequestDiff(ref, changes);
   }
 
-  async submitReview(ref: ChangeRequestRef, submission: ReviewSubmission): Promise<SubmitResult> {
+  async submitReview(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+    onProgress?: SubmitProgressFn,
+  ): Promise<SubmitResult> {
     const outcomes: CommentOutcome[] = [];
     let abort: ScmError | undefined;
+    // GitLab has no batched review: every comment is its own request, so the
+    // whole submit is this loop and progress is worth reporting per comment.
+    const total = submission.comments.length;
+    onProgress?.({ stage: 'comments', posted: 0, total });
 
     for (const comment of submission.comments) {
       if (abort) {
@@ -317,6 +326,7 @@ export class GitLabConnection implements Connection {
         // the rest of the batch — report, don't hammer.
         if (ABORT_KINDS.has(error.kind)) abort = error;
       }
+      onProgress?.({ stage: 'comments', posted: outcomes.length, total });
     }
 
     const result: SubmitResult = {
@@ -328,6 +338,7 @@ export class GitLabConnection implements Connection {
     const allOk = outcomes.every((o) => o.ok);
 
     if (submission.summary !== undefined && allOk) {
+      onProgress?.({ stage: 'summary', posted: 0, total: 0 });
       try {
         await this.http.post(`${this.mrPath(ref)}/notes`, { body: submission.summary });
         result.summaryPosted = true;

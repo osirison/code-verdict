@@ -172,6 +172,12 @@ function repoRoute(path: string): { repoId: string; tail: string } | undefined {
 }
 
 export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike {
+  // Thread state is per fake, and mutable: the shared contract suite now
+  // replies to a thread and resolves it, then asserts the next listThreads
+  // plays that back. A static response table cannot answer that question, and
+  // a fake that silently ignores a write is exactly how an unimplemented
+  // mutation passes its own tests.
+  const threads = initialThreads();
   const extraHeaders = Object.fromEntries(
     Object.entries(options.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]),
   );
@@ -189,7 +195,7 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
     }
 
     if (path === '/graphql') {
-      return json(graphqlResponse(init.body ?? ''), extraHeaders);
+      return json(graphqlResponse(init.body ?? '', threads), extraHeaders);
     }
 
     if (path === '/user') return json({ login: 'you', name: 'You' }, extraHeaders);
@@ -299,20 +305,45 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
   };
 }
 
-/** The two GraphQL operations the provider uses: read threads, resolve them. */
-function graphqlResponse(body: string): unknown {
+interface FakeThreadNode {
+  id: string;
+  isResolved: boolean;
+  isOutdated: boolean;
+  path: string;
+  line: number | null;
+  resolvedBy: { login: string } | null;
+  comments: { nodes: Array<{ id: string; databaseId: number; body: string; createdAt: string; author: { login: string } }> };
+}
+
+/** The GraphQL operations the provider uses: read threads, resolve, reply. */
+function graphqlResponse(body: string, threads: FakeThreadNode[]): unknown {
   const parsed = JSON.parse(body || '{}') as { query?: string; variables?: Record<string, unknown> };
   const query = parsed.query ?? '';
+  const threadId = parsed.variables?.threadId as string | undefined;
+  const target = threads.find((thread) => thread.id === threadId);
 
   if (/resolveReviewThread|unresolveReviewThread/.test(query)) {
-    return {
-      data: {
-        thread: { id: parsed.variables?.threadId, isResolved: /(?<!un)resolveReviewThread/.test(query) },
-      },
-    };
+    const resolved = /(?<!un)resolveReviewThread/.test(query);
+    if (target) {
+      target.isResolved = resolved;
+      target.resolvedBy = resolved ? { login: 'you' } : null;
+    }
+    return { data: { thread: { id: threadId, isResolved: resolved } } };
   }
   if (/addPullRequestReviewThreadReply/.test(query)) {
-    return { data: { addPullRequestReviewThreadReply: { comment: { id: 'C_reply' } } } };
+    const id = `C_reply_${target ? target.comments.nodes.length + 1 : 0}`;
+    if (target) {
+      target.comments.nodes.push({
+        id,
+        // Distinct from the seeded ids so thread-id resolution cannot match a
+        // reply by accident.
+        databaseId: 70000 + target.comments.nodes.length,
+        body: String(parsed.variables?.body ?? ''),
+        createdAt: '2026-08-20T13:00:00Z',
+        author: { login: 'you' },
+      });
+    }
+    return { data: { addPullRequestReviewThreadReply: { comment: { id } } } };
   }
   if (/statusCheckRollup/.test(query)) {
     const repoId = `${parsed.variables?.owner as string}/${parsed.variables?.repo as string}`;
@@ -355,39 +386,44 @@ function graphqlResponse(body: string): unknown {
         pullRequest: {
           reviewThreads: {
             pageInfo: { hasNextPage: false, endCursor: null },
-            nodes: [
-              {
-                id: 'PRRT_live',
-                isResolved: false,
-                isOutdated: false,
-                path: 'src/limiter.ts',
-                line: 12,
-                resolvedBy: null,
-                comments: {
-                  nodes: [
-                    { id: 'C_1', databaseId: 8001, body: 'Bound this by tenant.', createdAt: '2026-08-20T11:00:00Z', author: { login: 'you' } },
-                    { id: 'C_2', databaseId: 8002, body: 'Good catch — fixing.', createdAt: '2026-08-20T12:00:00Z', author: { login: 'dana' } },
-                  ],
-                },
-              },
-              {
-                id: 'PRRT_outdated',
-                isResolved: false,
-                // Force-pushed past: the neutral `anchorPresent: false`.
-                isOutdated: true,
-                path: 'src/limiter.ts',
-                line: null,
-                resolvedBy: null,
-                comments: {
-                  nodes: [
-                    { id: 'C_3', databaseId: 9001, body: 'This moved.', createdAt: '2026-08-20T11:30:00Z', author: { login: 'you' } },
-                  ],
-                },
-              },
-            ],
+            nodes: threads,
           },
         },
       },
     },
   };
+}
+
+/** A fresh copy per fake, so one test's reply cannot leak into the next. */
+function initialThreads(): FakeThreadNode[] {
+  return [
+    {
+      id: 'PRRT_live',
+      isResolved: false,
+      isOutdated: false,
+      path: 'src/limiter.ts',
+      line: 12,
+      resolvedBy: null,
+      comments: {
+        nodes: [
+          { id: 'C_1', databaseId: 8001, body: 'Bound this by tenant.', createdAt: '2026-08-20T11:00:00Z', author: { login: 'you' } },
+          { id: 'C_2', databaseId: 8002, body: 'Good catch — fixing.', createdAt: '2026-08-20T12:00:00Z', author: { login: 'dana' } },
+        ],
+      },
+    },
+    {
+      id: 'PRRT_outdated',
+      isResolved: false,
+      // Force-pushed past: the neutral `anchorPresent: false`.
+      isOutdated: true,
+      path: 'src/limiter.ts',
+      line: null,
+      resolvedBy: null,
+      comments: {
+        nodes: [
+          { id: 'C_3', databaseId: 9001, body: 'This moved.', createdAt: '2026-08-20T11:30:00Z', author: { login: 'you' } },
+        ],
+      },
+    },
+  ];
 }

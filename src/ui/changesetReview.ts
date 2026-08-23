@@ -10,7 +10,7 @@ import { connectionForPod } from '../app/connections';
 import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
 import { DEMO_AGENT_ID } from '../app/demoAgent';
-import { AgentRunError, discoverLmAgents, runLmChangesetAgent } from '../app/lmAgent';
+import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runLmChangesetAgent } from '../app/lmAgent';
 import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
@@ -273,7 +273,7 @@ export class ChangesetReviewPanel {
         message: failure.message,
         requestId: failure.requestId,
         partialCount: 0,
-        code: failure.timedOut ? 'copilot.request.timeout · 90000ms' : 'copilot.request.error',
+        code: failure.timedOut ? `copilot.request.timeout · ${failure.timeoutReason === 'ceiling' ? CEILING_TIMEOUT_MS : INACTIVITY_TIMEOUT_MS}ms` : 'copilot.request.error',
       };
       this.render();
     }
