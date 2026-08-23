@@ -59,6 +59,10 @@ interface SessionDraft {
   failedKeys?: string[];
   summaryPosted?: boolean;
   verdictApplied?: boolean;
+  /** itemId → thread id for comments that already landed, across attempts. */
+  threadsAccum?: Record<string, string>;
+  /** Sticky: once any comment posted on its own, the review is not one review. */
+  postedIndividually?: boolean;
 }
 
 export interface ReviewFlowDeps {
@@ -235,6 +239,7 @@ export class ReviewFlowPanel {
     this.summaryPosted = false;
     this.verdictApplied = false;
     this.threadsAccum = {};
+    this.postedIndividually = false;
     this.doneSentence = '';
     this.staleHead = undefined;
     this.staleItemIds = new Set();
@@ -270,6 +275,8 @@ export class ReviewFlowPanel {
       this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
       this.summaryPosted = draft.summaryPosted ?? false;
       this.verdictApplied = draft.verdictApplied ?? false;
+      this.threadsAccum = { ...draft.threadsAccum };
+      this.postedIndividually = draft.postedIndividually ?? false;
       this.screen = 'triage';
       this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
       // The diff just fetched is the branch as it stands now, so the same
@@ -368,6 +375,10 @@ export class ReviewFlowPanel {
       failedKeys: this.failedKeys ? [...this.failedKeys] : undefined,
       summaryPosted: this.summaryPosted || undefined,
       verdictApplied: this.verdictApplied || undefined,
+      // Without these two a reload between attempts loses every thread id the
+      // first attempt resolved, and forgets that it posted comment-by-comment.
+      threadsAccum: Object.keys(this.threadsAccum).length > 0 ? this.threadsAccum : undefined,
+      postedIndividually: this.postedIndividually || undefined,
     } satisfies SessionDraft);
   }
 
@@ -455,6 +466,7 @@ export class ReviewFlowPanel {
     this.summaryPosted = false;
     this.verdictApplied = false;
     this.threadsAccum = {};
+    this.postedIndividually = false;
     this.selectedId = this.review.items[0]?.id;
     this.staleHead = undefined;
     this.screen = 'triage';
@@ -714,6 +726,8 @@ export class ReviewFlowPanel {
   // ---- submit ---------------------------------------------------------------------
 
   private threadsAccum: Record<string, string> = {};
+  /** Sticky across retries: any comment posted on its own breaks "one review". */
+  private postedIndividually = false;
 
   private async submit(): Promise<void> {
     if (!this.review || !this.diff) return;
@@ -748,6 +762,7 @@ export class ReviewFlowPanel {
       }
       if (result.summaryPosted) this.summaryPosted = true;
       if (result.requestChangesApplied) this.verdictApplied = true;
+      if (result.postedAsSingleReview === false) this.postedIndividually = true;
       // A verdict that did not land is a failure like any other: without this
       // the comments post, the draft is cleared, and the request for changes is
       // lost with nothing to retry. `performChangesetSubmit` already surfaces it.
@@ -796,9 +811,12 @@ export class ReviewFlowPanel {
       this.failedKeys = undefined;
       // "as one review thread" only when a single review really was created:
       // a submit with no summary, and every per-comment fallback, post
-      // standalone comments instead.
+      // standalone comments instead. `postedIndividually` is what the provider
+      // reported about this submit and every earlier attempt on this draft —
+      // the capability alone only says the platform *can* batch.
       const postedAsOneReview = provider.capabilities.batchedReview
         && this.postThread
+        && !this.postedIndividually
         && result.summaryPosted
         && result.comments.every((outcome) => outcome.ok);
       this.doneSentence = [

@@ -487,6 +487,10 @@ export class GitHubConnection implements Connection {
       // only one verdict goes out, so only one may be reported applied.
       approvalApplied: event === 'APPROVE' ? true : undefined,
       requestChangesApplied: event === 'REQUEST_CHANGES' ? true : undefined,
+      // Only a review that actually carried comments is one. A verdict-only
+      // review — what a retry sends once the comments already landed — says
+      // nothing about how they were posted.
+      postedAsSingleReview: submission.comments.length > 0 ? true : undefined,
     };
   }
 
@@ -530,7 +534,12 @@ export class GitHubConnection implements Connection {
       }
     }
 
-    const result: SubmitResult = { comments: outcomes, summaryPosted: false };
+    const result: SubmitResult = {
+      comments: outcomes,
+      summaryPosted: false,
+      // Whatever else happens below, these comments were posted one at a time.
+      postedAsSingleReview: outcomes.length > 0 ? false : undefined,
+    };
     const allOk = outcomes.length > 0 && outcomes.every((outcome) => outcome.ok);
     const summaryToPost = hasSummary(submission.summary) && allOk;
 

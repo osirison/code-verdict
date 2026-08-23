@@ -319,7 +319,12 @@ export class GitLabConnection implements Connection {
       }
     }
 
-    const result: SubmitResult = { comments: outcomes, summaryPosted: false };
+    const result: SubmitResult = {
+      comments: outcomes,
+      summaryPosted: false,
+      // GitLab has no batched review: every comment is its own discussion.
+      postedAsSingleReview: outcomes.length > 0 ? false : undefined,
+    };
     const allOk = outcomes.every((o) => o.ok);
 
     if (submission.summary !== undefined && allOk) {

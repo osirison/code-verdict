@@ -75,6 +75,51 @@ describe('batched review — the normal path', () => {
   });
 });
 
+describe('postedAsSingleReview — how the comments actually went out', () => {
+  // The UI tells the user "posted as one review thread". Only the provider
+  // knows whether that is true: the capability flag says the platform *can*
+  // batch, not that this submit did.
+  it('is true when one review carried the comments', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      summary: 'Summary.',
+    });
+    expect(result.postedAsSingleReview).toBe(true);
+  });
+
+  it('is false when the fallback posted them one at a time', async () => {
+    const { conn, anchor } = await draft({ failReviewPositionOnBatch: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }, { key: 'b', body: 'Two.', anchor }],
+      summary: 'Summary.',
+    });
+    expect(result.comments.every((c) => c.ok)).toBe(true);
+    // Every comment landed and the summary posted — the old expression read
+    // that as "one review", which is exactly the sentence being disproven.
+    expect(result.summaryPosted).toBe(true);
+    expect(result.postedAsSingleReview).toBe(false);
+  });
+
+  it('says nothing about a submit that posted no comments', async () => {
+    // The shape a retry sends once the comments already landed: it must not
+    // reset an earlier attempt's answer.
+    const { conn } = await draft();
+    const result = await conn.submitReview(CR, { comments: [], summary: 'S.', requestChanges: true });
+    expect(result.requestChangesApplied).toBe(true);
+    expect(result.postedAsSingleReview).toBeUndefined();
+  });
+
+  it('is false when a refused verdict was downgraded to standalone comments', async () => {
+    const { conn, anchor } = await draft({ refuseVerdict: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      approve: true,
+    });
+    expect(result.postedAsSingleReview).toBe(false);
+  });
+});
+
 describe('a verdict GitHub will not take — reviewing your own pull request', () => {
   // Live behaviour, captured from api.github.com: POST /pulls/{n}/reviews with
   // APPROVE or REQUEST_CHANGES on your own PR is a 422. Only the event is

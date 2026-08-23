@@ -120,12 +120,20 @@ export async function buildPostedReview(
 ): Promise<PostedReviewView> {
   const ref = { repoId: entry.repoId, number: entry.crNumber };
   const ourThreadIds = new Set(Object.values(entry.threads));
+  // A comment can post fine and still leave us without its thread id, so the
+  // stored map can be short of the accepted items. Filtering strictly on the
+  // ids we do have would then hide real threads from replies, resolve and the
+  // counts — permanently. Short or empty, widen to "threads you started".
+  // `size > 0` keeps the legacy shape intact: an entry with no ids at all
+  // records accepted: 0 too, and must still reach the fallback.
+  const complete = ourThreadIds.size > 0 && ourThreadIds.size >= entry.counts.accepted;
   const threads = (await connection.listThreads(ref))
-    // Only threads this review posted. Legacy entries without thread ids
-    // fall back to "threads you started" — never the whole MR's
-    // discussions, which would include other reviewers' threads.
+    // Only threads this review posted. Entries with no thread ids at all —
+    // legacy records, and submits whose resolution failed outright — fall
+    // back to "threads you started", never the whole CR's discussions, which
+    // would include other reviewers' threads.
     .filter((t) =>
-      ourThreadIds.size > 0 ? ourThreadIds.has(t.id) : t.notes[0]?.author.username === you,
+      ourThreadIds.has(t.id) || (!complete && t.notes[0]?.author.username === you),
     )
     .map((t) => toThreadView(t, entry, you, conceded));
 

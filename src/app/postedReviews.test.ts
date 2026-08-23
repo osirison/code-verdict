@@ -150,6 +150,24 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     expect(foreign.threads).toHaveLength(0);
   });
 
+  it('does not hide a thread whose id failed to resolve', async () => {
+    // A comment can post fine and still leave us without its thread id. The
+    // entry is then short of `counts.accepted`, and filtering strictly on the
+    // ids we do have would drop the rest from replies, resolve and the counts.
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    expect(threads.length).toBeGreaterThan(1);
+    const partial = entryFor(threads.map((t) => t.id));
+    // One id resolved, the rest did not — but all of them were accepted.
+    partial.threads = { itm_0: threads[0]?.id as string };
+    const view = await buildPostedReview(connection, partial, 'you', new Set());
+    expect(view.threads.length).toBe(threads.length);
+
+    // A complete entry still filters strictly — other reviewers stay out.
+    const complete = entryFor([threads[0]?.id as string]);
+    expect((await buildPostedReview(connection, complete, 'you', new Set())).threads).toHaveLength(1);
+  });
+
   it('second opinion answers the author, never restates the finding', async () => {
     const connection = connect();
     const threads = await connection.listThreads(REF);
