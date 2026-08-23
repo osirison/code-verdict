@@ -169,7 +169,12 @@ export class ReviewFlowPanel {
   private disposed = false;
   private screen: FlowScreen = 'agent';
   private ref!: ChangeRequestRef;
-  private cr!: ChangeRequest;
+  /**
+   * Optional, not definite-assigned: load() clears it per MR (see its reset
+   * block) and it is only set once that MR's fetch returns, so every reader
+   * has to cope with the window in between (#39).
+   */
+  private cr?: ChangeRequest;
   private diff?: ChangeRequestDiff;
   private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
   private agentId: string = DEMO_AGENT_DESCRIPTOR.id;
@@ -275,6 +280,13 @@ export class ReviewFlowPanel {
     // Full per-MR reset: nothing (verdicts, threads, summary text, the
     // partial-failure ledger) may leak from one MR into another.
     this.ref = ref;
+    // cr and diff describe the *previous* MR until this one's fetch returns.
+    // Leaving them meant render() could paint that MR's branch, title and
+    // web URL under this ref's header for the length of the fetch — which
+    // the loading page (#39) made reachable, since it arms the keyboard
+    // handler while the fetch is still in flight.
+    this.cr = undefined;
+    this.diff = undefined;
     this.review = undefined;
     this.response = undefined;
     this.threads = {};
@@ -809,7 +821,8 @@ export class ReviewFlowPanel {
         void vscode.commands.executeCommand(COMMANDS.openDashboard);
         return;
       case 'openMr':
-        void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
+        // Reachable from the loading page, where cr is not fetched yet.
+        if (this.cr) void vscode.env.openExternal(vscode.Uri.parse(this.cr.webUrl));
         return;
       case 'trackReplies':
         void vscode.commands.executeCommand('codeVerdict.internal.postedReviews', {

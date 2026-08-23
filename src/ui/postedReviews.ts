@@ -87,25 +87,26 @@ export class PostedReviewsPanel {
   }
 
   private async onMessage(m: PostedMessage): Promise<void> {
-    // The skeleton's header renders these two as if they already work, and
-    // every click was dropped for the whole fetch window because the guard
-    // below sat in front of the entire switch (#39). Neither needs a pod:
-    // refresh() resolves it itself, and leaving the screen needs no
-    // connection at all.
-    if (m.type === 'backToDashboard') {
-      void vscode.commands.executeCommand('codeVerdict.openDashboard');
-      return;
-    }
-    if (m.type === 'refresh') {
-      await this.refresh();
-      return;
-    }
-    // The pod captured at refresh time — never pair a freshly-switched
-    // pod's connection with rows fetched for the previous one.
-    const pod = this.pod;
-    if (!pod) return;
-    const view = this.selectedView();
     try {
+      // These two are the only controls the loading skeleton renders, and
+      // neither needs a pod: refresh() resolves one itself, and leaving the
+      // screen needs no connection. Behind the guard below they were dead
+      // for the whole fetch window while looking like they worked (#39).
+      // Inside the try, so #41's invariant still holds for them: every
+      // message goes through one place where a rejection cannot vanish.
+      if (m.type === 'backToDashboard') {
+        void vscode.commands.executeCommand('codeVerdict.openDashboard');
+        return;
+      }
+      if (m.type === 'refresh') {
+        await this.refresh();
+        return;
+      }
+      // The pod captured at refresh time — never pair a freshly-switched
+      // pod's connection with rows fetched for the previous one.
+      const pod = this.pod;
+      if (!pod) return;
+      const view = this.selectedView();
       switch (m.type) {
         case 'selectReview':
           this.selectedIndex = m.index;
