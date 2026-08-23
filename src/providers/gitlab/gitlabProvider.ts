@@ -9,6 +9,7 @@ import type {
   ProviderCapabilities,
   ScmProvider,
   Vocabulary,
+  HostDescriptor,
 } from '../../platform/provider';
 import type {
   ChangeRequest,
@@ -24,8 +25,9 @@ import type {
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
+import { bearerToken } from '../../platform/provider';
 import { ScmError, isScmError, toScmError } from '../../platform/errors';
-import { parseSourceInput } from '../../platform/sourceInput';
+import { parseSourceInput } from './sourceInput';
 import type { FetchLike } from './http';
 import { GitLabHttp, encodeRepoId } from './http';
 import type {
@@ -64,12 +66,30 @@ const CAPABILITIES: ProviderCapabilities = {
 };
 
 const VOCABULARY: Vocabulary = {
+  platformName: 'GitLab',
   changeRequestNoun: 'merge request',
+  changeRequestNounPlural: 'merge requests',
   changeRequestAbbrev: 'MR',
   repoNoun: 'project',
+  repoNounPlural: 'projects',
   groupNoun: 'group',
   ciNoun: 'pipeline',
+  ciNounPlural: 'pipelines',
   formatCrRef: (number) => `!${number}`,
+};
+
+const HOST: HostDescriptor = {
+  instanceUrlLabel: 'GitLab instance URL',
+  defaultInstanceUrl: 'https://gitlab.com',
+  tokenPlaceholder: 'glpat-…',
+  tokenHint: 'a personal access token with `api` scope',
+  sourceInputPlaceholder: 'https://gitlab.com/hve/platform/core · 9102 · group 4821',
+  sourceInputHint: 'Accepts a full URL, a numeric project id, or \u201cgroup <id>\u201d.',
+  sourceSamples: [
+    { label: 'project URL', value: 'https://gitlab.com/hve/platform/core' },
+    { label: 'project id', value: '9102' },
+    { label: 'group 4821', value: 'group 4821' },
+  ],
 };
 
 /** Errors after which posting the remaining comments cannot succeed. */
@@ -299,7 +319,12 @@ export class GitLabConnection implements Connection {
       }
     }
 
-    const result: SubmitResult = { comments: outcomes, summaryPosted: false };
+    const result: SubmitResult = {
+      comments: outcomes,
+      summaryPosted: false,
+      // GitLab has no batched review: every comment is its own discussion.
+      postedAsSingleReview: outcomes.length > 0 ? false : undefined,
+    };
     const allOk = outcomes.every((o) => o.ok);
 
     if (submission.summary !== undefined && allOk) {
@@ -380,8 +405,13 @@ export function createGitLabProvider(fetchImpl?: FetchLike): ScmProvider {
     displayName: 'GitLab',
     capabilities: CAPABILITIES,
     vocabulary: VOCABULARY,
+    host: HOST,
+    // Self-managed and gitlab.com alike: a personal access token.
+    authModesFor: () => ['token'],
     connect(config: ConnectionConfig): Connection {
-      return new GitLabConnection(new GitLabHttp(config.instanceUrl, config.token, fetchImpl));
+      return new GitLabConnection(
+        new GitLabHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl),
+      );
     },
   };
 }

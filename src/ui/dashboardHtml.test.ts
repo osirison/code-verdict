@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { VERDICT_TOKENS_CSS } from './theme';
 import type { DashboardViewState } from './dashboardHtml';
 import { renderDashboardHtml } from './dashboardHtml';
 
 const state: DashboardViewState = {
+  vocabulary: GITLAB_VOCABULARY,
   podName: 'Platform squad',
   meta: '6 projects · 9 open MRs',
   scopeCounts: { you: 3, them: 6 },

@@ -25,12 +25,12 @@ export async function runDebugBootstrap(
   secrets: SecretStore,
   env: Record<string, string | undefined> = process.env,
 ): Promise<Pod> {
-  await secrets.store(tokenSecretKey(bypass.instanceUrl), bypass.token);
+  await secrets.store(tokenSecretKey(bypass.providerId, bypass.instanceUrl), bypass.token);
 
-  const provider = getProvider('gitlab');
+  const provider = getProvider(bypass.providerId);
   const connection = provider.connect({
     instanceUrl: bypass.instanceUrl,
-    token: bypass.token,
+    credential: { kind: 'token', token: bypass.token },
   });
 
   // Always verify connectivity — a reused pod against a dead emulator must
@@ -42,7 +42,7 @@ export async function runDebugBootstrap(
     );
   }
 
-  const existing = podStore.findByInstance('gitlab', bypass.instanceUrl);
+  const existing = podStore.findByInstance(bypass.providerId, bypass.instanceUrl);
   if (existing) {
     await podStore.setActive(existing.id);
     return existing;
@@ -76,7 +76,7 @@ export async function runDebugBootstrap(
   const pod: Pod = {
     id: DEBUG_POD_ID,
     name: 'Emulator pod',
-    providerId: 'gitlab',
+    providerId: bypass.providerId,
     instanceUrl: bypass.instanceUrl,
     sources,
     criteria: { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories] },

@@ -26,6 +26,7 @@ import {
   type VerdictNotification,
 } from '../domain/notifications';
 import { getProvider } from '../platform/registry';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import type { ChangeRequestRef, ReviewThread } from '../platform/types';
 import { AppSurface } from './appSurface';
 
@@ -160,6 +161,8 @@ export class VerdictNotifier implements vscode.Disposable {
    * already on the app surface, so revealing it is the whole jump.
    */
   private opener(n: VerdictNotification): { label: string; run: () => void } | undefined {
+    const pod = this.deps.podStore.activePod;
+    const vocabulary = pod ? getProvider(pod.providerId).vocabulary : NEUTRAL_VOCABULARY;
     switch (n.key) {
       case 'agentFinished':
         return {
@@ -179,7 +182,7 @@ export class VerdictNotifier implements vscode.Disposable {
           : undefined;
       case 'pipelineFailed':
         return n.webUrl
-          ? { label: 'Open pipeline', run: () => void vscode.env.openExternal(vscode.Uri.parse(n.webUrl as string)) }
+          ? { label: `Open ${vocabulary.ciNoun}`, run: () => void vscode.env.openExternal(vscode.Uri.parse(n.webUrl as string)) }
           : undefined;
     }
   }
@@ -232,6 +235,7 @@ export class VerdictNotifier implements vscode.Disposable {
           you: pod.username,
           submittedRefs: this.deps.reviewHistory.submittedRefs(),
           formatRef: (number) => vocabulary.formatCrRef(number),
+          ciNoun: vocabulary.ciNoun,
         },
       );
     } catch {

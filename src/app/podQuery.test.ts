@@ -22,7 +22,7 @@ const pod: Pod = {
 describe('pod query', () => {
   it('derives every dashboard number from one batched query', async () => {
     registerBuiltInProviders();
-    const connection = getProvider('fixture').connect({ instanceUrl: 'x', token: 'demo' });
+    const connection = getProvider('fixture').connect({ instanceUrl: 'x', credential: { kind: 'token', token: 'demo'  } });
     const data = await fetchPodData(connection, pod, 1_000);
 
     expect(repoIdsOf(pod)).toHaveLength(6);

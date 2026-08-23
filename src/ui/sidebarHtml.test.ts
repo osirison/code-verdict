@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { renderSidebarHtml, type SidebarViewState } from './sidebarHtml';
 
 const state: SidebarViewState = {
+  vocabulary: GITLAB_VOCABULARY,
   podName: 'Platform squad',
   podMeta: '6 projects',
   pods: [

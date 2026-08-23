@@ -161,6 +161,13 @@ export interface SubmitResult {
   /** Distinct from approval — requesting changes is its opposite. */
   requestChangesApplied?: boolean;
   requestChangesError?: ScmError;
+  /**
+   * Whether one review carried every comment, as `asSingleThread` asked. Only
+   * the provider knows: a platform with a batched path can still fall back to
+   * posting comments one at a time, and the UI must not claim otherwise.
+   * `undefined` when the submit posted no comments, and so says nothing.
+   */
+  postedAsSingleReview?: boolean;
 }
 
 export interface ThreadNote {

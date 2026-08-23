@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import type { FlowViewState } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 
 const state: FlowViewState = {
+  vocabulary: GITLAB_VOCABULARY,
   screen: 'triage',
   header: {
     refLabel: '!2841',

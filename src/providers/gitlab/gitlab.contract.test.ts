@@ -1,8 +1,12 @@
 import { describeProviderContract } from '../../platform/contract/providerContract';
+import type { ConnectionConfig } from '../../platform/provider';
 import { createGitLabProvider } from './gitlabProvider';
 import { makeFakeGitLabFetch } from './fakeGitLab';
 
-const CONFIG = { instanceUrl: 'https://gitlab.example', token: 'glpat-test' };
+const CONFIG: ConnectionConfig = {
+  instanceUrl: 'https://gitlab.example',
+  credential: { kind: 'token', token: 'glpat-test' },
+};
 
 describeProviderContract('gitlab (REST v4 against fake fetch)', {
   capabilities: createGitLabProvider().capabilities,

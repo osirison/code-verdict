@@ -19,6 +19,12 @@ export interface ChangesetSubmitState {
   summaryRefs: string[];
   requestChangesRefs: string[];
   threadIds: Record<string, string>;
+  /**
+   * Refs whose verdict the platform refuses outright. Recorded so a retry
+   * stops asking: without this the submit never reports complete, and the
+   * user is left retrying a request that can only ever be refused.
+   */
+  verdictRefusedRefs?: string[];
 }
 
 export interface ChangesetSubmitFailure {
@@ -64,6 +70,7 @@ export async function performChangesetSubmit(
   const posted = new Set(previous?.postedCommentKeys ?? []);
   const summaries = new Set(previous?.summaryRefs ?? []);
   const requested = new Set(previous?.requestChangesRefs ?? []);
+  const refused = new Set(previous?.verdictRefusedRefs ?? []);
   const threadIds = { ...(previous?.threadIds ?? {}) };
   const failures: ChangesetSubmitFailure[] = [];
 
@@ -71,7 +78,8 @@ export async function performChangesetSubmit(
     const key = refKey(plan.ref);
     const comments = plan.submission.comments.filter((comment) => !posted.has(comment.key));
     const needsSummary = !summaries.has(key);
-    const needsRequestChanges = Boolean(plan.submission.requestChanges) && !requested.has(key);
+    const needsRequestChanges = Boolean(plan.submission.requestChanges)
+      && !requested.has(key) && !refused.has(key);
     if (comments.length === 0 && !needsSummary && !needsRequestChanges) continue;
     try {
       const result = await connection.submitReview(plan.ref, {
@@ -89,7 +97,12 @@ export async function performChangesetSubmit(
       if (result.summaryPosted) summaries.add(key);
       else if (needsSummary && result.summaryError) failures.push({ ref: plan.ref, operation: 'summary', message: result.summaryError.message });
       if (result.requestChangesApplied) requested.add(key);
-      else if (needsRequestChanges && result.requestChangesError) failures.push({ ref: plan.ref, operation: 'requestChanges', message: result.requestChangesError.message });
+      else if (needsRequestChanges && result.requestChangesError) {
+        // Still reported as a failure — the user must know the verdict did not
+        // land — but a refusal is terminal, so it stops gating completion.
+        if (result.requestChangesError.kind === 'verdictRefused') refused.add(key);
+        failures.push({ ref: plan.ref, operation: 'requestChanges', message: result.requestChangesError.message });
+      }
     } catch (error) {
       failures.push({ ref: plan.ref, operation: 'request', message: error instanceof Error ? error.message : String(error) });
     }
@@ -103,9 +116,10 @@ export async function performChangesetSubmit(
     summaryRefs: allRefs.filter((key) => summaries.has(key)),
     requestChangesRefs: requestRefs.filter((key) => requested.has(key)),
     threadIds,
+    verdictRefusedRefs: refused.size > 0 ? [...refused] : undefined,
   };
   const complete = allCommentKeys.every((key) => posted.has(key))
     && allRefs.every((key) => summaries.has(key))
-    && requestRefs.every((key) => requested.has(key));
+    && requestRefs.every((key) => requested.has(key) || refused.has(key));
   return { complete, state, failures };
 }

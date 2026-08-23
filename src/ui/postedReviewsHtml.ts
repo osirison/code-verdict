@@ -7,6 +7,7 @@ import { formatAge } from './dashboardState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
 import { escapeHtml as e, renderPage } from './theme';
+import { cap, type Vocabulary } from './vocab';
 
 export interface PostedRow {
   view: PostedReviewView;
@@ -17,6 +18,8 @@ export interface PostedRow {
 }
 
 export interface PostedViewState {
+  /** Platform nouns for the active pod's provider — never hardcoded here. */
+  vocabulary: Vocabulary;
   podName: string;
   now: number;
   waitingOnYouTotal: number;
@@ -62,7 +65,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .rev-title { font-size: 12.5px; font-weight: 500; color: var(--fg-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rev-ref { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); margin-top: 2px; }
 .breakdown { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; }
-.rev-project { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rev-repo { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .badge { font-family: var(--font-mono); font-size: 10.5px; padding: 3px 7px; border-radius: 3px; }
 .badge-you { color: var(--sev-minor); background: var(--sev-minor-t); }
 .badge-none { color: var(--fg-dimmer); background: var(--nit-t); }
@@ -101,7 +104,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .empty { text-align: center; padding: 70px 20px; color: var(--fg-dim); font-size: 12.5px; }
 `;
 
-function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number): string {
+function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number, vocabulary: Vocabulary): string {
   const chip = STATUS_CHIP[t.status];
   const open = t.status !== 'resolved' && t.status !== 'conceded';
   return `<div class="th-row" data-thread="${e(t.threadId)}">
@@ -120,7 +123,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
           (r) => `<div class="entry entry-author"><div class="entry-label">@${e(r.author)} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
         )
         .join('')}
-      ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — GitLab dropped the anchor.</div>` : ''}
+      ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — ${e(vocabulary.platformName)} dropped the anchor.</div>` : ''}
       ${opinion ? `<div class="entry entry-agent"><div class="entry-label">agent · second opinion</div>${e(opinion)}</div>` : ''}
       ${
         open
@@ -149,7 +152,7 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       <span class="on-you">${state.waitingOnYouTotal} on you</span>
       <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
     </header>
-    <div class="thead"><div>Merge request</div><div>Threads</div><div>Project</div><div>Age</div></div>
+    <div class="thead"><div>${e(cap(state.vocabulary.changeRequestNoun))}</div><div>Threads</div><div>${e(cap(state.vocabulary.repoNoun))}</div><div>Age</div></div>
     ${state.rows
       .map(
         (row, index) => `<div class="rev-row ${index === state.selectedIndex ? 'selected' : ''}" data-index="${index}">
@@ -162,7 +165,7 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
             ? `<span class="badge badge-you">${row.view.counts.you} waiting on you</span>`
             : `<span class="badge badge-none">nothing on you</span>`
         }</div>
-        <div class="rev-project">${e(row.project)}</div>
+        <div class="rev-repo">${e(row.project)}</div>
         <div class="cell-age">${e(row.age)}</div>
       </div>`,
       )
@@ -182,7 +185,7 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
     </div>
     <div class="threads">
       ${selected.view.threads
-        .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId], state.now))
+        .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId], state.now, state.vocabulary))
         .join('')}
     </div>`
         : ''

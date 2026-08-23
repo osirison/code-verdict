@@ -8,6 +8,7 @@ import { detectChangesets } from '../app/changesets';
 import type { ChangesetDetectionOptions } from '../app/changesets';
 import { getProvider } from '../platform/registry';
 import type { ActivityEntry, DashboardViewState, RowScope } from './dashboardHtml';
+import { cap, repoCountOf } from './vocab';
 
 export function formatAge(iso: string, now: number): string {
   const ms = now - Date.parse(iso);
@@ -91,7 +92,7 @@ export function toViewState(
       activity.push({
         glyph: '✕',
         cls: 'bad',
-        text: `Pipeline #${run.id} failed${run.failedJobName ? ` · ${run.failedJobName}` : ''}`,
+        text: `${cap(vocabulary.ciNoun)} #${run.id} failed${run.failedJobName ? ` · ${run.failedJobName}` : ''}`,
         meta: `${repoLabel(pod, run.repoId)} · ${formatAge(run.createdAt, now)} ago`,
         at: run.createdAt,
       });
@@ -99,7 +100,7 @@ export function toViewState(
       activity.push({
         glyph: '✓',
         cls: 'ok',
-        text: `Pipeline #${run.id} passed`,
+        text: `${cap(vocabulary.ciNoun)} #${run.id} passed`,
         meta: `${repoLabel(pod, run.repoId)} · ${formatAge(run.createdAt, now)} ago`,
         at: run.createdAt,
       });
@@ -117,8 +118,9 @@ export function toViewState(
   activity.sort((a, b) => b.at.localeCompare(a.at));
 
   return {
+    vocabulary,
     podName: pod.name,
-    meta: `${repoIdsOf(pod).length} ${vocabulary.repoNoun}s · ${data.changeRequests.length} open ${vocabulary.changeRequestAbbrev}s`,
+    meta: `${repoCountOf(vocabulary, repoIdsOf(pod).length)} · ${data.changeRequests.length} open ${vocabulary.changeRequestAbbrev}s`,
     podOptions: data.podOptions?.map((p) => ({
       id: p.id,
       name: p.name,

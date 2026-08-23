@@ -61,7 +61,17 @@ export async function performSubmit(
   connection: Connection,
   ref: ChangeRequestRef,
   plan: SubmitPlan,
-  state: { retryKeys?: ReadonlySet<string>; summaryAlreadyPosted?: boolean } = {},
+  state: {
+    retryKeys?: ReadonlySet<string>;
+    summaryAlreadyPosted?: boolean;
+    /**
+     * The request-changes verdict already landed on a previous attempt. It must
+     * not be sent again: a platform that creates a new review per call (GitHub)
+     * would stack duplicate verdicts and re-notify the author on every retry.
+     * `performChangesetSubmit` tracks the same thing as `requestChangesRefs`.
+     */
+    verdictAlreadyApplied?: boolean;
+  } = {},
 ): Promise<SubmitResult> {
   const drafts = state.retryKeys
     ? plan.drafts.filter((d) => state.retryKeys?.has(d.key))
@@ -69,7 +79,7 @@ export async function performSubmit(
   return connection.submitReview(ref, {
     comments: drafts,
     summary: state.summaryAlreadyPosted ? undefined : plan.summary,
-    requestChanges: plan.requestChanges,
+    requestChanges: state.verdictAlreadyApplied ? false : plan.requestChanges,
     asSingleThread: plan.asSingleThread,
   });
 }

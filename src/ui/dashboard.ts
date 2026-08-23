@@ -10,6 +10,9 @@ import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboard
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
 import { AppSurface, type AppRoute } from './appSurface';
+import { tryGetProvider } from '../platform/registry';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
+import { repoCountOf } from './vocab';
 
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
@@ -59,12 +62,12 @@ export class DashboardPanel {
             await this.refresh();
           })();
           break;
-        case 'addProjects':
+        case 'addRepos':
           void vscode.commands.executeCommand(COMMANDS.addProject);
           break;
         case 'filters':
           void vscode.window.showInformationMessage(
-            'Verdict: dashboard filters beyond scope and project arrive with issue #8.',
+            'Verdict: dashboard filters beyond scope and repository arrive with issue #8.',
           );
           break;
         case 'openCr':
@@ -98,7 +101,7 @@ export class DashboardPanel {
     if (!pod) {
       if (canRender()) {
         this.panel.webview.html = renderFallbackHtml(
-          '<p>No pod configured. Run "Verdict: Sign in to GitLab" first.</p>',
+          '<p>No pod configured. Run "Verdict: Sign in" first.</p>',
         );
       }
       return;
@@ -113,7 +116,10 @@ export class DashboardPanel {
         id: candidate.id,
         name: candidate.name,
         active: candidate.id === pod.id,
-        meta: `${repoIdsOf(candidate).length} projects`,
+        meta: repoCountOf(
+          tryGetProvider(candidate.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY,
+          repoIdsOf(candidate).length,
+        ),
       }));
       this.panel.webview.html = renderDashboardHtml(
         toViewState({ ...data, podOptions }, Date.now(), submitted, this.deps.changesetOptions?.()),

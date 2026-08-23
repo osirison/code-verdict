@@ -23,6 +23,7 @@ import { composeSummary, type AgentVoice } from '../domain/summary';
 import { allDecided, clearVerdict, createReview, nextUndecided, setVerdict, verdictCounts } from '../domain/reviewState';
 import type { Category, Review, Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
+import { repoCountOf } from './vocab';
 import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
@@ -238,11 +239,12 @@ export class ChangesetReviewPanel {
     this.runError = undefined;
     this.runStep = 0;
     const pod = this.pod();
+    const runVocabulary = getProvider(pod.providerId).vocabulary;
     pod.agentId = this.agentId;
     await this.deps.podStore.upsert(pod);
     try {
       if (this.agentId === DEMO_AGENT_ID) {
-        const result = runDemoChangesetAgent(this.members, pod.criteria);
+        const result = runDemoChangesetAgent(this.members, pod.criteria, runVocabulary);
         this.runSteps = result.steps;
         for (let index = 0; index <= result.steps.length; index += 1) {
           if (this.disposed || token !== this.runToken) return;
@@ -255,9 +257,9 @@ export class ChangesetReviewPanel {
       }
       this.runSteps = [
         'Resolving agent from Copilot workspace…',
-        `Indexing every diff across ${this.members.length} merge requests…`,
+        `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
         'Cross-referencing contracts between repositories…',
-        'Scoring findings against project criteria…',
+        `Scoring findings against ${runVocabulary.repoNoun} criteria…`,
         'Items ready',
       ];
       this.runStep = 2;
@@ -443,7 +445,7 @@ export class ChangesetReviewPanel {
     this.submitState = result.state;
     await this.persist();
     if (!result.complete) {
-      this.submitError = result.failures[0]?.message ?? 'Some merge requests rejected the review';
+      this.submitError = result.failures[0]?.message ?? `Some ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural} rejected the review`;
       this.render();
       return;
     }
@@ -487,7 +489,7 @@ export class ChangesetReviewPanel {
     }
     await this.deps.workspaceState.update(this.draftKey(), undefined);
     const counts = verdictCounts(this.review);
-    this.doneSentence = `${counts.accepted} inline comments posted across ${this.members.length} merge requests. ${counts.rejected} dismissed findings stayed local.`;
+    this.doneSentence = `${counts.accepted} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}. ${counts.rejected} dismissed findings stayed local.`;
     this.submitError = undefined;
     this.screen = 'done';
     this.deps.onSubmitted?.();
@@ -547,7 +549,9 @@ export class ChangesetReviewPanel {
     const memberStats = diffStats(this.members.flatMap((member) => member.diff.files.map((file) => file.diff)));
     const history = new ReviewHistory(this.deps.globalState).list().filter((record) => record.podId === pod.id);
     const produced = history.reduce((count, record) => count + record.counts.accepted + record.counts.rejected + record.counts.skipped, 0);
+    const vocabulary = getProvider(pod.providerId).vocabulary;
     const state: FlowViewState = {
+      vocabulary,
       screen: this.screen,
       changeset: {
         id: this.changeset.id,
@@ -555,12 +559,12 @@ export class ChangesetReviewPanel {
         linkedIssue: this.changeset.linkedIssue,
         memberCount: this.members.length,
         projectCount: new Set(this.members.map((member) => member.ref.repoId)).size,
-        refs: this.members.map((member) => `!${member.ref.number}`),
+        refs: this.members.map((member) => vocabulary.formatCrRef(member.ref.number)),
         repoLabels: Object.fromEntries(this.members.map((member) => [member.ref.repoId, member.projectPath])),
       },
       header: {
-        refLabel: this.members.map((member) => `!${member.ref.number}`).join(' · '),
-        projectPath: `${this.members.length} projects`,
+        refLabel: this.members.map((member) => vocabulary.formatCrRef(member.ref.number)).join(' · '),
+        projectPath: repoCountOf(vocabulary, this.members.length),
         branch: this.changeset.linkedIssue ?? this.changeset.detectionDetail,
         fileCount: totalFiles,
         added: memberStats.added,
@@ -593,15 +597,16 @@ export class ChangesetReviewPanel {
       doneSentence: this.doneSentence,
       crWebUrl: this.changeset.members[0]?.webUrl ?? '',
     };
-    this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${this.members.length} MRs` : `Verdict: Review · ${this.members.length} MRs`;
+    const abbrev = `${this.members.length} ${vocabulary.changeRequestAbbrev}s`;
+    this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${abbrev}` : `Verdict: Review · ${abbrev}`;
     this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), crypto.randomBytes(16).toString('hex'));
     this.deps.onSidebarState?.(this.review ? {
       // Spec §15: the chrome names the changeset — `⧉ <name>` over
       // "N MRs · N repos" with the summed diff stat.
       headline: `⧉ ${this.changeset.name}`,
-      refLabel: `${this.members.length} MRs`,
+      refLabel: abbrev,
       changeset: true,
-      context: `${this.members.length} MRs · ${new Set(this.members.map((member) => member.ref.repoId)).size} repos`,
+      context: `${abbrev} · ${new Set(this.members.map((member) => member.ref.repoId)).size} repos`,
       agent: this.agentLabel(),
       added: state.header.added,
       removed: state.header.removed,

@@ -3,7 +3,7 @@ import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Pod } from '../domain/types';
 import { PodStore } from './pods';
 import type { KeyValueStore } from './storage';
-import { tokenSecretKey } from './storage';
+import { legacyTokenSecretKey, readToken, tokenSecretKey } from './storage';
 
 function memoryStore(): KeyValueStore {
   const map = new Map<string, unknown>();
@@ -55,8 +55,42 @@ describe('PodStore', () => {
 });
 
 describe('tokenSecretKey', () => {
-  it('keys tokens per instance host', () => {
-    expect(tokenSecretKey('http://127.0.0.1:8971')).toBe('codeVerdict.token.127.0.0.1:8971');
-    expect(tokenSecretKey('https://gitlab.com/')).toBe('codeVerdict.token.gitlab.com');
+  it('keys tokens per provider and instance host', () => {
+    expect(tokenSecretKey('gitlab', 'http://127.0.0.1:8971')).toBe('codeVerdict.token.gitlab|127.0.0.1:8971');
+    expect(tokenSecretKey('gitlab', 'https://gitlab.com/')).toBe('codeVerdict.token.gitlab|gitlab.com');
+  });
+
+  it('cannot collide with a legacy key, whatever the host is named', () => {
+    // Joining with "." made these the same string, so readToken would hand one
+    // pod's token to another and then persist the substitution.
+    expect(tokenSecretKey('gitlab', 'https://acme.com'))
+      .not.toBe(legacyTokenSecretKey('https://gitlab.acme.com'));
+    expect(tokenSecretKey('github', 'https://acme.com'))
+      .not.toBe(legacyTokenSecretKey('https://github.acme.com'));
+  });
+
+  it('keeps two providers on one host apart', () => {
+    expect(tokenSecretKey('github', 'https://example.test')).not.toBe(
+      tokenSecretKey('gitlab', 'https://example.test'),
+    );
+  });
+
+  it('migrates a legacy instance-only secret to the provider-scoped key', async () => {
+    const store = new Map<string, string>([[legacyTokenSecretKey('https://gitlab.com'), 'glpat-old']]);
+    const secrets = {
+      get: (key: string) => Promise.resolve(store.get(key)),
+      store: (key: string, value: string) => {
+        store.set(key, value);
+        return Promise.resolve();
+      },
+    };
+    await expect(readToken(secrets, 'gitlab', 'https://gitlab.com')).resolves.toBe('glpat-old');
+    // Rewritten under the scoped key, so the fallback is taken only once.
+    expect(store.get(tokenSecretKey('gitlab', 'https://gitlab.com'))).toBe('glpat-old');
+  });
+
+  it('returns undefined when neither key holds a secret', async () => {
+    const secrets = { get: () => Promise.resolve(undefined), store: () => Promise.resolve() };
+    await expect(readToken(secrets, 'gitlab', 'https://gitlab.com')).resolves.toBeUndefined();
   });
 });

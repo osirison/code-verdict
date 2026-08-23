@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { formatConnectionStatus, renderSettingsHtml, type SettingsViewState } from './settingsHtml';
 
 const state: SettingsViewState = {
+  vocabulary: GITLAB_VOCABULARY,
   instanceUrl: 'http://127.0.0.1:8971',
   connectionStatus: 'connected as @you · api scope',
   connected: true,
@@ -31,7 +33,7 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('Agent finished a review');
     expect(html).toContain('A posted thread went stale');
     expect(html).toContain('Rotate token');
-    expect(html).toContain('glpat-••••••••');
+    expect(html).toContain('••••••••');
   });
 
   it('wires controls through typed CSP-safe messages', () => {

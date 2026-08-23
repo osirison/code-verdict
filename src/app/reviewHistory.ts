@@ -41,6 +41,14 @@ export interface SubmittedReview {
   counts: VerdictCounts;
   /** itemId → discussion/thread id, for reply polling. */
   threads: Record<string, string>;
+  /**
+   * How many comments actually posted. `counts.accepted` is not the same
+   * number — an item accepted after a partial failure is counted but never
+   * submitted — and posted-review filtering needs the exact one to tell
+   * "some thread ids failed to resolve" from "these were never posted".
+   * Absent on records written before this was tracked.
+   */
+  postedComments?: number;
   /** Accepted-item snapshot — posted-review rows need titles/severities offline. */
   items?: SubmittedItemSnapshot[];
   /** All decisions, used for category/confidence tuning. Older records may omit it. */

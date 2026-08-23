@@ -56,7 +56,7 @@ afterAll(async () => {
 });
 
 function connect() {
-  return getProvider('gitlab').connect({ instanceUrl: baseUrl, token: 'glpat-emulator' });
+  return getProvider('gitlab').connect({ instanceUrl: baseUrl, credential: { kind: 'token', token: 'glpat-emulator'  } });
 }
 
 const REF = { repoId: '9101', number: '2833' };
@@ -148,6 +148,37 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     // …but a different author claims nothing.
     const foreign = await buildPostedReview(connection, entryFor([]), 'somebody-else', new Set());
     expect(foreign.threads).toHaveLength(0);
+  });
+
+  it('does not hide a thread whose id failed to resolve', async () => {
+    // A comment can post fine and still leave us without its thread id. The
+    // entry is then short of `counts.accepted`, and filtering strictly on the
+    // ids we do have would drop the rest from replies, resolve and the counts.
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    expect(threads.length).toBeGreaterThan(1);
+    const partial = entryFor(threads.map((t) => t.id));
+    // One id resolved, the rest did not — but all of them were accepted.
+    partial.threads = { itm_0: threads[0]?.id as string };
+    const view = await buildPostedReview(connection, partial, 'you', new Set());
+    expect(view.threads.length).toBe(threads.length);
+
+    // A complete entry still filters strictly — other reviewers stay out.
+    const complete = entryFor([threads[0]?.id as string]);
+    expect((await buildPostedReview(connection, complete, 'you', new Set())).threads).toHaveLength(1);
+  });
+
+  it('measures completeness against what posted, not against what was accepted', async () => {
+    // An item accepted after a partial failure is counted but never submitted,
+    // so counts.accepted overstates what should have a thread id. Widening on
+    // that would pull every unrelated thread you started into this review.
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const entry = entryFor([threads[0]?.id as string]);
+    entry.counts.accepted = 5; // four of them never posted
+    entry.postedComments = 1;
+    const view = await buildPostedReview(connection, entry, 'you', new Set());
+    expect(view.threads).toHaveLength(1);
   });
 
   it('second opinion answers the author, never restates the finding', async () => {

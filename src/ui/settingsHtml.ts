@@ -5,6 +5,7 @@ import {
   type NotificationMode,
 } from '../domain/notifications';
 import { escapeHtml, renderPage } from './theme';
+import type { Vocabulary } from './vocab';
 
 export type { DigestCadence, NotificationMode };
 
@@ -16,6 +17,8 @@ export interface NotificationSettingView {
 }
 
 export interface SettingsViewState {
+  /** Platform nouns for the active pod's provider — never hardcoded here. */
+  vocabulary: Vocabulary;
   instanceUrl: string;
   connectionStatus: string;
   connected: boolean;
@@ -101,7 +104,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     <h1>Settings</h1>
     <section class="section"><div class="label">Connection</div><div class="connection">
       <div class="connection-copy"><span class="instance">${e(state.instanceUrl)}</span><span class="status ${state.connected ? 'ok' : ''}">${e(state.connectionStatus)}</span></div>
-      <div class="connection-actions"><span class="masked">${state.hasToken ? 'glpat-••••••••' : 'no token'}</span><button class="btn" id="rotate-token">Rotate token</button></div>
+      <div class="connection-actions"><span class="masked">${state.hasToken ? '••••••••' : 'no token'}</span><button class="btn" id="rotate-token">Rotate token</button></div>
     </div></section>
     <section class="section"><div class="label">Notifications</div>${notifications}
       <button class="toggle" id="quiet"><span class="box">${state.quietMode ? '☑' : '☐'}</span><span>Quiet hours</span></button>
@@ -109,7 +112,7 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
       <div class="cadence"><span class="cadence-label">Digest arrives</span>${DIGEST_CADENCES.map((cadence) => `<button class="chip compact ${state.digestCadence === cadence ? 'active' : ''}" data-cadence="${cadence}">${cadence}</button>`).join('')}</div>
     </section>
     <section class="section"><div class="label">Data &amp; privacy</div>
-      <p class="note">Diff hunks, file paths and your criteria go to the Copilot agent you selected. Nothing reaches GitLab until you press Submit — rejected findings and their rationale never leave this machine.</p>
+      <p class="note">Diff hunks, file paths and your criteria go to the Copilot agent you selected. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
       <button class="toggle" id="share-rates"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
       <span class="subnote">${state.shareRates ? 'Aggregate rates are shared; finding text and rejection rationale stay local.' : 'Rates remain local to this VS Code profile.'}</span>
     </section>

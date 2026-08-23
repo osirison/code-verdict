@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { renderChangesetHtml, type ChangesetViewState } from './changesetHtml';
 
 const state: ChangesetViewState = {
+  vocabulary: GITLAB_VOCABULARY,
   id: 'trailer:1180',
   name: 'Key rotation, end to end',
   linkedIssue: '#1180',

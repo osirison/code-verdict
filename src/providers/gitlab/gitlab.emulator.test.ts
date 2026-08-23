@@ -16,10 +16,14 @@ import { describeProviderContract } from '../../platform/contract/providerContra
 import { isScmError } from '../../platform/errors';
 import { createGitLabProvider } from './gitlabProvider';
 
-const CONFIG = { instanceUrl: 'https://gitlab.emulator.local', token: 'glpat-emulator' };
+const INSTANCE_URL = 'https://gitlab.emulator.local';
+const TOKEN = 'glpat-emulator';
 
-function connect(emulator: GitLabEmulator, token = CONFIG.token) {
-  return createGitLabProvider(emulatorFetch(emulator)).connect({ ...CONFIG, token });
+function connect(emulator: GitLabEmulator, token = TOKEN) {
+  return createGitLabProvider(emulatorFetch(emulator)).connect({
+    instanceUrl: INSTANCE_URL,
+    credential: { kind: 'token', token },
+  });
 }
 
 describeProviderContract('gitlab provider against the emulator', {
@@ -55,7 +59,7 @@ describe('end-to-end flows against the emulator', () => {
       conn.listWorkItems(repoIds),
     ]);
     const pod: Pod = {
-      id: 'pod', name: 'Platform', providerId: 'gitlab', instanceUrl: CONFIG.instanceUrl,
+      id: 'pod', name: 'Platform', providerId: 'gitlab', instanceUrl: INSTANCE_URL,
       sources: [], criteria: { severityFloor: 'minor', minConfidence: 70, categories: ['security'], extraInstructions: '' },
       agentId: '', repos: repoIds.map((id) => ({ id, name: id, path: id })),
     };

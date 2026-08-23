@@ -10,6 +10,14 @@ export type ScmErrorKind =
   | 'insufficientScope'
   /** The diff anchor no longer matches (e.g. GitLab 400 "Note position is invalid"). Re-anchor, never retry blindly. */
   | 'staleAnchor'
+  /**
+   * The platform refuses this verdict outright — e.g. neither GitHub nor
+   * GitLab lets an author approve or request changes on their own change
+   * request. Terminal, like `staleAnchor` is re-anchorable: retrying sends
+   * the identical request and gets the identical refusal, so a caller that
+   * treats it as a transient failure never completes.
+   */
+  | 'verdictRefused'
   /** 429 — carries retryAfterSeconds when the platform provides it. */
   | 'rateLimited'
   | 'notFound'

@@ -18,7 +18,7 @@ const DEMO_GROUP_ID = '4821';
 
 export async function createDemoPod(podStore: PodStore): Promise<Pod> {
   const provider = getProvider('fixture');
-  const connection = provider.connect({ instanceUrl: DEMO_INSTANCE_URL, token: 'demo' });
+  const connection = provider.connect({ instanceUrl: DEMO_INSTANCE_URL, credential: { kind: 'none' } });
   const status = await connection.testConnection();
   // Resolve the demo group through the platform layer rather than hardcoding
   // repository ids here — the fixture data can grow without this file knowing,

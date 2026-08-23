@@ -34,6 +34,7 @@ const TEMPLATES: Template[] = [
     body: 'Interpolated state lands in retained logs. Redact it, or log an opaque id instead.',
     suggest: (line) => line.replace(/\$\{[^}]+\}/, '<redacted>'),
     answers: {
+      // vocab-ok: "log pipeline" is ordinary English in demo finding copy, not the CI noun
       explain: 'The log pipeline ships to a retained index; anything interpolated here is stored in plain text.',
       fix: 'Log the opaque id, never the value. The suggestion is line-accurate.',
       similar: 'Grep for logger.error interpolations across this repository.',
@@ -201,7 +202,7 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
       'Resolving agent from Copilot workspace…',
       `Indexing ${diff.files.length} changed files (+${stats.added} −${stats.removed})…`,
       'Cross-referencing module history…',
-      'Scoring findings against project criteria…',
+      'Scoring findings against your criteria…',
       `${items.length} items ready`,
     ],
   };

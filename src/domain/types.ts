@@ -43,6 +43,14 @@ export interface Pod {
   name: string;
   providerId: string;
   instanceUrl: string;
+  /**
+   * How this pod was connected. Absent on pods created before the credential
+   * union existed — those fall back to the provider's declared order.
+   * Recorded because a host can offer both: without it, a pod onboarded with a
+   * pasted token would silently authenticate as the editor's account instead,
+   * which is a different identity and a different set of visible repositories.
+   */
+  authMode?: 'token' | 'session' | 'none';
   sources: PodSource[];
   /** Per pod, not per change request. */
   criteria: Criteria;

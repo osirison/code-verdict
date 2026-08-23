@@ -58,6 +58,13 @@ interface SessionDraft {
   /** Partial-failure ledger — must survive reloads so a retry never re-posts what already landed (spec §7). */
   failedKeys?: string[];
   summaryPosted?: boolean;
+  verdictApplied?: boolean;
+  /** itemId → thread id for comments that already landed, across attempts. */
+  threadsAccum?: Record<string, string>;
+  /** Sticky: once any comment posted on its own, the review is not one review. */
+  postedIndividually?: boolean;
+  /** Comments already posted, so a retry does not lose the running total. */
+  postedCount?: number;
 }
 
 export interface ReviewFlowDeps {
@@ -144,6 +151,8 @@ export class ReviewFlowPanel {
   private submitError?: string;
   private failedKeys?: Set<string>;
   private summaryPosted = false;
+  /** The request-changes verdict landed — never send it twice (spec §7 ledger). */
+  private verdictApplied = false;
   private doneSentence = '';
   private staleHead?: string;
   /** Items whose anchor no longer resolves against the branch's new head. */
@@ -230,7 +239,10 @@ export class ReviewFlowPanel {
     this.submitError = undefined;
     this.failedKeys = undefined;
     this.summaryPosted = false;
+    this.verdictApplied = false;
     this.threadsAccum = {};
+    this.postedIndividually = false;
+    this.postedCount = 0;
     this.doneSentence = '';
     this.staleHead = undefined;
     this.staleItemIds = new Set();
@@ -265,6 +277,10 @@ export class ReviewFlowPanel {
       this.finalNote = draft.finalNote;
       this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
       this.summaryPosted = draft.summaryPosted ?? false;
+      this.verdictApplied = draft.verdictApplied ?? false;
+      this.threadsAccum = { ...draft.threadsAccum };
+      this.postedIndividually = draft.postedIndividually ?? false;
+      this.postedCount = draft.postedCount ?? 0;
       this.screen = 'triage';
       this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
       // The diff just fetched is the branch as it stands now, so the same
@@ -362,6 +378,12 @@ export class ReviewFlowPanel {
       finalNote: this.finalNote,
       failedKeys: this.failedKeys ? [...this.failedKeys] : undefined,
       summaryPosted: this.summaryPosted || undefined,
+      verdictApplied: this.verdictApplied || undefined,
+      // Without these two a reload between attempts loses every thread id the
+      // first attempt resolved, and forgets that it posted comment-by-comment.
+      threadsAccum: Object.keys(this.threadsAccum).length > 0 ? this.threadsAccum : undefined,
+      postedIndividually: this.postedIndividually || undefined,
+      postedCount: this.postedCount || undefined,
     } satisfies SessionDraft);
   }
 
@@ -397,7 +419,7 @@ export class ReviewFlowPanel {
       'Resolving agent from Copilot workspace…',
       `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
       'Cross-referencing module history…',
-      'Scoring findings against project criteria…',
+      `Scoring findings against ${getProvider(this.pod().providerId).vocabulary.repoNoun} criteria…`,
       'Items ready',
     ];
     this.runStep = 2;
@@ -447,7 +469,10 @@ export class ReviewFlowPanel {
     this.submitError = undefined;
     this.failedKeys = undefined;
     this.summaryPosted = false;
+    this.verdictApplied = false;
     this.threadsAccum = {};
+    this.postedIndividually = false;
+    this.postedCount = 0;
     this.selectedId = this.review.items[0]?.id;
     this.staleHead = undefined;
     this.screen = 'triage';
@@ -707,6 +732,10 @@ export class ReviewFlowPanel {
   // ---- submit ---------------------------------------------------------------------
 
   private threadsAccum: Record<string, string> = {};
+  /** Sticky across retries: any comment posted on its own breaks "one review". */
+  private postedIndividually = false;
+  /** How many comments have actually posted, across every attempt. */
+  private postedCount = 0;
 
   private async submit(): Promise<void> {
     if (!this.review || !this.diff) return;
@@ -728,7 +757,11 @@ export class ReviewFlowPanel {
           requestChanges: this.requestChanges && provider.capabilities.requestChanges,
           asSingleThread: this.postThread && provider.capabilities.batchedReview,
         },
-        { retryKeys: this.failedKeys, summaryAlreadyPosted: this.summaryPosted },
+        {
+          retryKeys: this.failedKeys,
+          summaryAlreadyPosted: this.summaryPosted,
+          verdictAlreadyApplied: this.verdictApplied,
+        },
       );
 
       const failed = result.comments.filter((c) => !c.ok);
@@ -736,9 +769,26 @@ export class ReviewFlowPanel {
         if (outcome.threadId) this.threadsAccum[outcome.key] = outcome.threadId;
       }
       if (result.summaryPosted) this.summaryPosted = true;
-      if (failed.length > 0 || (!this.summaryPosted && result.summaryError)) {
+      if (result.requestChangesApplied) this.verdictApplied = true;
+      if (result.postedAsSingleReview === false) this.postedIndividually = true;
+      // A retry only submits the failed remainder, so each success counts once.
+      this.postedCount += result.comments.filter((outcome) => outcome.ok).length;
+      // A verdict that did not land is a failure like any other: without this
+      // the comments post, the draft is cleared, and the request for changes is
+      // lost with nothing to retry. `performChangesetSubmit` already surfaces it.
+      //
+      // A *refused* verdict is the exception. It can never succeed, so holding
+      // the flow on the summary screen would strand the review there forever:
+      // never recorded in history, its thread ids never stored, while every
+      // comment is already live on the platform. Report it on the done screen
+      // instead of retrying it.
+      const verdictRefused = result.requestChangesError?.kind === 'verdictRefused';
+      const verdictFailed = !this.verdictApplied
+        && result.requestChangesError !== undefined
+        && !verdictRefused;
+      if (failed.length > 0 || (!this.summaryPosted && result.summaryError) || verdictFailed) {
         this.failedKeys = new Set(failed.map((c) => c.key));
-        const first = failed[0]?.error ?? result.summaryError;
+        const first = failed[0]?.error ?? result.summaryError ?? result.requestChangesError;
         this.submitError = first?.message ?? 'submit failed';
         this.screen = 'summary';
         // The ledger must survive a reload — a later retry may only post
@@ -762,6 +812,7 @@ export class ReviewFlowPanel {
         submittedAt: new Date().toISOString(),
         counts,
         threads,
+        postedComments: this.postedCount,
         items: this.review.items
           .filter((i) => this.review?.verdicts[i.id]?.verdict === 'accepted')
           .map((i) => ({ id: i.id, title: i.title, severity: i.severity, file: i.file, line: i.line })),
@@ -771,13 +822,28 @@ export class ReviewFlowPanel {
             ? [{ category: item.category, confidence: item.confidence, verdict, severity: item.severity }]
             : [];
         }),
-        requestedChanges: result.requestChangesApplied === true,
+        // From the ledger, not this attempt: a retry deliberately withholds a
+        // verdict that already landed, so its result carries no flag.
+        requestedChanges: this.verdictApplied,
       });
       await this.deps.workspaceState.update(this.draftKey(), undefined);
       this.submitError = undefined;
       this.failedKeys = undefined;
+      // "as one review thread" only when a single review really was created:
+      // a submit with no summary, and every per-comment fallback, post
+      // standalone comments instead. `postedIndividually` is what the provider
+      // reported about this submit and every earlier attempt on this draft —
+      // the capability alone only says the platform *can* batch.
+      const postedAsOneReview = provider.capabilities.batchedReview
+        && this.postThread
+        && !this.postedIndividually
+        && result.summaryPosted
+        && result.comments.every((outcome) => outcome.ok);
       this.doneSentence = [
-        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${this.postThread && provider.capabilities.batchedReview ? ' as one review thread' : ''}${result.requestChangesApplied ? ', changes requested' : ''}.`,
+        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
+        // Deliberately not phrased as an error: everything the user wrote did
+        // land, and there is nothing for them to retry.
+        verdictRefused ? `The request for changes was not applied: ${result.requestChangesError?.message ?? 'refused'}.` : '',
         counts.rejected > 0 ? `${counts.rejected} dismissed findings stayed local.` : '',
       ]
         .filter(Boolean)
@@ -835,6 +901,7 @@ export class ReviewFlowPanel {
         ? Math.round((history.reduce((n, r) => n + r.counts.accepted, 0) / produced) * 100)
         : undefined;
     const state: FlowViewState = {
+      vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
       acceptRate,
       memberOfChangeset: this.memberOfChangeset,
