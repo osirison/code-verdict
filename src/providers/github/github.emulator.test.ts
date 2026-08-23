@@ -9,7 +9,7 @@ import { isScmError } from '../../platform/errors';
 import { createGitHubProvider, githubProvider } from './githubProvider';
 import { makeFakeGitHubFetch, type FakeGitHubOptions, type RequestLog } from './fakeGitHub';
 import { mapGitHubError } from './errors';
-import { hasNextLink, restBaseUrl, graphqlUrl, isDotCom, splitRepoId } from './http';
+import { GitHubHttp, hasNextLink, restBaseUrl, graphqlUrl, isDotCom, splitRepoId } from './http';
 import { toCiStatus, toCiSummary, toFileDiff } from './mappers';
 
 const CONFIG: ConnectionConfig = {
@@ -24,10 +24,13 @@ function connect(options: FakeGitHubOptions = {}) {
 const CR = { repoId: 'acme/core', number: '2841' };
 
 async function draft(options: FakeGitHubOptions = {}) {
-  const conn = connect(options);
+  const log: RequestLog = options.log ?? { paths: [] };
+  const conn = connect({ ...options, log });
   const diff = await conn.getChangeRequestDiff(CR);
   const anchor = { filePath: 'src/limiter.ts', line: 12, refs: diff.anchorRefs };
-  return { conn, anchor };
+  // Only the writes matter to callers that assert on this.
+  log.paths.length = 0;
+  return { conn, anchor, log };
 }
 
 describe('batched review — the normal path', () => {
@@ -69,6 +72,54 @@ describe('batched review — the normal path', () => {
     const conn = connect();
     const result = await conn.submitReview(CR, { comments: [] });
     expect(result).toEqual({ comments: [], summaryPosted: false });
+  });
+});
+
+describe('a verdict GitHub will not take — reviewing your own pull request', () => {
+  // Live behaviour, captured from api.github.com: POST /pulls/{n}/reviews with
+  // APPROVE or REQUEST_CHANGES on your own PR is a 422. Only the event is
+  // refused; the comments and summary are fine. Throwing lost the whole review.
+  it('still posts the review, and reports the verdict through its own field', async () => {
+    const { conn, anchor, log } = await draft({ refuseVerdict: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      summary: 'This summary must survive the refusal.',
+      requestChanges: true,
+    });
+    expect(result.comments.map((c) => [c.key, c.ok])).toEqual([['a', true]]);
+    expect(result.summaryPosted).toBe(true);
+    expect(result.requestChangesApplied).toBe(false);
+    expect(result.requestChangesError?.kind).toBe('unknown');
+    expect(result.requestChangesError?.message).toContain('request changes on your own pull request');
+    // Never a comment failure (task 5.7).
+    expect(result.comments.every((c) => c.error === undefined)).toBe(true);
+    // Downgraded to COMMENT and re-sent as one review, not comment-by-comment.
+    expect(log.paths.filter((p) => p.endsWith('/comments') && !p.includes('/reviews/'))).toEqual([]);
+  });
+
+  it('reports a refused approval as approvalError, not as a thrown submit', async () => {
+    const { conn, anchor } = await draft({ refuseVerdict: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      summary: 'Looks good.',
+      approve: true,
+    });
+    expect(result.approvalApplied).toBe(false);
+    expect(result.approvalError?.message).toContain('approve your own pull request');
+    expect(result.comments.map((c) => c.ok)).toEqual([true]);
+  });
+
+  it('posts the comments standalone when the refused submit carries no summary', async () => {
+    // A bodiless COMMENT review is itself a 422, so the downgrade cannot use
+    // the batch endpoint here.
+    const { conn, anchor } = await draft({ refuseVerdict: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      approve: true,
+    });
+    expect(result.comments.map((c) => c.ok)).toEqual([true]);
+    expect(result.summaryPosted).toBe(false);
+    expect(result.approvalError).toBeDefined();
   });
 });
 
@@ -257,6 +308,50 @@ describe('error mapping', () => {
 
   it('keeps a non-position 422 out of the staleAnchor bucket', () => {
     expect(mapGitHubError(422, 'Validation failed: body cannot be blank').kind).toBe('unknown');
+  });
+
+  // Captured verbatim from api.github.com. The invented phrasings above are
+  // what the fake used to send; these are what GitHub actually sends, and the
+  // regex matched neither until a live submit threw instead of falling back.
+  it('maps the live "could not be resolved" phrasing from both endpoints', () => {
+    expect(mapGitHubError(422, 'Unprocessable Entity — Line could not be resolved').kind)
+      .toBe('staleAnchor');
+    expect(
+      mapGitHubError(
+        422,
+        'Validation Failed — pull_request_review_thread.line custom could not be resolved',
+      ).kind,
+    ).toBe('staleAnchor');
+  });
+
+  it('leaves an unresolvable commit_id an ordinary validation failure', () => {
+    // Same verb, different subject: re-anchoring cannot fix a bad commit id,
+    // so this must not route into the per-comment fallback.
+    expect(mapGitHubError(422, 'Validation Failed — commit_id could not be resolved').kind)
+      .toBe('unknown');
+  });
+
+  it('reads the detail out of a string-valued errors[]', async () => {
+    // POST /pulls/{n}/reviews answers with `message: "Unprocessable Entity"`
+    // and the reason as a bare string in errors[]. Handling only the object
+    // form dropped it, leaving an unclassifiable 422.
+    const body = JSON.stringify({
+      message: 'Unprocessable Entity',
+      errors: ['Line could not be resolved'],
+      status: '422',
+    });
+    const http = new GitHubHttp('https://github.com', 'ghp-test', () =>
+      Promise.resolve({
+        ok: false,
+        status: 422,
+        headers: { get: () => null },
+        json: () => Promise.resolve(JSON.parse(body) as unknown),
+        text: () => Promise.resolve(body),
+      }));
+    const error: unknown = await http.post('/repos/acme/core/pulls/1/reviews', {}).catch((e: unknown) => e);
+    expect(isScmError(error)).toBe(true);
+    expect(isScmError(error) ? error.kind : undefined).toBe('staleAnchor');
+    expect(isScmError(error) ? error.message : '').toContain('Line could not be resolved');
   });
 
   it('maps both primary and secondary rate limiting, carrying the delay', () => {

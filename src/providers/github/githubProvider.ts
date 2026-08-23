@@ -33,6 +33,7 @@ import { toScmError } from '../../platform/errors';
 import type { FetchLike } from './http';
 import { GitHubHttp, hostOf, isDotCom, splitRepoId } from './http';
 import { parseGitHubSourceInput } from './sourceInput';
+import { isVerdictRefused } from './errors';
 import {
   isRealIssue,
   toCiSummary,
@@ -159,6 +160,16 @@ function hasSummary(summary: string | undefined): boolean {
 function reviewBody(event: ReviewEvent, summary: string | undefined): string | undefined {
   if (hasSummary(summary)) return summary;
   return event === 'APPROVE' ? undefined : VERDICT_BODY[event];
+}
+
+/**
+ * The verdict half of a `SubmitResult`, for a verdict GitHub would not take.
+ * `COMMENT` carries no verdict, so it contributes nothing.
+ */
+function verdictFailure(event: ReviewEvent, error: ScmError): Partial<SubmitResult> {
+  if (event === 'APPROVE') return { approvalApplied: false, approvalError: error };
+  if (event === 'REQUEST_CHANGES') return { requestChangesApplied: false, requestChangesError: error };
+  return {};
 }
 
 /**
@@ -422,6 +433,19 @@ export class GitHubConnection implements Connection {
       return await this.submitAsOneReview(ref, submission, event);
     } catch (e) {
       const error = toScmError(e);
+      // GitHub refused the verdict, not the review — an author cannot approve
+      // or request changes on their own pull request. The comments and the
+      // summary are still valid, so re-send the identical review as a plain
+      // COMMENT and report the verdict through its own field. Throwing here
+      // would lose the whole review to a refusal of one field (task 5.7).
+      if (isVerdictRefused(error)) {
+        // Same guard as above: a bodiless COMMENT review is a 422, so a
+        // submission with no summary posts its comments standalone instead.
+        const downgraded = hasSummary(submission.summary)
+          ? await this.submitAsOneReview(ref, submission, 'COMMENT')
+          : await this.submitCommentByComment(ref, submission, 'COMMENT');
+        return { ...downgraded, ...verdictFailure(event, error) };
+      }
       if (error.kind !== 'staleAnchor') throw error;
       return this.submitCommentByComment(ref, submission, event);
     }

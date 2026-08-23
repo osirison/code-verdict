@@ -52,11 +52,34 @@ function isRateLimited(status: number, message: string, headers?: HeaderReader):
  * and re-posted every comment with the same bad commit id. `path` is included
  * because GitHub rejects a bad file anchor with "path ... diff" rather than
  * naming a position.
+ *
+ * "could not be resolved" is the phrasing the live API actually uses, captured
+ * from both endpoints against api.github.com:
+ *   POST /pulls/{n}/reviews  → "Unprocessable Entity — Line could not be resolved"
+ *   POST /pulls/{n}/comments → "Validation Failed —
+ *                               pull_request_review_thread.line custom could not be resolved"
+ * It stays qualified by line/path/position so that "commit_id could not be
+ * resolved" remains an ordinary validation failure, not a re-anchor signal.
  */
 function isStalePosition(message: string): boolean {
-  return /(position is (invalid|outdated))|((line|path|pull request review thread) .{0,40}part of the diff)|(not part of the diff)|(diff_hunk)|(outdated (diff|line|position))/i.test(
+  return /(position is (invalid|outdated))|((line|path|pull request review thread) .{0,40}part of the diff)|(not part of the diff)|(diff_hunk)|(outdated (diff|line|position))|((line|path|position)\b.{0,40}could not be resolved)/i.test(
     message,
   );
+}
+
+/**
+ * GitHub refuses to let an author approve or request changes on their own pull
+ * request. Captured live from api.github.com — both arrive as a 422 whose
+ * detail sits in a string-valued `errors[]`:
+ *   "Unprocessable Entity — Review Can not approve your own pull request"
+ *   "Unprocessable Entity — Review Can not request changes on your own pull request"
+ *
+ * Only the *event* is refused; the review itself is well formed. So this is a
+ * verdict outcome, not a submit failure, and the caller downgrades to a plain
+ * COMMENT rather than losing the comments and summary with it.
+ */
+export function isVerdictRefused(error: { status?: number; message: string }): boolean {
+  return error.status === 422 && /(cannot|can ?not) (approve|request changes)/i.test(error.message);
 }
 
 export function mapGitHubError(

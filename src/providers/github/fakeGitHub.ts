@@ -29,6 +29,8 @@ export interface FakeGitHubOptions {
   failCommentAtWith?: { at: number; status: number; message: string };
   /** Every write fails with this status/message. */
   failAllWrites?: { status: number; message: string };
+  /** The instance refuses APPROVE / REQUEST_CHANGES — you are the PR author. */
+  refuseVerdict?: boolean;
   /** Extra headers on every response — used to drive rate-limit mapping. */
   headers?: Record<string, string>;
 }
@@ -143,8 +145,13 @@ function json(body: unknown, headers: Record<string, string> = {}): FetchRespons
   };
 }
 
-function error(status: number, message: string, headers: Record<string, string> = {}): FetchResponseLike {
-  const text = JSON.stringify({ message });
+function error(
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+  errors?: ReadonlyArray<string | Record<string, string>>,
+): FetchResponseLike {
+  const text = JSON.stringify(errors === undefined ? { message } : { message, errors });
   return {
     ok: false,
     status,
@@ -245,8 +252,22 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
         if (stray) {
           return error(422, 'Validation Failed — commit_id is not a valid comment field', extraHeaders);
         }
+        // Real GitHub: an author cannot approve or request changes on their
+        // own pull request. The detail is a bare string in errors[], like the
+        // position rejection below.
+        if (options.refuseVerdict && (body.event === 'APPROVE' || body.event === 'REQUEST_CHANGES')) {
+          const verb = body.event === 'APPROVE' ? 'approve' : 'request changes on';
+          return error(422, 'Unprocessable Entity', extraHeaders, [
+            `Review Can not ${verb} your own pull request`,
+          ]);
+        }
         if (options.failReviewPositionOnBatch && hasComments) {
-          return error(422, 'Unprocessable Entity — line must be part of the diff', extraHeaders);
+          // Verbatim from api.github.com: the detail is a bare STRING in
+          // `errors[]`, and `message` is the generic status text. A fake that
+          // pre-flattens this into `message` never exercises the client's
+          // `errors[]` handling — which is how a dropped string entry survived
+          // three review rounds and a green suite.
+          return error(422, 'Unprocessable Entity', extraHeaders, ['Line could not be resolved']);
         }
         return json({ id: 555, state: body.event ?? 'COMMENTED', commit_id: HEAD_SHA }, extraHeaders);
       }
@@ -263,7 +284,12 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
           return error(fatal.status, fatal.message, extraHeaders);
         }
         if (options.failCommentAt !== undefined && commentAttempt === options.failCommentAt) {
-          return error(422, 'Unprocessable Entity — position is invalid', extraHeaders);
+          // The single-comment endpoint uses the other shape: object entries,
+          // and "Validation Failed" as the message.
+          return error(422, 'Validation Failed', extraHeaders, [
+            { resource: 'PullRequestReviewComment', code: 'custom',
+              field: 'pull_request_review_thread.line', message: 'could not be resolved' },
+          ]);
         }
         return json({ id: 9000 + commentAttempt, commit_id: HEAD_SHA }, extraHeaders);
       }

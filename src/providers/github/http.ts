@@ -234,11 +234,20 @@ async function readErrorMessage(res: FetchResponseLike): Promise<string> {
   try {
     const parsed = JSON.parse(raw) as {
       message?: unknown;
-      errors?: Array<{ message?: unknown; field?: unknown; code?: unknown }>;
+      errors?: Array<string | { message?: unknown; field?: unknown; code?: unknown }>;
     };
+    // `errors[]` carries two shapes. Object entries are the documented
+    // validation form; POST /pulls/{n}/reviews instead returns bare strings
+    // ("Line could not be resolved") under a generic "Unprocessable Entity"
+    // message. Dropping the string form loses the only text that says *why* —
+    // and the batched-review rejection is exactly that case, so the caller
+    // saw an unclassifiable 422 and could not fall back.
     const detail = Array.isArray(parsed.errors)
       ? parsed.errors
-          .map((e) => [e.field, e.code, e.message].filter((part) => typeof part === 'string').join(' '))
+          .map((e) =>
+            typeof e === 'string'
+              ? e
+              : [e.field, e.code, e.message].filter((part) => typeof part === 'string').join(' '))
           .filter((part) => part !== '')
           .join('; ')
       : '';
