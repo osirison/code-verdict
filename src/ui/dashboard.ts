@@ -48,6 +48,11 @@ export class DashboardPanel {
       this.disposed = true;
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. `painted` is already true, so this
+    // re-fetches and repaints in full rather than reshowing the skeleton.
+    route.onReload(() => void this.refresh());
     route.onMessage((rawMessage) => {
       const message = rawMessage as DashboardMessage;
       switch (message.type) {

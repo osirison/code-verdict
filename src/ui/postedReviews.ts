@@ -73,6 +73,12 @@ export class PostedReviewsPanel {
       this.deps.onSidebarThreads?.(undefined);
       if (PostedReviewsPanel.current === this) PostedReviewsPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. this.rows/this.pod are already fetched,
+    // so a plain re-render (falling back to setHtml since readiness was
+    // just reset) is enough — no need to hit the network again.
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as PostedMessage));
   }
 
@@ -81,6 +87,19 @@ export class PostedReviewsPanel {
   }
 
   private async onMessage(m: PostedMessage): Promise<void> {
+    // The skeleton's header renders these two as if they already work, and
+    // every click was dropped for the whole fetch window because the guard
+    // below sat in front of the entire switch (#39). Neither needs a pod:
+    // refresh() resolves it itself, and leaving the screen needs no
+    // connection at all.
+    if (m.type === 'backToDashboard') {
+      void vscode.commands.executeCommand('codeVerdict.openDashboard');
+      return;
+    }
+    if (m.type === 'refresh') {
+      await this.refresh();
+      return;
+    }
     // The pod captured at refresh time — never pair a freshly-switched
     // pod's connection with rows fetched for the previous one.
     const pod = this.pod;
@@ -153,12 +172,6 @@ export class PostedReviewsPanel {
         }
         case 'rerun':
           if (view) this.deps.openReviewFlow({ repoId: view.repoId, number: view.crNumber });
-          return;
-        case 'refresh':
-          await this.refresh();
-          return;
-        case 'backToDashboard':
-          void vscode.commands.executeCommand('codeVerdict.openDashboard');
           return;
       }
     } catch (e) {

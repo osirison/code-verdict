@@ -6,6 +6,20 @@ export interface AppRoute {
   readonly panel: vscode.WebviewPanel;
   onMessage(handler: MessageHandler): void;
   onLeave(handler: () => void): void;
+  /**
+   * Fires when this route's document reloads out from under it — "Developer:
+   * Reload Webviews", or dragging the Verdict tab into another editor group.
+   * VS Code recreates the webview from the *stored* `webview.html`, which a
+   * region patch never touches (only `setHtml` does), so the recreated DOM
+   * is whatever was last full-rendered — stale once a patch has landed since.
+   * Its REGIONS_SCRIPT re-arms and posts `verdictReady` again; arriving
+   * while this route already thought it was ready means exactly that a
+   * reload happened, not a duplicate signal. `ready` is reset to false
+   * first, so a handler's normal repaint path (refresh()/render()) falls
+   * back to a full `setHtml` on its own — no separate "force full" signal
+   * needed anywhere (issue #39 follow-up).
+   */
+  onReload(handler: () => void): void;
   /** Assigns the full page and marks the route not-ready for a region patch,
    * until the new page's REGIONS_SCRIPT echoes back `verdictReady` (#39). */
   setHtml(html: string): void;
@@ -31,6 +45,8 @@ interface ActiveRoute {
   id: string;
   handlers: MessageHandler[];
   leaveHandlers: Array<() => void>;
+  /** Fired when a second `verdictReady` arrives while already `ready` (#39 follow-up). */
+  reloadHandlers: Array<() => void>;
   back?: () => void;
   /** Whether the currently-loaded page's REGIONS_SCRIPT has armed itself. */
   ready: boolean;
@@ -47,6 +63,7 @@ export class AppSurface {
       panel: surface.panel,
       onMessage: (handler) => surface.active?.handlers.push(handler),
       onLeave: (handler) => surface.active?.leaveHandlers.push(handler),
+      onReload: (handler) => surface.active?.reloadHandlers.push(handler),
       setHtml: (html) => {
         route.ready = false;
         surface.panel.webview.html = html;
@@ -99,7 +116,19 @@ export class AppSurface {
         // appBack below — never fall through to route handlers, or every
         // page load would also dispatch as a message to whatever screen is
         // active.
-        if (this.active) this.active.ready = true;
+        if (this.active) {
+          if (this.active.ready) {
+            // A second arrival while already ready is not a duplicate — the
+            // document was recreated out from under this route (see
+            // AppRoute.onReload above). Reset readiness first so a handler's
+            // own repaint falls back to setHtml rather than trusting this
+            // fresh, possibly-stale DOM to accept a patch.
+            this.active.ready = false;
+            for (const handler of this.active.reloadHandlers) handler();
+          } else {
+            this.active.ready = true;
+          }
+        }
         return;
       }
       if (isBackMessage(message)) {
@@ -118,7 +147,7 @@ export class AppSurface {
   private activate(id: string, title: string, back?: () => void): ActiveRoute {
     if (this.active?.id !== id) {
       this.leaveActiveRoute();
-      this.active = { id, handlers: [], leaveHandlers: [], back, ready: false };
+      this.active = { id, handlers: [], leaveHandlers: [], reloadHandlers: [], back, ready: false };
     } else {
       this.active.back = back;
     }

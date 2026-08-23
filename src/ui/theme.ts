@@ -156,9 +156,11 @@ a { color: var(--link); text-decoration: none; }
 /*
  * Loading-skeleton placeholder (issue #39): a screen's first paint, before
  * the fetch that would otherwise leave the previous screen frozen on
- * navigation. Callers size it with an inline style (width/height) at each
- * use site, matching how this codebase already sizes one-off bars (e.g. the
- * submit progress bar in reviewFlowHtml).
+ * navigation. Only the shared look lives here — callers size it with a CSS
+ * class in their own nonce'd CSS const, never a style attribute: this
+ * page's CSP authorises nonce'd style elements only, and a nonce never
+ * covers a style attribute, so an inline size here silently collapses to
+ * zero (issue #45).
  */
 .skel { display: inline-block; background: var(--bg3); border: 1px solid var(--line2); border-radius: 4px; color: transparent; animation: skel-pulse 1.4s ease-in-out infinite; }
 

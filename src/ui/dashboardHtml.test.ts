@@ -163,7 +163,7 @@ describe('loading skeleton (issue #39 — navigation must not wait on the fetch)
 
     expect(html).toContain('Platform squad');
     expect(html).toContain('6 projects · 9 open MRs');
-    expect(html).toContain('class="skel"');
+    expect(html).toContain('class="skel skel-title"');
     expect(html).not.toContain('class="mr-row" data-repo=');
     expect(html).not.toContain('data-number=');
   });
@@ -177,5 +177,15 @@ describe('loading skeleton (issue #39 — navigation must not wait on the fetch)
     const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'n');
     expect(html).toContain("post({ type: 'refresh' })");
     expect(html).toContain("ev.target.closest('.mr-row')");
+  });
+
+  it('sizes every skeleton placeholder from a CSS class, never a style attribute (issue #45 — the CSP blocks style attributes, not style elements)', () => {
+    const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'nonce123');
+    expect(html).not.toContain('style="');
+  });
+
+  it('guards skeleton rows against posting an openCr with no ref — Number(undefined) is NaN', () => {
+    const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'n');
+    expect(html).toContain('row.dataset.number === undefined) return');
   });
 });

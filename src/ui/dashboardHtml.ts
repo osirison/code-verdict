@@ -178,6 +178,19 @@ section { padding: 16px 0 6px; }
 .empty h2 { font-size: 16px; font-weight: 600; color: var(--fg-hi); margin-bottom: 8px; }
 .empty p { font-size: 12.5px; color: var(--fg-dim); margin-bottom: 18px; }
 .empty .btn { margin: 0 4px; }
+
+/* Loading-skeleton sizes (issue #39), each named for the real element it
+   stands in for — sized by a class here, not a style attribute: this
+   page's CSP authorises nonce'd style elements only, and a nonce never
+   covers a style attribute, so the bars rendered at zero size (issue #45). */
+.skel-badge { width: 90px; height: 24px; }
+.skel-stat-label { width: 70%; height: 13px; }
+.skel-stat-value { width: 50%; height: 27px; }
+.skel-stat-note { width: 80%; height: 13px; }
+.skel-title { width: 60%; height: 13px; }
+.skel-meta { width: 40%; height: 10px; }
+.skel-cell { width: 70%; height: 13px; }
+.skel-pill { width: 56px; height: 18px; }
 `;
 
 /**
@@ -496,8 +509,6 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
  * so the data patch that lands later can replace it wholesale.
  */
 export function renderDashboardLoadingHtml(podName: string, meta: string, nonce: string): string {
-  const skelBar = (width: string, height = '13px'): string =>
-    `<span class="skel" style="width:${width};height:${height}"></span>`;
   const header = `
   <header>
     <div class="pod-wrap">
@@ -508,14 +519,14 @@ export function renderDashboardLoadingHtml(podName: string, meta: string, nonce:
       </button>
       <div class="pod-menu" data-pod-menu hidden></div>
     </div>
-    <div class="head-right">${skelBar('90px', '24px')}</div>
+    <div class="head-right"><span class="skel skel-badge"></span></div>
   </header>`;
   const statCards = Array.from({ length: 4 })
     .map(
       () => `<div class="stat">
-        <div class="stat-label">${skelBar('70%')}</div>
-        <div class="stat-value">${skelBar('50%', '27px')}</div>
-        <div class="stat-note">${skelBar('80%')}</div>
+        <div class="stat-label"><span class="skel skel-stat-label"></span></div>
+        <div class="stat-value"><span class="skel skel-stat-value"></span></div>
+        <div class="stat-note"><span class="skel skel-stat-note"></span></div>
       </div>`,
     )
     .join('');
@@ -523,13 +534,13 @@ export function renderDashboardLoadingHtml(podName: string, meta: string, nonce:
     .map(
       () => `<div class="mr-row">
         <div>
-          <div class="row-title">${skelBar('60%')}</div>
-          <div class="row-meta">${skelBar('40%', '10px')}</div>
+          <div class="row-title"><span class="skel skel-title"></span></div>
+          <div class="row-meta"><span class="skel skel-meta"></span></div>
         </div>
-        <div class="cell-repo">${skelBar('70%')}</div>
-        <div>${skelBar('56px', '18px')}</div>
-        <div class="cell-ci">${skelBar('70%')}</div>
-        <div class="cell-age">${skelBar('70%')}</div>
+        <div class="cell-repo"><span class="skel skel-cell"></span></div>
+        <div><span class="skel skel-pill"></span></div>
+        <div class="cell-ci"><span class="skel skel-cell"></span></div>
+        <div class="cell-age"><span class="skel skel-cell"></span></div>
       </div>`,
     )
     .join('');

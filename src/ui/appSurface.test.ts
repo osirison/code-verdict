@@ -88,6 +88,31 @@ describe('AppSurface', () => {
     handlers.dispose?.();
   });
 
+  it('fires onReload and resets readiness only on a second verdictReady past ready — the first does neither', async () => {
+    const { AppSurface } = await import('./appSurface.js');
+    const dashboard = AppSurface.show('dashboard', 'Verdict');
+    const reloaded = vi.fn();
+    dashboard.onReload(reloaded);
+
+    // The first verdictReady is the ordinary not-ready → ready transition:
+    // the document just finished its first load, nothing was recreated.
+    handlers.message?.({ type: 'verdictReady' });
+    expect(reloaded).not.toHaveBeenCalled();
+    expect(dashboard.postRegions({ body: '<p>1</p>' })).toBe(true);
+
+    // A second verdictReady while already ready means the document was
+    // recreated out from under this route (e.g. "Developer: Reload
+    // Webviews") — its REGIONS_SCRIPT re-armed and signalled again.
+    handlers.message?.({ type: 'verdictReady' });
+    expect(reloaded).toHaveBeenCalledOnce();
+    // Readiness is reset first, so the handler's own repaint (or any repaint
+    // that follows) falls back to a full setHtml rather than trusting the
+    // fresh DOM to already hold whatever the last patch delivered.
+    expect(dashboard.postRegions({ body: '<p>2</p>' })).toBe(false);
+
+    handlers.dispose?.();
+  });
+
   it('drops a patch queued by a route that is no longer active', async () => {
     const { AppSurface } = await import('./appSurface.js');
     const dashboard = AppSurface.show('dashboard', 'Verdict');

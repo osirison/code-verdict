@@ -120,6 +120,15 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .btn-agent:hover { background: var(--agent-t); }
 .reply-row { display: flex; gap: 8px; align-items: center; flex: 1; }
 .empty { text-align: center; padding: 70px 20px; color: var(--fg-dim); font-size: 12.5px; }
+
+/* Loading-skeleton sizes (issue #39), sized by a class here, not a style
+   attribute: this page's CSP authorises nonce'd style elements only, and a
+   nonce never covers a style attribute, so the bars rendered at zero size
+   (issue #45). */
+.skel-title { width: 130px; height: 12px; }
+.skel-meta { width: 150px; height: 10px; margin-top: 4px; }
+.skel-badge { width: 90px; height: 18px; }
+.skel-count { width: 60px; height: 14px; }
 `;
 
 function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number, vocabulary: Vocabulary): string {
@@ -174,10 +183,10 @@ function postedRowsRegion(state: PostedViewState): string {
       .map(
         (row) => `<div class="rev-row">
         <div>
-          <div class="rev-title">${e(row.refLabel)} · <span class="skel" style="width:130px;height:12px"></span></div>
-          <div class="breakdown skel" style="width:150px;height:10px;margin-top:4px"></div>
+          <div class="rev-title">${e(row.refLabel)} · <span class="skel skel-title"></span></div>
+          <div class="breakdown skel skel-meta"></div>
         </div>
-        <div><span class="badge skel" style="width:90px;height:18px"></span></div>
+        <div><span class="badge skel skel-badge"></span></div>
         <div class="rev-repo">${e(row.project)}</div>
         <div class="cell-age">${e(row.age)}</div>
       </div>`,
@@ -185,7 +194,7 @@ function postedRowsRegion(state: PostedViewState): string {
       .join('');
     return `<header>
       <h1>Reviews you contributed to · ${e(state.podName)}</h1>
-      <span class="on-you skel" style="width:60px;height:14px"></span>
+      <span class="on-you skel skel-count"></span>
       <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
     </header>
     <div class="thead"><div>${e(cap(state.vocabulary.changeRequestNoun))}</div><div>Threads</div><div>${e(cap(state.vocabulary.repoNoun))}</div><div>Age</div></div>
@@ -259,9 +268,16 @@ const SCRIPT = `
   document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#back-dash')) post({ type: 'backToDashboard' }); });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#rerun')) post({ type: 'rerun' }); });
+  // The loading skeleton's rows are .rev-row too, so they look selectable —
+  // but they carry no data-index, and Number(undefined) is NaN. Guard it the
+  // way dashboardHtml's openMrRow already guards its own skeleton rows (#39).
+  const selectRevRow = (row) => {
+    if (row.dataset.index === undefined) return;
+    post({ type: 'selectReview', index: Number(row.dataset.index) });
+  };
   document.addEventListener('click', (ev) => {
     const row = ev.target.closest('.rev-row');
-    if (row) post({ type: 'selectReview', index: Number(row.dataset.index) });
+    if (row) selectRevRow(row);
   });
   // .th-head (data-toggle) and .th-body (the resolve/concede/opinion/reply
   // actions below) are SIBLINGS inside .th-row, not ancestor and descendant —

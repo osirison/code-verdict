@@ -39,7 +39,7 @@ import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
-import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { escapeHtml } from './theme';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
@@ -225,6 +225,12 @@ export class ReviewFlowPanel {
     this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
       this.setReviewFocus(event.webviewPanel.active),
     );
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. This panel's state is already in
+    // memory, so a plain re-render (falling back to setHtml since readiness
+    // was just reset) is enough — no need to reload() from the network.
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
   }
 
@@ -295,69 +301,89 @@ export class ReviewFlowPanel {
     // an in-place state change (a verdict, a mode switch, ...) goes through
     // render() alone — so this always repaints.
     const pod = this.pod();
-    this.route.setHtml(renderReviewFlowLoadingHtml(
-      {
-        refLabel: this.refLabel(),
-        projectPath: pod.repos?.find((r) => r.id === ref.repoId)?.path ?? ref.repoId,
-      },
-      crypto.randomBytes(16).toString('hex'),
-    ));
+    // Hoisted so the catch below can repaint the same header on an error
+    // screen without recomputing it against whatever `this.ref`/`this.pod()`
+    // have become by the time the fetch below actually rejects.
+    const header = {
+      refLabel: this.refLabel(),
+      projectPath: pod.repos?.find((r) => r.id === ref.repoId)?.path ?? ref.repoId,
+    };
+    this.route.setHtml(renderReviewFlowLoadingHtml(header, crypto.randomBytes(16).toString('hex')));
 
-    const connection = await this.connection();
-    if (this.disposed || loadToken !== this.loadSeq) return;
-    // listOpenChangeRequests, getChangeRequestDiff and discoverLmAgents are
-    // independent reads — getChangeRequestDiff needs only ref, and
-    // discoverLmAgents needs nothing, so the previous sequential chain was
-    // pure latency (#39). Attach a no-op catch to the last two immediately:
-    // if the CR turns out to be gone below, whichever of them rejects must
-    // not surface as an unhandled rejection or bury the clearer "no longer
-    // open" message with a second, unrelated one.
-    const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
-    const diffPromise = connection.getChangeRequestDiff(ref);
-    const agentsPromise = discoverLmAgents();
-    diffPromise.catch(() => undefined);
-    agentsPromise.catch(() => undefined);
-    const crs = await crsPromise;
-    if (this.disposed || loadToken !== this.loadSeq) return;
-    const cr = crs.find((c) => c.ref.number === ref.number);
-    if (!cr) {
-      void vscode.window.showWarningMessage(`Verdict: ${ref.number} is no longer open.`);
-      void vscode.commands.executeCommand(COMMANDS.openDashboard);
-      return;
-    }
-    this.cr = cr;
-    this.diff = await diffPromise;
-    this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await agentsPromise)];
-    if (this.disposed || loadToken !== this.loadSeq) return;
-    if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
-      this.agentId = pod.agentId;
-    }
+    try {
+      const connection = await this.connection();
+      if (this.disposed || loadToken !== this.loadSeq) return;
+      // listOpenChangeRequests, getChangeRequestDiff and discoverLmAgents are
+      // independent reads — getChangeRequestDiff needs only ref, and
+      // discoverLmAgents needs nothing, so the previous sequential chain was
+      // pure latency (#39). Attach a no-op catch to the last two immediately:
+      // if the CR turns out to be gone below, whichever of them rejects must
+      // not surface as an unhandled rejection or bury the clearer "no longer
+      // open" message with a second, unrelated one.
+      const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
+      const diffPromise = connection.getChangeRequestDiff(ref);
+      const agentsPromise = discoverLmAgents();
+      diffPromise.catch(() => undefined);
+      agentsPromise.catch(() => undefined);
+      const crs = await crsPromise;
+      if (this.disposed || loadToken !== this.loadSeq) return;
+      const cr = crs.find((c) => c.ref.number === ref.number);
+      if (!cr) {
+        void vscode.window.showWarningMessage(`Verdict: ${ref.number} is no longer open.`);
+        void vscode.commands.executeCommand(COMMANDS.openDashboard);
+        return;
+      }
+      this.cr = cr;
+      this.diff = await diffPromise;
+      this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await agentsPromise)];
+      if (this.disposed || loadToken !== this.loadSeq) return;
+      if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
+        this.agentId = pod.agentId;
+      }
 
-    // A surviving draft re-enters triage (spec: drafts lose no work),
-    // including the partial-failure ledger.
-    const draft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
-    if (draft && draft.review.headSha) {
-      this.review = draft.review;
-      this.threads = draft.threads;
-      this.summaryText = draft.summaryText;
-      this.finalNote = draft.finalNote;
-      this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
-      this.summaryPosted = draft.summaryPosted ?? false;
-      this.verdictApplied = draft.verdictApplied ?? false;
-      this.threadsAccum = { ...draft.threadsAccum };
-      this.postedIndividually = draft.postedIndividually ?? false;
-      this.postedCount = draft.postedCount ?? 0;
-      this.screen = 'triage';
-      this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
-      // The diff just fetched is the branch as it stands now, so the same
-      // fetch that detects the moved head also says which findings moved.
-      this.staleHead = isStale(draft.review, cr.headSha) ? cr.headSha : undefined;
-      this.staleItemIds = this.staleHead ? this.markMoved(this.diff) : new Set();
-    } else {
-      this.screen = 'agent';
+      // A surviving draft re-enters triage (spec: drafts lose no work),
+      // including the partial-failure ledger.
+      const draft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
+      if (draft && draft.review.headSha) {
+        this.review = draft.review;
+        this.threads = draft.threads;
+        this.summaryText = draft.summaryText;
+        this.finalNote = draft.finalNote;
+        this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
+        this.summaryPosted = draft.summaryPosted ?? false;
+        this.verdictApplied = draft.verdictApplied ?? false;
+        this.threadsAccum = { ...draft.threadsAccum };
+        this.postedIndividually = draft.postedIndividually ?? false;
+        this.postedCount = draft.postedCount ?? 0;
+        this.screen = 'triage';
+        this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
+        // The diff just fetched is the branch as it stands now, so the same
+        // fetch that detects the moved head also says which findings moved.
+        this.staleHead = isStale(draft.review, cr.headSha) ? cr.headSha : undefined;
+        this.staleItemIds = this.staleHead ? this.markMoved(this.diff) : new Set();
+      } else {
+        this.screen = 'agent';
+      }
+      this.render();
+      void this.resolveChangesetMembership(loadToken);
+    } catch (e) {
+      // A stale load losing the race to a newer navigation (or the panel
+      // closing mid-fetch) is not a failure to report — whatever superseded
+      // it, or nothing once disposed, already owns the screen.
+      if (this.disposed || loadToken !== this.loadSeq) return;
+      // On `main` a rejection here left the previous review fully rendered.
+      // Painting the loading skeleton before the fetch (#39) means the same
+      // rejection instead stranded the reviewer on a dead spinner: every
+      // call site is `void ReviewFlowPanel.open(...)`, so it went to the
+      // extension-host console and nothing at all reached the screen.
+      const error = toScmError(e);
+      void vscode.window.showErrorMessage(`Verdict: ${error.message}`);
+      this.route.setHtml(renderReviewFlowErrorHtml(
+        header,
+        error.message,
+        crypto.randomBytes(16).toString('hex'),
+      ));
     }
-    this.render();
-    void this.resolveChangesetMembership(loadToken);
   }
 
   private memberOfChangeset?: { id: string; name: string; memberCount: number };
@@ -610,6 +636,11 @@ export class ReviewFlowPanel {
         break;
       case 'retryRun':
         void this.run();
+        return;
+      case 'retryLoad':
+        // The load-failure screen's only way out (#39). load() resets every
+        // per-MR field itself, so this is a fresh attempt, not a resume.
+        await this.load(this.ref);
         return;
       case 'openTuning':
         await vscode.commands.executeCommand('codeVerdict.selectAgent');

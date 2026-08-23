@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import type { FlowViewState } from './reviewFlowHtml';
-import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
 
 const state: FlowViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -311,7 +311,12 @@ describe('loading skeleton and region patching (issue #39)', () => {
 
     expect(html).toContain('!2841');
     expect(html).toContain('hve/platform/core');
-    expect(html).toContain('class="skel"');
+    expect(html).toContain('class="skel skel-title"');
+    expect(html).toContain('class="skel skel-meta"');
+    // Every value comes from a class in this page's own nonce'd CSS (issue
+    // #45) — a nonce authorises style elements, never a style attribute, so
+    // anything set that way is dropped before layout.
+    expect(html.slice(html.indexOf('<body>'))).not.toContain('style="');
     // this.cr is not yet assigned at this point, so nothing item-specific renders.
     expect(html).not.toContain('data-item=');
   });
@@ -338,5 +343,33 @@ describe('loading skeleton and region patching (issue #39)', () => {
     expect(html).toContain("ev.target.closest('.agent-option')");
     expect(html).not.toContain("document.getElementById('accept')?.addEventListener");
     expect(html).toContain("ev.target.closest('#accept')");
+  });
+});
+
+describe('load-failure error screen (issue #39)', () => {
+  it('shows the escaped message, a breadcrumb and a retry control', () => {
+    const html = renderReviewFlowErrorHtml(
+      { refLabel: '!2841', projectPath: 'hve/platform/core' },
+      'connection refused <script>',
+      'n',
+    );
+
+    // Escaped, not raw markup — the message comes from a caught error.
+    expect(html).toContain('connection refused &lt;script&gt;');
+    expect(html).not.toContain('refused <script>');
+    // The loading page's breadcrumb, unchanged — its ‹ Dashboard button is
+    // wired by AppSurface itself, so it works here with no extra plumbing.
+    expect(html).toContain('id="app-crumb-current"');
+    expect(html).toContain('!2841');
+    expect(html).toContain('‹ Dashboard');
+    // A way out that re-issues the same load.
+    expect(html).toContain('id="retry-load"');
+    expect(html).toContain(">Retry<");
+    expect(html).toContain("on('retry-load', 'retryLoad')");
+  });
+
+  it('wraps the body in the same #flow-body region a patch targets', () => {
+    const html = renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n');
+    expect(html).toContain('id="flow-body"');
   });
 });

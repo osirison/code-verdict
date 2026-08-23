@@ -144,7 +144,8 @@ export type FlowMessage =
   | { type: 'openTuning' }
   | { type: 'reviewSingle'; repoId: string; number: string }
   | { type: 'setCrossTarget'; itemId: string; repoId: string; location: string }
-  | { type: 'openChangeset'; changesetId: string };
+  | { type: 'openChangeset'; changesetId: string }
+  | { type: 'retryLoad' };
 
 export const SEVERITIES: readonly Severity[] = ['nit', 'minor', 'major', 'blocker'];
 
@@ -226,6 +227,12 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .fail-card { text-align: left; border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
 .fail-title { font-size: 13.5px; font-weight: 600; color: var(--fg-hi); }
 .fail-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+/* Loading-page skeleton bars (issue #39), sized by a class rather than a
+   style attribute — this page's CSP authorises nonce'd style elements
+   only, and a nonce never covers a style attribute, so the bars rendered at
+   zero height (issue #45). */
+.skel-title { width: 220px; height: 16px; margin: 0 auto; }
+.skel-meta { width: 320px; height: 12px; margin: 0 auto; }
 
 .tri-head { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
 .tri-title { font-size: 14px; font-weight: 600; color: var(--fg-hi); }
@@ -888,6 +895,7 @@ document.addEventListener('click', (ev) => { const b = ev.target.closest('button
 document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'setInstructions', text: ev.target.value }); });
 on('run', 'run'); on('cancel', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
+on('retry-load', 'retryLoad');
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
 on('reanchor', 'reanchor'); on('rerun', 'rerun');
 
@@ -1062,13 +1070,47 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
  * armed by the time that patch arrives.
  */
 export function renderReviewFlowLoadingHtml(header: { refLabel: string; projectPath: string }, nonce: string): string {
-  const e2 = e;
   const body = `<div id="flow-body"><div class="wrap">
-    <div class="subline">${e2(header.refLabel)} · ${e2(header.projectPath)}</div>
-    <div class="run-col" style="margin:60px auto 0">
+    <div class="subline">${e(header.refLabel)} · ${e(header.projectPath)}</div>
+    <div class="run-col">
       <div class="spinner"></div>
-      <div class="skel" style="width:220px;height:16px;margin:0 auto"></div>
-      <div class="skel" style="width:320px;height:12px;margin:0 auto"></div>
+      <div class="skel skel-title"></div>
+      <div class="skel skel-meta"></div>
+    </div>
+  </div></div>`;
+  return renderPage({
+    title: `Verdict: Run review · ${header.refLabel}`,
+    nonce,
+    css: CSS,
+    body,
+    script: SCRIPT,
+    breadcrumb: { current: header.refLabel },
+  });
+}
+
+/**
+ * The fetch inside `load()` rejected (issue #39): before this screen existed,
+ * a rejection there left the reviewer parked on the loading skeleton
+ * forever, with nothing but an extension-host toast to explain it. Reuses
+ * the running screen's `.fail-card` styling and the loading page's
+ * breadcrumb — its ‹ Dashboard button is wired by `AppSurface` itself, so it
+ * works here unchanged — plus a Retry that re-issues the same load.
+ */
+export function renderReviewFlowErrorHtml(
+  header: { refLabel: string; projectPath: string },
+  message: string,
+  nonce: string,
+): string {
+  const body = `<div id="flow-body"><div class="wrap">
+    <div class="subline">${e(header.refLabel)} · ${e(header.projectPath)}</div>
+    <div class="run-col">
+      <div class="fail-card">
+        <div class="fail-title">Could not load this review</div>
+        <div>${e(message)}</div>
+        <div class="actions-row">
+          <button class="btn btn-accent" id="retry-load">Retry</button>
+        </div>
+      </div>
     </div>
   </div></div>`;
   return renderPage({

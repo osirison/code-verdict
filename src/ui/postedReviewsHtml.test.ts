@@ -189,9 +189,26 @@ describe('loading skeleton and region patching (issue #39)', () => {
     expect(html).toContain('!2841');
     expect(html).toContain('core');
     expect(html).toContain('2d');
-    expect(html).toContain('class="skel"');
+    expect(html).toContain('class="skel skel-title"');
     // Nothing is selected while loading — no thread panel to show yet.
     expect(html).not.toContain('class="sel-bar"');
+  });
+
+  it('sizes every skeleton placeholder from a CSS class, never a style attribute (issue #45 — the CSP blocks style attributes, not style elements)', () => {
+    const html = renderPostedReviewsHtml(
+      state([], { loading: true, rows: [], pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }] }),
+      'nonce123',
+    );
+    expect(html).not.toContain('style="');
+  });
+
+  it('guards skeleton rows against selecting a non-existent review — no data-index, Number(undefined) is NaN', () => {
+    const html = renderPostedReviewsHtml(
+      state([], { loading: true, rows: [], pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }] }),
+      'nonce123',
+    );
+    expect(html).not.toContain('data-index=');
+    expect(html).toContain('row.dataset.index === undefined) return');
   });
 
   it('wraps the rows and detail in the two regions a patch targets', () => {
