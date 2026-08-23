@@ -13,7 +13,10 @@ const state: SidebarViewState = {
   mergeRequests: [
     { repoId: '9101', number: '2841', label: '!2841', title: 'Refactor token refresh', project: 'core', waiting: true },
   ],
-  issues: [{ label: '#1180', title: 'Key rotation, end to end', project: 'api-gateway' }],
+  issues: [{
+    repoId: '9105', number: '1180', webUrl: 'https://gitlab.example/hve/platform/notifications/-/issues/1180',
+    label: '#1180', title: 'Key rotation, end to end', project: 'api-gateway',
+  }],
   waitingOnYou: 1,
   activeRoute: 'dashboard',
 };
@@ -42,8 +45,22 @@ describe('sidebar fidelity (prototype navigation)', () => {
     expect(html).toContain(`script-src 'nonce-nonce123'`);
     expect(html).toContain("type: 'selectPod'");
     expect(html).toContain("type: 'openCr'");
+    expect(html).toContain("type: 'openIssue'");
     expect(html).toContain("type: 'openDashboard'");
     expect(html).toContain("type: 'openPostedReviews'");
+  });
+
+  it('renders issue rows as buttons carrying a navigation target (issue #40)', () => {
+    const html = renderSidebarHtml(state, 'nonce123');
+
+    // Same shape as the merge-request rows directly above: a real <button>
+    // (native keyboard activation, no bespoke handler needed) with the
+    // target riding as data attributes rather than baked into markup.
+    expect(html).toContain(
+      '<button class="issue" data-issue-repo="9105" data-issue-number="1180" data-issue-url="https://gitlab.example/hve/platform/notifications/-/issues/1180">',
+    );
+    expect(html).not.toContain('<div class="issue">');
+    expect(html).toContain("document.querySelectorAll('[data-issue-url]')");
   });
 
   it('replaces the general lists with live review progress, filters, and findings', () => {

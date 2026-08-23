@@ -234,6 +234,11 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       case 'openCr':
         this.deps.openCr({ repoId: message.repoId, number: message.number });
         break;
+      case 'openIssue':
+        // Web page, not an in-editor view (issue #40) — that needs a
+        // `getWorkItem` provider capability no provider declares yet.
+        void vscode.env.openExternal(vscode.Uri.parse(message.webUrl));
+        break;
     }
   }
 }
