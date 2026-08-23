@@ -486,6 +486,10 @@ export class GitHubConnection implements Connection {
       return await this.submitAsOneReview(ref, submission, 'COMMENT', onProgress);
     } catch (e) {
       const error = toScmError(e);
+      // Anything else means nothing was posted, so this throws and the caller
+      // keeps its draft to retry. Returning the refusal instead would report an
+      // empty submit as a success, and would carry *this* error rather than the
+      // refusal anyway — `asVerdictError` rewrites only refusals.
       if (error.kind !== 'staleAnchor') throw error;
       return this.submitCommentByComment(ref, submission, 'COMMENT', onProgress);
     }
