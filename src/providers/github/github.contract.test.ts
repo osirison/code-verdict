@@ -28,6 +28,8 @@ describeProviderContract('github (REST + GraphQL against fake fetch)', {
     repoPath: 'acme/core',
     groupId: 'acme',
   },
+  // The fake's threads are stateful, so a reply and a resolve can be read back.
+  threadMutationsPersist: true,
   crRef: { repoId: 'acme/core', number: '2841' },
   anchor: { filePath: 'src/limiter.ts', line: 12 },
 });

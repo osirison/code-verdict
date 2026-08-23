@@ -20,6 +20,8 @@ describeProviderContract('fixture', {
     repoPath: 'hve/platform/core',
     groupId: '4821',
   },
+  // FixtureConnection keeps its threads in an instance Map and mutates them.
+  threadMutationsPersist: true,
   crRef: { repoId: '9101', number: '2841' },
   anchor: { filePath: 'src/auth/token.ts', line: 63 },
 });
