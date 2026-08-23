@@ -134,7 +134,9 @@ describe('a verdict GitHub will not take — reviewing your own pull request', (
     expect(result.comments.map((c) => [c.key, c.ok])).toEqual([['a', true]]);
     expect(result.summaryPosted).toBe(true);
     expect(result.requestChangesApplied).toBe(false);
-    expect(result.requestChangesError?.kind).toBe('unknown');
+    // Terminal, not a generic 422: a caller that retries this gets the same
+    // refusal every time and never completes.
+    expect(result.requestChangesError?.kind).toBe('verdictRefused');
     expect(result.requestChangesError?.message).toContain('request changes on your own pull request');
     // Never a comment failure (task 5.7).
     expect(result.comments.every((c) => c.error === undefined)).toBe(true);
@@ -152,6 +154,34 @@ describe('a verdict GitHub will not take — reviewing your own pull request', (
     expect(result.approvalApplied).toBe(false);
     expect(result.approvalError?.message).toContain('approve your own pull request');
     expect(result.comments.map((c) => c.ok)).toEqual([true]);
+  });
+
+  it('survives a refused verdict AND a stale anchor in the same submit', async () => {
+    // The downgrade re-sends the review as a COMMENT — which can itself be
+    // rejected for a moved line. Without its own fallback that second 422
+    // escapes submitReview and the whole review is lost, which is the outcome
+    // the downgrade exists to prevent.
+    const { conn, anchor } = await draft({ refuseVerdict: true, failReviewPositionOnBatch: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }, { key: 'b', body: 'Two.', anchor }],
+      summary: 'Must still land.',
+      requestChanges: true,
+    });
+    expect(result.comments.map((c) => c.ok)).toEqual([true, true]);
+    expect(result.postedAsSingleReview).toBe(false);
+    expect(result.requestChangesError?.kind).toBe('verdictRefused');
+  });
+
+  it('reports a refusal from the per-comment path as verdictRefused too', async () => {
+    // Both submit paths reach a verdict review; both must classify it the same
+    // way, or the fallback path strands the caller in a retry loop.
+    const { conn, anchor } = await draft({ refuseVerdict: true, failReviewPositionOnBatch: true });
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'One.', anchor }],
+      approve: true,
+    });
+    expect(result.approvalError?.kind).toBe('verdictRefused');
+    expect(result.approvalApplied).toBe(false);
   });
 
   it('posts the comments standalone when the refused submit carries no summary', async () => {

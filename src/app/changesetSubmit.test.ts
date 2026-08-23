@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Review } from '../domain/types';
 import type { Connection } from '../platform/provider';
 import type { ReviewSubmission, SubmitResult } from '../platform/types';
+import { ScmError } from '../platform/errors';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from './changesetSubmit';
 
 const review: Review = {
@@ -20,6 +21,50 @@ const review: Review = {
 };
 
 describe('changeset submission', () => {
+  it('completes when the platform refuses the verdict, instead of retrying forever', async () => {
+    // Neither GitHub nor GitLab lets an author request changes on their own
+    // change request. Treating that as retryable never reports complete, so
+    // the flow is stuck while every comment is already live on the platform.
+    const plans = buildChangesetSubmitPlans(review, [
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' } },
+    ], 'Agent', 'you', 'Summary.', true, true);
+    const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
+      comments: submission.comments.map((c) => ({ key: c.key, ok: true, threadId: `thread-${c.key}` })),
+      summaryPosted: true,
+      requestChangesApplied: false,
+      requestChangesError: new ScmError('verdictRefused', 'Can not request changes on your own pull request'),
+    }));
+    const connection = { submitReview } as unknown as Connection;
+
+    const first = await performChangesetSubmit(connection, plans);
+    expect(first.complete).toBe(true);
+    // Reported, so the user is told — just not retried.
+    expect(first.failures.map((f) => f.operation)).toEqual(['requestChanges']);
+    expect(first.state.verdictRefusedRefs).toEqual(['9103!381']);
+
+    // A retry from that state asks for nothing at all.
+    const calls = submitReview.mock.calls.length;
+    const second = await performChangesetSubmit(connection, plans, first.state);
+    expect(second.complete).toBe(true);
+    expect(submitReview.mock.calls.length).toBe(calls);
+  });
+
+  it('still retries a verdict that failed for an ordinary reason', async () => {
+    const plans = buildChangesetSubmitPlans(review, [
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' } },
+    ], 'Agent', 'you', 'Summary.', true, true);
+    const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
+      comments: submission.comments.map((c) => ({ key: c.key, ok: true, threadId: `t-${c.key}` })),
+      summaryPosted: true,
+      requestChangesApplied: false,
+      requestChangesError: new ScmError('network', 'connection reset'),
+    }));
+    const connection = { submitReview } as unknown as Connection;
+    const first = await performChangesetSubmit(connection, plans);
+    expect(first.complete).toBe(false);
+    expect(first.state.verdictRefusedRefs).toBeUndefined();
+  });
+
   it('routes comments by owning MR and retries only missing operations', async () => {
     const plans = buildChangesetSubmitPlans(review, [
       { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, projectLabel: 'hve/platform/gateway' },

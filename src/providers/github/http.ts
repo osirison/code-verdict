@@ -244,10 +244,13 @@ async function readErrorMessage(res: FetchResponseLike): Promise<string> {
     // saw an unclassifiable 422 and could not fall back.
     const detail = Array.isArray(parsed.errors)
       ? parsed.errors
-          .map((e) =>
-            typeof e === 'string'
-              ? e
-              : [e.field, e.code, e.message].filter((part) => typeof part === 'string').join(' '))
+          .map((e) => {
+            if (typeof e === 'string') return e;
+            // Anything else — null included — must not throw: the outer catch
+            // would return the raw JSON body as the user-facing message.
+            if (typeof e !== 'object' || e === null) return '';
+            return [e.field, e.code, e.message].filter((part) => typeof part === 'string').join(' ');
+          })
           .filter((part) => part !== '')
           .join('; ')
       : '';

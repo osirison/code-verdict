@@ -140,6 +140,8 @@ async function main(): Promise<void> {
   });
   check('requestChangesApplied is false', r4.requestChangesApplied === false, r4.requestChangesApplied);
   check('surfaced as requestChangesError (task 5.7)', r4.requestChangesError !== undefined, r4.requestChangesError?.message);
+  // Terminal: a caller that retries this gets the identical refusal forever.
+  check('classified verdictRefused, not a generic 422', r4.requestChangesError?.kind === 'verdictRefused', r4.requestChangesError?.kind);
   check('the summary still landed despite the refusal', r4.summaryPosted === true);
   check('not reported as a comment failure', r4.comments.every((c) => c.ok), r4.comments.map((c) => c.ok));
 
@@ -163,6 +165,7 @@ async function main(): Promise<void> {
   check('postedAsSingleReview is true — the downgrade is still one review', r5.postedAsSingleReview === true);
   check('approvalApplied is false', r5.approvalApplied === false);
   check('surfaced as approvalError (task 5.7)', r5.approvalError !== undefined, r5.approvalError?.message);
+  check('classified verdictRefused', r5.approvalError?.kind === 'verdictRefused', r5.approvalError?.kind);
   const threads5 = await conn.listThreads(ref);
   const ids5 = new Set(threads5.map((t) => t.id));
   check('threadId still resolves on the downgraded review',

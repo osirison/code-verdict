@@ -28,8 +28,7 @@ import type {
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
-import type { ScmError } from '../../platform/errors';
-import { toScmError } from '../../platform/errors';
+import { ScmError, toScmError } from '../../platform/errors';
 import type { FetchLike } from './http';
 import { GitHubHttp, hostOf, isDotCom, splitRepoId } from './http';
 import { parseGitHubSourceInput } from './sourceInput';
@@ -167,9 +166,20 @@ function reviewBody(event: ReviewEvent, summary: string | undefined): string | u
  * `COMMENT` carries no verdict, so it contributes nothing.
  */
 function verdictFailure(event: ReviewEvent, error: ScmError): Partial<SubmitResult> {
-  if (event === 'APPROVE') return { approvalApplied: false, approvalError: error };
-  if (event === 'REQUEST_CHANGES') return { requestChangesApplied: false, requestChangesError: error };
+  const reported = asVerdictError(error);
+  if (event === 'APPROVE') return { approvalApplied: false, approvalError: reported };
+  if (event === 'REQUEST_CHANGES') return { requestChangesApplied: false, requestChangesError: reported };
   return {};
+}
+
+/**
+ * A refusal is terminal, so it must not reach the caller as a generic 422 they
+ * will retry forever. Anything else passes through unchanged.
+ */
+function asVerdictError(error: ScmError): ScmError {
+  return isVerdictRefused(error)
+    ? new ScmError('verdictRefused', error.message, { status: error.status })
+    : error;
 }
 
 /**
@@ -439,15 +449,34 @@ export class GitHubConnection implements Connection {
       // COMMENT and report the verdict through its own field. Throwing here
       // would lose the whole review to a refusal of one field (task 5.7).
       if (isVerdictRefused(error)) {
-        // Same guard as above: a bodiless COMMENT review is a 422, so a
-        // submission with no summary posts its comments standalone instead.
-        const downgraded = hasSummary(submission.summary)
-          ? await this.submitAsOneReview(ref, submission, 'COMMENT')
-          : await this.submitCommentByComment(ref, submission, 'COMMENT');
-        return { ...downgraded, ...verdictFailure(event, error) };
+        return { ...(await this.submitDowngraded(ref, submission)), ...verdictFailure(event, error) };
       }
       if (error.kind !== 'staleAnchor') throw error;
       return this.submitCommentByComment(ref, submission, event);
+    }
+  }
+
+  /**
+   * The review minus its refused verdict. It needs the same stale-anchor
+   * fallback the primary path has: a submission can carry both a refused
+   * verdict and a moved line, and without this the second 422 escapes
+   * `submitReview` and loses everything the downgrade exists to save.
+   */
+  private async submitDowngraded(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+  ): Promise<SubmitResult> {
+    // A bodiless COMMENT review is itself a 422, so a submission with no
+    // summary posts its comments standalone instead.
+    if (!hasSummary(submission.summary)) {
+      return this.submitCommentByComment(ref, submission, 'COMMENT');
+    }
+    try {
+      return await this.submitAsOneReview(ref, submission, 'COMMENT');
+    } catch (e) {
+      const error = toScmError(e);
+      if (error.kind !== 'staleAnchor') throw error;
+      return this.submitCommentByComment(ref, submission, 'COMMENT');
     }
   }
 
@@ -563,8 +592,7 @@ export class GitHubConnection implements Connection {
         if (summaryToPost) result.summaryError = error;
         // GitHub refuses to let an author approve or request changes on their
         // own pull request. That is a verdict outcome, never a comment failure.
-        if (event === 'APPROVE') result.approvalError = error;
-        if (event === 'REQUEST_CHANGES') result.requestChangesError = error;
+        Object.assign(result, verdictFailure(event, error));
       }
     }
     return result;

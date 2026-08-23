@@ -168,6 +168,19 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     expect((await buildPostedReview(connection, complete, 'you', new Set())).threads).toHaveLength(1);
   });
 
+  it('measures completeness against what posted, not against what was accepted', async () => {
+    // An item accepted after a partial failure is counted but never submitted,
+    // so counts.accepted overstates what should have a thread id. Widening on
+    // that would pull every unrelated thread you started into this review.
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const entry = entryFor([threads[0]?.id as string]);
+    entry.counts.accepted = 5; // four of them never posted
+    entry.postedComments = 1;
+    const view = await buildPostedReview(connection, entry, 'you', new Set());
+    expect(view.threads).toHaveLength(1);
+  });
+
   it('second opinion answers the author, never restates the finding', async () => {
     const connection = connect();
     const threads = await connection.listThreads(REF);
