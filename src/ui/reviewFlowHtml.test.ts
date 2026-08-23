@@ -61,6 +61,28 @@ const state: FlowViewState = {
   crWebUrl: 'https://gitlab.example/hve/platform/core/-/merge_requests/2841',
 };
 
+describe('follow-up answers patch in place (#37, #38)', () => {
+  const html = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n');
+
+  it('gives each finding a thread container the client can target', () => {
+    // Without a container the only way to show an answer is to re-render the
+    // document, which rebuilds the ask box and drops focus mid-question.
+    expect(html).toContain('data-thread-for=');
+  });
+
+  it('patches the thread rather than replacing the document', () => {
+    expect(html).toContain("data.type !== 'verdict:thread'");
+    expect(html).toContain('replaceChildren');
+  });
+
+  it('renders model output as text, never as markup', () => {
+    // The answer is whatever the model returned; innerHTML here would be an
+    // injection sink fed by an external system.
+    expect(html).toContain('text.textContent = t.text');
+    expect(html).not.toContain('innerHTML = t.text');
+  });
+});
+
 describe('the submitting screen (#42)', () => {
   const submitting = (submitProgress: FlowViewState['submitProgress']): string =>
     renderReviewFlowHtml({ ...state, screen: 'submitting', submitProgress }, 'HVE Core / PR Review', 'n');

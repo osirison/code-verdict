@@ -121,7 +121,55 @@ export async function runLmChangesetAgent(
   return validateChangesetResponse(await runPrompt(agentId, prompt, options), members);
 }
 
+/**
+ * A follow-up question about one finding (#37). Unlike a review run this
+ * expects prose, not the JSON contract, so it shares the streaming, timeout
+ * and trace machinery through `streamText` and skips the parse entirely.
+ */
+export async function runFollowUpPrompt(
+  agentId: string,
+  prompt: string,
+  options?: RunAgentOptions,
+): Promise<string> {
+  return streamText(agentId, prompt, options, (text, trace) => {
+    trace.rawText(text, true);
+    trace.success(0);
+    return text.trim();
+  });
+}
+
 export async function runPrompt(agentId: string, prompt: string, options?: RunAgentOptions): Promise<AgentReviewResponse> {
+  return streamText(agentId, prompt, options, (text, trace) => {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start < 0 || end <= start) {
+      trace.rawText(text, false, 'no JSON object found');
+      throw new AgentResponseError('agent returned no JSON object');
+    }
+    let parsed: AgentReviewResponse;
+    try {
+      parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1))).response;
+    } catch (parseError) {
+      trace.rawText(text, false, parseError instanceof Error ? parseError.message : String(parseError));
+      throw parseError;
+    }
+    trace.rawText(text, true);
+    trace.success(parsed.items.length);
+    return parsed;
+  });
+}
+
+/**
+ * Stream one prompt and hand the collected text to `finish`, which runs INSIDE
+ * the try so a parse failure is classified and traced exactly like a transport
+ * failure. Everything about timeouts, cancellation and tracing lives here once.
+ */
+async function streamText<T>(
+  agentId: string,
+  prompt: string,
+  options: RunAgentOptions | undefined,
+  finish: (text: string, trace: AgentTrace) => T,
+): Promise<T> {
   const [vendor, family] = agentId.slice(LM_PREFIX.length).split('/');
   const requestId = Math.random().toString(16).slice(2, 8);
   const trace = new AgentTrace(options?.trace ?? defaultTraceSink(), requestId, vendor ?? '', family ?? '');
@@ -163,22 +211,7 @@ export async function runPrompt(agentId: string, prompt: string, options?: RunAg
       const progress = trace.fragment(fragment);
       options?.onProgress?.(progress);
     }
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start < 0 || end <= start) {
-      trace.rawText(text, false, 'no JSON object found');
-      throw new AgentResponseError('agent returned no JSON object');
-    }
-    let parsed: AgentReviewResponse;
-    try {
-      parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1))).response;
-    } catch (parseError) {
-      trace.rawText(text, false, parseError instanceof Error ? parseError.message : String(parseError));
-      throw parseError;
-    }
-    trace.rawText(text, true);
-    trace.success(parsed.items.length);
-    return parsed;
+    return finish(text, trace);
   } catch (e) {
     if (tokenSource.token.isCancellationRequested) {
       const message =

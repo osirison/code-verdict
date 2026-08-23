@@ -12,7 +12,7 @@ import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
@@ -32,7 +32,7 @@ import {
   setVerdict,
   verdictCounts,
 } from '../domain/reviewState';
-import type { Category, Review, Severity } from '../domain/types';
+import type { Category, Review, ReviewItem, Severity } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
@@ -50,6 +50,43 @@ import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
  * enough that a push lands in the banner while the reviewer is still reading.
  */
 const HEAD_POLL_MS = 45_000;
+
+type AskPreset = 'explain' | 'fix' | 'similar' | 'why' | 'freeform';
+
+/**
+ * What each chip actually asks. These used to read a pre-baked `answers` map
+ * that no agent is required to supply, so they almost always answered "the
+ * agent has nothing further on this" (#37).
+ */
+const PRESET_QUESTION: Record<Exclude<AskPreset, 'freeform'>, string> = {
+  explain: 'Explain the concrete risk this finding describes. What goes wrong, and under what conditions?',
+  fix: 'Show the smallest change that removes this problem. Give the code, and say what it changes.',
+  similar: 'Where else in this diff does the same problem appear? Quote each occurrence, or say none.',
+  why: 'Why was this flagged at this severity and confidence? Say what would make it more or less serious.',
+};
+
+/**
+ * A follow-up asks about ONE finding, so it carries that finding and the hunk
+ * it sits in — never the whole diff, which is the review run's job and a much
+ * larger request.
+ */
+function followUpPrompt(item: ReviewItem, question: string, hunk: string | undefined): string {
+  return [
+    'You are answering a reviewer\'s follow-up question about a single code review finding.',
+    'Answer in plain prose, at most two short paragraphs. No JSON, no preamble.',
+    '',
+    `Finding: ${item.title}`,
+    `Severity: ${item.severity} · confidence ${item.confidence}`,
+    `Location: ${item.file}:${item.line}`,
+    `Detail: ${item.body}`,
+    item.code ? `Flagged code:\n${item.code}` : '',
+    hunk ? `Surrounding diff:\n${hunk}` : '',
+    '',
+    `Question: ${question}`,
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+}
 
 interface SessionDraft {
   review: Review;
@@ -595,18 +632,8 @@ export class ReviewFlowPanel {
         if (!this.review) return;
         const item = this.review.items.find((i) => i.id === m.itemId);
         if (!item) return;
-        const list = (this.threads[m.itemId] ??= []);
-        if (m.preset === 'freeform') {
-          list.push({ label: 'agent · reply', text: this.freeformAnswer(m.text ?? '') });
-        } else {
-          const label = `agent · ${m.preset}`;
-          // Idempotent — asking twice does not duplicate (spec).
-          if (!list.some((t) => t.label === label)) {
-            list.push({ label, text: item.answers?.[m.preset] ?? 'The agent has nothing further on this.' });
-          }
-        }
-        await this.persistDraft();
-        break;
+        await this.ask(item, m.preset, m.text);
+        return;
       }
       case 'openInEditor': {
         // Land on the flagged line, not just the file — and only when this
@@ -745,8 +772,65 @@ export class ReviewFlowPanel {
   private submitting = false;
   private submitProgress?: SubmitProgressView;
 
-  private freeformAnswer(question: string): string {
-    return `On "${question.trim()}": the finding stands as written — the flagged line is the concrete risk, and the suggested change (where present) is the smallest fix that removes it.`;
+  /**
+   * Ask the agent about one finding, for real.
+   *
+   * Both follow-up paths used to be fiction (#37): the preset chips read an
+   * `answers` map no agent is required to supply, so they almost always said
+   * "the agent has nothing further on this", and the freeform box returned a
+   * fixed sentence with the question interpolated into it — the question was
+   * never read, let alone answered.
+   *
+   * The answer is appended through a targeted message rather than a re-render.
+   * A full render replaces the document, which drops focus out of the ask box
+   * and sends the next keystroke to the triage handler as a verdict (#38).
+   */
+  private async ask(item: ReviewItem, preset: AskPreset, text?: string): Promise<void> {
+    const question = preset === 'freeform' ? (text ?? '').trim() : PRESET_QUESTION[preset];
+    if (question === '') return;
+    const label = preset === 'freeform' ? 'agent · reply' : `agent · ${preset}`;
+    const list = (this.threads[item.id] ??= []);
+
+    // A pre-baked answer, when an agent did supply one, still beats a request.
+    const canned = preset === 'freeform' ? undefined : item.answers?.[preset];
+    if (canned !== undefined) {
+      this.appendAnswer(item.id, list, label, canned);
+      await this.persistDraft();
+      return;
+    }
+    if (!this.agentId.startsWith('lm:')) {
+      this.appendAnswer(item.id, list, label, 'This agent does not answer follow-up questions.');
+      await this.persistDraft();
+      return;
+    }
+
+    this.appendAnswer(item.id, list, label, 'Thinking…');
+    const entry = list[list.length - 1] as { label: string; text: string };
+    try {
+      const hunk = this.diff?.files.find((f) => f.newPath === item.file)?.diff;
+      entry.text = await runFollowUpPrompt(this.agentId, followUpPrompt(item, question, hunk));
+    } catch (e) {
+      const error = e instanceof AgentRunError ? e.message : toScmError(e).message;
+      entry.text = `The agent could not answer: ${error}`;
+    }
+    this.postThreadUpdate(item.id, list);
+    await this.persistDraft();
+  }
+
+  /** Appends and pushes it to the webview without rebuilding the document. */
+  private appendAnswer(
+    itemId: string,
+    list: Array<{ label: string; text: string }>,
+    label: string,
+    text: string,
+  ): void {
+    list.push({ label, text });
+    this.postThreadUpdate(itemId, list);
+  }
+
+  private postThreadUpdate(itemId: string, list: Array<{ label: string; text: string }>): void {
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({ type: 'verdict:thread', itemId, thread: list });
   }
 
   private generateSummaryText(): string {

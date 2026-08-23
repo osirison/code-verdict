@@ -588,11 +588,11 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
       <button class="chip preset" data-preset="similar">Find similar in repo</button>
       <button class="chip preset" data-preset="why">Why flagged?</button>
     </div>
-    ${view.thread
+    <div class="thread-list" data-thread-for="${e(view.item.id)}">${view.thread
       .map(
         (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
       )
-      .join('')}
+      .join('')}</div>
     <div class="ask-row">
       <span class="prompt">▸</span>
       <input class="input" id="ask" placeholder="Ask the agent about this finding…">
@@ -654,11 +654,11 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
           <button class="chip preset" data-preset="similar">Find similar in repo</button>
           <button class="chip preset" data-preset="why">Why flagged?</button>
         </div>
-        ${selected.thread
+        <div class="thread-list" data-thread-for="${e(selected.item.id)}">${selected.thread
           .map(
             (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
           )
-          .join('')}`
+          .join('')}</div>`
           : ''
       }
     </div>
@@ -879,6 +879,28 @@ document.getElementById('skip')?.addEventListener('click', () => verdict('skippe
 on('prev-item', 'move', { delta: -1 }); on('next-item', 'move', { delta: 1 });
 document.querySelectorAll('.pip[data-select]').forEach((p) => p.addEventListener('click', () => post({ type: 'select', itemId: p.dataset.select })));
 document.querySelectorAll('.preset').forEach((p) => p.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset }); }));
+// The agent's answer arrives as a message and is patched into place. Rendering
+// the whole document instead would rebuild the ask box mid-question: focus
+// falls back to <body>, and A/R/S then land on the triage handler as verdicts.
+window.addEventListener('message', (ev) => {
+  const data = ev.data;
+  if (!data || data.type !== 'verdict:thread') return;
+  const host = document.querySelector('[data-thread-for="' + String(data.itemId).replace(/"/g, '') + '"]');
+  if (!host) return;
+  host.replaceChildren(...(data.thread || []).map((t) => {
+    const entry = document.createElement('div');
+    entry.className = 'thread-entry';
+    const label = document.createElement('div');
+    label.className = 'thread-label';
+    label.textContent = t.label;
+    const text = document.createElement('div');
+    text.className = 'thread-text';
+    // textContent, not innerHTML: this is model output.
+    text.textContent = t.text;
+    entry.append(label, text);
+    return entry;
+  }));
+});
 document.getElementById('ask')?.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { const id = itemId(); if (id && ev.target.value.trim()) { post({ type: 'ask', itemId: id, preset: 'freeform', text: ev.target.value }); ev.target.value = ''; } }
 });
