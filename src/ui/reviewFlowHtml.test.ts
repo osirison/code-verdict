@@ -75,6 +75,26 @@ describe('follow-up answers patch in place (#37, #38)', () => {
     expect(html).toContain('replaceChildren');
   });
 
+  it('escapes the item id for the thread selector instead of stripping quotes', () => {
+    const id = 'itm"a\\';
+    const base = state.items[0]!;
+    const html = renderReviewFlowHtml({
+      ...state,
+      mode: 'split',
+      items: [{ ...base, thread: base.thread ?? [], item: { ...base.item, id } }],
+      selectedId: id,
+    }, 'HVE Core / PR Review', 'n');
+
+    // The attribute carries the id verbatim (HTML-escaped only), so any lookup
+    // that alters the value cannot match its own element.
+    expect(html).toContain('data-thread-for="itm&quot;a\\"');
+    // Stripping quotes broke that match, and a trailing backslash escaped the
+    // selector's closing quote so querySelector threw and the agent's answer
+    // never arrived.
+    expect(html).toContain('CSS.escape(String(data.itemId))');
+    expect(html).not.toContain("String(data.itemId).replace(");
+  });
+
   it('renders model output as text, never as markup', () => {
     // The answer is whatever the model returned; innerHTML here would be an
     // injection sink fed by an external system.

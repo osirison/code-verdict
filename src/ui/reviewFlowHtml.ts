@@ -885,7 +885,12 @@ document.querySelectorAll('.preset').forEach((p) => p.addEventListener('click', 
 window.addEventListener('message', (ev) => {
   const data = ev.data;
   if (!data || data.type !== 'verdict:thread') return;
-  const host = document.querySelector('[data-thread-for="' + String(data.itemId).replace(/"/g, '') + '"]');
+  // CSS.escape, not a hand-rolled strip: item ids come straight from the
+  // agent's JSON. Stripping quotes changed the value, so an id containing one
+  // stopped matching its own element, and an id ending in a backslash escaped
+  // the closing quote and made querySelector throw — killing the very handler
+  // that delivers the answer.
+  const host = document.querySelector('[data-thread-for="' + CSS.escape(String(data.itemId)) + '"]');
   if (!host) return;
   host.replaceChildren(...(data.thread || []).map((t) => {
     const entry = document.createElement('div');
