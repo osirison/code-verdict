@@ -11,7 +11,18 @@ import type { Vocabulary } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
 
-export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'done';
+export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'submitting' | 'done';
+
+/**
+ * What the submit is doing, mirrored from the provider. Submitting is the
+ * longest operation in the product and used to run behind an unchanged summary
+ * screen, so it looked like the panel had frozen (#42).
+ */
+export interface SubmitProgressView {
+  stage: 'comments' | 'summary' | 'verdict';
+  posted: number;
+  total: number;
+}
 
 export interface FlowHeaderInfo {
   refLabel: string;
@@ -55,6 +66,8 @@ export interface FlowViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
   screen: FlowScreen;
+  /** Set only while `screen` is 'submitting'. */
+  submitProgress?: SubmitProgressView;
   header: FlowHeaderInfo;
   agents: AgentDescriptor[];
   agentId: string;
@@ -423,6 +436,31 @@ function renderRunReview(s: FlowViewState): string {
 }
 
 // ---- §4 Running -------------------------------------------------------------
+
+function renderSubmitting(s: FlowViewState): string {
+  const p = s.submitProgress;
+  const total = p?.total ?? 0;
+  // The verdict and summary are single requests with nothing to count, so the
+  // bar only tracks comments; it holds at full while the last two go out.
+  const pct = p?.stage === 'comments' && total > 0
+    ? Math.round((p.posted / total) * 100)
+    : total > 0 ? 100 : 0;
+  const line = p === undefined
+    ? 'Starting…'
+    : p.stage === 'comments'
+      ? `Posting ${p.posted} of ${total} inline ${total === 1 ? 'comment' : 'comments'}…`
+      : p.stage === 'summary'
+        ? 'Posting the summary…'
+        : 'Applying the verdict…';
+  return `<div class="run-col">
+    <div class="spinner"></div>
+    <div class="agent-name">Submitting your review</div>
+    <div class="dim">${pct}%</div>
+    <div class="progress"><div style="width:${pct}%"></div></div>
+    <div class="runlog"><div class="now">· ${e(line)}</div></div>
+    <div class="dim">Leave this open — closing it will not stop what has already been posted.</div>
+  </div>`;
+}
 
 function renderRunning(s: FlowViewState): string {
   const agent = s.agents.find((a) => a.id === s.agentId);
@@ -879,6 +917,8 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
       ? renderRunReview(s)
       : s.screen === 'running'
         ? renderRunning(s)
+      : s.screen === 'submitting'
+        ? renderSubmitting(s)
         : s.screen === 'triage'
           ? s.mode === 'queue'
             ? renderTriageQueue(s, agentLabel)

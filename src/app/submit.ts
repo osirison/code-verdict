@@ -5,12 +5,7 @@
  * remainder — never re-posts what already landed.
  */
 import type { Connection } from '../platform/provider';
-import type {
-  AnchorRefs,
-  ChangeRequestRef,
-  ReviewCommentDraft,
-  SubmitResult,
-} from '../platform/types';
+import type { AnchorRefs, ChangeRequestRef, ReviewCommentDraft, SubmitProgressFn, SubmitResult } from '../platform/types';
 import type { Review } from '../domain/types';
 
 export function composeCommentDrafts(
@@ -72,6 +67,7 @@ export async function performSubmit(
      */
     verdictAlreadyApplied?: boolean;
   } = {},
+  onProgress?: SubmitProgressFn,
 ): Promise<SubmitResult> {
   const drafts = state.retryKeys
     ? plan.drafts.filter((d) => state.retryKeys?.has(d.key))
@@ -81,5 +77,5 @@ export async function performSubmit(
     summary: state.summaryAlreadyPosted ? undefined : plan.summary,
     requestChanges: state.verdictAlreadyApplied ? false : plan.requestChanges,
     asSingleThread: plan.asSingleThread,
-  });
+  }, onProgress);
 }

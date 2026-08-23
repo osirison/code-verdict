@@ -7,11 +7,12 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
+import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, discoverLmAgents, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runLmAgent } from '../app/lmAgent';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
@@ -37,7 +38,7 @@ import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
-import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
+import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
@@ -435,7 +436,7 @@ export class ReviewFlowPanel {
         message: err.message,
         requestId: err.requestId,
         partialCount: 0,
-        code: err.timedOut ? 'copilot.request.timeout · 90000ms' : 'copilot.request.error',
+        code: err.timedOut ? `copilot.request.timeout · ${err.timeoutReason === 'ceiling' ? CEILING_TIMEOUT_MS : INACTIVITY_TIMEOUT_MS}ms` : 'copilot.request.error',
       };
       this.render();
     }
@@ -482,7 +483,30 @@ export class ReviewFlowPanel {
 
   // ---- messages ------------------------------------------------------------------
 
+  /**
+   * Every message goes through here so a rejection cannot vanish. The panel
+   * dispatches with `void this.onMessage(...)`, so an unhandled rejection went
+   * to the extension-host console and the user saw nothing at all — a button
+   * that simply did nothing (#41). `approve` was the reported case, but every
+   * branch of the switch had the same exposure.
+   */
   private async onMessage(m: FlowMessage): Promise<void> {
+    try {
+      await this.handleMessage(m);
+    } catch (e) {
+      const error = toScmError(e);
+      // A refused verdict is an explanation, not a failure: the platform will
+      // never accept it, and there is nothing for the user to retry.
+      void (error.kind === 'verdictRefused'
+        ? vscode.window.showInformationMessage(`Verdict: ${error.message}`)
+        : vscode.window.showErrorMessage(`Verdict: ${error.message}`));
+      // The switch may have mutated state before throwing, and the screen it
+      // was heading for never rendered.
+      this.render();
+    }
+  }
+
+  private async handleMessage(m: FlowMessage): Promise<void> {
     const pod = this.pod();
     switch (m.type) {
       case 'toggleAgentOpen':
@@ -717,6 +741,10 @@ export class ReviewFlowPanel {
     this.render();
   }
 
+  /** True from the first request until the last one settles — see submit(). */
+  private submitting = false;
+  private submitProgress?: SubmitProgressView;
+
   private freeformAnswer(question: string): string {
     return `On "${question.trim()}": the finding stands as written — the flagged line is the concrete risk, and the suggested change (where present) is the smallest fix that removes it.`;
   }
@@ -742,6 +770,15 @@ export class ReviewFlowPanel {
     // Palette-invoked submits must obey the same gate as the button: a
     // fully-triaged review, from the summary screen.
     if (this.screen !== 'summary' || !allDecided(this.review)) return;
+    // The screen is NOT the guard. It stayed 'summary' for the whole submit,
+    // so a second click — which a panel that looks frozen invites — passed the
+    // check above and started a concurrent submit with the same drafts,
+    // posting every comment twice (#42).
+    if (this.submitting) return;
+    this.submitting = true;
+    this.submitProgress = undefined;
+    this.screen = 'submitting';
+    this.render();
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
     const you = pod.username ?? 'you';
@@ -761,6 +798,11 @@ export class ReviewFlowPanel {
           retryKeys: this.failedKeys,
           summaryAlreadyPosted: this.summaryPosted,
           verdictAlreadyApplied: this.verdictApplied,
+        },
+        (progress) => {
+          if (this.disposed || !this.submitting) return;
+          this.submitProgress = progress;
+          this.render();
         },
       );
 
@@ -855,6 +897,12 @@ export class ReviewFlowPanel {
       this.submitError = isScmError(e) ? e.message : e instanceof Error ? e.message : String(e);
       this.screen = 'summary';
       this.render();
+    } finally {
+      // In a finally, so a throw cannot wedge the panel: with the flag left
+      // set, every later submit would return at the guard and the review
+      // could never be sent again.
+      this.submitting = false;
+      this.submitProgress = undefined;
     }
   }
 
@@ -903,6 +951,7 @@ export class ReviewFlowPanel {
     const state: FlowViewState = {
       vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
+      submitProgress: this.submitProgress,
       acceptRate,
       memberOfChangeset: this.memberOfChangeset,
       header: {

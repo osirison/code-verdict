@@ -75,6 +75,48 @@ describe('batched review — the normal path', () => {
   });
 });
 
+describe('submit progress (#42)', () => {
+  it('ticks once per comment on the slow per-comment path', async () => {
+    const { conn, anchor } = await draft({ failReviewPositionOnBatch: true });
+    const seen: Array<[string, number, number]> = [];
+    await conn.submitReview(
+      CR,
+      {
+        comments: [
+          { key: 'a', body: 'One.', anchor },
+          { key: 'b', body: 'Two.', anchor },
+        ],
+        summary: 'Summary.',
+      },
+      (p) => seen.push([p.stage, p.posted, p.total]),
+    );
+    // Zero first, so the UI can show the total before anything has landed.
+    expect(seen.filter((s) => s[0] === 'comments')).toEqual([
+      ['comments', 0, 2],
+      ['comments', 1, 2],
+      ['comments', 2, 2],
+    ]);
+    expect(seen.some((s) => s[0] === 'summary')).toBe(true);
+  });
+
+  it('reports the batch as one step, since it is one request', async () => {
+    const { conn, anchor } = await draft();
+    const seen: Array<[string, number, number]> = [];
+    await conn.submitReview(
+      CR,
+      { comments: [{ key: 'a', body: 'One.', anchor }], summary: 'S.' },
+      (p) => seen.push([p.stage, p.posted, p.total]),
+    );
+    expect(seen).toEqual([['comments', 0, 1]]);
+  });
+
+  it('a submit with no callback behaves exactly as before', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, { comments: [{ key: 'a', body: 'One.', anchor }], summary: 'S.' });
+    expect(result.comments.map((c) => c.ok)).toEqual([true]);
+  });
+});
+
 describe('postedAsSingleReview — how the comments actually went out', () => {
   // The UI tells the user "posted as one review thread". Only the provider
   // knows whether that is true: the capability flag says the platform *can*

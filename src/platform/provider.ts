@@ -9,6 +9,7 @@ import type {
   ReviewThread,
   SourceResolution,
   SubmitResult,
+  SubmitProgressFn,
   WorkItem,
 } from './types';
 
@@ -192,7 +193,11 @@ export interface Connection {
 
   getChangeRequestDiff(ref: ChangeRequestRef): Promise<ChangeRequestDiff>;
 
-  submitReview(ref: ChangeRequestRef, submission: ReviewSubmission): Promise<SubmitResult>;
+  submitReview(
+    ref: ChangeRequestRef,
+    submission: ReviewSubmission,
+    onProgress?: SubmitProgressFn,
+  ): Promise<SubmitResult>;
 
   listThreads(ref: ChangeRequestRef): Promise<ReviewThread[]>;
   resolveThread(ref: ChangeRequestRef, threadId: string, resolved: boolean): Promise<void>;
