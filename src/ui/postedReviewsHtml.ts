@@ -17,6 +17,17 @@ export interface PostedRow {
   age: string;
 }
 
+/**
+ * A row before the fetch that would build a real `PostedRow` (issue #39):
+ * only what `ReviewHistory` already knows locally — no `view`, since that
+ * needs a live connection (threads, counts, agent label).
+ */
+export interface PostedPendingRow {
+  refLabel: string;
+  project: string;
+  age: string;
+}
+
 export interface PostedViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
@@ -28,6 +39,13 @@ export interface PostedViewState {
   expandedThreadId?: string;
   /** threadId → second-opinion text, appended on demand. */
   opinions: Record<string, string>;
+  /**
+   * True while the initial fetch is still in flight (issue #39): `rows` is
+   * empty and `pendingRows` — the local history cache, with no fetch
+   * required — renders instead, title and counts standing in as skeletons.
+   */
+  loading?: boolean;
+  pendingRows?: PostedPendingRow[];
 }
 
 export type PostedMessage =
@@ -145,13 +163,39 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
   </div>`;
 }
 
-export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): string {
-  const selected = state.rows[state.selectedIndex];
-  const body =
-    state.rows.length === 0
-      ? `<header><h1>Reviews you contributed to · ${e(state.podName)}</h1><div class="head-right"><button class="tool" id="back-dash">Dashboard</button></div></header>
-         <div class="empty">Nothing submitted yet — run a review and submit it, then track the replies here.</div>`
-      : `<header>
+/**
+ * The list header and its rows (issue #39): the reply-total badge changes
+ * with the fetch, so it lives here rather than outside the patched region —
+ * a refresh must not leave a stale "N on you" count next to fresh rows.
+ */
+function postedRowsRegion(state: PostedViewState): string {
+  if (state.loading) {
+    const rows = (state.pendingRows ?? [])
+      .map(
+        (row) => `<div class="rev-row">
+        <div>
+          <div class="rev-title">${e(row.refLabel)} · <span class="skel" style="width:130px;height:12px"></span></div>
+          <div class="breakdown skel" style="width:150px;height:10px;margin-top:4px"></div>
+        </div>
+        <div><span class="badge skel" style="width:90px;height:18px"></span></div>
+        <div class="rev-repo">${e(row.project)}</div>
+        <div class="cell-age">${e(row.age)}</div>
+      </div>`,
+      )
+      .join('');
+    return `<header>
+      <h1>Reviews you contributed to · ${e(state.podName)}</h1>
+      <span class="on-you skel" style="width:60px;height:14px"></span>
+      <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
+    </header>
+    <div class="thead"><div>${e(cap(state.vocabulary.changeRequestNoun))}</div><div>Threads</div><div>${e(cap(state.vocabulary.repoNoun))}</div><div>Age</div></div>
+    ${rows}`;
+  }
+  if (state.rows.length === 0) {
+    return `<header><h1>Reviews you contributed to · ${e(state.podName)}</h1><div class="head-right"><button class="tool" id="back-dash">Dashboard</button></div></header>
+         <div class="empty">Nothing submitted yet — run a review and submit it, then track the replies here.</div>`;
+  }
+  return `<header>
       <h1>Reviews you contributed to · ${e(state.podName)}</h1>
       <span class="on-you">${state.waitingOnYouTotal} on you</span>
       <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
@@ -173,10 +217,14 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
         <div class="cell-age">${e(row.age)}</div>
       </div>`,
       )
-      .join('')}
-    ${
-      selected
-        ? `<div class="sel-bar">
+      .join('')}`;
+}
+
+/** The selected review's thread panel (issue #39) — empty while nothing is selected, including throughout `loading`. */
+function postedDetailRegion(state: PostedViewState): string {
+  const selected = state.rows[state.selectedIndex];
+  if (!selected) return '';
+  return `<div class="sel-bar">
       <div>
         <div class="who">${e(selected.refLabel)} · ${e(selected.title)}</div>
         <div class="sub">${e(selected.project)} · submitted ${e(selected.age)} ago · ${e(selected.view.agentLabel)}</div>
@@ -191,49 +239,92 @@ export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): 
       ${selected.view.threads
         .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId], state.now, state.vocabulary))
         .join('')}
-    </div>`
-        : ''
-    }`;
+    </div>`;
+}
 
-  const script = `
-    const vscode = window.verdictVscode;
-    const post = (m) => vscode.postMessage(m);
-    document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
-    document.getElementById('back-dash')?.addEventListener('click', () => post({ type: 'backToDashboard' }));
-    document.getElementById('rerun')?.addEventListener('click', () => post({ type: 'rerun' }));
-    document.querySelectorAll('.rev-row').forEach((row) =>
-      row.addEventListener('click', () => post({ type: 'selectReview', index: Number(row.dataset.index) })));
-    document.querySelectorAll('[data-toggle]').forEach((el) =>
-      el.addEventListener('click', () => post({ type: 'toggleThread', threadId: el.dataset.toggle })));
-    document.querySelectorAll('[data-resolve]').forEach((el) =>
-      el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'resolve', threadId: el.dataset.resolve, resolved: true }); }));
-    document.querySelectorAll('[data-reopen]').forEach((el) =>
-      el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'resolve', threadId: el.dataset.reopen, resolved: false }); }));
-    document.querySelectorAll('[data-concede]').forEach((el) =>
-      el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'concede', threadId: el.dataset.concede }); }));
-    document.querySelectorAll('[data-opinion]').forEach((el) =>
-      el.addEventListener('click', (ev) => { ev.stopPropagation(); post({ type: 'secondOpinion', threadId: el.dataset.opinion }); }));
-    // One submit path for the key and the button — a single-line input has no
-    // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
-    // an Enter keydown, so plain 'Enter' keeps both working with one check.
-    // The input is never cleared here: on success 'reply' round-trips into a
-    // refresh(), which replaces this whole document and so blanks the field
-    // as a side effect; on failure nothing re-renders and the typed text
-    // stays put for a retry, instead of vanishing with the failed send.
-    function submitReply(input) {
-      const text = input.value.trim();
-      if (!text) return;
-      post({ type: 'reply', threadId: input.dataset.reply, text });
-    }
-    document.querySelectorAll('[data-reply]').forEach((el) =>
-      el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitReply(el); }));
-    document.querySelectorAll('[data-reply-send]').forEach((btn) =>
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        const input = btn.closest('.reply-row')?.querySelector('[data-reply]');
-        if (input) submitReply(input);
-      }));
-  `;
+/** Both patchable regions, from the same helpers the full page uses — one source of markup (issue #39). */
+export function renderPostedReviewsRegions(state: PostedViewState): Record<string, string> {
+  return { 'pr-rows': postedRowsRegion(state), 'pr-detail': postedDetailRegion(state) };
+}
 
-  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script, breadcrumb: { current: 'Posted reviews' } });
+/**
+ * Bound once on `document`, not per element (issue #39): a region patch
+ * replaces `#pr-rows`/`#pr-detail`'s innerHTML wholesale, which would drop
+ * any listener bound to an element inside them. Delegation means the patched
+ * markup needs no re-binding at all.
+ */
+const SCRIPT = `
+  const vscode = window.verdictVscode;
+  const post = (m) => vscode.postMessage(m);
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#back-dash')) post({ type: 'backToDashboard' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#rerun')) post({ type: 'rerun' }); });
+  document.addEventListener('click', (ev) => {
+    const row = ev.target.closest('.rev-row');
+    if (row) post({ type: 'selectReview', index: Number(row.dataset.index) });
+  });
+  // .th-head (data-toggle) and .th-body (the resolve/concede/opinion/reply
+  // actions below) are SIBLINGS inside .th-row, not ancestor and descendant —
+  // closest('[data-toggle]') starting from an action button never matches,
+  // so it cannot also fire the toggle. Never widen this to '.th-row': that
+  // would make the header and the actions the same delegation target and
+  // reintroduce exactly the double-fire the stopPropagation() calls below
+  // guard against.
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-toggle]');
+    if (el) post({ type: 'toggleThread', threadId: el.dataset.toggle });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-resolve]');
+    if (!el) return;
+    ev.stopPropagation();
+    post({ type: 'resolve', threadId: el.dataset.resolve, resolved: true });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-reopen]');
+    if (!el) return;
+    ev.stopPropagation();
+    post({ type: 'resolve', threadId: el.dataset.reopen, resolved: false });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-concede]');
+    if (!el) return;
+    ev.stopPropagation();
+    post({ type: 'concede', threadId: el.dataset.concede });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-opinion]');
+    if (!el) return;
+    ev.stopPropagation();
+    post({ type: 'secondOpinion', threadId: el.dataset.opinion });
+  });
+  // One submit path for the key and the button — a single-line input has no
+  // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
+  // an Enter keydown, so plain 'Enter' keeps both working with one check.
+  // The input is never cleared here: on success 'reply' round-trips into a
+  // refresh(), which patches #pr-detail with a freshly-built (and so blank)
+  // field — or, before the page has signalled ready, replaces the whole
+  // document, same result; on failure nothing re-renders and the typed text
+  // stays put for a retry, instead of vanishing with the failed send.
+  function submitReply(input) {
+    const text = input.value.trim();
+    if (!text) return;
+    post({ type: 'reply', threadId: input.dataset.reply, text });
+  }
+  document.addEventListener('keydown', (ev) => {
+    const el = ev.target.closest('[data-reply]');
+    if (el && ev.key === 'Enter') submitReply(el);
+  });
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-reply-send]');
+    if (!btn) return;
+    ev.stopPropagation();
+    const input = btn.closest('.reply-row')?.querySelector('[data-reply]');
+    if (input) submitReply(input);
+  });
+`;
+
+export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): string {
+  const body = `<div id="pr-rows">${postedRowsRegion(state)}</div><div id="pr-detail">${postedDetailRegion(state)}</div>`;
+  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Posted reviews' } });
 }

@@ -853,32 +853,65 @@ function renderDone(s: FlowViewState): string {
 
 // ---- dispatcher -----------------------------------------------------------------
 
+/**
+ * Bound once on \`document\` for the whole page's lifetime, not per element
+ * (issue #39): a region patch replaces \`#flow-body\`'s innerHTML wholesale
+ * on every screen transition — triage, summary, submitting, and so on all
+ * go through the same render() — which would drop any listener bound to an
+ * element inside it. Delegation means the patched markup needs no
+ * re-binding at all, so \`on()\` below now delegates by id instead of binding
+ * to the element directly, and every other per-element \`getElementById\` /
+ * \`querySelectorAll(...).forEach\` binding does the same.
+ */
 const SCRIPT = `
 const vscode = window.verdictVscode;
 const post = (m) => vscode.postMessage(m);
-const on = (id, type, extra) => document.getElementById(id)?.addEventListener('click', (ev) => { ev.preventDefault(); post({ type, ...(extra ?? {}) }); });
+const on = (id, type, extra) => document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#' + id)) return;
+  ev.preventDefault();
+  post({ type, ...(extra ?? {}) });
+});
 
 on('agent-toggle', 'toggleAgentOpen');
-document.querySelectorAll('.agent-option').forEach((el) => el.addEventListener('click', () => post({ type: 'selectAgent', agentId: el.dataset.agent })));
-document.getElementById('floor')?.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-floor]'); if (b) post({ type: 'setFloor', floor: b.dataset.floor }); });
-document.getElementById('conf')?.addEventListener('change', (ev) => post({ type: 'setConfidence', value: Number(ev.target.value) }));
-document.getElementById('conf')?.addEventListener('input', (ev) => { const el = document.getElementById('conf-val'); if (el) el.textContent = ev.target.value + '%'; });
-document.getElementById('cats')?.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-cat]'); if (b) post({ type: 'toggleCategory', category: b.dataset.cat }); });
-document.getElementById('extra')?.addEventListener('change', (ev) => post({ type: 'setInstructions', text: ev.target.value }));
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('.agent-option');
+  if (el) post({ type: 'selectAgent', agentId: el.dataset.agent });
+});
+document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-floor]'); if (b) post({ type: 'setFloor', floor: b.dataset.floor }); });
+document.addEventListener('change', (ev) => { if (ev.target.id === 'conf') post({ type: 'setConfidence', value: Number(ev.target.value) }); });
+document.addEventListener('input', (ev) => {
+  if (ev.target.id !== 'conf') return;
+  const el = document.getElementById('conf-val');
+  if (el) el.textContent = ev.target.value + '%';
+});
+document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-cat]'); if (b) post({ type: 'toggleCategory', category: b.dataset.cat }); });
+document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'setInstructions', text: ev.target.value }); });
 on('run', 'run'); on('cancel', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
-document.getElementById('mode')?.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
+document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
 on('reanchor', 'reanchor'); on('rerun', 'rerun');
 
 const itemId = () => document.querySelector('[data-item]')?.dataset.item;
 const verdict = (v, applyFix) => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: v, applyFix }); };
-document.getElementById('accept')?.addEventListener('click', () => verdict('accepted', true));
-document.getElementById('accept-comment')?.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: 'accepted', applyFix: false }); });
-document.getElementById('reject')?.addEventListener('click', () => verdict('rejected', false));
-document.getElementById('skip')?.addEventListener('click', () => verdict('skipped', false));
+document.addEventListener('click', (ev) => { if (ev.target.closest('#accept')) verdict('accepted', true); });
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#accept-comment')) return;
+  const id = itemId();
+  if (id) post({ type: 'verdict', itemId: id, verdict: 'accepted', applyFix: false });
+});
+document.addEventListener('click', (ev) => { if (ev.target.closest('#reject')) verdict('rejected', false); });
+document.addEventListener('click', (ev) => { if (ev.target.closest('#skip')) verdict('skipped', false); });
 on('prev-item', 'move', { delta: -1 }); on('next-item', 'move', { delta: 1 });
-document.querySelectorAll('.pip[data-select]').forEach((p) => p.addEventListener('click', () => post({ type: 'select', itemId: p.dataset.select })));
-document.querySelectorAll('.preset').forEach((p) => p.addEventListener('click', () => { const id = itemId(); if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset }); }));
+document.addEventListener('click', (ev) => {
+  const p = ev.target.closest('.pip[data-select]');
+  if (p) post({ type: 'select', itemId: p.dataset.select });
+});
+document.addEventListener('click', (ev) => {
+  const p = ev.target.closest('.preset');
+  if (!p) return;
+  const id = itemId();
+  if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset });
+});
 // The agent's answer arrives as a message and is patched into place. Rendering
 // the whole document instead would rebuild the ask box mid-question: focus
 // falls back to <body>, and A/R/S then land on the triage handler as verdicts.
@@ -906,25 +939,55 @@ window.addEventListener('message', (ev) => {
     return entry;
   }));
 });
-document.getElementById('ask')?.addEventListener('keydown', (ev) => {
+document.addEventListener('keydown', (ev) => {
+  if (ev.target.id !== 'ask') return;
   if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { const id = itemId(); if (id && ev.target.value.trim()) { post({ type: 'ask', itemId: id, preset: 'freeform', text: ev.target.value }); ev.target.value = ''; } }
 });
-document.getElementById('open-editor')?.addEventListener('click', (ev) => { ev.preventDefault(); const el = ev.currentTarget; post({ type: 'openInEditor', file: el.dataset.file, line: Number(el.dataset.line) }); });
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('#open-editor');
+  if (!el) return;
+  ev.preventDefault();
+  post({ type: 'openInEditor', file: el.dataset.file, line: Number(el.dataset.line) });
+});
 on('gen-summary', 'generateSummary');
 
-document.getElementById('summary-text')?.addEventListener('change', (ev) => post({ type: 'editSummary', text: ev.target.value }));
+document.addEventListener('change', (ev) => { if (ev.target.id === 'summary-text') post({ type: 'editSummary', text: ev.target.value }); });
 on('regenerate', 'regenerate');
-document.getElementById('final-note')?.addEventListener('change', (ev) => post({ type: 'setNote', text: ev.target.value }));
-document.querySelectorAll('[data-note]').forEach((c) => c.addEventListener('click', () => { const t = document.getElementById('final-note'); if (t) { t.value = c.dataset.note; post({ type: 'setNote', text: c.dataset.note }); } }));
-document.getElementById('clear-note')?.addEventListener('click', (ev) => { ev.preventDefault(); const t = document.getElementById('final-note'); if (t) t.value = ''; post({ type: 'setNote', text: '' }); });
-document.getElementById('opt-thread')?.addEventListener('change', () => post({ type: 'toggleOption', option: 'postThread' }));
-document.getElementById('opt-changes')?.addEventListener('change', () => post({ type: 'toggleOption', option: 'requestChanges' }));
+document.addEventListener('change', (ev) => { if (ev.target.id === 'final-note') post({ type: 'setNote', text: ev.target.value }); });
+document.addEventListener('click', (ev) => {
+  const c = ev.target.closest('[data-note]');
+  if (!c) return;
+  const t = document.getElementById('final-note');
+  if (t) { t.value = c.dataset.note; post({ type: 'setNote', text: c.dataset.note }); }
+});
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#clear-note')) return;
+  ev.preventDefault();
+  const t = document.getElementById('final-note');
+  if (t) t.value = '';
+  post({ type: 'setNote', text: '' });
+});
+document.addEventListener('change', (ev) => { if (ev.target.id === 'opt-thread') post({ type: 'toggleOption', option: 'postThread' }); });
+document.addEventListener('change', (ev) => { if (ev.target.id === 'opt-changes') post({ type: 'toggleOption', option: 'requestChanges' }); });
 on('submit', 'submit'); on('retry-submit', 'retrySubmit'); on('reconnect', 'reconnect'); on('back-triage', 'backToTriage'); on('copy-md', 'copyMarkdown');
 on('approve', 'approve'); on('lower-bar', 'lowerBar'); on('back-dash', 'backToDashboard');
 on('track-replies', 'trackReplies'); on('open-mr', 'openMr'); on('tuning-link', 'openTuning');
-document.getElementById('review-single')?.addEventListener('click', (ev) => { ev.preventDefault(); const el = document.querySelector('[data-item]'); if (el) post({ type: 'reviewSingle', repoId: el.dataset.repoId, number: el.dataset.crNumber }); });
-document.getElementById('open-changeset')?.addEventListener('click', (ev) => { ev.preventDefault(); post({ type: 'openChangeset', changesetId: ev.currentTarget.dataset.changeset }); });
-document.querySelectorAll('[data-cross-target]').forEach((b) => b.addEventListener('click', () => post({ type: 'setCrossTarget', itemId: b.dataset.crossTarget, repoId: b.dataset.targetRepo, location: b.dataset.targetLocation })));
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#review-single')) return;
+  ev.preventDefault();
+  const el = document.querySelector('[data-item]');
+  if (el) post({ type: 'reviewSingle', repoId: el.dataset.repoId, number: el.dataset.crNumber });
+});
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('#open-changeset');
+  if (!el) return;
+  ev.preventDefault();
+  post({ type: 'openChangeset', changesetId: el.dataset.changeset });
+});
+document.addEventListener('click', (ev) => {
+  const b = ev.target.closest('[data-cross-target]');
+  if (b) post({ type: 'setCrossTarget', itemId: b.dataset.crossTarget, repoId: b.dataset.targetRepo, location: b.dataset.targetLocation });
+});
 
 // Keyboard (spec §12 Triage group) — active while the review tab has focus.
 document.addEventListener('keydown', (ev) => {
@@ -938,12 +1001,16 @@ document.addEventListener('keydown', (ev) => {
 });
 `;
 
-export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce: string): string {
-  const body =
-    s.screen === 'agent'
-      ? renderRunReview(s)
-      : s.screen === 'running'
-        ? renderRunning(s)
+/**
+ * The screen-dependent part of the page (issue #39), shared by the full page
+ * and the region patch — one source of markup, no duplication. Wrapped by
+ * both in the same `id="flow-body"` container.
+ */
+export function renderReviewFlowBody(s: FlowViewState, agentLabel: string): string {
+  return s.screen === 'agent'
+    ? renderRunReview(s)
+    : s.screen === 'running'
+      ? renderRunning(s)
       : s.screen === 'submitting'
         ? renderSubmitting(s)
         : s.screen === 'triage'
@@ -957,20 +1024,59 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
             : s.screen === 'summary'
               ? renderSummary(s)
               : renderDone(s);
-  const title =
-    s.changeset && s.screen !== 'done'
-      ? `Verdict: Review · ${s.changeset.memberCount} ${s.vocabulary.changeRequestAbbrev}s`
-      : s.screen === 'agent'
+}
+
+/** The breadcrumb's current-crumb text — shared so the region patch can update it without a full page's worth of markup. */
+export function reviewFlowCrumb(s: Pick<FlowViewState, 'changeset' | 'header'>): string {
+  return s.changeset ? s.changeset.name : `${s.header.refLabel} · ${s.header.title}`;
+}
+
+function reviewFlowTitle(s: FlowViewState): string {
+  return s.changeset && s.screen !== 'done'
+    ? `Verdict: Review · ${s.changeset.memberCount} ${s.vocabulary.changeRequestAbbrev}s`
+    : s.screen === 'agent'
       ? `Verdict: Run review · ${s.header.refLabel}`
       : s.screen === 'done'
         ? `Verdict: Posted · ${s.header.refLabel}`
         : `Verdict: Review · ${s.header.refLabel}`;
+}
+
+export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce: string): string {
+  const body = `<div id="flow-body">${renderReviewFlowBody(s, agentLabel)}</div>`;
   return renderPage({
-    title,
+    title: reviewFlowTitle(s),
     nonce,
     css: CSS,
     body,
     script: SCRIPT,
-    breadcrumb: { current: s.changeset ? s.changeset.name : `${s.header.refLabel} · ${s.header.title}` },
+    breadcrumb: { current: reviewFlowCrumb(s) },
+  });
+}
+
+/**
+ * First paint on navigation, before the fetch (issue #39): only `refLabel`
+ * and `projectPath` are known synchronously — `this.cr` is not yet assigned,
+ * so a full `FlowViewState` cannot be constructed. Wrapped in the same
+ * `id="flow-body"` container so the data patch that lands later can replace
+ * it wholesale, and ships the same script so delegated listeners are already
+ * armed by the time that patch arrives.
+ */
+export function renderReviewFlowLoadingHtml(header: { refLabel: string; projectPath: string }, nonce: string): string {
+  const e2 = e;
+  const body = `<div id="flow-body"><div class="wrap">
+    <div class="subline">${e2(header.refLabel)} · ${e2(header.projectPath)}</div>
+    <div class="run-col" style="margin:60px auto 0">
+      <div class="spinner"></div>
+      <div class="skel" style="width:220px;height:16px;margin:0 auto"></div>
+      <div class="skel" style="width:320px;height:12px;margin:0 auto"></div>
+    </div>
+  </div></div>`;
+  return renderPage({
+    title: `Verdict: Run review · ${header.refLabel}`,
+    nonce,
+    css: CSS,
+    body,
+    script: SCRIPT,
+    breadcrumb: { current: header.refLabel },
   });
 }

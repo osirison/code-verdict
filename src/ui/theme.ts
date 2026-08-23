@@ -147,9 +147,20 @@ a { color: var(--link); text-decoration: none; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-/* The only two animations, both deliberate (spec: tool, not showcase). */
+/* Three animations, each deliberate (spec: tool, not showcase): tin/spin for
+   motion, skel-pulse for the loading placeholders below (issue #39). */
 @keyframes tin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes skel-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+
+/*
+ * Loading-skeleton placeholder (issue #39): a screen's first paint, before
+ * the fetch that would otherwise leave the previous screen frozen on
+ * navigation. Callers size it with an inline style (width/height) at each
+ * use site, matching how this codebase already sizes one-off bars (e.g. the
+ * submit progress bar in reviewFlowHtml).
+ */
+.skel { display: inline-block; background: var(--bg3); border: 1px solid var(--line2); border-radius: 4px; color: transparent; animation: skel-pulse 1.4s ease-in-out infinite; }
 
 .mono { font-family: var(--font-mono); }
 .dim { color: var(--fg-dim); }
@@ -360,6 +371,59 @@ const KEYS_SCRIPT = `
 })();
 `;
 
+/**
+ * Shared region-patch mechanism (issue #39): lets a panel replace a piece of
+ * an already-loaded page instead of the whole document, so the previous
+ * screen never has to sit frozen for a whole fetch on navigation. Bundled
+ * into every full-page bootstrap (see `renderPage`) — it is inert until an
+ * `AppRoute.postRegions` call actually posts a `verdict:regions` message.
+ *
+ * `verdictReady` tells `AppSurface` this listener is armed; until it lands,
+ * `postRegions` reports "not ready" and the caller falls back to a full
+ * `setHtml`, so readiness is never load-bearing for correctness.
+ */
+export const REGIONS_SCRIPT = `
+;(() => {
+  window.verdictVscode.postMessage({ type: 'verdictReady' });
+  window.addEventListener('message', (ev) => {
+    const data = ev.data;
+    if (!data || data.type !== 'verdict:regions') return;
+    // A patch replaces innerHTML wholesale, which would otherwise drop focus
+    // to <body> and send the next keystroke to a screen's keyboard handler
+    // as though it were a real shortcut (the other half of #38 — a full
+    // re-render used to do exactly this). Snapshot focus/selection/scroll,
+    // patch, then restore them.
+    //
+    // Restore focus and selection ONLY — never .value: the re-rendered value
+    // is the panel's own state (e.g. a regenerated summary), and restoring a
+    // stale typed value would clobber it.
+    const active = document.activeElement;
+    const focusId = active && active.id ? active.id : undefined;
+    let selStart, selEnd;
+    try { selStart = active ? active.selectionStart : undefined; selEnd = active ? active.selectionEnd : undefined; } catch {}
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    for (const id of Object.keys(data.regions)) {
+      // Not every region id exists on every screen (e.g. a page with no
+      // breadcrumb) — skip rather than throw, and let the rest of the batch
+      // still land.
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = data.regions[id];
+    }
+    if (focusId) {
+      const restored = document.getElementById(focusId);
+      if (restored) {
+        restored.focus();
+        if (selStart != null && selEnd != null) {
+          try { restored.setSelectionRange(selStart, selEnd); } catch {}
+        }
+      }
+    }
+    window.scrollTo(scrollX, scrollY);
+  });
+})();
+`;
+
 export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -391,15 +455,19 @@ export function renderPage(opts: {
   codicons?: CodiconAssets;
 }): string {
   const breadcrumb = opts.breadcrumb
-    ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
+    ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current" id="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
     : '';
   const body = opts.embedded
     ? opts.body
     : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>${renderKeysOverlay()}`;
   const keysScript = opts.embedded ? '' : KEYS_SCRIPT;
-  const bootstrap = opts.script || opts.breadcrumb
-    ? `window.verdictVscode=acquireVsCodeApi();document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));${opts.script ?? ''}${keysScript}`
-    : keysScript;
+  const regionsScript = opts.embedded ? '' : REGIONS_SCRIPT;
+  // REGIONS_SCRIPT needs the vscode API to post `verdictReady`, so acquire it
+  // for every full (non-embedded) page — not only when the caller supplies
+  // its own script or a breadcrumb, as before #39.
+  const bootstrap = opts.script || opts.breadcrumb || !opts.embedded
+    ? `window.verdictVscode=acquireVsCodeApi();${opts.breadcrumb ? `document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));` : ''}${opts.script ?? ''}${keysScript}${regionsScript}`
+    : `${keysScript}${regionsScript}`;
   const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';
   const codicons = opts.codicons;
   const styleSrc = codicons ? `'nonce-${opts.nonce}' ${codicons.cspSource}` : `'nonce-${opts.nonce}'`;

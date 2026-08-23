@@ -10,6 +10,7 @@ const panel = vi.hoisted(() => ({
   reveal: vi.fn(),
   webview: {
     html: '',
+    postMessage: vi.fn(),
     onDidReceiveMessage: vi.fn((handler: (message: unknown) => void) => {
       handlers.message = handler;
       return { dispose: vi.fn() };
@@ -32,6 +33,7 @@ describe('AppSurface', () => {
   beforeEach(() => {
     createWebviewPanel.mockClear();
     panel.reveal.mockClear();
+    panel.webview.postMessage.mockClear();
   });
 
   it('reuses one panel and replaces route message and back handlers', async () => {
@@ -61,6 +63,45 @@ describe('AppSurface', () => {
     expect(panel.title).toBe('Verdict: Review');
 
     routeSubscription.dispose();
+    handlers.dispose?.();
+  });
+
+  it('postRegions falls back to setHtml until verdictReady, and setHtml resets readiness', async () => {
+    const { AppSurface } = await import('./appSurface.js');
+    const dashboard = AppSurface.show('dashboard', 'Verdict');
+
+    // Not ready yet — the caller must fall back to a full render.
+    expect(dashboard.postRegions({ body: '<p>1</p>' })).toBe(false);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+
+    handlers.message?.({ type: 'verdictReady' });
+    expect(dashboard.postRegions({ body: '<p>2</p>' })).toBe(true);
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: 'verdict:regions',
+      regions: { body: '<p>2</p>' },
+    });
+
+    dashboard.setHtml('<p>fresh</p>');
+    expect(panel.webview.html).toBe('<p>fresh</p>');
+    expect(dashboard.postRegions({ body: '<p>3</p>' })).toBe(false);
+
+    handlers.dispose?.();
+  });
+
+  it('drops a patch queued by a route that is no longer active', async () => {
+    const { AppSurface } = await import('./appSurface.js');
+    const dashboard = AppSurface.show('dashboard', 'Verdict');
+    handlers.message?.({ type: 'verdictReady' });
+
+    // Navigate away before the stale route's data arrives.
+    AppSurface.show('review', 'Verdict: Review');
+    panel.webview.postMessage.mockClear();
+
+    // Dropped, not delivered — and reported as handled so the caller does
+    // not fall back to setHtml() and clobber the screen now showing.
+    expect(dashboard.postRegions({ body: '<p>stale</p>' })).toBe(true);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+
     handlers.dispose?.();
   });
 });

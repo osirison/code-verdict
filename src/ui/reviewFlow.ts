@@ -39,8 +39,9 @@ import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
-import { renderReviewFlowHtml } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
+import { escapeHtml } from './theme';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
 
@@ -287,8 +288,36 @@ export class ReviewFlowPanel {
     this.agentOpen = false;
     this.memberOfChangeset = undefined;
 
+    // First paint on navigation (#39): refLabel() and the project path need
+    // only this.ref (set above) and this.pod(), both synchronous — show
+    // them immediately instead of leaving the previous screen frozen for
+    // the whole fetch below. load() only ever runs for a fresh navigation —
+    // an in-place state change (a verdict, a mode switch, ...) goes through
+    // render() alone — so this always repaints.
+    const pod = this.pod();
+    this.route.setHtml(renderReviewFlowLoadingHtml(
+      {
+        refLabel: this.refLabel(),
+        projectPath: pod.repos?.find((r) => r.id === ref.repoId)?.path ?? ref.repoId,
+      },
+      crypto.randomBytes(16).toString('hex'),
+    ));
+
     const connection = await this.connection();
-    const crs = await connection.listOpenChangeRequests([ref.repoId]);
+    if (this.disposed || loadToken !== this.loadSeq) return;
+    // listOpenChangeRequests, getChangeRequestDiff and discoverLmAgents are
+    // independent reads — getChangeRequestDiff needs only ref, and
+    // discoverLmAgents needs nothing, so the previous sequential chain was
+    // pure latency (#39). Attach a no-op catch to the last two immediately:
+    // if the CR turns out to be gone below, whichever of them rejects must
+    // not surface as an unhandled rejection or bury the clearer "no longer
+    // open" message with a second, unrelated one.
+    const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
+    const diffPromise = connection.getChangeRequestDiff(ref);
+    const agentsPromise = discoverLmAgents();
+    diffPromise.catch(() => undefined);
+    agentsPromise.catch(() => undefined);
+    const crs = await crsPromise;
     if (this.disposed || loadToken !== this.loadSeq) return;
     const cr = crs.find((c) => c.ref.number === ref.number);
     if (!cr) {
@@ -297,10 +326,9 @@ export class ReviewFlowPanel {
       return;
     }
     this.cr = cr;
-    this.diff = await connection.getChangeRequestDiff(ref);
-    this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await discoverLmAgents())];
+    this.diff = await diffPromise;
+    this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await agentsPromise)];
     if (this.disposed || loadToken !== this.loadSeq) return;
-    const pod = this.pod();
     if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
       this.agentId = pod.agentId;
     }
@@ -1010,7 +1038,13 @@ export class ReviewFlowPanel {
   }
 
   private render(): void {
-    if (this.disposed) return;
+    // The loading page (#39) ships the full page script, so the keyboard
+    // handler and the message dispatch are both armed during the fetch
+    // window in load() — a stray keypress (jumpSeverity) or an unhandled
+    // message type can reach here through the switch's implicit fall-through
+    // to render() before this.cr is assigned. Before it exists, the loading
+    // page already showing is the correct thing to leave on screen.
+    if (this.disposed || !this.cr) return;
     const pod = this.pod();
     const stats = this.diff ? diffStats(this.diff.files.map((f) => f.diff)) : { added: 0, removed: 0 };
     const items: TriageItemView[] = (this.review?.items ?? []).map((item) => ({
@@ -1086,14 +1120,24 @@ export class ReviewFlowPanel {
       doneSentence: this.doneSentence,
       crWebUrl: this.cr.webUrl,
     };
-    const nonce = crypto.randomBytes(16).toString('hex');
     this.panel.title =
       this.screen === 'agent'
         ? `Verdict: Run review · ${state.header.refLabel}`
         : this.screen === 'done'
           ? `Verdict: Posted · ${state.header.refLabel}`
           : `Verdict: Review · ${state.header.refLabel}`;
-    this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), nonce);
+    // Patch the region in place rather than replacing the whole document
+    // (#39) — render() runs on every screen transition (triage, summary,
+    // submitting, ...), so this is what stops each of those from rebuilding
+    // the entire page. Falling back to setHtml only when the page has not
+    // yet signalled ready is exactly today's always-full-render behaviour.
+    const agentLabel = this.agentLabel();
+    if (!this.route.postRegions({
+      'flow-body': renderReviewFlowBody(state, agentLabel),
+      'app-crumb-current': escapeHtml(reviewFlowCrumb(state)),
+    })) {
+      this.route.setHtml(renderReviewFlowHtml(state, agentLabel, crypto.randomBytes(16).toString('hex')));
+    }
     this.deps.onSidebarState?.(this.review ? {
       headline: `${state.header.refLabel} · ${state.header.title}`,
       refLabel: state.header.refLabel,

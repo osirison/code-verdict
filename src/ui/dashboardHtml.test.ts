@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { VERDICT_TOKENS_CSS } from './theme';
 import type { DashboardViewState } from './dashboardHtml';
-import { renderDashboardHtml } from './dashboardHtml';
+import { renderDashboardHtml, renderDashboardLoadingHtml } from './dashboardHtml';
 
 const state: DashboardViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -144,5 +144,38 @@ describe('dashboard fidelity (spec §2)', () => {
     expect(html).toContain(`style-src 'nonce-nonce123'`);
     expect(html).toContain(`script-src 'nonce-nonce123'`);
     expect(html).not.toContain('http://');
+  });
+
+  it('binds listeners once on document, not per element (issue #39 region patching)', () => {
+    // A region patch replaces #db-body's innerHTML wholesale, which drops
+    // any listener bound directly to an element inside it — delegation on
+    // document survives the patch without re-binding.
+    expect(html).not.toContain("querySelectorAll('[data-pod-id]').forEach");
+    expect(html).toContain("ev.target.closest('[data-pod-id]')");
+    expect(html).not.toContain("row.addEventListener('click', open)");
+    expect(html).toContain("ev.target.closest('.mr-row')");
+  });
+});
+
+describe('loading skeleton (issue #39 — navigation must not wait on the fetch)', () => {
+  it('shows the pod name and meta immediately, with skeleton placeholders and no MR rows', () => {
+    const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'nonce123');
+
+    expect(html).toContain('Platform squad');
+    expect(html).toContain('6 projects · 9 open MRs');
+    expect(html).toContain('class="skel"');
+    expect(html).not.toContain('class="mr-row" data-repo=');
+    expect(html).not.toContain('data-number=');
+  });
+
+  it('wraps the skeleton in the same #db-body region the data patch targets', () => {
+    const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'n');
+    expect(html).toContain('id="db-body"');
+  });
+
+  it('ships the full page script so delegated listeners are already armed before data arrives', () => {
+    const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'n');
+    expect(html).toContain("post({ type: 'refresh' })");
+    expect(html).toContain("ev.target.closest('.mr-row')");
   });
 });
