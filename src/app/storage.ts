@@ -3,6 +3,23 @@
  * `vscode` module. `vscode.Memento` and `vscode.SecretStorage` satisfy
  * these structurally.
  */
+/**
+ * Read-modify-write is the shape of nearly every store built on this —
+ * `PodStore.upsert`, `ReviewHistory.add`, `ReviewRunStore.record`,
+ * `ThreadFlags.concede`, `ManualChangesetStore.add`. It is safe on one
+ * condition, which the interface states rather than leaves to luck: **`get`
+ * reflects a preceding `update` immediately, without waiting for that
+ * update's promise to settle.** `vscode.Memento` satisfies it (it writes its
+ * in-memory value synchronously and persists afterwards), and so must any
+ * test double.
+ *
+ * Given that, a read and a write with no `await` between them cannot
+ * interleave with another caller's — JavaScript runs the pair to completion.
+ * Put an `await` between them and the guarantee is gone: two callers read the
+ * same array and the second write drops the first's entry. So keep the pair
+ * synchronous; do not reach for a queue or a lock, which would only hide
+ * where the real requirement lives.
+ */
 export interface KeyValueStore {
   get<T>(key: string): T | undefined;
   update(key: string, value: unknown): Thenable<void>;

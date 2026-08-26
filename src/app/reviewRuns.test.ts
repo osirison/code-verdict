@@ -52,6 +52,26 @@ describe('review-run store', () => {
     expect(byRef.get('4477!2841')?.findingCount).toBe(2);
   });
 
+  // Review comment on PR #47 claimed `record` can lose a run: two concurrent
+  // calls read the same array, both append, the second write wins. It cannot
+  // happen — `list()` and `store.update()` sit in one synchronous block with
+  // no await between them, so nothing can run in between — but the claim
+  // deserves the scenario it named, run rather than argued.
+  it('keeps both runs when two records for different change requests overlap', async () => {
+    const store = new ReviewRunStore(memoryStore());
+
+    // Deliberately not awaited in turn: both calls are in flight together,
+    // which is exactly the interleaving the finding described.
+    await Promise.all([
+      store.record(run({ crNumber: '2841', findingCount: 3 })),
+      store.record(run({ crNumber: '2999', findingCount: 1 })),
+    ]);
+
+    expect(store.list()).toHaveLength(2);
+    expect(store.byRef().get('9101!2841')?.findingCount).toBe(3);
+    expect(store.byRef().get('9101!2999')?.findingCount).toBe(1);
+  });
+
   it('reads an empty store without throwing, and never hands out its own array', async () => {
     const backing = memoryStore();
     const store = new ReviewRunStore(backing);
