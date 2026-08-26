@@ -21,7 +21,9 @@ function thread(overrides: Partial<PostedThreadView> = {}): PostedThreadView {
     line: 63,
     status: 'replied',
     yourBody: 'This logs the refresh token in cleartext.',
-    replies: [{ author: 'dana', body: 'Pushed a fix — can you re-check?', at: '2026-08-20T11:00:00.000Z' }],
+    replies: [
+      { author: 'dana', body: 'Pushed a fix — can you re-check?', at: '2026-08-20T11:00:00.000Z', yours: false },
+    ],
     ...overrides,
   };
 }
@@ -155,8 +157,8 @@ describe('refresh renders whatever the state carries (#34 — data → pixels)',
         row([
           thread({
             replies: [
-              { author: 'dana', body: 'First pass — looks fine to me.', at: '2026-08-20T11:00:00.000Z' },
-              { author: 'dana', body: 'Posted from the web UI directly.', at: '2026-08-21T09:00:00.000Z' },
+              { author: 'dana', body: 'First pass — looks fine to me.', at: '2026-08-20T11:00:00.000Z', yours: false },
+              { author: 'dana', body: 'Posted from the web UI directly.', at: '2026-08-21T09:00:00.000Z', yours: false },
             ],
           }),
         ]),
@@ -183,6 +185,84 @@ describe('refresh renders whatever the state carries (#34 — data → pixels)',
     expect(collapsed).not.toContain('class="th-body"');
     expect(expanded).toContain('class="th-body"');
     expect(expanded).toContain('Pushed a fix — can you re-check?');
+  });
+});
+
+describe('a reply of yours is not the author replying to you', () => {
+  /**
+   * The `class="entry …"` attribute of the block that renders `body`. Anchors
+   * on the body itself rather than on ordinal position, so it keeps testing
+   * the same thing if entries are ever reordered or one is added between.
+   */
+  function entryClassOf(html: string, body: string): string {
+    const at = html.indexOf(body);
+    expect(at).toBeGreaterThan(-1);
+    const open = html.lastIndexOf('<div class="entry ', at);
+    return html.slice(open, html.indexOf('>', open));
+  }
+
+  it('renders your reply and the author\'s in different entry classes', () => {
+    // `replies` now carries both, so the class has to be picked per reply.
+    // Rendering yours in the author's colour would show the author conceding
+    // your own argument back to you — the CSS has carried .entry-you and
+    // .entry-author for exactly this distinction all along.
+    const html = renderPostedReviewsHtml(
+      state(
+        [
+          row([
+            thread({
+              replies: [
+                { author: 'dana', body: 'The shipper scrubs secrets in prod.', at: '2026-08-20T11:00:00.000Z', yours: false },
+                { author: 'you', body: 'It scrubs known keys only, not this one.', at: '2026-08-21T09:00:00.000Z', yours: true },
+              ],
+            }),
+          ]),
+        ],
+        { expandedThreadId: 'thread-1' },
+      ),
+      'nonce123',
+    );
+
+    expect(entryClassOf(html, 'The shipper scrubs secrets in prod.')).toContain('entry-author');
+    expect(entryClassOf(html, 'It scrubs known keys only, not this one.')).toContain('entry-you');
+    expect(entryClassOf(html, 'It scrubs known keys only, not this one.')).not.toContain('entry-author');
+    // The posted comment keeps its own block — it is the finding, not a reply.
+    expect(entryClassOf(html, 'This logs the refresh token in cleartext.')).toContain('entry-you');
+    expect(html).toContain('you · posted comment');
+    // Your reply is labelled as yours, not as an @-mention of your own login.
+    expect(html).not.toContain('@you');
+  });
+
+  it('renders a thread whose every reply is yours instead of dropping the conversation', () => {
+    // The reported case: on a change request you authored yourself every note
+    // is yours, and the screen showed only the posted comment.
+    const html = renderPostedReviewsHtml(
+      state(
+        [
+          row([
+            thread({
+              status: 'awaiting',
+              replies: [
+                { author: 'you', body: 'Still reproduces on main.', at: '2026-08-20T11:00:00.000Z', yours: true },
+                { author: 'you', body: 'Trace attached in the pipeline log.', at: '2026-08-21T09:00:00.000Z', yours: true },
+              ],
+            }),
+          ]),
+        ],
+        { expandedThreadId: 'thread-1' },
+      ),
+      'nonce123',
+    );
+
+    const first = html.indexOf('Still reproduces on main.');
+    const second = html.indexOf('Trace attached in the pipeline log.');
+    expect(first).toBeGreaterThan(-1);
+    expect(second).toBeGreaterThan(first);
+    // Asserted per entry, not over the whole page: `.entry-author` is also a
+    // CSS rule in the page's style block, so a document-wide check would pass
+    // whatever the entries actually rendered as.
+    expect(entryClassOf(html, 'Still reproduces on main.')).not.toContain('entry-author');
+    expect(entryClassOf(html, 'Trace attached in the pipeline log.')).not.toContain('entry-author');
   });
 });
 

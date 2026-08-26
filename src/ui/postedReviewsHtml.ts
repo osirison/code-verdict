@@ -178,7 +178,13 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
       <div class="entry entry-you"><div class="entry-label">you · posted comment</div>${e(t.yourBody)}</div>
       ${t.replies
         .map(
-          (r) => `<div class="entry entry-author"><div class="entry-label">@${e(r.author)} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
+          // The entry class is chosen per reply, not fixed to .entry-author:
+          // `replies` carries your own notes as well as theirs, and a reply of
+          // yours rendered in the author's colour reads as the author
+          // conceding your point back to you. .entry-you is the same treatment
+          // the posted comment above gets, which is what makes the alternation
+          // legible as a conversation.
+          (r) => `<div class="entry ${r.yours ? 'entry-you' : 'entry-author'}"><div class="entry-label">${r.yours ? 'you' : `@${e(r.author)}`} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
         )
         .join('')}
       ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — ${e(vocabulary.platformName)} dropped the anchor.</div>` : ''}

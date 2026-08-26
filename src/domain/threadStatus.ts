@@ -22,6 +22,15 @@ export function deriveThreadStatus(thread: ReviewThread, ctx: ThreadStatusContex
   if (!thread.anchorPresent) return 'stale';
 
   const last = thread.notes[thread.notes.length - 1];
+  // On a change request you authored yourself the reviewer and the author are
+  // one person, so the last note is always yours and every thread reads
+  // `awaiting` no matter how long the conversation ran. Resist special-casing
+  // that here: awaiting/replied answers "whose turn is it", and when both
+  // turns are the same person the question genuinely has no answer — a status
+  // invented to paper over it would be a claim about nobody. The real
+  // complaint behind it was that the conversation was invisible, and that is
+  // fixed where it belongs, in `toThreadView`, which keeps your own notes in
+  // `replies` instead of filtering them out.
   if (last && last.author.username !== ctx.you) return 'replied';
   return 'awaiting';
 }

@@ -264,3 +264,100 @@ describe('posted reviews against the emulator (spec §9, handoff §8)', () => {
     expect(opinion).toContain(replied?.replies[0]?.body.split('\n')[0]?.slice(0, 30));
   });
 });
+
+// "On Post Review screen, the refresh does not load the author's comments."
+// The refresh loaded them; `toThreadView` filtered every note you wrote out
+// of `replies`, and `threadRow` renders nothing but `yourBody` plus one block
+// per reply — so your own notes were fetched, mapped and discarded before any
+// of them could reach a screen.
+//
+// Nothing caught it because the only path these tests had to a second note
+// was the emulator's `/reply` control route, which swaps the author to `kai`
+// whenever it would otherwise be you (emulator/engine.ts). The fake was
+// written from the same assumption as the code — that a reply is always
+// somebody else's — so it could only ever confirm that assumption. This is
+// the failure mode docs/ARCHITECTURE.md names when it says fakeGitHub.ts's
+// shapes were "captured from the live API rather than written from memory".
+// The tests below therefore go through `connection.replyToThread`, the same
+// call this screen's own Reply box makes, which posts as you for real.
+describe("your own notes on a thread (the screen used to discard them)", () => {
+  /** The seeded thread that already carries one foreign reply after yours. */
+  async function repliedThread(connection: ReturnType<typeof connect>) {
+    const threads = await connection.listThreads(REF);
+    const target = threads.find((t) => t.notes.length > 1 && !t.resolved);
+    expect(target).toBeDefined();
+    return { threads, target };
+  }
+
+  it('keeps a note you wrote after the first, flagged as yours, alongside the author\'s', async () => {
+    const connection = connect();
+    const { threads, target } = await repliedThread(connection);
+    await connection.replyToThread(REF, target?.id as string, 'The role check is not in this diff.');
+
+    const view = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const thread = view.threads.find((t) => t.threadId === target?.id);
+    // Both notes after the posted comment survive, in order, each tagged with
+    // who wrote it — the author's first, then yours.
+    expect(thread?.replies.map((r) => r.yours)).toEqual([false, true]);
+    expect(thread?.replies[0]?.author).toBe('kai');
+    expect(thread?.replies[1]?.body).toBe('The role check is not in this diff.');
+    expect(thread?.replies[1]?.author).toBe('you');
+    // The posted comment stays the finding, not the first entry of the thread.
+    expect(thread?.yourBody).toBe(target?.notes[0]?.body);
+  });
+
+  it('shows the whole conversation on a thread where every note is yours', async () => {
+    // The reported symptom: on a change request you authored yourself, every
+    // reply is yours, so filtering yours out left the thread looking frozen at
+    // the posted comment. Two replies through the reply box, both yours.
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const awaiting = threads.find((t) => t.notes.length === 1 && !t.resolved && t.anchorPresent);
+    expect(awaiting).toBeDefined();
+    await connection.replyToThread(REF, awaiting?.id as string, 'Still reproduces on main.');
+    await connection.replyToThread(REF, awaiting?.id as string, 'Trace attached in the pipeline log.');
+
+    const view = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const thread = view.threads.find((t) => t.threadId === awaiting?.id);
+    expect(thread?.replies.map((r) => r.body)).toEqual([
+      'Still reproduces on main.',
+      'Trace attached in the pipeline log.',
+    ]);
+    expect(thread?.replies.every((r) => r.yours)).toBe(true);
+    // Status is untouched and stays `awaiting`: the last note is yours, which
+    // is the honest answer to "whose turn is it" when both turns are you. See
+    // the note in deriveThreadStatus — making the conversation visible is the
+    // fix, contorting the status is not.
+    expect(thread?.status).toBe('awaiting');
+  });
+
+  it('answers the last reply that is not yours, even when yours is more recent', async () => {
+    const connection = connect();
+    const { threads, target } = await repliedThread(connection);
+    await connection.replyToThread(REF, target?.id as string, 'Standing by the finding as posted.');
+
+    const view = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const thread = view.threads.find((t) => t.threadId === target?.id);
+    const opinion = composeSecondOpinion(thread as NonNullable<typeof thread>);
+    // The author's argument, not your own last word — a second opinion that
+    // rebutted you would be the agent arguing with the reviewer it seconds.
+    expect(opinion).toContain(`@${thread?.replies[0]?.author}`);
+    expect(opinion).toContain(thread?.replies[0]?.body.split('\n')[0]?.slice(0, 30));
+    expect(opinion).not.toContain('Standing by the finding as posted');
+    expect(opinion).not.toContain('@you');
+  });
+
+  it('falls back to "nothing to answer" when every reply is yours', async () => {
+    const connection = connect();
+    const threads = await connection.listThreads(REF);
+    const awaiting = threads.find((t) => t.notes.length === 1 && !t.resolved && t.anchorPresent);
+    await connection.replyToThread(REF, awaiting?.id as string, 'Bumping this.');
+
+    const view = await buildPostedReview(connection, entryFor(threads.map((t) => t.id)), 'you', new Set());
+    const thread = view.threads.find((t) => t.threadId === awaiting?.id);
+    expect(thread?.replies).toHaveLength(1);
+    expect(composeSecondOpinion(thread as NonNullable<typeof thread>)).toBe(
+      'No author reply to answer yet — the finding stands as posted.',
+    );
+  });
+});

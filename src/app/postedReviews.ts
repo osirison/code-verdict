@@ -21,7 +21,14 @@ export interface PostedThreadView {
   line?: number;
   status: ThreadStatus;
   yourBody: string;
-  replies: Array<{ author: string; body: string; at: string }>;
+  /**
+   * Every note after the posted comment, in order, whoever wrote it. `yours`
+   * tags the ones you wrote rather than dropping them: filtering them out
+   * here discarded your own replies before the renderer could show them, and
+   * on a change request you authored yourself every reply is yours, so the
+   * thread rendered frozen at the posted comment however much was said.
+   */
+  replies: Array<{ author: string; body: string; at: string; yours: boolean }>;
   closedBy?: string;
 }
 
@@ -96,10 +103,16 @@ export function toThreadView(
     line: item?.line ?? thread.line,
     status,
     yourBody: first?.body ?? '',
-    replies: thread.notes
-      .slice(1)
-      .filter((n) => n.author.username !== you)
-      .map((n) => ({ author: n.author.username, body: n.body, at: n.createdAt })),
+    // Tagged, never filtered: `threadRow` renders `yourBody` plus one block
+    // per reply and nothing else, so a note excluded here reaches no screen
+    // at all — fetched, mapped and thrown away. The reader still has to be
+    // able to tell the two apart, which is what `yours` is for.
+    replies: thread.notes.slice(1).map((n) => ({
+      author: n.author.username,
+      body: n.body,
+      at: n.createdAt,
+      yours: n.author.username === you,
+    })),
     // The POC shows "fixed in <sha> · @user"; the fixing commit is not
     // derivable from discussions alone, so the closed line names the
     // resolver (conceded threads say so explicitly).
@@ -165,7 +178,20 @@ export async function buildPostedReview(
  * the finding (spec §9).
  */
 export function composeSecondOpinion(view: PostedThreadView): string {
-  const reply = view.replies[view.replies.length - 1];
+  // `replies` carries your own notes now, so the newest one is often yours —
+  // and the composed text rebuts whatever it is handed. Answering your own
+  // note would have the agent argue against the reviewer it is seconding, so
+  // walk back to the last note somebody else wrote. A thread where every
+  // reply is yours has no counter-argument on the table yet, which is what
+  // the existing fallback already says.
+  let reply: PostedThreadView['replies'][number] | undefined;
+  for (let i = view.replies.length - 1; i >= 0; i -= 1) {
+    const candidate = view.replies[i];
+    if (candidate && !candidate.yours) {
+      reply = candidate;
+      break;
+    }
+  }
   if (!reply) return 'No author reply to answer yet — the finding stands as posted.';
   const claim = firstLine(reply.body);
   return (
