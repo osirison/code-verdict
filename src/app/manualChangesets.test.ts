@@ -38,4 +38,30 @@ describe('ManualChangesetStore', () => {
     expect(store.list('pod-a')).toEqual([second]);
     expect(store.list('pod-b')).toEqual([other]);
   });
+
+  it('drops a deleted pod’s whole bucket without disturbing the others', async () => {
+    const backing = memoryStore();
+    const store = new ManualChangesetStore(backing);
+    await store.add('pod-a', 'First', [{ repoId: '1', number: '1' }, { repoId: '2', number: '2' }]);
+    await store.add('pod-a', 'Second', [{ repoId: '3', number: '3' }, { repoId: '4', number: '4' }]);
+    const other = await store.add('pod-b', 'Other pod', [{ repoId: '5', number: '5' }, { repoId: '6', number: '6' }]);
+
+    await store.removePod('pod-a');
+
+    expect(store.list('pod-a')).toEqual([]);
+    expect(store.list('pod-b')).toEqual([other]);
+    // The key is gone, not left holding an empty array — a deleted pod should
+    // leave nothing behind in globalState.
+    expect(backing.get<Record<string, unknown>>('codeVerdict.manualChangesets')).not.toHaveProperty('pod-a');
+  });
+
+  it('is a no-op for a pod that never had any', async () => {
+    const backing = memoryStore();
+    const store = new ManualChangesetStore(backing);
+    const other = await store.add('pod-b', 'Other pod', [{ repoId: '5', number: '5' }, { repoId: '6', number: '6' }]);
+
+    await store.removePod('pod-a');
+
+    expect(store.list('pod-b')).toEqual([other]);
+  });
 });

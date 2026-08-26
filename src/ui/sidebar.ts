@@ -198,6 +198,12 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
         this.deps.onPodChanged?.();
         await this.render();
         break;
+      case 'deletePod':
+        // Straight to the command rather than PodStore.remove here — the modal
+        // confirmation and the orphan cleanup live there, and a second copy of
+        // that sequence is a second place to get the shared-token rule wrong.
+        await vscode.commands.executeCommand(COMMANDS.deletePod, message.podId);
+        break;
       case 'openDashboard':
         await vscode.commands.executeCommand(COMMANDS.openDashboard);
         break;

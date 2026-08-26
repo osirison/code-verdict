@@ -39,6 +39,9 @@ function memorySecrets(): SecretStore & { dump(): Map<string, string> } {
     store: async (key, value) => {
       map.set(key, value);
     },
+    delete: async (key) => {
+      map.delete(key);
+    },
   };
 }
 

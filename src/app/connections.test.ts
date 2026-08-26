@@ -18,6 +18,10 @@ function secretsWith(entries: Record<string, string> = {}): SecretStore & { seen
       seen.set(key, value);
       return Promise.resolve();
     },
+    delete: (key: string) => {
+      seen.delete(key);
+      return Promise.resolve();
+    },
   };
 }
 

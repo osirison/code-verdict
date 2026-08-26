@@ -47,6 +47,20 @@ export class ManualChangesetStore {
     });
   }
 
+  /**
+   * Drop every group a deleted pod owned. They name change requests by repo
+   * id inside that pod's sources, so nothing can read them once the pod is
+   * gone — leaving them would only grow globalState forever.
+   */
+  async removePod(podId: string): Promise<void> {
+    const all = this.all();
+    if (!(podId in all)) return;
+    await this.store.update(
+      STORE_KEY,
+      Object.fromEntries(Object.entries(all).filter(([key]) => key !== podId)),
+    );
+  }
+
   private all(): StoreShape {
     return this.store.get<StoreShape>(STORE_KEY) ?? {};
   }

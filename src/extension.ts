@@ -5,13 +5,16 @@ import { runDebugBootstrap } from './app/debugBootstrap';
 import { ManualChangesetStore } from './app/manualChangesets';
 import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
+import { deleteTokenIfUnused } from './app/storage';
 import { fetchPodData, repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
 import { getProvider, listRealProviders } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
+import { ReviewRunStore } from './app/reviewRuns';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
+import { setApiTraceSink } from './app/apiTrace';
 import { getSignInOptions, needsSignInChoice, type SignInOption } from './signInFlow';
 import { registerBuiltInProviders } from './registry';
 import { DashboardPanel } from './ui/dashboard';
@@ -32,6 +35,24 @@ import { VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
+
+  // `registerBuiltInProviders` built the providers over a traced fetch; this
+  // is where those lines go. The channel is created whether or not tracing is
+  // on, so "Verdict: Show API trace" always has something to reveal — the
+  // setting switches the sink, and with no sink the wrapper is inert.
+  const apiTraceChannel = vscode.window.createOutputChannel('Verdict: API');
+  const apiTracingEnabled = (): boolean =>
+    vscode.workspace.getConfiguration('codeVerdict').get<boolean>('trace.api', false);
+  const applyApiTraceSetting = (): void => {
+    setApiTraceSink(apiTracingEnabled() ? apiTraceChannel : undefined);
+  };
+  applyApiTraceSetting();
+  context.subscriptions.push(
+    apiTraceChannel,
+    // The sink is module state in `apiTrace.ts` and outlives the channel it
+    // points at; drop it with the channel rather than leave a disposed one wired.
+    new vscode.Disposable(() => setApiTraceSink(undefined)),
+  );
 
   // The session bridge: `connections.ts` stays vscode-free, so the editor's
   // account API is injected here. A provider that declares the 'session' mode
@@ -56,8 +77,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const podStore = new PodStore(context.globalState);
   const secrets = context.secrets;
   const reviewHistory = new ReviewHistory(context.globalState);
+  const reviewRuns = new ReviewRunStore(context.globalState);
 
   const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
+
+  /**
+   * Every surface that reads review state, repainted. A submit and a finished
+   * run are different events (a clean run posts nothing), but both change
+   * exactly these four views, so they share one fan-out rather than drifting.
+   */
+  const repaintReviewSurfaces = (): void => {
+    sidebar.refresh();
+    void DashboardPanel.refreshIfOpen();
+    ChangesetPanel.refreshIfOpen();
+    TuningPanel.refreshIfOpen();
+  };
 
   /** One pod fetch → the detected changesets, with the current settings applied. */
   const detectForActivePod = async () => {
@@ -73,12 +107,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secrets,
     workspaceState: context.workspaceState,
     globalState: context.globalState,
-    onSubmitted: () => {
-      sidebar.refresh();
-      void DashboardPanel.refreshIfOpen();
-      ChangesetPanel.refreshIfOpen();
-      TuningPanel.refreshIfOpen();
-    },
+    onSubmitted: () => repaintReviewSurfaces(),
+    // A finished run changes the same four views a submit does — the clean
+    // run that used to leave the dashboard reading "not run" forever most of
+    // all — so it repaints them the same way.
+    onRunRecorded: () => repaintReviewSurfaces(),
     onSidebarState: (state?: SidebarActiveReview) => {
       sidebar.setActiveReview(state);
       statusBar.setActiveReview(state);
@@ -163,12 +196,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     globalState: context.globalState,
     openSingle: (ref: { repoId: string; number: string }) => void ReviewFlowPanel.open(flowDeps, ref),
     openDashboard: () => void openDashboard(),
-    onSubmitted: () => {
-      sidebar.refresh();
-      void DashboardPanel.refreshIfOpen();
-      ChangesetPanel.refreshIfOpen();
-      TuningPanel.refreshIfOpen();
-    },
+    onSubmitted: () => repaintReviewSurfaces(),
     onSidebarState: (state?: SidebarActiveReview) => {
       sidebar.setActiveReview(state);
       statusBar.setActiveReview(state);
@@ -247,6 +275,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
+    reviewRuns: () => reviewRuns.byRef(),
     onPodChanged: () => sidebar.refresh(),
     changesetOptions,
     openCr: (ref, submitted) => {
@@ -331,6 +360,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await DashboardPanel.refreshIfOpen();
     ChangesetPanel.refreshIfOpen();
     TuningPanel.refreshIfOpen();
+  };
+
+  /**
+   * "Verdict: Delete pod". `podId` arrives from the sidebar's per-row control;
+   * from the palette it is absent and the pod is picked here. The dispatch
+   * loop types every handler as `() => …`, so the parameter is invisible to
+   * that Record — `executeCommand` still forwards it at runtime.
+   */
+  const deletePod = async (podId?: string): Promise<void> => {
+    const pods = podStore.list();
+    if (pods.length === 0) {
+      void vscode.window.showInformationMessage('Verdict: no pods to delete.');
+      return;
+    }
+    let chosenId = podId;
+    if (chosenId === undefined) {
+      const picked = await vscode.window.showQuickPick(
+        pods.map((p) => ({ label: p.name, description: p.instanceUrl, id: p.id })),
+        { placeHolder: 'Delete pod' },
+      );
+      if (!picked) return;
+      chosenId = picked.id;
+    }
+    const target = pods.find((p) => p.id === chosenId);
+    // A sidebar row can outlive its pod by one repaint — deleting twice is a
+    // no-op here rather than a confirmation prompt for nothing.
+    if (!target) return;
+
+    // Modal: this destroys local state and the token behind it, and a toast
+    // that can be missed is not consent.
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete the pod "${target.name}"? Its saved changeset groups go with it. Reviews you already submitted stay in your history.`,
+      { modal: true },
+      'Delete',
+    );
+    if (confirmed !== 'Delete') return;
+
+    await podStore.remove(target.id);
+    // Keyed by pod id and naming repositories only that pod resolved: orphaned
+    // the moment it goes.
+    await new ManualChangesetStore(context.globalState).removePod(target.id);
+    // Tokens are keyed provider + host, never per pod (storage.ts), so this
+    // drops the secret only when no surviving pod reads the same one.
+    await deleteTokenIfUnused(secrets, target, podStore.list());
+    // Review history is deliberately KEPT. Those entries record reviews
+    // actually posted to the platform — they outlive a local pod, they still
+    // back the posted-review screen and the tuning scorecard, and deleting a
+    // pod must not rewrite what the team can already see on the server.
+
+    sidebar.refresh();
+    await DashboardPanel.refreshIfOpen();
+    ChangesetPanel.refreshIfOpen();
+    TuningPanel.refreshIfOpen();
+    void vscode.window.showInformationMessage(
+      podStore.list().length === 0
+        ? `Verdict: deleted "${target.name}". No pods left — run "Verdict: Sign in" to make one.`
+        : `Verdict: deleted "${target.name}".`,
+    );
   };
 
   /**
@@ -419,8 +506,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     [COMMANDS.signIn]: signIn,
     [COMMANDS.newPod]: signIn,
     [COMMANDS.switchPod]: switchPod,
+    [COMMANDS.deletePod]: deletePod,
     [COMMANDS.editCriteria]: () => SettingsPanel.show({ podStore, secrets }),
     [COMMANDS.selectAgent]: () => TuningPanel.show({ podStore, globalState: context.globalState }),
+    [COMMANDS.showApiTrace]: () => {
+      // `true` keeps focus where it was: this is a diagnostic to glance at,
+      // usually while something else is failing.
+      apiTraceChannel.show(true);
+      if (!apiTracingEnabled()) {
+        void vscode.window.showInformationMessage(
+          'Verdict: API tracing is off — switch on "codeVerdict.trace.api" and the next request appears here.',
+        );
+      }
+    },
   };
 
   for (const id of ALL_COMMAND_IDS) {
@@ -439,7 +537,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(vscode.commands.registerCommand(id, handler));
   }
 
-  // Not in the palette (the naming doc's 19 commands reserve openReview
+  // Not in the palette (the naming doc's 21 commands reserve openReview
   // for triage) — the sidebar row, dashboard rows and "Track replies"
   // reach Posted reviews through this internal id.
   context.subscriptions.push(
@@ -484,6 +582,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (event.affectsConfiguration('codeVerdict.notifications.digestCadence')) {
         notifier.center.reschedule();
       }
+      // Toggling tracing takes effect on the next request, not the next
+      // window: the wrapper reads the sink per call.
+      if (event.affectsConfiguration('codeVerdict.trace.api')) applyApiTraceSetting();
     }),
     notifier,
   );
