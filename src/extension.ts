@@ -103,6 +103,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secrets,
     reviewHistory,
     onBadgeCount: (count) => statusBar.setNotifications(count),
+    onPollPaused: (pause) => statusBar.setPollPaused(pause),
     openReview: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
     openPostedReviews: (ref) => void PostedReviewsPanel.show(postedDeps, ref),
   });

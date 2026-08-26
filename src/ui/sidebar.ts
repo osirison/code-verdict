@@ -18,7 +18,8 @@ import {
 import { toSidebarViewState } from './sidebarState';
 import { tryGetProvider } from '../platform/registry';
 import { NEUTRAL_VOCABULARY } from '../platform/provider';
-import { repoCountOf } from './vocab';
+import { approxDelay, repoCountOf } from './vocab';
+import type { PollPause } from './notifier';
 import type { CodiconAssets } from './theme';
 
 /** The checklist before the wizard is open — nothing done, everything ahead. */
@@ -258,6 +259,7 @@ export class VerdictStatusBar {
   private readonly agent: vscode.StatusBarItem;
   private readonly keys: vscode.StatusBarItem;
   private readonly bell: vscode.StatusBarItem;
+  private readonly paused: vscode.StatusBarItem;
 
   constructor() {
     // Descending priority keeps the segments in spec order, left to right.
@@ -265,6 +267,7 @@ export class VerdictStatusBar {
     this.agent = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 89);
     this.keys = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
     this.bell = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 87);
+    this.paused = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 86);
     this.keys.text = '$(keyboard) ? keys';
     this.keys.tooltip = 'Verdict keyboard map';
     this.keys.command = INTERNAL_COMMANDS.keyboardHelp;
@@ -287,6 +290,28 @@ export class VerdictStatusBar {
     this.bell.text = `$(bell) ${count}`;
     this.bell.tooltip = `${count} Verdict notification${count === 1 ? '' : 's'} waiting — click to view`;
     this.bell.show();
+  }
+
+  /**
+   * Background polling stopped, and when it starts again. Hidden while polling
+   * runs — the ordinary state needs no segment.
+   *
+   * This is the surface for it rather than a toast: the pause lasts as long as
+   * the platform's window, up to an hour, and the user's question during that
+   * hour is "is it still paused, and until when?" A toast cannot answer a
+   * question asked later. The notifier toasts once, on the way in.
+   */
+  setPollPaused(pause?: PollPause): void {
+    if (!pause) {
+      this.paused.hide();
+      return;
+    }
+    const wait = approxDelay(Math.max(0, Math.round((pause.resumesAt - Date.now()) / 1000)));
+    this.paused.text = '$(clock) Verdict: updates paused';
+    this.paused.tooltip =
+      `${pause.platformName} is rate limiting this account — background updates resume in ${wait ?? 'a moment'}.`
+      + ' Opening and submitting reviews still work.';
+    this.paused.show();
   }
 
   setActiveReview(review?: SidebarActiveReview): void {
@@ -318,5 +343,6 @@ export class VerdictStatusBar {
     this.agent.dispose();
     this.keys.dispose();
     this.bell.dispose();
+    this.paused.dispose();
   }
 }

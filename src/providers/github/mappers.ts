@@ -68,13 +68,31 @@ export interface GhIssue {
   pull_request?: unknown;
 }
 
-export interface GhCheckRun {
-  id: number;
-  name: string;
+/**
+ * The lifecycle/outcome pair every Actions run reports: `conclusion` is null
+ * until `status` reaches `completed`. Captured from
+ * `GET /repos/{owner}/{repo}/actions/runs` on 2026-08-26 — an `in_progress`
+ * run carries `conclusion: null`, which is why the status is read first.
+ */
+export interface GhRunState {
   status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending';
   conclusion?: string | null;
+}
+
+/**
+ * One workflow run, as the repository-wide list returns it. Only the fields
+ * the neutral `CiRun` needs are declared; the live payload carries some forty
+ * more (jobs_url, check_suite_id, run_attempt, …).
+ *
+ * `name` is deliberately absent from the mapping below: it is the *run's*
+ * display name, which a workflow's `run-name:` can set to anything — one live
+ * capture reads "Addressing comment on PR #332669". It is not a job name.
+ */
+export interface GhWorkflowRun extends GhRunState {
+  id: number;
+  head_branch?: string | null;
   html_url?: string | null;
-  started_at?: string | null;
+  created_at?: string | null;
 }
 
 export interface GhFile {
@@ -105,8 +123,8 @@ export function toRepoGroup(org: GhOrg): RepoGroup {
   return { id: org.login, path: org.login, name: org.name ?? org.login };
 }
 
-/** A check run's own state. `neutral` and `skipped` do not block, so they read as success. */
-export function toCiStatus(run: Pick<GhCheckRun, 'status' | 'conclusion'>): CiStatus {
+/** A run's own state. `neutral` and `skipped` do not block, so they read as success. */
+export function toCiStatus(run: GhRunState): CiStatus {
   if (run.status !== 'completed') {
     return run.status === 'in_progress' ? 'running' : 'pending';
   }
@@ -171,16 +189,25 @@ export function toWorkItem(repoId: string, issue: GhIssue): WorkItem {
   };
 }
 
-export function toCiRun(repoId: string, run: GhCheckRun): CiRun {
-  const status = toCiStatus(run);
+/**
+ * A workflow run is what the neutral `CiRun` means by "a CI pipeline /
+ * workflow run", and `ref` is the branch it ran on — the same field GitLab
+ * fills from a pipeline's `ref`.
+ *
+ * `failedJobName` is left unset on purpose. The repository-wide run list names
+ * the run, never the job inside it that failed; the job needs
+ * `/actions/runs/{id}/jobs`, one request per run — the fan-out `listCiRuns`
+ * exists to avoid. The renderers already fall back to `ref`, as they do for
+ * GitLab, which never sets it either.
+ */
+export function toCiRun(repoId: string, run: GhWorkflowRun): CiRun {
   return {
     id: String(run.id),
     repoId,
-    status,
+    status: toCiStatus(run),
     webUrl: run.html_url ?? undefined,
-    ref: run.name,
-    failedJobName: status === 'failed' ? run.name : undefined,
-    createdAt: run.started_at ?? undefined,
+    ref: run.head_branch ?? undefined,
+    createdAt: run.created_at ?? undefined,
   };
 }
 

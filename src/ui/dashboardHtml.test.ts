@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { GITLAB_VOCABULARY } from '../testing/specFixtures';
+import { GITHUB_VOCABULARY, GITLAB_VOCABULARY } from '../testing/specFixtures';
+import { ScmError } from '../platform/errors';
+import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { VERDICT_TOKENS_CSS } from './theme';
 import type { DashboardViewState } from './dashboardHtml';
-import { renderDashboardHtml, renderDashboardLoadingHtml } from './dashboardHtml';
+import { renderDashboardHtml, renderDashboardLoadingHtml, renderLoadFailure } from './dashboardHtml';
 
 const state: DashboardViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -187,5 +189,70 @@ describe('loading skeleton (issue #39 — navigation must not wait on the fetch)
   it('guards skeleton rows against posting an openCr with no ref — Number(undefined) is NaN', () => {
     const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'n');
     expect(html).toContain('row.dataset.number === undefined) return');
+  });
+});
+
+describe('a pod that would not load says what happened, not what the platform said', () => {
+  /**
+   * The body the user actually saw, near enough verbatim. Relaying it made
+   * them believe the extension was scraping.
+   */
+  const RAW = 'API rate limit exceeded for user ID 93209527. If you reach out to GitHub Support for help, '
+    + 'please include the request ID. For more on scraping GitHub, see the documentation.';
+
+  function rateLimited(retryAfterSeconds?: number): ScmError {
+    return new ScmError('rateLimited', RAW, { status: 403, retryAfterSeconds });
+  }
+
+  it('leads with the platform name and when the limit clears', () => {
+    const html = renderLoadFailure(rateLimited(12 * 60), GITHUB_VOCABULARY);
+    const lead = html.slice(0, html.indexOf('<details>'));
+
+    expect(lead).toContain('GitHub is rate limiting this account');
+    expect(lead).toContain('it clears in about 12 minutes');
+    expect(lead).toContain('No data was lost');
+    // The words that misled: neither appears before the disclosure.
+    expect(lead).not.toContain('scraping');
+    expect(lead).not.toContain('user ID');
+    expect(lead).not.toContain('Support');
+  });
+
+  it('keeps the raw body reachable for a bug report, one disclosure down', () => {
+    const html = renderLoadFailure(rateLimited(60 * 60), GITHUB_VOCABULARY);
+    expect(html).toContain('<details><summary>What GitHub sent</summary>');
+    expect(html).toContain('user ID 93209527');
+    expect(html.indexOf('scraping')).toBeGreaterThan(html.indexOf('<details>'));
+  });
+
+  it('names each platform in its own words, and neither when no pod is active', () => {
+    expect(renderLoadFailure(rateLimited(120), GITLAB_VOCABULARY)).toContain('GitLab is rate limiting');
+    const neutral = renderLoadFailure(rateLimited(120), NEUTRAL_VOCABULARY);
+    expect(neutral).toContain('Your platform is rate limiting');
+    expect(neutral).not.toContain('GitHub is');
+  });
+
+  it('rounds the wait, and says nothing about it when the platform reported none', () => {
+    expect(renderLoadFailure(rateLimited(45), GITHUB_VOCABULARY)).toContain('clears in under a minute');
+    expect(renderLoadFailure(rateLimited(3600), GITHUB_VOCABULARY)).toContain('clears in about an hour');
+    expect(renderLoadFailure(rateLimited(2 * 3600), GITHUB_VOCABULARY)).toContain('clears in about 2 hours');
+    const silent = renderLoadFailure(rateLimited(undefined), GITHUB_VOCABULARY);
+    expect(silent).toContain('GitHub is rate limiting this account.');
+    expect(silent).not.toContain('clears in');
+  });
+
+  it('escapes the raw body instead of pasting markup into the page', () => {
+    const html = renderLoadFailure(
+      new ScmError('rateLimited', '<img src=x onerror="boom">', { retryAfterSeconds: 60 }),
+      GITHUB_VOCABULARY,
+    );
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img src=x onerror=&quot;boom&quot;&gt;');
+  });
+
+  it('leaves every other failure with the copy it had', () => {
+    const html = renderLoadFailure(new Error('connect ECONNREFUSED 127.0.0.1:8929'), GITLAB_VOCABULARY);
+    expect(html).toContain('Could not load the pod: connect ECONNREFUSED 127.0.0.1:8929');
+    expect(html).toContain('npm run emulator');
+    expect(html).not.toContain('rate limiting');
   });
 });

@@ -4,6 +4,11 @@ import { describe, expect, it } from 'vitest';
 import { ALL_COMMAND_IDS, ALL_INTERNAL_COMMAND_IDS, INTERNAL_COMMANDS } from './commands';
 import { DIGEST_CADENCES, NOTIFICATION_EVENTS, NOTIFICATION_MODES } from './domain/notifications';
 import { DEFAULT_TRAILER } from './app/changesets';
+import {
+  DEFAULT_POLL_INTERVAL_SECONDS,
+  MAX_POLL_INTERVAL_SECONDS,
+  MIN_POLL_INTERVAL_SECONDS,
+} from './app/pollSchedule';
 
 interface PackageJson {
   description: string;
@@ -13,7 +18,12 @@ interface PackageJson {
     views: Record<string, Array<{ id: string; name: string; type?: string }>>;
     menus: Record<string, Array<{ command: string; when?: string }>>;
     viewsWelcome: Array<{ view: string; contents: string }>;
-    configuration: { properties: Record<string, { enum?: string[]; default?: unknown; description?: string }> };
+    configuration: {
+      properties: Record<
+        string,
+        { enum?: string[]; default?: unknown; description?: string; minimum?: number; maximum?: number }
+      >;
+    };
   };
 }
 
@@ -138,6 +148,24 @@ describe('notification settings contributions', () => {
     expect(cadence?.enum).toEqual([...DIGEST_CADENCES]);
     expect(cadence?.default).toBe('End of day');
     expect(properties['codeVerdict.notifications.quietMode']?.default).toBe(false);
+  });
+
+  // The poll floor is a number the code clamps and the manifest advertises. A
+  // manifest promising a range the code does not honour is worse than no range
+  // at all, so both ends are pinned here the same way the modes above are.
+  it('contributes the poll interval floor with the range the scheduler enforces', () => {
+    const poll = properties['codeVerdict.notifications.pollIntervalSeconds'];
+    expect(poll?.default).toBe(DEFAULT_POLL_INTERVAL_SECONDS);
+    expect(poll?.minimum).toBe(MIN_POLL_INTERVAL_SECONDS);
+    expect(poll?.maximum).toBe(MAX_POLL_INTERVAL_SECONDS);
+  });
+
+  it('keeps the poll interval out of the per-event namespace', () => {
+    // `notifications.events.*` is enumerated against NOTIFICATION_EVENTS above;
+    // a settings key that merely starts the same way would fail that count.
+    expect(
+      Object.keys(properties).filter((key) => key.startsWith('codeVerdict.notifications.events.')),
+    ).not.toContain('codeVerdict.notifications.pollIntervalSeconds');
   });
 });
 

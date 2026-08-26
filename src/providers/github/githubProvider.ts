@@ -31,7 +31,7 @@ import type {
 } from '../../platform/types';
 import { ScmError, toScmError } from '../../platform/errors';
 import type { FetchLike } from './http';
-import { GitHubHttp, hostOf, isDotCom, splitRepoId } from './http';
+import { EtagCache, GitHubHttp, RateBudget, hostOf, isDotCom, splitRepoId } from './http';
 import { parseGitHubSourceInput } from './sourceInput';
 import { isVerdictRefused } from './errors';
 import {
@@ -44,12 +44,12 @@ import {
   toRepository,
   toReviewThread,
   toWorkItem,
-  type GhCheckRun,
   type GhFile,
   type GhIssue,
   type GhOrg,
   type GhPull,
   type GhRepo,
+  type GhWorkflowRun,
   type GqlChecksResponse,
   type GqlThread,
   type CiSummary,
@@ -371,25 +371,40 @@ export class GitHubConnection implements Connection {
     return perRepo.flat();
   }
 
-  async listCiRuns(repoIds: readonly string[], limitPerRepo = 20): Promise<CiRun[]> {
+  /**
+   * One request per repository, whatever the run count.
+   *
+   * The REST check-runs endpoint is per-ref, so reading checks this way cost
+   * a commit list plus one request per commit — 21 requests per repository on
+   * the old default — and the 60s notifier poll spent the hourly budget on it.
+   * `/actions/runs` is the repository-wide list: newest first, every branch,
+   * exactly what GitLab's `/pipelines` returns and what the neutral `CiRun`
+   * already calls "a CI pipeline / workflow run".
+   *
+   * What that costs, stated plainly: this now reports Actions runs only. A
+   * repository whose checks come from a third-party integration alone reports
+   * none where the per-commit version reported that integration's check runs.
+   * The alternative — a GraphQL walk of the default branch's `checkSuites` —
+   * is also one request but covers one branch, and its payload could not be
+   * captured live for the fake the way this one was.
+   *
+   * `limitPerRepo` defaults to 3, matching every other implementation and the
+   * only caller (`fetchPodData`); 20 was a per-repository default nothing
+   * asked for.
+   */
+  async listCiRuns(repoIds: readonly string[], limitPerRepo = 3): Promise<CiRun[]> {
     const perRepo = await Promise.all(
       repoIds.map(async (repoId) => {
         try {
-          const commits = await this.http.get<Array<{ sha: string }>>(
-            `${this.repoPath(repoId)}/commits`,
-            { per_page: Math.min(limitPerRepo, 30) },
+          const payload = await this.http.get<{ workflow_runs?: GhWorkflowRun[] }>(
+            `${this.repoPath(repoId)}/actions/runs`,
+            { per_page: limitPerRepo },
           );
-          const runs = await Promise.all(
-            commits.slice(0, limitPerRepo).map(async (commit) => {
-              const payload = await this.http.get<{ check_runs?: GhCheckRun[] }>(
-                `${this.repoPath(repoId)}/commits/${encodeURIComponent(commit.sha)}/check-runs`,
-                { per_page: 100 },
-              );
-              return (payload.check_runs ?? []).map((run) => toCiRun(repoId, run));
-            }),
-          );
-          return runs.flat().slice(0, limitPerRepo);
+          return (payload.workflow_runs ?? []).map((run) => toCiRun(repoId, run));
         } catch {
+          // CI is decoration on the dashboard, and Actions can be disabled per
+          // repository (or instance-wide on GHES) — one repository that cannot
+          // answer must not empty the pod's whole run list.
           return [] as CiRun[];
         }
       }),
@@ -739,6 +754,17 @@ export class GitHubConnection implements Connection {
 }
 
 export function createGitHubProvider(fetchImpl?: FetchLike, now?: () => number): ScmProvider {
+  // Both of these live here, not inside the client, because `connectionForPod`
+  // builds a fresh `Connection` for every notifier poll (src/app/connections.ts).
+  // State owned by `GitHubHttp` would therefore be empty every 60 seconds:
+  // the etag cache cold on exactly the poll a 304 exists to make free, and the
+  // observed rate budget re-learned from zero on every poll, which is why
+  // `rateState` could be parsed on every response and still stop nothing. The
+  // provider is the longest-lived object that is still provider-scoped, so
+  // both outlive the connections without the app layer learning that GitHub
+  // charges differently for a 304 or meters anything at all.
+  const etags = new EtagCache();
+  const budget = new RateBudget();
   return {
     id: 'github',
     displayName: 'GitHub',
@@ -755,7 +781,10 @@ export function createGitHubProvider(fetchImpl?: FetchLike, now?: () => number):
     },
     connect(config: ConnectionConfig): Connection {
       return new GitHubConnection(
-        new GitHubHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl, now),
+        new GitHubHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl, now, etags, {
+          budget,
+          intent: config.intent,
+        }),
         hostOf(config.instanceUrl),
       );
     },

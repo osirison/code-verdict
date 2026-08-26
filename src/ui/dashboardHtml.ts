@@ -7,8 +7,9 @@
  * webviews as designed — native chrome (sidebar, status bar) uses Codicons.
  */
 import type { CiStatus } from '../platform/types';
+import { isScmError } from '../platform/errors';
 import { escapeHtml, renderPage } from './theme';
-import { cap, repoCountOf, type Vocabulary } from './vocab';
+import { approxDelay, cap, repoCountOf, type Vocabulary } from './vocab';
 
 export { escapeHtml };
 
@@ -90,6 +91,43 @@ export type DashboardMessage =
   | { type: 'selectPod'; podId: string }
   | { type: 'addRepos' }
   | { type: 'filters' };
+
+/**
+ * Why a pod would not load, in the product's own words.
+ *
+ * A rate limit gets its own copy because relaying the platform's prose was
+ * actively misleading: the 403 body names the numeric user id and points at a
+ * scraping policy, and a user who saw it concluded the extension was scraping
+ * when it was spending an ordinary authenticated budget. What they need is
+ * what happened and when it clears; the raw text stays one disclosure away,
+ * because that is what a bug report needs.
+ *
+ * Every noun here comes from the active provider's `Vocabulary` — this file
+ * never learns which platform it is talking to.
+ */
+export function renderLoadFailure(error: unknown, vocabulary: Vocabulary): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (isScmError(error) && error.kind === 'rateLimited') {
+    return [
+      `<p>${escapeHtml(cap(vocabulary.platformName))} is rate limiting this account${clearsIn(error.retryAfterSeconds)}.`,
+      ' No data was lost. Refresh once it clears.</p>',
+      `<details><summary>What ${escapeHtml(vocabulary.platformName)} sent</summary>`,
+      `<p><code>${escapeHtml(raw)}</code></p></details>`,
+    ].join('');
+  }
+  return `<p>Could not load the pod: ${escapeHtml(raw)}</p>`
+    + '<p>Is the emulator running? (<code>npm run emulator</code>)</p>';
+}
+
+/**
+ * " — it clears in about 12 minutes", from the reset the platform reported.
+ * Silent when it reported none: a made-up wait is worse than no wait, since
+ * the user schedules their retry around it.
+ */
+function clearsIn(seconds: number | undefined): string {
+  const phrase = approxDelay(seconds);
+  return phrase === undefined ? '' : ` — it clears in ${phrase}`;
+}
 
 /** Script-free page for error / no-pod states, with the same strict CSP. */
 export function renderFallbackHtml(messageHtml: string): string {

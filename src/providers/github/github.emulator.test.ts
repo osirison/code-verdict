@@ -9,7 +9,8 @@ import { isScmError } from '../../platform/errors';
 import { createGitHubProvider, githubProvider } from './githubProvider';
 import { makeFakeGitHubFetch, type FakeGitHubOptions, type RequestLog } from './fakeGitHub';
 import { mapGitHubError } from './errors';
-import { GitHubHttp, hasNextLink, restBaseUrl, graphqlUrl, isDotCom, splitRepoId } from './http';
+import { EtagCache, GitHubHttp, RATE_FLOORS, RateBudget, hasNextLink, restBaseUrl, graphqlUrl, isDotCom, splitRepoId } from './http';
+import type { FetchLike, FetchResponseLike } from './http';
 import { toCiStatus, toCiSummary, toFileDiff } from './mappers';
 
 const CONFIG: ConnectionConfig = {
@@ -684,6 +685,132 @@ describe('list calls are batched per repository, never per change request', () =
   });
 });
 
+describe('CI runs cost one request per repository', () => {
+  it('issues exactly one request per repository, whatever the run count', async () => {
+    const log: RequestLog = { paths: [], urls: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.listCiRuns(['acme/core', 'acme/auth-service', 'acme/api-gateway']);
+
+    expect([...log.paths].sort()).toEqual([
+      '/repos/acme/api-gateway/actions/runs',
+      '/repos/acme/auth-service/actions/runs',
+      '/repos/acme/core/actions/runs',
+    ]);
+    // The shape this replaced: a commit list, then one check-runs request per
+    // commit — 1 + N per repository, on a 60s poll.
+    expect(log.paths.some((path) => path.endsWith('/commits') || path.includes('/check-runs'))).toBe(false);
+  });
+
+  it('asks for the limit it was given, and defaults to the one the caller passes', async () => {
+    const log: RequestLog = { paths: [], urls: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.listCiRuns(['acme/core']);
+    // The default is the dashboard's own 3 — 20 was a number nothing asked for.
+    expect(log.urls?.[0]).toContain('per_page=3');
+
+    await conn.listCiRuns(['acme/core'], 10);
+    expect(log.urls?.[1]).toContain('per_page=10');
+  });
+
+  it('maps a failed and a passing workflow run onto the neutral CiRun', async () => {
+    const runs = await connect().listCiRuns(['acme/core']);
+
+    expect(runs).toEqual([
+      {
+        id: '32918212053',
+        repoId: 'acme/core',
+        status: 'failed',
+        webUrl: 'https://github.com/acme/core/actions/runs/32918212053',
+        ref: 'feat/rate-limit',
+        createdAt: '2026-08-20T09:58:00Z',
+      },
+      {
+        id: '32914104866',
+        repoId: 'acme/core',
+        status: 'success',
+        webUrl: 'https://github.com/acme/core/actions/runs/32914104866',
+        ref: 'main',
+        createdAt: '2026-08-20T08:31:00Z',
+      },
+    ]);
+    // The repository-wide list names the run, never the job that failed inside
+    // it — naming that job is one request per run, the fan-out this removed.
+    expect(runs[0]?.failedJobName).toBeUndefined();
+  });
+
+  it('reads a run still in flight as running, with no conclusion to read', async () => {
+    const runs = await connect().listCiRuns(['acme/auth-service']);
+    expect(runs.map((run) => [run.status, run.ref])).toEqual([['running', 'feat/rotate']]);
+  });
+
+  it('returns nothing for a repository with no runs, rather than throwing', async () => {
+    await expect(connect().listCiRuns(['acme/api-gateway'])).resolves.toEqual([]);
+  });
+
+  it('keeps the other repositories when one cannot answer', async () => {
+    // Actions can be disabled per repository, and on a GHES instance outright.
+    const fake = makeFakeGitHubFetch();
+    const conn = createGitHubProvider(async (url, init) => {
+      if (new URL(url).pathname === '/repos/acme/core/actions/runs') {
+        return {
+          ok: false, status: 404,
+          headers: { get: () => null },
+          json: () => Promise.resolve({ message: 'Not Found' }),
+          text: () => Promise.resolve('{"message":"Not Found"}'),
+        };
+      }
+      return fake(url, init);
+    }).connect(CONFIG);
+
+    const runs = await conn.listCiRuns(['acme/core', 'acme/auth-service']);
+    expect(runs.map((run) => run.repoId)).toEqual(['acme/auth-service']);
+  });
+});
+
+describe('the rate limit the user actually hit', () => {
+  /** Verbatim shape of GitHub's primary-limit 403: 403, remaining 0, a reset. */
+  function rateLimitedFetch(resetEpoch: number) {
+    const body = JSON.stringify({
+      message: 'API rate limit exceeded for user ID 93209527. If you reach out to GitHub Support for help, '
+        + 'please include the request ID. For more on scraping GitHub, see the documentation.',
+    });
+    const headers: Record<string, string> = {
+      'x-ratelimit-remaining': '0',
+      'x-ratelimit-limit': '5000',
+      'x-ratelimit-reset': String(resetEpoch),
+    };
+    return async () => ({
+      ok: false,
+      status: 403,
+      headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+      json: () => Promise.resolve(JSON.parse(body) as unknown),
+      text: () => Promise.resolve(body),
+    });
+  }
+
+  it('surfaces a rateLimited error carrying the seconds until it clears', async () => {
+    const resetEpoch = Math.floor(Date.now() / 1000) + 12 * 60;
+    const conn = createGitHubProvider(rateLimitedFetch(resetEpoch)).connect(CONFIG);
+
+    const error: unknown = await conn.listOpenChangeRequests(['acme/core']).catch((e: unknown) => e);
+    expect(isScmError(error)).toBe(true);
+    if (!isScmError(error)) return;
+    expect(error.kind).toBe('rateLimited');
+    expect(error.status).toBe(403);
+    // Derived from x-ratelimit-reset against the clock, so allow the second or
+    // two the test itself takes.
+    expect(error.retryAfterSeconds).toBeGreaterThan(12 * 60 - 5);
+    expect(error.retryAfterSeconds).toBeLessThanOrEqual(12 * 60);
+  });
+
+  it('leaves the CI list empty rather than failing the whole pod fetch', async () => {
+    const conn = createGitHubProvider(rateLimitedFetch(Math.floor(Date.now() / 1000) + 60)).connect(CONFIG);
+    await expect(conn.listCiRuns(['acme/core'])).resolves.toEqual([]);
+  });
+});
+
 describe('a summary the user cleared is not a summary', () => {
   it('never reports canned verdict text as the user\'s summary', async () => {
     const { conn, anchor } = await draft();
@@ -757,5 +884,448 @@ describe('threadId is a thread id, in both submit paths', () => {
     });
     expect(result.comments[0]?.ok).toBe(true);
     expect(result.comments[0]?.threadId).toBeUndefined();
+  });
+});
+
+
+describe('conditional requests — the poll that costs nothing', () => {
+  /** A response with header lookup as case-insensitive as a real one. */
+  function reply(status: number, body: string, headers: Record<string, string> = {}): FetchResponseLike {
+    const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+    return {
+      // `Response.ok` is 200-299, so a 304 arrives here as not-ok — which is
+      // why an unhandled one would reach the error mapper as `unknown`.
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (name: string) => lower[name.toLowerCase()] ?? null },
+      json: () => Promise.resolve(JSON.parse(body) as unknown),
+      text: () => Promise.resolve(body),
+    };
+  }
+
+  const validatorOf = (init?: { headers?: Record<string, string> }): string | null =>
+    init?.headers?.['If-None-Match'] ?? null;
+
+  it('rides a 304 on the second poll and replays the same answer', async () => {
+    const log: RequestLog = { paths: [], urls: [], validators: [], statuses: [] };
+    const provider = createGitHubProvider(makeFakeGitHubFetch({ log }));
+
+    // Two connections, because that is what production does: `connectionForPod`
+    // builds a fresh one on every notifier poll. A cache owned by the client
+    // would be cold here, and this whole stage would be a no-op.
+    const first = await provider.connect(CONFIG).listCiRuns(['acme/core']);
+    const second = await provider.connect(CONFIG).listCiRuns(['acme/core']);
+
+    expect(second).toEqual(first);
+    expect(second).not.toHaveLength(0);
+    expect(log.validators?.[0]).toBeNull();
+    expect(log.validators?.[1]).toMatch(/^W\//);
+    // Two requests issued, one charged: only the 200 counts against the limit.
+    expect(log.statuses).toEqual([200, 304]);
+  });
+
+  it('replaces the remembered body when the resource changes', async () => {
+    let body = '[{"id":1}]';
+    let etag = 'W/"one"';
+    const sent: Array<string | null> = [];
+    const http = new GitHubHttp('https://github.com', 'ghp-test', (_url, init) => {
+      const validator = validatorOf(init);
+      sent.push(validator);
+      return Promise.resolve(
+        validator === etag ? reply(304, '', { etag }) : reply(200, body, { etag }),
+      );
+    });
+
+    expect(await http.get('/repos/acme/core/pulls')).toEqual([{ id: 1 }]);
+    body = '[{"id":2}]';
+    etag = 'W/"two"';
+    // The client still holds the first validator, so it asks conditionally and
+    // is answered in full — then rides the *new* validator, not the retired one.
+    expect(await http.get('/repos/acme/core/pulls')).toEqual([{ id: 2 }]);
+    expect(await http.get('/repos/acme/core/pulls')).toEqual([{ id: 2 }]);
+    expect(sent).toEqual([null, 'W/"one"', 'W/"two"']);
+  });
+
+  it('never sends a validator on a write, and never remembers a write', async () => {
+    const sent: Array<[string, string | null]> = [];
+    const http = new GitHubHttp('https://github.com', 'ghp-test', (_url, init) => {
+      const method = init?.method ?? 'GET';
+      sent.push([method, validatorOf(init)]);
+      // A validator on an unsafe method is a *precondition*, not a body
+      // shortcut: a server honouring it would refuse the write.
+      return Promise.resolve(reply(200, '[]', { etag: method === 'GET' ? 'W/"read"' : 'W/"write"' }));
+    });
+
+    await http.get('/repos/acme/core/pulls');
+    await http.post('/repos/acme/core/pulls', { title: 'x' });
+    await http.get('/repos/acme/core/pulls');
+
+    expect(sent).toEqual([
+      ['GET', null],
+      ['POST', null],
+      // The POST's own etag never entered the cache — the GET still rides its own.
+      ['GET', 'W/"read"'],
+    ]);
+  });
+
+  it('re-asks unconditionally when a 304 arrives with nothing to replay', async () => {
+    const etags = new EtagCache();
+    const sent: Array<string | null> = [];
+    let calls = 0;
+    const http = new GitHubHttp('https://github.com', 'ghp-test', (_url, init) => {
+      calls += 1;
+      sent.push(validatorOf(init));
+      if (calls === 2) {
+        // Evicted while this very request was in flight — the notifier's three
+        // pod calls and every page of each share one cache.
+        etags.clear();
+        return Promise.resolve(reply(304, '', { etag: 'W/"e"' }));
+      }
+      return Promise.resolve(reply(200, '[{"id":7}]', { etag: 'W/"e"' }));
+    }, Date.now, etags);
+
+    await http.get('/repos/acme/core/pulls');
+    const second = await http.get('/repos/acme/core/pulls');
+
+    // Not `undefined`: a silent empty answer here empties the dashboard, which
+    // is far worse than the one wasted request this costs.
+    expect(second).toEqual([{ id: 7 }]);
+    expect(calls).toBe(3);
+    expect(sent).toEqual([null, 'W/"e"', null]);
+  });
+
+  it('assembles every page when both pages come back 304, and still terminates', async () => {
+    const NEXT = '<https://api.github.com/repos/acme/core/pulls?per_page=100&page=2>; rel="next"';
+    const sent: string[] = [];
+    const fetchImpl: FetchLike = (url, init) => {
+      const page = new URL(url).searchParams.get('page') ?? '?';
+      const validator = validatorOf(init);
+      sent.push(`${page}:${validator ?? '-'}`);
+      const etag = page === '1' ? 'W/"p1"' : 'W/"p2"';
+      // api.github.com does repeat `link` on a 304 (captured 2026-08-26). This
+      // one does not — the case where trusting the live header alone would
+      // truncate every paginated list to its first page and look like nothing
+      // was wrong.
+      if (validator === etag) return Promise.resolve(reply(304, '', { etag }));
+      return Promise.resolve(page === '1'
+        ? reply(200, '[{"number":1}]', { etag, link: NEXT })
+        : reply(200, '[{"number":2}]', { etag }));
+    };
+    const http = new GitHubHttp('https://github.com', 'ghp-test', fetchImpl);
+
+    expect(await http.getAll('/repos/acme/core/pulls')).toEqual([{ number: 1 }, { number: 2 }]);
+    expect(await http.getAll('/repos/acme/core/pulls')).toEqual([{ number: 1 }, { number: 2 }]);
+    // Each page has its own URL, its own validator and its own entry.
+    expect(sent).toEqual(['1:-', '2:-', '1:W/"p1"', '2:W/"p2"']);
+  });
+
+  it('reads the budget off a 304 as readily as off a 200', async () => {
+    let calls = 0;
+    const http = new GitHubHttp('https://github.com', 'ghp-test', () => {
+      calls += 1;
+      // The numbers are contrived so the assertion can only pass if the 304's
+      // own headers were read. A real *authorized* 304 leaves `remaining`
+      // exactly where the 200 left it — that is the point of the whole change.
+      return Promise.resolve(calls === 1
+        ? reply(200, '[]', { etag: 'W/"e"', 'x-ratelimit-remaining': '4999', 'x-ratelimit-reset': '1787714876' })
+        : reply(304, '', { etag: 'W/"e"', 'x-ratelimit-remaining': '4321', 'x-ratelimit-reset': '1787714876' }));
+    });
+
+    await http.get('/repos/acme/core/pulls');
+    await http.get('/repos/acme/core/pulls');
+    expect(http.rateState('core')).toEqual({ remaining: 4321, resetAt: 1787714876 });
+  });
+
+  it('retires a validator the resource stopped issuing', async () => {
+    let issuing = true;
+    const sent: Array<string | null> = [];
+    const http = new GitHubHttp('https://github.com', 'ghp-test', (_url, init) => {
+      sent.push(validatorOf(init));
+      return Promise.resolve(issuing ? reply(200, '[]', { etag: 'W/"e"' }) : reply(200, '[]'));
+    });
+
+    await http.get('/repos/acme/core/pulls');
+    issuing = false;
+    await http.get('/repos/acme/core/pulls');
+    // Keeping the dead etag would mean sending a header that can only ever
+    // cost a request, for as long as the process lives.
+    await http.get('/repos/acme/core/pulls');
+    expect(sent).toEqual([null, 'W/"e"', null]);
+  });
+
+  it("never replays one account's body as another account's answer", async () => {
+    const etags = new EtagCache();
+    const sent: Array<[string, string | null]> = [];
+    const fetchImpl: FetchLike = (_url, init) => {
+      sent.push([init?.headers?.Authorization ?? '', validatorOf(init)]);
+      return Promise.resolve(reply(200, '[]', { etag: 'W/"same-url"' }));
+    };
+    // One provider serves every pod on a host, so two accounts share this cache.
+    const mine = new GitHubHttp('https://github.com', 'ghp-mine', fetchImpl, Date.now, etags);
+    const theirs = new GitHubHttp('https://github.com', 'ghp-theirs', fetchImpl, Date.now, etags);
+
+    await mine.get('/repos/acme/core/pulls');
+    await theirs.get('/repos/acme/core/pulls');
+    await mine.get('/repos/acme/core/pulls');
+
+    expect(sent).toEqual([
+      ['Bearer ghp-mine', null],
+      ['Bearer ghp-theirs', null],
+      ['Bearer ghp-mine', 'W/"same-url"'],
+    ]);
+  });
+});
+
+describe('the cache the validators live in', () => {
+  const entry = (body: string) => ({ etag: `W/"${body}"`, body, link: null });
+
+  it('evicts the least recently used, not the first inserted', () => {
+    const cache = new EtagCache(2);
+    cache.set('a', entry('1'));
+    cache.set('b', entry('2'));
+    // A poll re-reading 'a' is what makes it the recent one.
+    cache.get('a');
+    cache.set('c', entry('3'));
+
+    expect(cache.get('a')?.body).toBe('1');
+    expect(cache.get('b')).toBeUndefined();
+    expect(cache.get('c')?.body).toBe('3');
+    expect(cache.size).toBe(2);
+  });
+
+  it('declines an oversized body rather than evicting the rest to hold it', () => {
+    const cache = new EtagCache(8, 4);
+    cache.set('small', entry('123'));
+    cache.set('huge', entry('123456'));
+    // The huge URL keeps paying full price — one request, every poll.
+    expect(cache.get('huge')).toBeUndefined();
+    expect(cache.get('small')?.body).toBe('123');
+  });
+
+  /**
+   * The entry bound is not a round number, it is a fan-out. `fetchPodData`
+   * asks for three lists per repository and two of them paginate to ten pages,
+   * so the URL set a poll cycles through is far wider than the "three per
+   * repository" a single-page pod suggests. A bound under it does not degrade
+   * gracefully — LRU over a cycle that does not fit hits nothing at all, and
+   * the poll silently goes back to full price with the cache still in place.
+   */
+  it('holds a whole poll of a wide pod, so the cycle does not evict itself', () => {
+    const cache = new EtagCache();
+    const REPOS = 30;
+    const PAGES = 2;
+    const urls: string[] = [];
+    for (let repo = 0; repo < REPOS; repo += 1) {
+      for (let page = 1; page <= PAGES; page += 1) {
+        urls.push(`/repos/acme/repo-${repo}/pulls?page=${page}`);
+        urls.push(`/repos/acme/repo-${repo}/issues?page=${page}`);
+      }
+      urls.push(`/repos/acme/repo-${repo}/actions/runs`);
+    }
+    for (const url of urls) cache.set(url, entry(url));
+    // Poll two finds every validator it left behind — the whole point.
+    expect(urls.filter((url) => cache.get(url) !== undefined)).toHaveLength(urls.length);
+  });
+
+  it('evicts until the total fits, and keeps the running total honest', () => {
+    const cache = new EtagCache(8, 8, 8);
+    cache.set('a', entry('aaaa'));
+    cache.set('b', entry('bbbb'));
+    cache.set('c', entry('cccc'));
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.size).toBe(2);
+
+    // Deleting must give the bytes back, or the cap ratchets shut.
+    cache.delete('b');
+    cache.set('d', entry('dddd'));
+    expect(cache.get('c')?.body).toBe('cccc');
+    expect(cache.get('d')?.body).toBe('dddd');
+  });
+});
+
+describe('stopping before the wall', () => {
+  const NOW_MS = 1_700_000_000_000;
+  const RESET_AT = NOW_MS / 1000 + 600;
+
+  /**
+   * A server that answers everything, reporting whatever budget the test wants
+   * and no validator — so nothing is cached and every allowed request shows up
+   * in `sent`.
+   */
+  function server(
+    counts: { core: number; graphql: number },
+    sent: string[],
+    reset: number = RESET_AT,
+  ): FetchLike {
+    return (url) => {
+      sent.push(url);
+      const bucket = url.endsWith('/graphql') ? 'graphql' : 'core';
+      const body = bucket === 'graphql' ? '{"data":{"ok":true}}' : '[]';
+      const headers: Record<string, string> = {
+        'x-ratelimit-remaining': String(counts[bucket]),
+        'x-ratelimit-reset': String(reset),
+      };
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+        json: () => Promise.resolve(JSON.parse(body) as unknown),
+        text: () => Promise.resolve(body),
+      });
+    };
+  }
+
+  const kindOf = (e: unknown): string | undefined => (isScmError(e) ? e.kind : undefined);
+  const delayOf = (e: unknown): number | undefined => (isScmError(e) ? e.retryAfterSeconds : undefined);
+
+  it('refuses at the floor without issuing the request', async () => {
+    const sent: string[] = [];
+    const http = new GitHubHttp(
+      'https://github.com', 'ghp-test', server({ core: RATE_FLOORS.background, graphql: 5000 }, sent),
+      () => NOW_MS, new EtagCache(), { intent: 'background' },
+    );
+
+    await http.get('/repos/acme/core/pulls');
+    expect(sent).toHaveLength(1);
+
+    const error: unknown = await http.get('/repos/acme/core/pulls').catch((e: unknown) => e);
+    expect(kindOf(error)).toBe('rateLimited');
+    // The caller cannot tell this from the 403 it replaces, which is the point:
+    // it carries the same kind and the same reset.
+    expect(delayOf(error)).toBe(600);
+    // Nothing went out. Spending the last requests to be told they are gone is
+    // the behaviour this exists to stop.
+    expect(sent).toHaveLength(1);
+  });
+
+  it('keeps the reserve for the connection that asked for it', async () => {
+    const sent: string[] = [];
+    const budget = new RateBudget();
+    const fetchImpl = server({ core: RATE_FLOORS.background - 10, graphql: 5000 }, sent);
+    const poll = new GitHubHttp('https://github.com', 'ghp-test', fetchImpl, () => NOW_MS, new EtagCache(), {
+      budget, intent: 'background',
+    });
+    const user = new GitHubHttp('https://github.com', 'ghp-test', fetchImpl, () => NOW_MS, new EtagCache(), {
+      budget, intent: 'interactive',
+    });
+
+    await poll.get('/repos/acme/core/pulls');
+    expect(kindOf(await poll.get('/repos/acme/core/pulls').catch((e: unknown) => e))).toBe('rateLimited');
+    // The whole reason for a reserve: what the user is waiting on still goes.
+    await expect(user.get('/repos/acme/core/pulls')).resolves.toEqual([]);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('stops the exhausted bucket only', async () => {
+    const sent: string[] = [];
+    const http = new GitHubHttp(
+      'https://github.com', 'ghp-test', server({ core: 3, graphql: 4999 }, sent),
+      () => NOW_MS, new EtagCache(),
+    );
+
+    await http.get('/repos/acme/core/pulls');
+    // `core` and `graphql` are separate resources with separate counters; a
+    // client that pooled them would silence the half that still has budget.
+    await expect(http.graphql('query { viewer { login } }', {})).resolves.toEqual({ ok: true });
+    expect(kindOf(await http.get('/repos/acme/core/pulls').catch((e: unknown) => e))).toBe('rateLimited');
+    expect(sent).toEqual([
+      'https://api.github.com/repos/acme/core/pulls',
+      'https://api.github.com/graphql',
+    ]);
+  });
+
+  it('stops the exhausted bucket only, the other way round', async () => {
+    const sent: string[] = [];
+    const http = new GitHubHttp(
+      'https://github.com', 'ghp-test', server({ core: 4999, graphql: 2 }, sent),
+      () => NOW_MS, new EtagCache(),
+    );
+
+    await http.graphql('query { viewer { login } }', {});
+    expect(kindOf(await http.graphql('query { viewer { login } }', {}).catch((e: unknown) => e)))
+      .toBe('rateLimited');
+    await expect(http.get('/repos/acme/core/pulls')).resolves.toEqual([]);
+  });
+
+  it('remembers the budget across the connections one provider hands out', async () => {
+    const sent: string[] = [];
+    const provider = createGitHubProvider(server({ core: 1, graphql: 5000 }, sent), () => NOW_MS);
+    const background = { ...CONFIG, intent: 'background' as const };
+
+    // `connectionForPod` builds a fresh Connection every poll. A budget owned
+    // by the client would be re-learned from zero each time, which is why
+    // `rateState` could be parsed on every response and still stop nothing.
+    await provider.connect(background).listWorkItems(['acme/core']);
+    const error: unknown = await provider.connect(background)
+      .listWorkItems(['acme/core'])
+      .catch((e: unknown) => e);
+
+    expect(kindOf(error)).toBe('rateLimited');
+    expect(sent).toHaveLength(1);
+  });
+
+  it("never spends one account's reading on another account", async () => {
+    const sent: string[] = [];
+    const budget = new RateBudget();
+    const fetchImpl = server({ core: 1, graphql: 5000 }, sent);
+    const opts = { budget, intent: 'background' as const };
+    const mine = new GitHubHttp('https://github.com', 'ghp-mine', fetchImpl, () => NOW_MS, new EtagCache(), opts);
+    const theirs = new GitHubHttp('https://github.com', 'ghp-theirs', fetchImpl, () => NOW_MS, new EtagCache(), opts);
+
+    await mine.get('/repos/acme/core/pulls');
+    expect(kindOf(await mine.get('/repos/acme/core/pulls').catch((e: unknown) => e))).toBe('rateLimited');
+    // One provider serves every pod on a host. Two tokens hold two budgets.
+    await expect(theirs.get('/repos/acme/core/pulls')).resolves.toEqual([]);
+  });
+
+  it('starts spending again once the window has rolled over', async () => {
+    const sent: string[] = [];
+    let clock = NOW_MS;
+    const http = new GitHubHttp(
+      'https://github.com', 'ghp-test', server({ core: 0, graphql: 5000 }, sent),
+      () => clock, new EtagCache(),
+    );
+
+    await http.get('/repos/acme/core/pulls');
+    expect(kindOf(await http.get('/repos/acme/core/pulls').catch((e: unknown) => e))).toBe('rateLimited');
+
+    clock = (RESET_AT + 1) * 1000;
+    // A reading describes one window. Once that window is gone the reading is
+    // not "no budget", it is "no information" — refusing on it forever is how
+    // a rate-limit guard becomes the outage.
+    await expect(http.get('/repos/acme/core/pulls')).resolves.toEqual([]);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('reads nothing from a response that carries no budget headers', async () => {
+    const sent: string[] = [];
+    const http = new GitHubHttp('https://github.com', 'ghp-test', (url) => {
+      sent.push(url);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: () => Promise.resolve([] as unknown),
+        text: () => Promise.resolve('[]'),
+      });
+    }, () => NOW_MS, new EtagCache(), { intent: 'background' });
+
+    await http.get('/repos/acme/core/pulls');
+    // `Number(null)` is 0 and 0 is finite, so parsing unconditionally would
+    // read a 204, an error page or a proxy that strips headers as "nothing
+    // left" — and then refuse everything after it.
+    expect(http.rateState('core')).toEqual({});
+    await expect(http.get('/repos/acme/core/pulls')).resolves.toEqual([]);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('will not refuse on half a reading', async () => {
+    const budget = new RateBudget();
+    budget.observe('acct', 'core', { get: (n) => (n === 'x-ratelimit-remaining' ? '0' : null) });
+    // A count with no reset cannot answer "when should I try again?", and a
+    // refusal that cannot say when is worse than one wasted request.
+    expect(budget.secondsUntilReset('acct', 'core', 50, NOW_MS)).toBeUndefined();
+    budget.observe('acct', 'core', { get: (n) => (n === 'x-ratelimit-reset' ? String(RESET_AT) : null) });
+    expect(budget.secondsUntilReset('acct', 'core', 50, NOW_MS)).toBe(600);
   });
 });

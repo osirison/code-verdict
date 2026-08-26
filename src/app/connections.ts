@@ -1,5 +1,5 @@
 import { getProvider, tryGetProvider } from '../platform/registry';
-import type { AuthMode, Connection, Credential } from '../platform/provider';
+import type { AuthMode, Connection, ConnectionIntent, Credential } from '../platform/provider';
 import { ScmError } from '../platform/errors';
 import type { Pod } from '../domain/types';
 import type { SecretStore } from './storage';
@@ -74,7 +74,18 @@ async function credentialForPod(pod: Pod, secrets: SecretStore): Promise<Credent
   throw new ScmError('auth', `Could not obtain a session for ${pod.instanceUrl}. Reconnect the pod.`);
 }
 
-export async function connectionForPod(pod: Pod, secrets: SecretStore): Promise<Connection> {
+/**
+ * `intent` tells the provider who is waiting on this connection. Only the
+ * background poll declares itself; everything else is a user standing in front
+ * of the screen, which is what the default means. A provider that meters
+ * requests can then keep a reserve for the second kind — nothing here knows or
+ * needs to know whether one does.
+ */
+export async function connectionForPod(
+  pod: Pod,
+  secrets: SecretStore,
+  opts: { intent?: ConnectionIntent } = {},
+): Promise<Connection> {
   const provider = tryGetProvider(pod.providerId);
   // A pod naming a provider this build does not have is reported, never
   // silently redirected to a different one.
@@ -84,5 +95,6 @@ export async function connectionForPod(pod: Pod, secrets: SecretStore): Promise<
   return provider.connect({
     instanceUrl: pod.instanceUrl,
     credential: await credentialForPod(pod, secrets),
+    intent: opts.intent,
   });
 }

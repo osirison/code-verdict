@@ -86,12 +86,76 @@ that half.
 `src/platform/provider.ts` defines two interfaces:
 
 - **`ScmProvider`** — static identity: `id`, `displayName`, `capabilities`, `vocabulary`, `host`,
-  `authModesFor(instanceUrl)`, and `connect(config)` returning a `Connection`.
+  `authModesFor(instanceUrl)`, and `connect(config)` returning a `Connection`. The config carries an
+  optional `intent` — whether someone is waiting on this connection — which a metered platform may
+  use to reserve budget and an unmetered one ignores.
 - **`Connection`** — everything the product needs from a platform: `testConnection`,
   `resolveSource` (URL / repo id / group id — the onboarding rules in handoff §4),
-  `listGroupRepositories`, `listOpenChangeRequests` (batched per repository, never per CR),
+  `listGroupRepositories`, `listOpenChangeRequests`, `listWorkItems`, `listCiRuns` (each batched
+  per repository — never one request per change request, per commit or per run),
   `getChangeRequestDiff`, `submitReview`, `listThreads`, `resolveThread`, `replyToThread`,
   `approve`.
+
+A `Connection` is cheap and short-lived — `connectionForPod` builds a fresh one for every poll, so
+it must never be the owner of anything that has to outlive a poll. What does have to outlive one
+belongs to the provider: `createGitHubProvider` owns the ETag cache for exactly that reason.
+
+### Conditional requests are how the budget is kept
+
+Batching cuts how many requests a poll issues. Conditional requests cut how many it is *charged
+for*, which is the number that runs out. GitHub does not count a 304 against the primary rate limit
+when the request carried an `Authorization` header, so every REST GET sends `If-None-Match` when the
+client has a validator for that exact URL, query string included, and a 304 replays the remembered
+body. Rate-limit headers are read on the 304 path too — they are as true there as on a 200. A 304
+whose remembered body is gone re-asks unconditionally rather than answering with nothing; emptying
+the dashboard is worse than spending one request. The exemption is authorization-gated, and GitLab
+grants no equivalent (measured: a GitLab 304 still increments `ratelimit-observed`), so this is a
+GitHub-provider concern and not a platform-wide one.
+
+### The client stops before the wall
+
+Batching and conditional requests both reduce spending. Neither of them decides when to stop, and
+the third failure is the one the user actually hit: the client parsed `x-ratelimit-remaining` on
+every response, read it back nowhere, and drove into the limit anyway.
+
+`RateBudget` is what the readings now feed. It lives in the `createGitHubProvider` closure for the
+same reason the ETag cache does — a `Connection` is rebuilt every poll, and a budget the client
+forgets each minute cannot stop anything. It is keyed by account and split by bucket: two tokens on
+one host hold independent budgets, and `core` and `graphql` are independent counters.
+
+A bucket at or below its floor refuses the next request outright, as a `rateLimited` `ScmError`
+carrying the reset — the same shape the 403 it replaces would have produced, so nothing above the
+provider can tell them apart. The floor differs by **intent**: a background connection stops with
+50 requests still standing, an interactive one at 5. That reserve is the point. One interactive flow
+— open a change request, read its files, submit — costs at most a dozen requests, so 50 is two or
+three whole flows kept back from the poll, at a cost of 1% of the hourly budget.
+
+`ConnectionIntent` is a neutral field on `ConnectionConfig`, set only by the notifier and defaulting
+to `interactive`; providers that meter nothing ignore it. Unstated intent is never the cheap one.
+
+### The poll's cadence is derived, not fixed
+
+One poll costs four requests per repository plus one per submitted review still open. A fixed 60s
+interval is therefore two different settings wearing one number: right for a five-repository pod,
+and 4,800 requests an hour for a twenty-repository one. `src/app/pollSchedule.ts` derives the
+interval from that fan-out against a background allowance of 1,200 requests an hour — a quarter of
+the authenticated budget in the worst case where nothing is cached, and near zero once validators
+are held. `codeVerdict.notifications.pollIntervalSeconds` sets the *floor*, not the interval.
+
+Two things are tied to that derived interval and must move with it. The **focus poll** is the one
+path the schedule does not bound, so its gap is a quarter of the earned interval rather than a flat
+15s — at a flat 15s an hour of Alt-Tab on a twenty-repository pod issues around 19,000 requests
+against an allowance of 1,200. And `NotificationCenter` re-baselines silently across a gap it reads
+as a pod waking up; its default 10 minutes is narrower than the interval a pod of more than fifty
+repositories earns, so the notifier widens that window to fit. Left alone, such a pod would poll
+forever, pay for every poll, and derive no event at all.
+
+A `rateLimited` poll is the one failure with a known duration, so it is the one that changes the
+cadence: the notifier stands down until the reported reset plus a small margin, and resumes on its
+own. Every other failure keeps the ordinary interval — a network blip is not a reason to go quiet
+for an hour. The user is told once per exhaustion (the flag clears only on a poll that succeeds, so
+a refused resume attempt does not toast again) and the status bar carries the state for as long as
+it lasts.
 
 ### Capabilities, not `if (gitlab)`
 
@@ -160,8 +224,10 @@ caret, ⚠, and the ○/✓ setup marks. They are content the spec dictates, not
 
 Spec §14 is drawn from a prototype that mocks the whole VS Code window, so its `⎇ branch` and
 `✕ 1 ⚠ 0` segments belong to the editor's own git and problems indicators. Verdict contributes the
-three that are its own — review state, agent, and the keys hint — and lets VS Code own the rest.
-Duplicating a native indicator is a bug, not fidelity.
+three the spec names as its own — review state, agent, and the keys hint — plus two that answer a
+question only Verdict can answer: the 🔔 badge count, and whether background polling is paused and
+until when. Both hide when there is nothing to say. Duplicating a native indicator is a bug, not
+fidelity; a Verdict state the user can sit in for an hour with no way to check on it is also a bug.
 
 ## Anchoring: one matcher, three callers
 
