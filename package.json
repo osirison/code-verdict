@@ -83,6 +83,10 @@
         "title": "Verdict: Switch pod"
       },
       {
+        "command": "codeVerdict.deletePod",
+        "title": "Verdict: Delete pod"
+      },
+      {
         "command": "codeVerdict.addProject",
         "title": "Verdict: Add project to pod"
       },
@@ -93,6 +97,10 @@
       {
         "command": "codeVerdict.signIn",
         "title": "Verdict: Sign in"
+      },
+      {
+        "command": "codeVerdict.showApiTrace",
+        "title": "Verdict: Show API trace"
       }
     ],
     "viewsContainers": {
@@ -295,6 +303,11 @@
           "default": true,
           "description": "Suggest a changeset when change requests across repositories share a source branch name. Trailer detection takes precedence; switch this off if reused branch names make it noisy."
         },
+        "codeVerdict.trace.api": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every API request the extension makes — method, URL, status, elapsed time and remaining rate limit — to the \"Verdict: API\" output channel. Credentials are redacted: authorization headers are never logged, and tokens carried in a URL are replaced before the line is written."
+        },
         "codeVerdict.pods": {
           "type": "array",
           "default": [],
@@ -403,10 +416,12 @@
     "emulator": "esbuild emulator/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/emulator.cjs --log-level=warning && node dist/emulator.cjs"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.10.0",
     "@types/vscode": "~1.96.0",
     "esbuild": "^0.25.0",
     "eslint": "^9.17.0",
+    "jsdom": "^30.0.1",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.19.0",
     "vitest": "^3.0.0"

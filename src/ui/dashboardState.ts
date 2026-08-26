@@ -6,8 +6,9 @@ import { deriveStats, repoIdsOf, repoLabel } from '../app/podQuery';
 import type { PodData } from '../app/podQuery';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetDetectionOptions } from '../app/changesets';
+import type { ReviewRun } from '../app/reviewRuns';
 import { getProvider } from '../platform/registry';
-import type { ActivityEntry, DashboardViewState, RowScope } from './dashboardHtml';
+import type { ActivityEntry, DashboardRow, DashboardViewState, RowScope } from './dashboardHtml';
 import { cap, repoCountOf } from './vocab';
 
 export function formatAge(iso: string, now: number): string {
@@ -19,9 +20,45 @@ export function formatAge(iso: string, now: number): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+/**
+ * The refresh button's label. It used to be `formatAge(data.fetchedAt, now)`,
+ * with `fetchedAt` stamped at fetch time and `now` a few milliseconds later
+ * at render time — so it read "0m ago" permanently and never moved, which is
+ * half of why ⟳ looked dead. A wall-clock stamp cannot go stale that way, and
+ * needs no client-side timer: a region patch replaces the whole header, so an
+ * interval ticking the age would have to be re-armed after every repaint.
+ */
+export function formatClock(at: number): string {
+  const when = new Date(at);
+  return `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * Precedence, strictly: submitted (it is on the platform) > clean (the agent
+ * ran and found nothing) > findings waiting for triage > never run. Only the
+ * first of those is a `ReviewHistory` entry; the middle two come from the
+ * run store, which is why a clean run used to read "not run" forever.
+ *
+ * Labels are sized for the 104px "AI review" column: at 11px mono a pill fits
+ * about eleven characters inside its 8px padding, so "N findings" and "no
+ * findings" fit and "N findings ready" would not.
+ */
+function aiPill(submitted: boolean, run: ReviewRun | undefined): DashboardRow['ai'] {
+  if (submitted) return { label: 'submitted', cls: 'pill-agent' };
+  if (run?.outcome === 'clean') return { label: 'no findings', cls: 'pill-ok' };
+  if (run) return { label: `${run.findingCount} finding${run.findingCount === 1 ? '' : 's'}`, cls: 'pill-warn' };
+  return { label: 'not run', cls: 'pill' };
+}
+
 export interface DashboardDeps {
   /** CR refs (repoId!number) with a submitted review — fills the AI pill. */
   submittedRefs?: () => ReadonlySet<string>;
+  /**
+   * Latest review run per CR ref (repoId!number), submitted or not. Separate
+   * from `submittedRefs` on purpose: a clean run is a real outcome to show
+   * and is never a submitted review.
+   */
+  reviewRuns?: () => ReadonlyMap<string, ReviewRun>;
   /** Row click: submitted rows open Posted reviews, others Run review (§2). */
   openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
   openChangeset?: (changesetId: string) => void;
@@ -48,6 +85,7 @@ export function toViewState(
   now: number,
   submittedRefs: ReadonlySet<string>,
   changesetOptions?: ChangesetDetectionOptions,
+  reviewRuns: ReadonlyMap<string, ReviewRun> = new Map(),
 ): DashboardViewState {
   const pod = data.pod;
   const you = pod.username;
@@ -56,6 +94,11 @@ export function toViewState(
 
   const counts = new Map<string, number>();
   const scopeCounts = { you: 0, them: 0 };
+  // Counted off the rows, like scopeCounts: `submittedRefs` is every entry
+  // ever written — other pods, and change requests that have since closed —
+  // while `total` is only this pod's open ones, so using its size made the
+  // numerator outrun the denominator (a "12/9 reviewed" stat).
+  let reviewedRows = 0;
   const rows = data.changeRequests.map((cr) => {
     counts.set(cr.ref.repoId, (counts.get(cr.ref.repoId) ?? 0) + 1);
     const scope: RowScope =
@@ -66,7 +109,12 @@ export function toViewState(
           : 'none';
     if (scope === 'you') scopeCounts.you += 1;
     if (scope === 'them') scopeCounts.them += 1;
-    const submitted = submittedRefs.has(`${cr.ref.repoId}!${cr.ref.number}`);
+    const refKey = `${cr.ref.repoId}!${cr.ref.number}`;
+    const submitted = submittedRefs.has(refKey);
+    const run = reviewRuns.get(refKey);
+    // "Reviewed" is "the agent has run on it", which a clean run satisfies —
+    // it is exactly the row set whose pill is not "not run".
+    if (submitted || run) reviewedRows += 1;
     return {
       repoId: cr.ref.repoId,
       number: cr.ref.number,
@@ -76,9 +124,7 @@ export function toViewState(
       branch: cr.sourceBranch,
       project: repoLabel(pod, cr.ref.repoId),
       scope,
-      ai: submitted
-        ? ({ label: 'submitted', cls: 'pill-agent' } as const)
-        : ({ label: 'not run', cls: 'pill' } as const),
+      ai: aiPill(submitted, run),
       submitted,
       ciStatus: cr.ci?.status,
       age: formatAge(cr.updatedAt, now),
@@ -130,9 +176,9 @@ export function toViewState(
     scopeCounts,
     stats: {
       ...deriveStats(data),
-      aiCoverage: { reviewed: submittedRefs.size, total: data.changeRequests.length },
+      aiCoverage: { reviewed: reviewedRows, total: data.changeRequests.length },
     },
-    fetchedAgo: `${formatAge(new Date(data.fetchedAt).toISOString(), now)} ago`,
+    fetchedLabel: formatClock(data.fetchedAt),
     projects: repoIdsOf(pod).map((id) => ({
       id,
       label: repoLabel(pod, id),

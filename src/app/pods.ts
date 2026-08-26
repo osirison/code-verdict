@@ -38,6 +38,27 @@ export class PodStore {
     await this.store.update(PODS_KEY, next);
   }
 
+  /**
+   * Delete a pod and leave the active pointer valid. The caller owns the
+   * state that hangs off the pod (its token, its manual changesets) — this
+   * knows only about the two keys it writes.
+   */
+  async remove(id: string): Promise<void> {
+    const pods = this.list();
+    const next = pods.filter((p) => p.id !== id);
+    // Unknown id: no write at all, so a stale sidebar row firing twice cannot
+    // disturb the active pointer.
+    if (next.length === pods.length) return;
+    await this.store.update(PODS_KEY, next);
+    // One condition covers three cases: the removed pod was the active one,
+    // it was the last one (`next[0]?.id` is undefined, which clears the key),
+    // and the pointer was already dangling. `activePod` falls back to pods[0]
+    // regardless, but a stale id left in globalState outlives that fallback —
+    // re-create a pod with the same id and it silently becomes active.
+    const active = this.store.get<string>(ACTIVE_KEY);
+    if (!next.some((p) => p.id === active)) await this.store.update(ACTIVE_KEY, next[0]?.id);
+  }
+
   async setActive(id: string): Promise<void> {
     await this.store.update(ACTIVE_KEY, id);
   }

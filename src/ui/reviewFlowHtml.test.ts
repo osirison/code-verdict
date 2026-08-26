@@ -373,3 +373,97 @@ describe('load-failure error screen (issue #39)', () => {
     expect(html).toContain('id="flow-body"');
   });
 });
+
+describe('the author is never offered a verdict on their own change request', () => {
+  const clean: FlowViewState = { ...state, screen: 'clean', items: [], selectedId: undefined, diffLines: undefined };
+  const summary: FlowViewState = {
+    ...state,
+    screen: 'summary',
+    items: state.items.map((view) => ({ ...view, verdict: 'accepted' as const })),
+    counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 },
+  };
+  // The note's own wording contains "approval", so absence is asserted on the
+  // button's id, never on the word.
+  const NOTE = 'You opened this merge request — GitLab does not accept an approval from its author.';
+
+  it('hides Approve on the clean screen and says why, in the platform\'s own nouns', () => {
+    const html = renderReviewFlowBody({ ...clean, selfAuthored: true }, 'HVE Core / PR Review');
+
+    expect(html).not.toContain('id="approve"');
+    expect(html).toContain(NOTE);
+    // The way out is still there — only the verdict is withheld.
+    expect(html).toContain('id="lower-bar"');
+    expect(html).toContain('id="back-dash"');
+  });
+
+  it('keeps Approve when the change request is someone else\'s', () => {
+    const html = renderReviewFlowBody({ ...clean, selfAuthored: false }, 'HVE Core / PR Review');
+
+    expect(html).toContain('id="approve"');
+    expect(html).toContain('Approve merge request');
+    expect(html).not.toContain(NOTE);
+  });
+
+  it('keeps Approve when authorship is unknown — an absent flag is not a yes', () => {
+    // `Pod.username` is optional, so the builder cannot always answer. Unknown
+    // has to behave exactly as before: the button renders and the platform's
+    // own refusal is what the reviewer sees, if it is even their own MR.
+    const html = renderReviewFlowBody(clean, 'HVE Core / PR Review');
+
+    expect(clean.selfAuthored).toBeUndefined();
+    expect(html).toContain('id="approve"');
+    expect(html).not.toContain(NOTE);
+  });
+
+  it('never offers Approve on a changeset clean screen, whoever authored it', () => {
+    // A changeset spans four MRs — there is no single one the button could
+    // approve, and changesetReview.ts only navigates to the dashboard.
+    const html = renderReviewFlowBody({
+      ...clean,
+      changeset: {
+        id: 'trailer:1180', name: 'Key rotation, end to end', linkedIssue: '#1180',
+        memberCount: 4, projectCount: 4, refs: ['!812', '!2841', '!381', '!1509'],
+      },
+    }, 'HVE Core / PR Review');
+
+    expect(html).not.toContain('id="approve"');
+    expect(html).toContain('id="back-dash"');
+  });
+
+  it('shows the request-changes option as unavailable, with the same reason', () => {
+    const html = renderReviewFlowBody({ ...summary, selfAuthored: true }, 'HVE Core / PR Review');
+
+    expect(html).toContain('id="opt-changes" disabled');
+    expect(html).not.toContain('id="opt-changes" checked');
+    expect(html).toContain('GitLab does not accept a request for changes from its author.');
+    // The unrelated option is untouched.
+    expect(html).toContain('id="opt-thread"');
+  });
+
+  it('leaves the request-changes option alone for everyone else', () => {
+    const html = renderReviewFlowBody({ ...summary, selfAuthored: false }, 'HVE Core / PR Review');
+
+    expect(html).toContain('id="opt-changes" checked');
+    expect(html).not.toContain('id="opt-changes" disabled');
+    expect(html).not.toContain('from its author');
+  });
+
+  it('renders nothing at all when the provider has no request-changes verdict', () => {
+    // Distinct from the author case: there is no such verdict to explain.
+    const html = renderReviewFlowBody(
+      { ...summary, supportsRequestChanges: false, selfAuthored: true },
+      'HVE Core / PR Review',
+    );
+
+    expect(html).not.toContain('id="opt-changes"');
+    expect(html).not.toContain('a request for changes from its author');
+  });
+
+  it('centres the clean actions row with a class, not a CSP-dropped style attribute (#45)', () => {
+    const page = renderReviewFlowHtml({ ...clean, selfAuthored: true }, 'HVE Core / PR Review', 'n');
+
+    expect(page).toContain('class="actions-row actions-center"');
+    expect(page).toContain('.actions-center { justify-content: center; }');
+    expect(renderReviewFlowBody(clean, 'HVE Core / PR Review')).not.toContain('style="justify-content:center"');
+  });
+});

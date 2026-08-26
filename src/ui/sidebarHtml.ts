@@ -122,6 +122,7 @@ export interface SidebarViewState {
 export type SidebarMessage =
   | { type: 'refresh' }
   | { type: 'selectPod'; podId: string }
+  | { type: 'deletePod'; podId: string }
   | { type: 'openDashboard' }
   | { type: 'openChangesets'; firstId?: string }
   | { type: 'openPostedReviews' }
@@ -153,9 +154,19 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .divider { border-top: 1px solid var(--line); margin-top: 4px; }
 .section { padding: 11px 12px 8px; color: var(--fg-dimmer); font-size: 10px; font-weight: 500; letter-spacing: .09em; text-transform: uppercase; }
 .pod-list, .list { display: flex; flex-direction: column; padding-bottom: 8px; }
-.pod-row { display: grid; grid-template-columns: 12px minmax(0, 1fr); column-gap: 7px; width: 100%; border: none; background: none; color: var(--fg-dim); padding: 7px 12px; cursor: pointer; font-family: var(--font-ui); text-align: left; }
-.pod-row:hover { background: var(--hover); }
-.pod-row.active { background: var(--sel); color: var(--fg-hi); }
+/* The row is two controls, so the selection background moves to the wrapper —
+   otherwise the delete button sits outside the highlight it belongs to. */
+.pod-row-wrap { display: flex; align-items: stretch; width: 100%; }
+.pod-row-wrap:hover { background: var(--hover); }
+.pod-row-wrap.active { background: var(--sel); }
+.pod-row { display: grid; grid-template-columns: 12px minmax(0, 1fr); column-gap: 7px; flex: 1; min-width: 0; border: none; background: none; color: var(--fg-dim); padding: 7px 12px; cursor: pointer; font-family: var(--font-ui); text-align: left; }
+.pod-row.active { color: var(--fg-hi); }
+/* Hidden until the row is hovered so the list stays as quiet as the prototype,
+   but still reachable by keyboard — :focus-visible brings it back. */
+.pod-delete { display: flex; align-items: center; border: none; background: none; color: var(--fg-dimmer); padding: 0 10px; cursor: pointer; font: inherit; opacity: 0; }
+.pod-row-wrap:hover .pod-delete, .pod-delete:focus-visible { opacity: 1; }
+.pod-delete:hover, .pod-delete:focus-visible { color: var(--fg-hi); }
+.pod-delete .codicon { font-size: 13px; }
 .pod-check { color: var(--accent); font-family: var(--font-mono); font-size: 10px; padding-top: 2px; }
 .pod-name { font-size: 12px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pod-meta { grid-column: 2; margin-top: 2px; color: var(--fg-dimmer); font-family: var(--font-mono); font-size: 10.5px; }
@@ -363,11 +374,14 @@ function renderThreads(threads: SidebarThreads): string {
 export function renderSidebarHtml(state: SidebarViewState, nonce: string): string {
   const e = escapeHtml;
   const podRows = state.pods.length > 0
-    ? state.pods.map((pod) => `<button class="pod-row ${pod.active ? 'active' : ''}" data-pod="${e(pod.id)}">
-        <span class="pod-check">${pod.active ? '✓' : ''}</span>
-        <span class="pod-name">${e(pod.name)}</span>
-        <span class="pod-meta">${e(pod.meta)}</span>
-      </button>`).join('')
+    ? state.pods.map((pod) => `<div class="pod-row-wrap ${pod.active ? 'active' : ''}">
+        <button class="pod-row ${pod.active ? 'active' : ''}" data-pod="${e(pod.id)}">
+          <span class="pod-check">${pod.active ? '✓' : ''}</span>
+          <span class="pod-name">${e(pod.name)}</span>
+          <span class="pod-meta">${e(pod.meta)}</span>
+        </button>
+        <button class="pod-delete" data-pod-delete="${e(pod.id)}" title="Delete pod" aria-label="Delete pod ${e(pod.name)}">${icon('trash')}</button>
+      </div>`).join('')
     : '<div class="empty">No pods configured</div>';
   const mergeRequestRows = state.mergeRequests.length > 0
     ? state.mergeRequests.map((mr) => `<button class="review" data-cr-repo="${e(mr.repoId)}" data-cr-number="${e(mr.number)}">
@@ -459,6 +473,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     document.getElementById('tuning')?.addEventListener('click', () => post({ type: 'openTuning' }));
     document.getElementById('settings')?.addEventListener('click', () => post({ type: 'openSettings' }));
     document.querySelectorAll('[data-pod]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectPod', podId: row.dataset.pod })));
+    document.querySelectorAll('[data-pod-delete]').forEach((button) => button.addEventListener('click', () => post({ type: 'deletePod', podId: button.dataset.podDelete })));
     document.querySelectorAll('[data-cr-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'openCr', repoId: row.dataset.crRepo, number: row.dataset.crNumber })));
     document.querySelectorAll('[data-issue-url]').forEach((row) => row.addEventListener('click', () => post({ type: 'openIssue', webUrl: row.dataset.issueUrl })));
     document.querySelectorAll('[data-finding]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectFinding', itemId: row.dataset.finding })));

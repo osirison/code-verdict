@@ -17,7 +17,12 @@ export interface PodData {
 
 export interface PodStats {
   waitingOnYou: number;
-  /** Reviewed / total open — reviewed stays 0 until the review store lands. */
+  /**
+   * Reviewed / total open. `deriveStats` leaves `reviewed` at 0 — it sees one
+   * pod fetch and nothing about review state — and `dashboardState.toViewState`
+   * overrides it, counting the rows the run store or the submitted set claims.
+   * Counted there rather than here so the numerator stays a subset of `total`.
+   */
   aiCoverage: { reviewed: number; total: number };
   pipelinesFailing: number;
   projectsInPod: number;

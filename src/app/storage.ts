@@ -11,6 +11,7 @@ export interface KeyValueStore {
 export interface SecretStore {
   get(key: string): Thenable<string | undefined>;
   store(key: string, value: string): Thenable<void>;
+  delete(key: string): Thenable<void>;
 }
 
 function hostOf(instanceUrl: string): string {
@@ -60,4 +61,37 @@ export async function readToken(
   if (legacy === undefined) return undefined;
   await secrets.store(key, legacy);
   return legacy;
+}
+
+/** Just enough of a pod to name the secret it reads — keeps this file domain-free. */
+export interface TokenOwner {
+  providerId: string;
+  instanceUrl: string;
+}
+
+/**
+ * Drop a deleted pod's token, but only when nothing that survives reads the
+ * same secret. Secrets are keyed provider + host and never per pod, so two
+ * pods on one instance share one credential — deleting it with a sibling
+ * still around signs that sibling out of a pod nobody touched.
+ *
+ * Compared by key rather than by `instanceUrl`, because "https://host/" and
+ * "https://host" are two strings naming one secret.
+ */
+export async function deleteTokenIfUnused(
+  secrets: SecretStore,
+  removed: TokenOwner,
+  remaining: readonly TokenOwner[],
+): Promise<void> {
+  const key = tokenSecretKey(removed.providerId, removed.instanceUrl);
+  if (remaining.some((pod) => tokenSecretKey(pod.providerId, pod.instanceUrl) === key)) return;
+  await secrets.delete(key);
+
+  // The legacy key is host-only, so a surviving pod on the same host under a
+  // *different* provider can still migrate its token out of it via readToken.
+  // That makes the condition for dropping it strictly stronger than the one
+  // above: nothing left on this host at all, whatever the provider.
+  const legacy = legacyTokenSecretKey(removed.instanceUrl);
+  if (remaining.some((pod) => legacyTokenSecretKey(pod.instanceUrl) === legacy)) return;
+  await secrets.delete(legacy);
 }
