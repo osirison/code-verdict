@@ -10,9 +10,15 @@ import { connectionForPod } from '../app/connections';
 import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
 import { DEMO_AGENT_ID } from '../app/demoAgent';
-import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runLmChangesetAgent } from '../app/lmAgent';
+import {
+  AgentRunError,
+  changesetContextEntries,
+  discoverLmAgents,
+  runLmChangesetAgent,
+} from '../app/lmAgent';
 import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
+import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
@@ -24,10 +30,12 @@ import { allDecided, clearVerdict, createReview, nextUndecided, setVerdict, verd
 import type { Category, Review, Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
 import { repoCountOf } from './vocab';
+import { agentRunTimeouts } from './agentRunOptions';
 import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
+import { RunLiveness } from './runLiveness';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarActiveReview } from './sidebarHtml';
 
@@ -96,6 +104,8 @@ export class ChangesetReviewPanel {
   private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
   private agentId = DEMO_AGENT_ID;
   private agentOpen = false;
+  /** Collapsed until asked for: the findings are what the triage screen is for. */
+  private contextOpen = false;
   private screen: FlowScreen = 'agent';
   private mode: 'split' | 'queue' | 'diff' = 'split';
   private response?: AgentReviewResponse;
@@ -106,6 +116,7 @@ export class ChangesetReviewPanel {
   private runStep = 0;
   private runError?: { message: string; requestId: string; partialCount: number; code: string };
   private runToken = 0;
+  private readonly runLive = new RunLiveness();
   private summaryText = '';
   private finalNote = '';
   private postThread = true;
@@ -169,6 +180,9 @@ export class ChangesetReviewPanel {
           ref: member.ref,
           projectPath: member.projectPath,
           diff: await connection.getChangeRequestDiff(member.ref),
+          // fetchPodData already fetched the pod's work items for detection —
+          // resolving each member's links off that batch costs no request.
+          context: buildReviewContext(member, data.workItems, { trailer: options.trailer }),
         }))),
         discoverLmAgents(),
       ]);
@@ -238,10 +252,14 @@ export class ChangesetReviewPanel {
     this.screen = 'running';
     this.runError = undefined;
     this.runStep = 0;
+    this.runLive.clear();
     const pod = this.pod();
     const runVocabulary = getProvider(pod.providerId).vocabulary;
     pod.agentId = this.agentId;
     await this.deps.podStore.upsert(pod);
+    // Read once, outside the try: the failure card names the window that ran
+    // out, and the catch cannot re-read a value the try scope owned.
+    const timeouts = agentRunTimeouts();
     try {
       if (this.agentId === DEMO_AGENT_ID) {
         const result = runDemoChangesetAgent(this.members, pod.criteria, runVocabulary);
@@ -263,8 +281,16 @@ export class ChangesetReviewPanel {
         'Items ready',
       ];
       this.runStep = 2;
+      // The log parks here for the whole request; the liveness line under it
+      // is what says the run is alive rather than hung.
+      this.runLive.start();
       this.render();
-      const response = await runLmChangesetAgent(this.agentId, this.members, pod.criteria);
+      const response = await runLmChangesetAgent(this.agentId, this.members, pod.criteria, {
+        timeouts,
+        onProgress: (progress) => {
+          if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
+        },
+      });
       if (!this.disposed && token === this.runToken) this.finishRun(response);
     } catch (error) {
       if (this.disposed || token !== this.runToken) return;
@@ -273,7 +299,11 @@ export class ChangesetReviewPanel {
         message: failure.message,
         requestId: failure.requestId,
         partialCount: 0,
-        code: failure.timedOut ? `copilot.request.timeout · ${failure.timeoutReason === 'ceiling' ? CEILING_TIMEOUT_MS : INACTIVITY_TIMEOUT_MS}ms` : 'copilot.request.error',
+        // The window that actually ran out, not the shipped default — a
+        // reviewer who lengthened it needs the code to name their number.
+        code: failure.timedOut
+          ? `copilot.request.timeout · ${failure.timeoutReason === 'ceiling' ? timeouts.ceilingMs : timeouts.inactivityMs}ms`
+          : 'copilot.request.error',
       };
       this.render();
     }
@@ -324,6 +354,7 @@ export class ChangesetReviewPanel {
       case 'cancel': this.runToken += 1; this.screen = 'agent'; break;
       case 'retryRun': case 'rerun': void this.run(); return;
       case 'usePartial': this.runError = undefined; this.screen = 'agent'; break;
+      case 'toggleReviewContext': this.contextOpen = !this.contextOpen; break;
       case 'setMode': this.mode = message.mode; break;
       case 'select': this.selectedId = message.itemId; break;
       case 'verdict': {
@@ -550,6 +581,12 @@ export class ChangesetReviewPanel {
     const history = new ReviewHistory(this.deps.globalState).list().filter((record) => record.podId === pod.id);
     const produced = history.reduce((count, record) => count + record.counts.accepted + record.counts.rejected + record.counts.skipped, 0);
     const vocabulary = getProvider(pod.providerId).vocabulary;
+    // The same contexts the prompt carries, under labels a human reads instead
+    // of the wire format's — see ReviewContextView.truncated for why the
+    // measurement below still runs against the prompt's own entries.
+    const contextEntries = this.members.flatMap((member) => (member.context
+      ? [{ context: member.context, label: `${member.projectPath} · ${vocabulary.formatCrRef(member.ref.number)}` }]
+      : []));
     const state: FlowViewState = {
       vocabulary,
       screen: this.screen,
@@ -578,12 +615,20 @@ export class ChangesetReviewPanel {
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
       runSteps: this.runSteps,
       runStep: this.runStep,
+      runLive: this.runLive.snapshot(),
       runError: this.runError,
       mode: this.mode,
       items,
       selectedId: this.selectedId,
       diffLines,
       counts,
+      context: contextEntries.length > 0
+        ? {
+            open: this.contextOpen,
+            truncated: reviewContextTruncatedForPrompt(changesetContextEntries(this.members)),
+            entries: contextEntries,
+          }
+        : undefined,
       stale: this.stale,
       candidates: this.response?.candidates ?? [],
       filesRead: this.response?.stats?.filesRead ?? totalFiles,

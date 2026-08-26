@@ -94,6 +94,7 @@ export interface GlIssue {
   iid: number;
   project_id: number;
   title: string;
+  description?: string | null;
   state: string;
   assignees?: GlUser[];
   milestone?: { title: string } | null;
@@ -202,6 +203,7 @@ export function toWorkItem(issue: GlIssue): WorkItem {
     repoId: String(issue.project_id),
     number: String(issue.iid),
     title: issue.title,
+    description: issue.description ?? undefined,
     state: issue.state === 'opened' ? 'open' : 'closed',
     assignee: issue.assignees?.[0] ? toUser(issue.assignees[0]) : undefined,
     milestone: issue.milestone?.title,

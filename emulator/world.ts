@@ -128,6 +128,7 @@ export interface EmIssue {
   iid: number;
   project_id: number;
   title: string;
+  description: string;
   state: 'opened' | 'closed';
   assignees: EmUser[];
   milestone: { title: string } | null;
@@ -602,6 +603,7 @@ export function generateWorld(
         iid: 1100 + world.issues.length,
         project_id: project.id,
         title: rng.pick(ISSUE_TITLES),
+        description: 'Filler work item body — the review context reads this field, so it is never empty.',
         state: 'opened',
         assignees: rng.chance(0.7) ? [rng.pick(users)] : [],
         milestone: rng.chance(0.5) ? { title: '26.08' } : null,
@@ -617,6 +619,7 @@ export function generateWorld(
     iid: 1180,
     project_id: 9102,
     title: 'Key rotation, end to end',
+    description: 'Rotate signing keys without a restart.\n\nThe gateway must accept both the outgoing and the incoming key for one TTL, and the console must render the new expiry field.',
     state: 'opened',
     assignees: [users[1] as EmUser],
     milestone: { title: '26.08' },

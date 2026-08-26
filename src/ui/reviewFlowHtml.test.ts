@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
-import type { FlowViewState } from './reviewFlowHtml';
-import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
+import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
+import type { FlowViewState, ReviewContextView } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, runOutputSummary } from './reviewFlowHtml';
 
 const state: FlowViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -371,5 +372,166 @@ describe('load-failure error screen (issue #39)', () => {
   it('wraps the body in the same #flow-body region a patch targets', () => {
     const html = renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n');
     expect(html).toContain('id="flow-body"');
+  });
+});
+
+describe('the context the agent was given, on the screen where the human decides', () => {
+  const reviewContext: ReviewContext = {
+    title: 'Rotate signing keys without a restart',
+    description: 'Part-of: #1180\n\nAccept both keys for one TTL, then drop the old one.',
+    linkedItems: [{
+      number: '1180',
+      resolved: true,
+      state: 'open',
+      title: 'Key rotation, end to end',
+      description: 'The gateway must accept the outgoing key for one TTL.',
+      webUrl: 'https://gitlab.example/issues/1180',
+    }],
+  };
+  /** Split mode throughout: the fixture's diff mode is the one screen that still
+   *  carries a pre-existing style attribute (--item-sev), which the last case here
+   *  would trip over for a reason that has nothing to do with this box (#45). */
+  const render = (context: Partial<ReviewContextView>, over: Partial<FlowViewState> = {}): string =>
+    renderReviewFlowBody(
+      { ...state, mode: 'split', context: { open: true, truncated: false, entries: [{ context: reviewContext }], ...context }, ...over },
+      'HVE Core / PR Review',
+    );
+
+  it('shows the description and the linked item the prompt carried', () => {
+    const html = render({});
+
+    expect(html).toContain('What this change is for');
+    expect(html).toContain('Accept both keys for one TTL, then drop the old one.');
+    expect(html).toContain('#1180 · open · Key rotation, end to end');
+    expect(html).toContain('The gateway must accept the outgoing key for one TTL.');
+  });
+
+  it('collapses to a single row that says what is inside, and renders nothing at all without a context', () => {
+    // Findings are the point of this screen; an open description would push the
+    // selected one under the fold.
+    const collapsed = render({ open: false });
+    expect(collapsed).toContain('Merge request description · 1 issue linked');
+    expect(collapsed).not.toContain('Accept both keys for one TTL, then drop the old one.');
+    // The row opens it, through the same delegated binding every other control
+    // on this page uses — the panel holds open/closed, because a region patch
+    // (#39) replaces this markup on every verdict.
+    expect(renderReviewFlowHtml({ ...state, mode: 'split' }, 'HVE Core / PR Review', 'n'))
+      .toContain("on('ctx-toggle', 'toggleReviewContext')");
+
+    // No context (before the fetch returns, or on a screen that never had one)
+    // is not an empty box — it is no box.
+    expect(renderReviewFlowBody({ ...state, mode: 'split' }, 'HVE Core / PR Review')).not.toContain('ctx-head');
+  });
+
+  it('escapes the markdown a human wrote instead of running it', () => {
+    const html = render({
+      entries: [{
+        context: {
+          ...reviewContext,
+          description: '<script>alert(1)</script> Rotate A & B',
+        },
+      }],
+    });
+
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt; Rotate A &amp; B');
+    expect(html).not.toContain('<script>alert(1)');
+  });
+
+  it('says plainly that nothing is linked rather than showing an empty box', () => {
+    const html = render({ entries: [{ context: { ...reviewContext, linkedItems: [] } }] });
+
+    expect(html).toContain('No issue is linked from the description — the agent was given this merge request alone.');
+  });
+
+  it('says the reference was all the agent got when the item could not be read', () => {
+    const html = render({ entries: [{ context: { ...reviewContext, linkedItems: [{ number: '1181', resolved: false }] } }] });
+
+    expect(html).toContain('The agent was given this reference only — the issue itself could not be read.');
+  });
+
+  it('marks a prompt that was cut, and marks nothing when it was not', () => {
+    // A real over-budget description, measured by the same predicate the panel
+    // uses — the notice has to track what the prompt actually carried.
+    const long = { ...reviewContext, description: 'x'.repeat(CONTEXT_SECTION_BUDGET + 1) };
+    const entries = [{ context: long }];
+    expect(reviewContextTruncatedForPrompt(entries)).toBe(true);
+
+    const cut = render({ truncated: reviewContextTruncatedForPrompt(entries), entries });
+    expect(cut).toContain('agent saw a shortened copy');
+    expect(cut).toContain('some of the text below did not fit its prompt');
+    // The full text is still on screen — that is what the reviewer judges against.
+    expect(cut).toContain('x'.repeat(CONTEXT_SECTION_BUDGET + 1));
+
+    expect(reviewContextTruncatedForPrompt([{ context: reviewContext }])).toBe(false);
+    expect(render({})).not.toContain('agent saw a shortened copy');
+  });
+
+  it('names the linked item in the platform own noun', () => {
+    const html = render({}, {
+      vocabulary: { ...GITLAB_VOCABULARY, workItemNoun: 'ticket', workItemNounPlural: 'tickets' },
+    });
+
+    expect(html).toContain('1 ticket linked');
+    expect(html).not.toContain('1 issue linked');
+  });
+
+  it('carries no style attribute — a nonce authorises style elements only (#45)', () => {
+    expect(render({})).not.toContain('style="');
+  });
+
+  it('labels one block per member in changeset scope', () => {
+    const html = render({
+      entries: [
+        { context: reviewContext, label: 'hve/platform/core · !2841' },
+        { context: { title: 'Read both keys', description: undefined, linkedItems: [] }, label: 'hve/console · !1509' },
+      ],
+    });
+
+    expect(html).toContain('hve/platform/core · !2841 · Rotate signing keys without a restart');
+    expect(html).toContain('hve/console · !1509 · Read both keys');
+    expect(html).toContain('No description on this merge request — the agent was given the title alone.');
+    // Two blocks, so the row counts them instead of describing the one.
+    expect(html).toContain('2 merge requests · 1 issue linked');
+  });
+});
+
+/**
+ * The running screen used to be a spinner over a canned log parked on step 2,
+ * so a healthy long review and a hung one looked the same. These assert the
+ * numbers that tell them apart are actually on the page.
+ */
+describe('the running screen shows the run is alive', () => {
+  function running(runLive?: FlowViewState['runLive']): string {
+    return renderReviewFlowBody({ ...state, screen: 'running', runSteps: ['Resolving agent…', 'Items ready'], runStep: 1, runLive }, 'HVE Core');
+  }
+
+  it('counts elapsed time and arriving output, with the start stamp the page ticks from', () => {
+    const html = running({ startedAt: 1_770_000_000_000, elapsedMs: 185_000, fragmentsReceived: 12, charsReceived: 8421 });
+    expect(html).toContain('data-started="1770000000000"');
+    expect(html).toContain('>3:05</b> elapsed');
+    expect(html).toContain('12 fragments · 8,421 characters');
+  });
+
+  it('says it is waiting rather than showing a zero before the first fragment', () => {
+    const html = running({ startedAt: 1_770_000_000_000, elapsedMs: 0, fragmentsReceived: 0, charsReceived: 0 });
+    expect(html).toContain('>0:00</b> elapsed');
+    expect(html).toContain('waiting for the first output');
+    expect(html).not.toContain('0 fragments');
+  });
+
+  it('renders no liveness line for the demo agent, which walks its own log', () => {
+    expect(running(undefined)).not.toContain('run-live');
+  });
+
+  it('carries no style attribute of its own — a nonce authorises style elements only (#45)', () => {
+    const html = running({ startedAt: 1, elapsedMs: 0, fragmentsReceived: 1, charsReceived: 1 });
+    // The pre-existing progress bar still writes one (#45 is open against it); nothing new does.
+    expect(html.match(/style="/g)?.length ?? 0).toBe(1);
+  });
+
+  it('formats the same counters for the page as for the markup, so a push never disagrees with a render', () => {
+    expect(runOutputSummary(1, 40)).toBe('1 fragment · 40 characters');
+    expect(runOutputSummary(0, 0)).toBe('waiting for the first output');
+    expect(runOutputSummary(9, 1_234_567)).toBe('9 fragments · 1,234,567 characters');
   });
 });

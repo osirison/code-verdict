@@ -77,6 +77,8 @@ const VOCABULARY: Vocabulary = {
   groupNoun: 'organization',
   ciNoun: 'check',
   ciNounPlural: 'checks',
+  workItemNoun: 'issue',
+  workItemNounPlural: 'issues',
   formatCrRef: (number) => `#${number}`,
 };
 

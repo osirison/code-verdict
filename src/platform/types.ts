@@ -64,6 +64,8 @@ export interface WorkItem {
   repoId: string;
   number: string;
   title: string;
+  /** Provider-authored body. Absent when the item has none — a title alone is not what a change is for. */
+  description?: string;
   state: 'open' | 'closed';
   assignee?: UserRef;
   milestone?: string;

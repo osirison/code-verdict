@@ -6,11 +6,14 @@ import { NEUTRAL_VOCABULARY, type Vocabulary } from '../platform/provider';
 import type { Criteria, ReviewItem } from '../domain/types';
 import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 import { DEMO_AGENT_ID, DEMO_AGENT_LABEL, runDemoAgent, type DemoAgentResult } from './demoAgent';
+import type { ReviewContext } from './reviewContext';
 
 export interface ChangesetAgentMember {
   ref: ChangeRequestRef;
   projectPath: string;
   diff: ChangeRequestDiff;
+  /** What this member is for. Optional: the demo agent reads diffs only. */
+  context?: ReviewContext;
 }
 
 function compositeHead(members: readonly ChangesetAgentMember[]): string {
