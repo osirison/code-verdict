@@ -178,9 +178,28 @@ section { padding: 16px 0 6px; }
 .empty h2 { font-size: 16px; font-weight: 600; color: var(--fg-hi); margin-bottom: 8px; }
 .empty p { font-size: 12.5px; color: var(--fg-dim); margin-bottom: 18px; }
 .empty .btn { margin: 0 4px; }
+
+/* Loading-skeleton sizes (issue #39), each named for the real element it
+   stands in for — sized by a class here, not a style attribute: this
+   page's CSP authorises nonce'd style elements only, and a nonce never
+   covers a style attribute, so the bars rendered at zero size (issue #45). */
+.skel-badge { width: 90px; height: 24px; }
+.skel-stat-label { width: 70%; height: 13px; }
+.skel-stat-value { width: 50%; height: 27px; }
+.skel-stat-note { width: 80%; height: 13px; }
+.skel-title { width: 60%; height: 13px; }
+.skel-meta { width: 40%; height: 10px; }
+.skel-cell { width: 70%; height: 13px; }
+.skel-pill { width: 56px; height: 18px; }
 `;
 
-export function renderDashboardHtml(state: DashboardViewState, nonce: string): string {
+/**
+ * The data-dependent part of the page (issue #39): everything that needs
+ * `podStore.list()`/the fetch, wrapped by both the full page and the loading
+ * page in the same `id="db-body"` container so a patch can replace either
+ * with the other — one source of markup, no duplication.
+ */
+export function renderDashboardBody(state: DashboardViewState): string {
   const e = escapeHtml;
   const v = state.vocabulary;
   const empty = state.rows.length === 0;
@@ -320,7 +339,7 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
     )
     .join('');
 
-  const body = empty
+  return empty
     ? `${header}
        <div class="empty">
          <h2>Nothing waiting on you</h2>
@@ -357,86 +376,182 @@ export function renderDashboardHtml(state: DashboardViewState, nonce: string): s
            }
          </div>
        </div>`;
+}
 
-  const script = `
-    const vscode = window.verdictVscode;
-    const post = (m) => vscode.postMessage(m);
-    const podMenu = document.querySelector('[data-pod-menu]');
-    const togglePodMenu = () => {
-      if (!podMenu) return;
-      const open = podMenu.hasAttribute('hidden');
-      podMenu.toggleAttribute('hidden', !open);
-    };
+/**
+ * Bound once on `document` for the whole page's lifetime, not per element
+ * (issue #39): a region patch replaces `#db-body`'s innerHTML wholesale,
+ * which would silently drop any listener bound to an element inside it.
+ * Delegation means the patched markup needs no re-binding at all. Every DOM
+ * reference below is looked up fresh at use time for the same reason — a
+ * cached reference (the old `podMenu` const) would go stale the moment a
+ * patch replaces the node it pointed to.
+ */
+const SCRIPT = `
+  const vscode = window.verdictVscode;
+  const post = (m) => vscode.postMessage(m);
+  const podMenuEl = () => document.querySelector('[data-pod-menu]');
+  const togglePodMenu = () => {
+    const menu = podMenuEl();
+    if (!menu) return;
+    const open = menu.hasAttribute('hidden');
+    menu.toggleAttribute('hidden', !open);
+  };
 
-    document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
-    document.getElementById('filters')?.addEventListener('click', () => post({ type: 'filters' }));
-    document.getElementById('pod-switch')?.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      togglePodMenu();
-    });
-    document.getElementById('switch-pod-empty')?.addEventListener('click', () => post({ type: 'switchPod' }));
-    document.getElementById('add-repos')?.addEventListener('click', () => post({ type: 'addRepos' }));
-    document.querySelectorAll('[data-pod-id]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const podId = btn.dataset.podId;
-        if (podId) post({ type: 'selectPod', podId });
-        if (podMenu) podMenu.setAttribute('hidden', '');
-      });
-    });
-    document.addEventListener('click', (ev) => {
-      if (!podMenu || podMenu.hasAttribute('hidden')) return;
-      if (ev.target instanceof Node && !ev.target.closest('.pod-wrap')) {
-        podMenu.setAttribute('hidden', '');
-      }
-    });
-
-    let scopeSel = 'all';
-    let repoSel = '*';
-    const applyFilters = () => {
-      const counts = new Map();
-      for (const row of document.querySelectorAll('.mr-row')) {
-        const scopeOk = scopeSel === 'all' || row.dataset.scope === scopeSel;
-        if (scopeOk) counts.set(row.dataset.repo, (counts.get(row.dataset.repo) ?? 0) + 1);
-        row.hidden = !(scopeOk && (repoSel === '*' || row.dataset.repo === repoSel));
-      }
-      for (const chip of document.querySelectorAll('.chip[data-repo]')) {
-        if (chip.dataset.repo === '*') continue;
-        chip.hidden = scopeSel !== 'all' && !counts.has(chip.dataset.repo);
-      }
-    };
-    document.getElementById('scope')?.addEventListener('click', (ev) => {
-      const btn = ev.target.closest('button[data-scope]');
-      if (!btn) return;
-      document.querySelectorAll('#scope button').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      scopeSel = btn.dataset.scope;
-      applyFilters();
-      // If the selected repo has no rows under the new scope, fall back
-      // to the all-repos chip instead of leaving the table blank.
-      const activeChip = document.querySelector('.chip[data-repo="' + repoSel + '"]');
-      if (repoSel !== '*' && activeChip?.hidden) {
-        repoSel = '*';
-        document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
-        document.querySelector('.chip[data-repo="*"]')?.classList.add('active');
-        applyFilters();
-      }
-    });
-    for (const chip of document.querySelectorAll('.chip[data-repo]')) {
-      chip.addEventListener('click', () => {
-        document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
-        chip.classList.add('active');
-        repoSel = chip.dataset.repo;
-        applyFilters();
-      });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#filters')) post({ type: 'filters' }); });
+  document.addEventListener('click', (ev) => {
+    if (!ev.target.closest('#pod-switch')) return;
+    ev.stopPropagation();
+    togglePodMenu();
+  });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#switch-pod-empty')) post({ type: 'switchPod' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#add-repos')) post({ type: 'addRepos' }); });
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-pod-id]');
+    if (!btn) return;
+    const podId = btn.dataset.podId;
+    if (podId) post({ type: 'selectPod', podId });
+    const menu = podMenuEl();
+    if (menu) menu.setAttribute('hidden', '');
+  });
+  document.addEventListener('click', (ev) => {
+    const menu = podMenuEl();
+    if (!menu || menu.hasAttribute('hidden')) return;
+    if (ev.target instanceof Node && !ev.target.closest('.pod-wrap')) {
+      menu.setAttribute('hidden', '');
     }
+  });
+
+  let scopeSel = 'all';
+  let repoSel = '*';
+  const applyFilters = () => {
+    const counts = new Map();
     for (const row of document.querySelectorAll('.mr-row')) {
-      const open = () => post({ type: 'openCr', repoId: row.dataset.repo, number: row.dataset.number, submitted: row.dataset.submitted === 'true' });
-      row.addEventListener('click', open);
-      row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') open(); });
+      const scopeOk = scopeSel === 'all' || row.dataset.scope === scopeSel;
+      if (scopeOk) counts.set(row.dataset.repo, (counts.get(row.dataset.repo) ?? 0) + 1);
+      row.hidden = !(scopeOk && (repoSel === '*' || row.dataset.repo === repoSel));
     }
-    document.querySelectorAll('[data-changeset]').forEach((card) => card.addEventListener('click', () => post({ type: 'openChangeset', changesetId: card.dataset.changeset })));
-    document.getElementById('new-changeset')?.addEventListener('click', () => post({ type: 'newChangeset' }));
-  `;
+    for (const chip of document.querySelectorAll('.chip[data-repo]')) {
+      if (chip.dataset.repo === '*') continue;
+      chip.hidden = scopeSel !== 'all' && !counts.has(chip.dataset.repo);
+    }
+  };
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-scope]');
+    if (!btn) return;
+    document.querySelectorAll('#scope button').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    scopeSel = btn.dataset.scope;
+    applyFilters();
+    // If the selected repo has no rows under the new scope, fall back
+    // to the all-repos chip instead of leaving the table blank.
+    const activeChip = document.querySelector('.chip[data-repo="' + repoSel + '"]');
+    if (repoSel !== '*' && activeChip?.hidden) {
+      repoSel = '*';
+      document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
+      document.querySelector('.chip[data-repo="*"]')?.classList.add('active');
+      applyFilters();
+    }
+  });
+  document.addEventListener('click', (ev) => {
+    const chip = ev.target.closest('.chip[data-repo]');
+    if (!chip) return;
+    document.querySelectorAll('.chip[data-repo]').forEach((c) => c.classList.remove('active'));
+    chip.classList.add('active');
+    repoSel = chip.dataset.repo;
+    applyFilters();
+  });
+  // The loading skeleton's rows are .mr-row too, so they look clickable
+  // (and are, for the whole fetch window) — but they carry no data-number,
+  // so guard against posting an openCr for a non-existent CR (#39).
+  const openMrRow = (row) => {
+    if (row.dataset.number === undefined) return;
+    post({ type: 'openCr', repoId: row.dataset.repo, number: row.dataset.number, submitted: row.dataset.submitted === 'true' });
+  };
+  document.addEventListener('click', (ev) => { const row = ev.target.closest('.mr-row'); if (row) openMrRow(row); });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    const row = ev.target.closest('.mr-row');
+    if (row) openMrRow(row);
+  });
+  document.addEventListener('click', (ev) => {
+    const card = ev.target.closest('[data-changeset]');
+    if (card) post({ type: 'openChangeset', changesetId: card.dataset.changeset });
+  });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#new-changeset')) post({ type: 'newChangeset' }); });
 
-  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script });
+  // A region patch (#39) rebuilds #db-body from the fetched state alone,
+  // which carries no notion of these client-only scope/repo filters — the
+  // same reset that already happened on every refresh before delegation,
+  // when the whole document (and this script) reloaded each time. Without
+  // it a stale filter would silently keep applying to rows a chip click
+  // never touched, while the freshly-rendered chips show "All" active.
+  window.addEventListener('message', (ev) => {
+    const data = ev.data;
+    if (data && data.type === 'verdict:regions' && data.regions && 'db-body' in data.regions) {
+      scopeSel = 'all';
+      repoSel = '*';
+    }
+  });
+`;
+
+export function renderDashboardHtml(state: DashboardViewState, nonce: string): string {
+  const body = `<div id="db-body">${renderDashboardBody(state)}</div>`;
+  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT });
+}
+
+/**
+ * First paint on navigation, before the fetch (issue #39): the pod name and
+ * meta are known synchronously from `podStore.activePod`, so the header
+ * renders for real; everything the fetch would supply — stats, rows,
+ * changesets — is a skeleton. Wrapped in the same `id="db-body"` container
+ * so the data patch that lands later can replace it wholesale.
+ */
+export function renderDashboardLoadingHtml(podName: string, meta: string, nonce: string): string {
+  const header = `
+  <header>
+    <div class="pod-wrap">
+      <button class="pod-switch" id="pod-switch" title="Switch pod" type="button">
+        <h1>${escapeHtml(podName)}</h1>
+        <span class="meta">${escapeHtml(meta)}</span>
+        <span class="caret">▼</span>
+      </button>
+      <div class="pod-menu" data-pod-menu hidden></div>
+    </div>
+    <div class="head-right"><span class="skel skel-badge"></span></div>
+  </header>`;
+  const statCards = Array.from({ length: 4 })
+    .map(
+      () => `<div class="stat">
+        <div class="stat-label"><span class="skel skel-stat-label"></span></div>
+        <div class="stat-value"><span class="skel skel-stat-value"></span></div>
+        <div class="stat-note"><span class="skel skel-stat-note"></span></div>
+      </div>`,
+    )
+    .join('');
+  const skelRows = Array.from({ length: 4 })
+    .map(
+      () => `<div class="mr-row">
+        <div>
+          <div class="row-title"><span class="skel skel-title"></span></div>
+          <div class="row-meta"><span class="skel skel-meta"></span></div>
+        </div>
+        <div class="cell-repo"><span class="skel skel-cell"></span></div>
+        <div><span class="skel skel-pill"></span></div>
+        <div class="cell-ci"><span class="skel skel-cell"></span></div>
+        <div class="cell-age"><span class="skel skel-cell"></span></div>
+      </div>`,
+    )
+    .join('');
+  const body = `<div id="db-body">${header}
+    <div class="stats">${statCards}</div>
+    <div class="split">
+      <div>
+        <section>${skelRows}</section>
+      </div>
+      <div class="col-right"></div>
+    </div>
+  </div>`;
+  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT });
 }

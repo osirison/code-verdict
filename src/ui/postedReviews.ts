@@ -14,8 +14,8 @@ import { getProvider } from '../platform/registry';
 import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { formatAge } from './dashboardState';
 import { escapeHtml, renderFallbackHtml } from './dashboardHtml';
-import type { PostedMessage, PostedRow } from './postedReviewsHtml';
-import { renderPostedReviewsHtml } from './postedReviewsHtml';
+import type { PostedMessage, PostedRow, PostedViewState } from './postedReviewsHtml';
+import { renderPostedReviewsHtml, renderPostedReviewsRegions } from './postedReviewsHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarThread, SidebarThreads } from './sidebarHtml';
 import { COMMANDS } from '../commands';
@@ -55,6 +55,8 @@ export class PostedReviewsPanel {
 
   private disposed = false;
   private refreshSeq = 0;
+  /** First refresh on this instance paints the loading skeleton (#39); see refresh(). */
+  private painted = false;
   private focusRef?: { repoId: string; number: string };
   private pod?: ReturnType<PodStore['list']>[number];
   private rows: PostedRow[] = [];
@@ -71,22 +73,40 @@ export class PostedReviewsPanel {
       this.deps.onSidebarThreads?.(undefined);
       if (PostedReviewsPanel.current === this) PostedReviewsPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. this.rows/this.pod are already fetched,
+    // so a plain re-render (falling back to setHtml since readiness was
+    // just reset) is enough — no need to hit the network again.
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as PostedMessage));
   }
-
-  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private selectedView(): PostedReviewView | undefined {
     return this.rows[this.selectedIndex]?.view;
   }
 
   private async onMessage(m: PostedMessage): Promise<void> {
-    // The pod captured at refresh time — never pair a freshly-switched
-    // pod's connection with rows fetched for the previous one.
-    const pod = this.pod;
-    if (!pod) return;
-    const view = this.selectedView();
     try {
+      // These two are the only controls the loading skeleton renders, and
+      // neither needs a pod: refresh() resolves one itself, and leaving the
+      // screen needs no connection. Behind the guard below they were dead
+      // for the whole fetch window while looking like they worked (#39).
+      // Inside the try, so #41's invariant still holds for them: every
+      // message goes through one place where a rejection cannot vanish.
+      if (m.type === 'backToDashboard') {
+        void vscode.commands.executeCommand('codeVerdict.openDashboard');
+        return;
+      }
+      if (m.type === 'refresh') {
+        await this.refresh();
+        return;
+      }
+      // The pod captured at refresh time — never pair a freshly-switched
+      // pod's connection with rows fetched for the previous one.
+      const pod = this.pod;
+      if (!pod) return;
+      const view = this.selectedView();
       switch (m.type) {
         case 'selectReview':
           this.selectedIndex = m.index;
@@ -154,12 +174,6 @@ export class PostedReviewsPanel {
         case 'rerun':
           if (view) this.deps.openReviewFlow({ repoId: view.repoId, number: view.crNumber });
           return;
-        case 'refresh':
-          await this.refresh();
-          return;
-        case 'backToDashboard':
-          void vscode.commands.executeCommand('codeVerdict.openDashboard');
-          return;
       }
     } catch (e) {
       void vscode.window.showErrorMessage(
@@ -174,42 +188,77 @@ export class PostedReviewsPanel {
     const pod = this.deps.podStore.activePod;
     if (!pod) {
       if (canRender()) {
-        this.panel.webview.html = renderFallbackHtml('<p>No pod configured.</p>');
+        this.route.setHtml(renderFallbackHtml('<p>No pod configured.</p>'));
       }
       return;
     }
     try {
+      const vocabulary = getProvider(pod.providerId).vocabulary;
       const history = new ReviewHistory(this.deps.globalState)
         .list()
         .filter((r) => r.podId === pod.id)
         .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
+      // First paint on navigation (#39): ReviewHistory is local and
+      // synchronous, so refLabel/project/age are already known — show them
+      // as a skeleton immediately instead of leaving the previous screen
+      // frozen for the whole fetch. A fresh PostedReviewsPanel is created on
+      // every navigation here (AppSurface.activate leaves the previous
+      // route), so painted === false means exactly "arrived here by
+      // navigation" — the ⟳ refresh button never re-triggers this skeleton.
+      if (!this.painted) {
+        const now = Date.now();
+        this.route.setHtml(renderPostedReviewsHtml(
+          {
+            vocabulary,
+            podName: pod.name,
+            now,
+            waitingOnYouTotal: 0,
+            rows: [],
+            selectedIndex: 0,
+            opinions: {},
+            loading: true,
+            pendingRows: history.map((entry) => ({
+              refLabel: vocabulary.formatCrRef(entry.crNumber),
+              project: pod.repos?.find((r) => r.id === entry.repoId)?.name ?? entry.repoId,
+              age: formatAge(entry.submittedAt, now),
+            })),
+          },
+          crypto.randomBytes(16).toString('hex'),
+        ));
+        this.painted = true;
+      }
       const connection = await connectionForPod(pod, this.deps.secrets);
       const flags = new ThreadFlags(this.deps.globalState);
-      const vocabulary = getProvider(pod.providerId).vocabulary;
-      const crs = await connection.listOpenChangeRequests([
-        ...new Set(history.map((r) => r.repoId)),
+      // The open-CR list and every buildPostedReview() call are independent
+      // reads — run them concurrently instead of waiting on the list before
+      // starting the fan-out (today's sequential order was pure latency,
+      // #39).
+      const [crs, views] = await Promise.all([
+        connection.listOpenChangeRequests([...new Set(history.map((r) => r.repoId))]),
+        Promise.all(
+          history.map((entry) =>
+            buildPostedReview(
+              connection,
+              entry,
+              pod.username ?? 'you',
+              flags.conceded(crKey(entry.repoId, entry.crNumber)),
+            ),
+          ),
+        ),
       ]);
       const now = Date.now();
-      const rows = await Promise.all(
-        history.map(async (entry) => {
-          const view = await buildPostedReview(
-            connection,
-            entry,
-            pod.username ?? 'you',
-            flags.conceded(crKey(entry.repoId, entry.crNumber)),
-          );
-          const cr = crs.find(
-            (c) => c.ref.repoId === entry.repoId && c.ref.number === entry.crNumber,
-          );
-          return {
-            view,
-            refLabel: vocabulary.formatCrRef(entry.crNumber),
-            title: cr?.title ?? `${vocabulary.formatCrRef(entry.crNumber)}`,
-            project: pod.repos?.find((r) => r.id === entry.repoId)?.name ?? entry.repoId,
-            age: formatAge(entry.submittedAt, now),
-          } satisfies PostedRow;
-        }),
-      );
+      const rows = history.map((entry, i): PostedRow => {
+        const cr = crs.find(
+          (c) => c.ref.repoId === entry.repoId && c.ref.number === entry.crNumber,
+        );
+        return {
+          view: views[i] as PostedReviewView,
+          refLabel: vocabulary.formatCrRef(entry.crNumber),
+          title: cr?.title ?? `${vocabulary.formatCrRef(entry.crNumber)}`,
+          project: pod.repos?.find((r) => r.id === entry.repoId)?.name ?? entry.repoId,
+          age: formatAge(entry.submittedAt, now),
+        };
+      });
       if (!canRender()) return;
       this.pod = pod;
       this.rows = rows;
@@ -225,9 +274,9 @@ export class PostedReviewsPanel {
       this.render();
     } catch (e) {
       if (!canRender()) return;
-      this.panel.webview.html = renderFallbackHtml(
+      this.route.setHtml(renderFallbackHtml(
         `<p>Could not load posted reviews: ${escapeHtml(e instanceof Error ? e.message : String(e))}</p>`,
-      );
+      ));
     }
   }
 
@@ -280,20 +329,24 @@ export class PostedReviewsPanel {
   private render(): void {
     if (this.disposed) return;
     this.publishSidebarThreads();
-    const nonce = crypto.randomBytes(16).toString('hex');
     const renderPod = this.pod ?? this.deps.podStore.activePod;
-    this.panel.webview.html = renderPostedReviewsHtml(
-      {
-        vocabulary: renderPod ? getProvider(renderPod.providerId).vocabulary : NEUTRAL_VOCABULARY,
-        podName: renderPod?.name ?? '',
-        now: Date.now(),
-        waitingOnYouTotal: this.rows.reduce((n, r) => n + r.view.counts.you, 0),
-        rows: this.rows,
-        selectedIndex: this.selectedIndex,
-        expandedThreadId: this.expandedThreadId,
-        opinions: this.opinions,
-      },
-      nonce,
-    );
+    const state: PostedViewState = {
+      vocabulary: renderPod ? getProvider(renderPod.providerId).vocabulary : NEUTRAL_VOCABULARY,
+      podName: renderPod?.name ?? '',
+      now: Date.now(),
+      waitingOnYouTotal: this.rows.reduce((n, r) => n + r.view.counts.you, 0),
+      rows: this.rows,
+      selectedIndex: this.selectedIndex,
+      expandedThreadId: this.expandedThreadId,
+      opinions: this.opinions,
+    };
+    // Patch the two regions in place rather than replacing the whole
+    // document (#39) — a plain selection (selectReview/toggleThread/
+    // secondOpinion/selectThread) used to rebuild the entire page. Falling
+    // back to setHtml only when the page has not yet signalled ready is
+    // exactly today's always-full-render behaviour.
+    if (!this.route.postRegions(renderPostedReviewsRegions(state))) {
+      this.route.setHtml(renderPostedReviewsHtml(state, crypto.randomBytes(16).toString('hex')));
+    }
   }
 }

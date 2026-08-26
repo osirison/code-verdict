@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import type { PostedReviewView, PostedThreadView } from '../app/postedReviews';
 import type { PostedRow, PostedViewState } from './postedReviewsHtml';
-import { renderPostedReviewsHtml } from './postedReviewsHtml';
+import { renderPostedReviewsHtml, renderPostedReviewsRegions } from './postedReviewsHtml';
 
 function thread(overrides: Partial<PostedThreadView> = {}): PostedThreadView {
   return {
@@ -80,14 +80,13 @@ describe('reply affordance (#33 — Enter did nothing, no send button)', () => {
     // Enter in a single-line input was silently swallowed. The fix checks
     // only the key. (The page chrome's separate "?" shortcuts-overlay script
     // legitimately checks metaKey for its own binding, so scope the
-    // assertion to the <script> block, then to the submitReply handler
-    // within it, rather than the whole page.)
+    // assertion to this file's own script, then to the submitReply handler
+    // within it, rather than the whole page — the shared keyboard-overlay
+    // and region-patch scripts are appended after it in the same tag.)
     const scriptStart = html.indexOf('<script nonce=');
     const script = html.slice(scriptStart, html.indexOf('</script>', scriptStart));
-    const replyHandler = script.slice(
-      script.indexOf('function submitReply'),
-      script.indexOf("querySelectorAll('[data-reply-send]')"),
-    );
+    const ownScript = script.slice(0, script.indexOf("const overlay = document.getElementById('verdict-keys')"));
+    const replyHandler = ownScript.slice(ownScript.indexOf('function submitReply'));
     expect(replyHandler).not.toContain('metaKey');
     expect(replyHandler).not.toContain('ctrlKey');
     expect(replyHandler).toContain("ev.key === 'Enter'");
@@ -173,5 +172,66 @@ describe('refresh renders whatever the state carries (#34 — data → pixels)',
     expect(collapsed).not.toContain('class="th-body"');
     expect(expanded).toContain('class="th-body"');
     expect(expanded).toContain('Pushed a fix — can you re-check?');
+  });
+});
+
+describe('loading skeleton and region patching (issue #39)', () => {
+  it('renders history-derived rows with skeleton title and counts under loading', () => {
+    const html = renderPostedReviewsHtml(
+      state([], {
+        loading: true,
+        rows: [],
+        pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }],
+      }),
+      'nonce123',
+    );
+
+    expect(html).toContain('!2841');
+    expect(html).toContain('core');
+    expect(html).toContain('2d');
+    expect(html).toContain('class="skel skel-title"');
+    // Nothing is selected while loading — no thread panel to show yet.
+    expect(html).not.toContain('class="sel-bar"');
+  });
+
+  it('sizes every skeleton placeholder from a CSS class, never a style attribute (issue #45 — the CSP blocks style attributes, not style elements)', () => {
+    const html = renderPostedReviewsHtml(
+      state([], { loading: true, rows: [], pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }] }),
+      'nonce123',
+    );
+    expect(html).not.toContain('style="');
+  });
+
+  it('guards skeleton rows against selecting a non-existent review — no data-index, Number(undefined) is NaN', () => {
+    const html = renderPostedReviewsHtml(
+      state([], { loading: true, rows: [], pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }] }),
+      'nonce123',
+    );
+    expect(html).not.toContain('data-index=');
+    expect(html).toContain('row.dataset.index === undefined) return');
+  });
+
+  it('wraps the rows and detail in the two regions a patch targets', () => {
+    const html = renderPostedReviewsHtml(state([row([thread()])], { expandedThreadId: 'thread-1' }), 'n');
+    expect(html).toContain('id="pr-rows"');
+    expect(html).toContain('id="pr-detail"');
+  });
+
+  it('renderPostedReviewsRegions produces exactly the two regions, as a substring of the full page for the same state', () => {
+    const s = state([row([thread()])], { expandedThreadId: 'thread-1' });
+    const regions = renderPostedReviewsRegions(s);
+
+    expect(Object.keys(regions).sort()).toEqual(['pr-detail', 'pr-rows']);
+    const html = renderPostedReviewsHtml(s, 'n');
+    expect(html).toContain(regions['pr-rows']);
+    expect(html).toContain(regions['pr-detail']);
+  });
+
+  it('binds listeners once on document, not per element (region patching survives without re-binding)', () => {
+    const html = renderPostedReviewsHtml(state([row([thread()])], { expandedThreadId: 'thread-1' }), 'n');
+    expect(html).not.toContain("querySelectorAll('.rev-row').forEach");
+    expect(html).toContain("ev.target.closest('.rev-row')");
+    expect(html).not.toContain("querySelectorAll('[data-resolve]').forEach");
+    expect(html).toContain("ev.target.closest('[data-resolve]')");
   });
 });

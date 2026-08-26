@@ -6,7 +6,7 @@ import type { PodStore } from '../app/pods';
 import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import type { DashboardMessage } from './dashboardHtml';
-import { escapeHtml, renderDashboardHtml, renderFallbackHtml } from './dashboardHtml';
+import { escapeHtml, renderDashboardBody, renderDashboardHtml, renderDashboardLoadingHtml, renderFallbackHtml } from './dashboardHtml';
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
 import { AppSurface, type AppRoute } from './appSurface';
@@ -35,6 +35,8 @@ export class DashboardPanel {
 
   private disposed = false;
   private refreshSeq = 0;
+  /** First refresh on this instance paints the loading skeleton (#39); see refresh(). */
+  private painted = false;
 
   private constructor(
     private readonly route: AppRoute,
@@ -46,6 +48,11 @@ export class DashboardPanel {
       this.disposed = true;
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. `painted` is already true, so this
+    // re-fetches and repaints in full rather than reshowing the skeleton.
+    route.onReload(() => void this.refresh());
     route.onMessage((rawMessage) => {
       const message = rawMessage as DashboardMessage;
       switch (message.type) {
@@ -87,10 +94,6 @@ export class DashboardPanel {
     });
   }
 
-  private get panel(): vscode.WebviewPanel {
-    return this.route.panel;
-  }
-
   async refresh(): Promise<void> {
     // Guard both races: writes after disposal throw, and a slow older fetch
     // must never repaint over a newer one (e.g. after a pod switch).
@@ -100,11 +103,27 @@ export class DashboardPanel {
     const pod = this.podStore.activePod;
     if (!pod) {
       if (canRender()) {
-        this.panel.webview.html = renderFallbackHtml(
+        this.route.setHtml(renderFallbackHtml(
           '<p>No pod configured. Run "Verdict: Sign in" first.</p>',
-        );
+        ));
       }
       return;
+    }
+    // First paint on navigation (#39): the pod name and a repo-count meta
+    // line are known synchronously, so show the real header immediately
+    // instead of leaving the previous screen frozen for the whole fetch. A
+    // fresh DashboardPanel is created on every navigation to the dashboard
+    // (AppSurface.activate leaves the previous route), so painted === false
+    // means exactly "arrived here by navigation" — the ⟳ refresh button
+    // never re-triggers this skeleton.
+    if (!this.painted) {
+      const vocabulary = tryGetProvider(pod.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY;
+      this.route.setHtml(renderDashboardLoadingHtml(
+        pod.name,
+        repoCountOf(vocabulary, repoIdsOf(pod).length),
+        crypto.randomBytes(16).toString('hex'),
+      ));
+      this.painted = true;
     }
     try {
       const connection = await connectionForPod(pod, this.secrets);
@@ -121,16 +140,24 @@ export class DashboardPanel {
           repoIdsOf(candidate).length,
         ),
       }));
-      this.panel.webview.html = renderDashboardHtml(
-        toViewState({ ...data, podOptions }, Date.now(), submitted, this.deps.changesetOptions?.()),
-        nonce,
+      const state = toViewState(
+        { ...data, podOptions },
+        Date.now(),
+        submitted,
+        this.deps.changesetOptions?.(),
       );
+      // Patch the region in place rather than replacing the whole document
+      // (#39) — falling back to setHtml only when the page has not yet
+      // signalled ready is exactly today's always-full-render behaviour.
+      if (!this.route.postRegions({ 'db-body': renderDashboardBody(state) })) {
+        this.route.setHtml(renderDashboardHtml(state, nonce));
+      }
     } catch (e) {
       if (!canRender()) return;
       const message = escapeHtml(e instanceof Error ? e.message : String(e));
-      this.panel.webview.html = renderFallbackHtml(
+      this.route.setHtml(renderFallbackHtml(
         `<p>Could not load the pod: ${message}</p><p>Is the emulator running? (<code>npm run emulator</code>)</p>`,
-      );
+      ));
     }
   }
 }
