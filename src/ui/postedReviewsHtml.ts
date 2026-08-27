@@ -4,6 +4,7 @@
  */
 import type { PostedReviewView, PostedThreadView } from '../app/postedReviews';
 import { formatAge } from './dashboardState';
+import { selectedPostedRow } from './postedReviewsState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
 import { escapeHtml as e, renderPage } from './theme';
@@ -15,6 +16,12 @@ export interface PostedRow {
   title: string;
   project: string;
   age: string;
+  /**
+   * The change request this review was posted to is no longer open — merged
+   * or closed. Derived in `postedReviewsState.buildPostedRows` from absence
+   * in the batched open list, never stored.
+   */
+  archived: boolean;
 }
 
 /**
@@ -33,9 +40,26 @@ export interface PostedViewState {
   vocabulary: Vocabulary;
   podName: string;
   now: number;
+  /**
+   * Counted over the visible rows only. A thread still open on a change
+   * request that has already merged or closed is not work the reviewer can
+   * act on, and a badge inflated with unreachable threads is the same
+   * complaint archiving fixes, one line further up the screen.
+   */
   waitingOnYouTotal: number;
+  /** The visible subset — archived rows are absent unless `showArchived`. */
   rows: PostedRow[];
-  selectedIndex: number;
+  /** Whether the archived rows are part of `rows` right now. */
+  showArchived: boolean;
+  /** Archived rows across the whole history — shown even while the filter is off. */
+  archivedCount: number;
+  /**
+   * The selected review by ref, not by index into `rows`: the visible set
+   * changes with the filter, so an index would select a different review the
+   * moment archived rows appear or disappear. Absent selects the first
+   * visible row, which is what index 0 used to mean.
+   */
+  selectedRef?: { repoId: string; number: string };
   expandedThreadId?: string;
   /** threadId → second-opinion text, appended on demand. */
   opinions: Record<string, string>;
@@ -49,7 +73,8 @@ export interface PostedViewState {
 }
 
 export type PostedMessage =
-  | { type: 'selectReview'; index: number }
+  | { type: 'selectReview'; repoId: string; number: string }
+  | { type: 'toggleArchived' }
   | { type: 'toggleThread'; threadId: string }
   | { type: 'resolve'; threadId: string; resolved: boolean }
   | { type: 'concede'; threadId: string }
@@ -74,6 +99,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .head-right { margin-left: auto; }
 .tool { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); border: 1px solid var(--line2); border-radius: 4px; background: none; padding: 4px 9px; cursor: pointer; }
 .tool:hover { background: var(--hover); }
+.tool.active { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
 
 .thead, .rev-row { display: grid; grid-template-columns: minmax(0,1fr) 190px 92px 58px; gap: 10px; padding: 0 20px; align-items: center; }
 .thead { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .09em; color: var(--fg-dimmer); padding: 10px 20px 6px; }
@@ -88,6 +114,10 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .badge-you { color: var(--sev-minor); background: var(--sev-minor-t); }
 .badge-none { color: var(--fg-dimmer); background: var(--nit-t); }
 .cell-age { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+/* A revealed archived row has to read as archived, or the filter looks
+   broken: same row, dimmed, with the pill saying why it is normally absent. */
+.rev-row.archived .rev-title { color: var(--fg-dim); }
+.pill-archived { margin-left: 7px; color: var(--fg-dimmer); background: var(--nit-t); }
 
 .sel-bar { display: flex; align-items: center; gap: 18px; background: var(--bg2); padding: 12px 20px; border-bottom: 1px solid var(--line); }
 .sel-bar .who { font-size: 13px; font-weight: 600; color: var(--fg-hi); }
@@ -120,6 +150,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .btn-agent:hover { background: var(--agent-t); }
 .reply-row { display: flex; gap: 8px; align-items: center; flex: 1; }
 .empty { text-align: center; padding: 70px 20px; color: var(--fg-dim); font-size: 12.5px; }
+.empty .btn { margin-top: 14px; }
 
 /* Loading-skeleton sizes (issue #39), sized by a class here, not a style
    attribute: this page's CSP authorises nonce'd style elements only, and a
@@ -147,7 +178,13 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
       <div class="entry entry-you"><div class="entry-label">you · posted comment</div>${e(t.yourBody)}</div>
       ${t.replies
         .map(
-          (r) => `<div class="entry entry-author"><div class="entry-label">@${e(r.author)} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
+          // The entry class is chosen per reply, not fixed to .entry-author:
+          // `replies` carries your own notes as well as theirs, and a reply of
+          // yours rendered in the author's colour reads as the author
+          // conceding your point back to you. .entry-you is the same treatment
+          // the posted comment above gets, which is what makes the alternation
+          // legible as a conversation.
+          (r) => `<div class="entry ${r.yours ? 'entry-you' : 'entry-author'}"><div class="entry-label">${r.yours ? 'you' : `@${e(r.author)}`} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
         )
         .join('')}
       ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — ${e(vocabulary.platformName)} dropped the anchor.</div>` : ''}
@@ -173,12 +210,27 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
 }
 
 /**
+ * The `.head-right` tools. The archived filter carries its count in the
+ * label even while it is off: an archived review has to read as one click
+ * away, not as gone — that visibility is also what makes the `maxPages`
+ * truncation in `buildPostedRows` survivable.
+ */
+function headTools(state: PostedViewState): string {
+  return `<div class="head-right"><button class="tool ${state.showArchived ? 'active' : ''}" data-archived-filter aria-pressed="${state.showArchived}">Archived · ${state.archivedCount}</button> <button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>`;
+}
+
+/**
  * The list header and its rows (issue #39): the reply-total badge changes
  * with the fetch, so it lives here rather than outside the patched region —
  * a refresh must not leave a stale "N on you" count next to fresh rows.
  */
 function postedRowsRegion(state: PostedViewState): string {
   if (state.loading) {
+    // Every pending row renders, archived or not, and the header carries no
+    // filter: `pendingRows` come from local history *before* the fetch that
+    // says which change requests are still open, so nothing here could know
+    // what is archived. Guessing would flicker a row out and back in; the
+    // patch settles it a moment later instead.
     const rows = (state.pendingRows ?? [])
       .map(
         (row) => `<div class="rev-row">
@@ -201,20 +253,36 @@ function postedRowsRegion(state: PostedViewState): string {
     ${rows}`;
   }
   if (state.rows.length === 0) {
-    return `<header><h1>Reviews you contributed to · ${e(state.podName)}</h1><div class="head-right"><button class="tool" id="back-dash">Dashboard</button></div></header>
-         <div class="empty">Nothing submitted yet — run a review and submit it, then track the replies here.</div>`;
+    // Three ways to be empty and only one of them is "nothing submitted".
+    // Rendering that copy over a history made entirely of archived reviews
+    // is the lie this change exists to remove, so the other two say what the
+    // filter is doing and hand back the way to see them.
+    const head = state.showArchived || state.archivedCount > 0
+      ? headTools(state)
+      : `<div class="head-right"><button class="tool" id="back-dash">Dashboard</button></div>`;
+    const body = state.archivedCount > 0
+      ? `Every review you submitted here is archived — each ${e(state.vocabulary.changeRequestNoun)} has since been merged or closed.<div><button class="btn" data-archived-filter>Show ${state.archivedCount} archived</button></div>`
+      : state.showArchived
+        ? 'Nothing submitted yet, archived included — run a review and submit it, then track the replies here.'
+        : 'Nothing submitted yet — run a review and submit it, then track the replies here.';
+    return `<header><h1>Reviews you contributed to · ${e(state.podName)}</h1>${head}</header>
+         <div class="empty">${body}</div>`;
   }
+  const selected = selectedPostedRow(state.rows, state.selectedRef);
   return `<header>
       <h1>Reviews you contributed to · ${e(state.podName)}</h1>
       <span class="on-you">${state.waitingOnYouTotal} on you</span>
-      <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
+      ${headTools(state)}
     </header>
     <div class="thead"><div>${e(cap(state.vocabulary.changeRequestNoun))}</div><div>Threads</div><div>${e(cap(state.vocabulary.repoNoun))}</div><div>Age</div></div>
     ${state.rows
       .map(
-        (row, index) => `<div class="rev-row ${index === state.selectedIndex ? 'selected' : ''}" data-index="${index}">
+        // Addressed by ref, never by index: the visible set shrinks and grows
+        // with the filter, so an index would point at a different review the
+        // moment archived rows join or leave it.
+        (row) => `<div class="rev-row ${row === selected ? 'selected' : ''}${row.archived ? ' archived' : ''}" data-repo="${e(row.view.repoId)}" data-number="${e(row.view.crNumber)}">
         <div>
-          <div class="rev-title">${e(row.refLabel)} · ${e(row.title)}</div>
+          <div class="rev-title">${e(row.refLabel)} · ${e(row.title)}${row.archived ? '<span class="pill pill-archived">archived</span>' : ''}</div>
           <div class="breakdown">${row.view.counts.you} you · ${row.view.counts.author} author · ${row.view.counts.closed} closed</div>
         </div>
         <div>${
@@ -231,11 +299,14 @@ function postedRowsRegion(state: PostedViewState): string {
 
 /** The selected review's thread panel (issue #39) — empty while nothing is selected, including throughout `loading`. */
 function postedDetailRegion(state: PostedViewState): string {
-  const selected = state.rows[state.selectedIndex];
+  // The same resolution the list uses, from the same rows — the detail panel
+  // must never render a review the list is not showing, or a resolve/reply
+  // would land on a different change request than the one on screen.
+  const selected = selectedPostedRow(state.rows, state.selectedRef);
   if (!selected) return '';
   return `<div class="sel-bar">
       <div>
-        <div class="who">${e(selected.refLabel)} · ${e(selected.title)}</div>
+        <div class="who">${e(selected.refLabel)} · ${e(selected.title)}${selected.archived ? '<span class="pill pill-archived">archived</span>' : ''}</div>
         <div class="sub">${e(selected.project)} · submitted ${e(selected.age)} ago · ${e(selected.view.agentLabel)}</div>
       </div>
       <div class="grow"></div>
@@ -268,12 +339,20 @@ const SCRIPT = `
   document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#back-dash')) post({ type: 'backToDashboard' }); });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#rerun')) post({ type: 'rerun' }); });
+  // An attribute, not an id like #refresh: the header tool and the
+  // all-archived empty state's button are the same control rendered twice,
+  // and two elements sharing one id is invalid. The extension owns the state
+  // either way — the visible set decides which review is selected, so
+  // filtering inside the page would leave the panel, the detail region and
+  // the sidebar pointing at a row nobody can see.
+  document.addEventListener('click', (ev) => { if (ev.target.closest('[data-archived-filter]')) post({ type: 'toggleArchived' }); });
   // The loading skeleton's rows are .rev-row too, so they look selectable —
-  // but they carry no data-index, and Number(undefined) is NaN. Guard it the
-  // way dashboardHtml's openMrRow already guards its own skeleton rows (#39).
+  // but they carry no ref, because pendingRows are built before the fetch.
+  // Guard it the way dashboardHtml's openMrRow already guards its own
+  // skeleton rows (#39).
   const selectRevRow = (row) => {
-    if (row.dataset.index === undefined) return;
-    post({ type: 'selectReview', index: Number(row.dataset.index) });
+    if (row.dataset.number === undefined) return;
+    post({ type: 'selectReview', repoId: row.dataset.repo, number: row.dataset.number });
   };
   document.addEventListener('click', (ev) => {
     const row = ev.target.closest('.rev-row');

@@ -50,6 +50,27 @@ describe('sidebar fidelity (prototype navigation)', () => {
     expect(html).toContain("type: 'openPostedReviews'");
   });
 
+  it('gives every pod row its own delete control', () => {
+    const html = renderSidebarHtml(state, 'nonce123');
+
+    // The delete button is a sibling of the selecting button, not nested
+    // inside it — a <button> inside a <button> is invalid, and the inner
+    // click would select the pod on its way out.
+    expect(html).toContain('<div class="pod-row-wrap active">');
+    expect(html).toContain('<button class="pod-delete" data-pod-delete="platform"');
+    expect(html).toContain('<button class="pod-delete" data-pod-delete="payments"');
+    expect(html).toContain('aria-label="Delete pod Platform squad"');
+    expect(html).toContain("document.querySelectorAll('[data-pod-delete]')");
+    expect(html).toContain("type: 'deletePod'");
+    // The selecting rows keep their own hook: [data-pod] must not match the
+    // delete buttons, or every delete would also switch pods.
+    expect(html).toContain('<button class="pod-row active" data-pod="platform">');
+    // Styling is a class in the nonce'd <style> block; a style attribute is
+    // silently dropped by the page CSP (issue #45).
+    expect(html).toContain('.pod-delete {');
+    expect(html).not.toMatch(/<button class="pod-delete"[^>]*style=/);
+  });
+
   it('renders issue rows as buttons carrying a navigation target (issue #40)', () => {
     const html = renderSidebarHtml(state, 'nonce123');
 

@@ -15,7 +15,7 @@ const state: DashboardViewState = {
     pipelinesFailing: 1,
     projectsInPod: 6,
   },
-  fetchedAgo: '2m ago',
+  fetchedLabel: '14:32',
   projects: [{ id: '9101', label: 'core', count: 2 }],
   rows: [
     {
@@ -27,7 +27,7 @@ const state: DashboardViewState = {
       branch: 'feat/auth-refresh',
       project: 'core',
       scope: 'them',
-      ai: { label: '8 items', cls: 'pill-warn' },
+      ai: { label: '8 findings', cls: 'pill-warn' },
       submitted: false,
       ciStatus: 'success',
       age: '2d',
@@ -84,7 +84,21 @@ describe('dashboard fidelity (spec §2)', () => {
     expect(html).toContain('6 projects · 9 open MRs');
     expect(html).toContain('Waiting on you · 3');
     expect(html).toContain('Waiting on them · 6');
-    expect(html).toContain('⟳ 2m ago');
+    // A wall clock, not an age: `fetchedAgo` was computed from a timestamp
+    // stamped milliseconds earlier in the same refresh, so it read "0m ago"
+    // forever and the button looked dead (bug 5).
+    expect(html).toContain('<span class="refresh-glyph">⟳</span> <span>14:32</span>');
+    expect(html).not.toContain('ago</span></button>');
+  });
+
+  it('acknowledges a refresh click before the fetch returns, with a class and no style attribute', () => {
+    // The click has to change something immediately — a repaint carrying
+    // identical data is otherwise indistinguishable from a dead button. The
+    // class is added on the way out, not on the reply.
+    expect(html).toContain("btn.classList.add('busy')");
+    expect(html.indexOf("classList.add('busy')")).toBeLessThan(html.indexOf("post({ type: 'refresh' })"));
+    expect(html).toContain('.head-right .tool.busy .refresh-glyph { animation: spin');
+    expect(html).not.toContain('style="');
   });
 
   it('renders the pod picker menu and an issues section in the left panel', () => {
@@ -125,7 +139,7 @@ describe('dashboard fidelity (spec §2)', () => {
   it('derives every stat from the state and colors the AI pill by state', () => {
     expect(html).toContain('7/9');
     expect(html).toContain('pill pill-warn');
-    expect(html).toContain('8 items');
+    expect(html).toContain('8 findings');
     expect(html).toContain('!2841 · @you · feat/auth-refresh');
   });
 

@@ -46,9 +46,11 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Edit review criteria | `codeVerdict.editCriteria` | Severity floor, categories, confidence |
 | Verdict: New pod | `codeVerdict.newPod` | |
 | Verdict: Switch pod | `codeVerdict.switchPod` | Quick pick |
+| Verdict: Delete pod | `codeVerdict.deletePod` | Quick pick, then a modal confirm |
 | Verdict: Add project to pod | `codeVerdict.addProject` | Accepts URL, project id, or group id |
 | Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
 | Verdict: Sign in | `codeVerdict.signIn` | |
+| Verdict: Show API trace | `codeVerdict.showApiTrace` | Reveals the API log; says which setting turns tracing on when it is off |
 
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.
@@ -57,7 +59,8 @@ elsewhere. Nothing is bound by default outside that context.
 
 `codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.severityFloor`,
 `codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
-`codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.pods`.
+`codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
+`codeVerdict.pods`.
 
 The access token is never a setting — it lives in the VS Code secret store.
 

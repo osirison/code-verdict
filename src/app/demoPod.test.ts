@@ -20,6 +20,7 @@ function memoryStore(): KeyValueStore {
 const noSecrets: SecretStore = {
   get: async () => undefined,
   store: async () => {},
+  delete: async () => {},
 };
 
 describe('demo pod (spec §1 "Skip and use a demo pod")', () => {

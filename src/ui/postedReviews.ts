@@ -16,6 +16,13 @@ import { formatAge } from './dashboardState';
 import { escapeHtml, renderFallbackHtml } from './dashboardHtml';
 import type { PostedMessage, PostedRow, PostedViewState } from './postedReviewsHtml';
 import { renderPostedReviewsHtml, renderPostedReviewsRegions } from './postedReviewsHtml';
+import {
+  buildPostedRows,
+  countArchived,
+  countWaitingOnYou,
+  selectedPostedRow,
+  visiblePostedRows,
+} from './postedReviewsState';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarThread, SidebarThreads } from './sidebarHtml';
 import { COMMANDS } from '../commands';
@@ -59,8 +66,18 @@ export class PostedReviewsPanel {
   private painted = false;
   private focusRef?: { repoId: string; number: string };
   private pod?: ReturnType<PodStore['list']>[number];
+  /** Every row, archived included — the filter narrows this at render time. */
   private rows: PostedRow[] = [];
-  private selectedIndex = 0;
+  /**
+   * The filter lives here rather than in the page, unlike the dashboard's
+   * scope/repo chips: those only hide DOM nodes, while the visible set here
+   * decides which review is selected, which threads the detail panel renders
+   * and what the sidebar mirrors. A page-side filter would leave all three
+   * pointing at a row nobody can see.
+   */
+  private showArchived = false;
+  /** Selection by ref, so it survives the filter changing the visible set. */
+  private selectedRef?: { repoId: string; number: string };
   private expandedThreadId?: string;
   private opinions: Record<string, string> = {};
 
@@ -82,8 +99,24 @@ export class PostedReviewsPanel {
     route.onMessage((message) => void this.onMessage(message as PostedMessage));
   }
 
+  private visibleRows(): PostedRow[] {
+    return visiblePostedRows(this.rows, this.showArchived);
+  }
+
+  /**
+   * The selected row as the page draws it — resolved against the visible
+   * rows through the same helper the renderer calls, so a thread action can
+   * never target a review other than the one on screen. A selection that has
+   * become archived while the filter is off is not visible, and falls back
+   * to the first visible row: that is the report's own request, since the
+   * archived review is no longer something to act on.
+   */
+  private selectedRow(): PostedRow | undefined {
+    return selectedPostedRow(this.visibleRows(), this.selectedRef);
+  }
+
   private selectedView(): PostedReviewView | undefined {
-    return this.rows[this.selectedIndex]?.view;
+    return this.selectedRow()?.view;
   }
 
   private async onMessage(m: PostedMessage): Promise<void> {
@@ -109,8 +142,15 @@ export class PostedReviewsPanel {
       const view = this.selectedView();
       switch (m.type) {
         case 'selectReview':
-          this.selectedIndex = m.index;
+          this.selectedRef = { repoId: m.repoId, number: m.number };
           this.expandedThreadId = undefined;
+          this.render();
+          return;
+        case 'toggleArchived':
+          // Render-only: every row already carries `archived` from the last
+          // fetch, so revealing them is a filter change, never a refetch.
+          // The selection is a ref, so it survives the visible set changing.
+          this.showArchived = !this.showArchived;
           this.render();
           return;
         case 'toggleThread':
@@ -214,7 +254,11 @@ export class PostedReviewsPanel {
             now,
             waitingOnYouTotal: 0,
             rows: [],
-            selectedIndex: 0,
+            // Nothing local knows what is archived yet — that answer comes
+            // from the open-CR list below — so the skeleton shows every
+            // history entry and claims no archived count.
+            showArchived: this.showArchived,
+            archivedCount: 0,
             opinions: {},
             loading: true,
             pendingRows: history.map((entry) => ({
@@ -247,30 +291,49 @@ export class PostedReviewsPanel {
         ),
       ]);
       const now = Date.now();
-      const rows = history.map((entry, i): PostedRow => {
-        const cr = crs.find(
-          (c) => c.ref.repoId === entry.repoId && c.ref.number === entry.crNumber,
-        );
-        return {
+      // The open-CR list was already being fetched for the row titles; it
+      // also answers "is this review's change request still open", which is
+      // the whole archive signal (see buildPostedRows).
+      const rows = buildPostedRows(
+        history.map((entry, i) => ({
           view: views[i] as PostedReviewView,
           refLabel: vocabulary.formatCrRef(entry.crNumber),
-          title: cr?.title ?? `${vocabulary.formatCrRef(entry.crNumber)}`,
           project: pod.repos?.find((r) => r.id === entry.repoId)?.name ?? entry.repoId,
           age: formatAge(entry.submittedAt, now),
-        };
-      });
+        })),
+        crs,
+      );
       if (!canRender()) return;
       this.pod = pod;
       this.rows = rows;
       if (this.focusRef) {
         const wanted = this.focusRef;
-        const index = rows.findIndex(
+        const match = rows.find(
           (r) => r.view.repoId === wanted.repoId && r.view.crNumber === wanted.number,
         );
-        if (index >= 0) this.selectedIndex = index;
+        if (match) {
+          // "Track replies" and the dashboard's submitted rows jump straight
+          // to one review. An archived one is still reachable that way — the
+          // reveal turns the filter on rather than selecting a hidden row and
+          // showing the reviewer an unrelated one.
+          if (match.archived) this.showArchived = true;
+          this.selectedRef = { repoId: match.view.repoId, number: match.view.crNumber };
+        }
         this.focusRef = undefined;
       }
-      if (this.selectedIndex >= rows.length) this.selectedIndex = 0;
+      // Commit whatever the render is about to draw, so after every refresh
+      // the stored selection *is* the drawn one. The fallback inside
+      // selectedPostedRow is first-visible-row, which moves when the filter
+      // widens the visible set — leaving the ref unresolved (never selected
+      // yet, left the history on a pod switch or a cleared store, or archived
+      // out from under the filter by this very refresh) would make the next
+      // toggleArchived click move the selection instead of only lengthening
+      // the list. A toggle stays display-only: it never calls refresh, so a
+      // deliberate selection still survives hide-then-reveal.
+      const resolved = selectedPostedRow(this.visibleRows(), this.selectedRef);
+      this.selectedRef = resolved
+        ? { repoId: resolved.view.repoId, number: resolved.view.crNumber }
+        : undefined;
       this.render();
     } catch (e) {
       if (!canRender()) return;
@@ -284,23 +347,28 @@ export class PostedReviewsPanel {
   static selectThread(threadId: string): void {
     const panel = PostedReviewsPanel.current;
     if (!panel || panel.disposed) return;
-    const index = panel.rows.findIndex((row) =>
+    // Searched across every row, archived included: the sidebar mirrors this
+    // screen, and a thread it offers has to be reachable. An archived hit
+    // turns the filter on — the same reveal focusRef performs — instead of
+    // selecting a row the list is hiding.
+    const match = panel.rows.find((row) =>
       row.view.threads.some((thread) => thread.threadId === threadId),
     );
-    if (index < 0) return;
-    panel.selectedIndex = index;
+    if (!match) return;
+    if (match.archived) panel.showArchived = true;
+    panel.selectedRef = { repoId: match.view.repoId, number: match.view.crNumber };
     panel.expandedThreadId = threadId;
     panel.render();
     AppSurface.reveal();
   }
 
   private publishSidebarThreads(): void {
-    const view = this.selectedView();
+    const row = this.selectedRow();
+    const view = row?.view;
     if (!view) {
       this.deps.onSidebarThreads?.(undefined);
       return;
     }
-    const row = this.rows[this.selectedIndex];
     const count = (status: SidebarThread['status']): number =>
       view.threads.filter((thread) => thread.status === status).length;
     const summary = ([
@@ -330,13 +398,20 @@ export class PostedReviewsPanel {
     if (this.disposed) return;
     this.publishSidebarThreads();
     const renderPod = this.pod ?? this.deps.podStore.activePod;
+    const visible = this.visibleRows();
     const state: PostedViewState = {
       vocabulary: renderPod ? getProvider(renderPod.providerId).vocabulary : NEUTRAL_VOCABULARY,
       podName: renderPod?.name ?? '',
       now: Date.now(),
-      waitingOnYouTotal: this.rows.reduce((n, r) => n + r.view.counts.you, 0),
-      rows: this.rows,
-      selectedIndex: this.selectedIndex,
+      // Over the visible rows, not all of them: a thread left open on a
+      // change request that has already merged or closed is not work the
+      // reviewer can act on, and a badge counting unreachable threads is the
+      // same complaint the archiving fixes, in the header instead of the list.
+      waitingOnYouTotal: countWaitingOnYou(visible),
+      rows: visible,
+      showArchived: this.showArchived,
+      archivedCount: countArchived(this.rows),
+      selectedRef: this.selectedRef,
       expandedThreadId: this.expandedThreadId,
       opinions: this.opinions,
     };

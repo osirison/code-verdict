@@ -21,6 +21,7 @@ import {
   type ReviewContextEntry,
 } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
+import { ReviewRunStore } from '../app/reviewRuns';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
@@ -121,6 +122,14 @@ export interface ReviewFlowDeps {
   workspaceState: KeyValueStore;
   globalState: KeyValueStore;
   onSubmitted?: () => void;
+  /**
+   * A review RUN was recorded — a different event from `onSubmitted`, and
+   * deliberately not folded into it: nothing has been posted to the platform
+   * yet, and a clean run never will be. Fired after the store write resolves
+   * so whatever repaints on the far side reads the run that just landed, not
+   * the state before it.
+   */
+  onRunRecorded?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
   /** Spec §3: identity and agent, before any findings exist. */
   onSidebarPending?: (state?: SidebarPendingReview) => void;
@@ -599,6 +608,14 @@ export class ReviewFlowPanel {
       refLabel: this.refLabel(),
       itemCount: response.items.length,
     });
+    // Both branches, not just the submit path: a run that came back clean was
+    // written nowhere at all, so the dashboard kept saying "not run" for a
+    // change request the agent had already cleared, and ⟳ kept showing the
+    // same thing — the whole reason the refresh button read as dead.
+    // Fire-and-forget like `persistDraft` below, for the same reason: the
+    // paint must not wait on globalState. Not `.catch()`ed — a failed write
+    // is a real fault and belongs in the extension-host log, not swallowed.
+    void this.recordRun(response);
     if (response.items.length === 0) {
       // The superseded draft must not resurrect a dead review on next open.
       void this.deps.workspaceState.update(this.draftKey(), undefined);
@@ -628,6 +645,25 @@ export class ReviewFlowPanel {
     this.screen = 'triage';
     void this.persistDraft();
     this.render();
+  }
+
+  /**
+   * Record the outcome of a run and only then tell the rest of the extension
+   * to repaint: the callback fans out to views that read this very store, so
+   * firing it before the write resolves would repaint them onto the previous
+   * run. The agent label is resolved here rather than in the store so the
+   * dashboard can name the agent offline, the way `ReviewHistory` does.
+   */
+  private async recordRun(response: AgentReviewResponse): Promise<void> {
+    await new ReviewRunStore(this.deps.globalState).record({
+      repoId: this.ref.repoId,
+      crNumber: this.ref.number,
+      outcome: response.items.length === 0 ? 'clean' : 'findings',
+      findingCount: response.items.length,
+      agentLabel: this.agentLabel(),
+      ranAt: new Date().toISOString(),
+    });
+    this.deps.onRunRecorded?.();
   }
 
   // ---- messages ------------------------------------------------------------------
@@ -1001,7 +1037,11 @@ export class ReviewFlowPanel {
         {
           drafts,
           summary: composeSummaryBody(this.summaryText, this.finalNote),
-          requestChanges: this.requestChanges && provider.capabilities.requestChanges,
+          // The author's own request-for-changes is refused the same way their
+          // approval is, and `requestChanges` defaults to true — so the summary
+          // screen's disabled checkbox is the notice, this is the enforcement.
+          // A stale webview can still post toggleOption after the page changed.
+          requestChanges: this.requestChanges && provider.capabilities.requestChanges && !this.selfAuthored(),
           asSingleThread: this.postThread && provider.capabilities.batchedReview,
         },
         {
@@ -1135,6 +1175,20 @@ export class ReviewFlowPanel {
     return this.agents.find((a) => a.id === this.agentId)?.label ?? this.agentId;
   }
 
+  /**
+   * Did the signed-in user open this change request? The same comparison
+   * `podQuery.ts` and `dashboardState.ts` make. `Pod.username` is optional, so
+   * a missing one is *unknown*, never yes — answering yes on a guess would hide
+   * the approval from a reviewer entitled to give it, and the platform's own
+   * refusal (`verdictRefused`) already covers the unknown case. Read off the
+   * pod, not off the view state's `username`, which falls back to the literal
+   * 'you' and would match an author of that name.
+   */
+  private selfAuthored(): boolean {
+    const you = this.pod().username;
+    return you !== undefined && this.cr?.author.username === you;
+  }
+
   private render(): void {
     // The loading page (#39) ships the full page script, so the keyboard
     // handler and the message dispatch are both armed during the fetch
@@ -1173,6 +1227,7 @@ export class ReviewFlowPanel {
       screen: this.screen,
       submitProgress: this.submitProgress,
       acceptRate,
+      selfAuthored: this.selfAuthored(),
       memberOfChangeset: this.memberOfChangeset,
       header: {
         refLabel: this.refLabel(),

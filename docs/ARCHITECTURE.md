@@ -156,6 +156,19 @@ and `font-src` to the webview's `cspSource`. Without that option the CSP stays f
 Glyphs the spec names in prose stay as written characters — the ✓/✕/⤼ verdict marks, the ▾ file
 caret, ⚠, and the ○/✓ setup marks. They are content the spec dictates, not chrome.
 
+## Every webview style goes in the nonce'd `<style>` block
+
+`renderPage` emits `style-src 'nonce-…'`, and a nonce covers `<style>` elements only — never a
+`style="…"` attribute. An inline style on any element is therefore dropped silently: no console
+error, no visual hint, the rule simply never applies. It cost issue #45, where the loading
+skeleton's bars rendered at zero size because their dimensions were attributes.
+
+So every rule lives in the page's CSS block behind a class, including one-off layout tweaks. There
+is no attribute-shaped escape hatch: `style="--item-sev:…"` is blocked exactly like any other
+inline style, custom property or not. A value that genuinely varies per element needs either a
+fixed set of classes, or a rule emitted into the same nonce'd `<style>` block and matched on a
+data attribute.
+
 ## The status bar shows only what is Verdict's
 
 Spec §14 is drawn from a prototype that mocks the whole VS Code window, so its `⎇ branch` and
@@ -249,4 +262,14 @@ scoped one, so existing pods are not silently signed out.
 - **Enforcement**: `src/ui/vocabulary.test.ts` (no hardcoded platform nouns), `src/commands.test.ts`
   (the palette set, and no platform named in any static product-surface string), and the ESLint
   `no-restricted-imports` rule (only `src/registry.ts` imports a concrete provider).
+- **Page behaviour** (jsdom): a test that asserts against a rendered HTML *string* cannot tell a
+  wired control from a dead one — which is how the dashboard's ⟳ button came to be reported broken
+  while every dashboard test passed. `src/ui/dashboardScript.test.ts` executes the real page script
+  instead: construct `new JSDOM(renderX(...), { runScripts: 'dangerously', beforeParse })`, stub
+  `acquireVsCodeApi` in `beforeParse`, dispatch the event, assert on what was posted. Two mechanics
+  matter. Construct `JSDOM` by hand under the normal `node` environment — vitest's `jsdom`
+  environment hands back a document whose scripts never ran, and switching the global `environment`
+  in `vitest.config.ts` drags every other test file into a DOM it does not need. And pass a
+  `VirtualConsole` that drops `jsdomError`: `REGIONS_SCRIPT` ends by restoring scroll, and jsdom
+  does not implement `window.scrollTo`. Issue #43 tracks generalising this into a harness.
 - **Extension host** (later): smoke tests via `@vscode/test-electron`.

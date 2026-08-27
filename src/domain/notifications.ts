@@ -31,7 +31,7 @@ export interface NotificationEventDef {
 /**
  * The seven events, in the order the settings screen lists them. package.json
  * must contribute `codeVerdict.notifications.events.<key>` with exactly these
- * defaults — enforced by commands.test.ts, the same way the 19 commands are.
+ * defaults — enforced by commands.test.ts, the same way the 21 commands are.
  */
 export const NOTIFICATION_EVENTS: readonly NotificationEventDef[] = [
   { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', defaultMode: 'Interrupt' },

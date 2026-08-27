@@ -668,7 +668,7 @@ behaviour requirements. Press `?` for the keyboard overlay.
 | File | What it is |
 | --- | --- |
 | `Code Verdict - developer handoff.md` | State machine, TypeScript domain model, source-resolution rules, review-run contract, submit and thread semantics, GitLab endpoint list, v1 definition of done. |
-| `Code Verdict - naming & commands.md` | Name rules, the 19 `Verdict:` commands with ids, keybinding scoping, the `codeVerdict.*` settings namespace, shipped UI strings, fixed vocabulary. |
+| `Code Verdict - naming & commands.md` | Name rules, the 21 `Verdict:` commands with ids, keybinding scoping, the `codeVerdict.*` settings namespace, shipped UI strings, fixed vocabulary. |
 | `Code Verdict - API fixtures.json` | One reference payload per contract: agent response (with filtered-out candidates), MR, line-comment POST with suggestion + position, summary note, discussions response annotated with derived thread status, and the five error shapes. |
 
 **Known scope gaps to confirm with product before building:** pipeline and issue screens are

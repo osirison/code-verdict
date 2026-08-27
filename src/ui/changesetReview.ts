@@ -434,6 +434,9 @@ export class ChangesetReviewPanel {
         break;
       }
       case 'reviewSingle': if (message.repoId && message.number) this.deps.openSingle({ repoId: message.repoId, number: message.number }); return;
+      // A changeset spans several change requests, so there is no single one to
+      // approve; renderClean stops offering the button once `changeset` is set.
+      // This stays as the fallback for a stale page that still posts 'approve'.
       case 'backToDashboard': case 'approve': this.deps.openDashboard(); return;
       case 'openMr': {
         const item = this.review?.items.find((candidate) => candidate.id === this.selectedId);

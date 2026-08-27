@@ -118,6 +118,15 @@ export interface FlowViewState {
   criteria: Criteria;
   /** "56% accepted in this pod" — undefined hides the tuning link. */
   acceptRate?: number;
+  /**
+   * The signed-in user opened this change request. Optional because the answer
+   * can be genuinely unknown — `Pod.username` is optional, so a pod that has
+   * not resolved one yet cannot tell. Unknown must render as *not* the author:
+   * the platform's own refusal (`verdictRefused`, platform/errors.ts) is the
+   * backstop, and hiding the controls on a guess would strip a reviewer of the
+   * verdict they are entitled to give.
+   */
+  selfAuthored?: boolean;
   // running
   runSteps: string[];
   runStep: number;
@@ -391,6 +400,7 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .filtered { text-align: left; }
 .filtered .bucket { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--row); font-size: 12.5px; }
 .filtered .why { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dimmer); }
+.self-note { border: 1px dashed var(--line2); border-radius: 6px; padding: 12px 14px; font-size: 12px; line-height: 1.6; color: var(--fg-dim); }
 
 .tally-blocks { display: flex; gap: 10px; }
 .tally { flex: 1; border-radius: 6px; padding: 12px 14px; text-align: center; font-size: 12px; }
@@ -406,9 +416,14 @@ textarea.summary { width: 100%; min-height: 96px; border: none; background: var(
 .sugg-mark { color: var(--agent); font-family: var(--font-mono); font-size: 10.5px; text-align: right; }
 .rejected-row { color: var(--fg-dimmer); font-size: 12px; padding: 7px 14px; border-bottom: 1px solid var(--row); }
 .empty-comments { border: 1px dashed var(--line2); border-radius: 6px; padding: 18px; text-align: center; font-size: 12px; color: var(--fg-dimmer); }
-.options-row { display: flex; gap: 20px; font-size: 12px; color: var(--fg); }
+.options-row { display: flex; gap: 20px; font-size: 12px; color: var(--fg); align-items: center; flex-wrap: wrap; }
+.options-row .opt-off { color: var(--fg-dimmer); }
+.options-row .opt-why { font-size: 11px; color: var(--fg-dimmer); }
 .submit-fail { border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
 .actions-row { display: flex; gap: 10px; align-items: center; }
+/* Was style="justify-content:center" on the clean screen's row, which the page
+   CSP silently dropped — a nonce authorises <style>, never a style attribute (#45). */
+.actions-center { justify-content: center; }
 .posts-as { margin-left: auto; font-size: 11px; color: var(--fg-dimmer); }
 
 .done-col { max-width: 560px; margin: 80px auto; text-align: center; display: flex; flex-direction: column; gap: 16px; }
@@ -903,7 +918,24 @@ function renderTriageDiff(s: FlowViewState): string {
 
 // ---- §6 Clean bill -----------------------------------------------------------
 
+/**
+ * Why the author's own verdict controls are missing. Neither platform accepts
+ * APPROVE or REQUEST_CHANGES from the change request's author — the refusal is
+ * terminal and already classified as `verdictRefused` (platform/errors.ts), so
+ * offering the control only bought the reviewer a click and an error toast.
+ * `verdict` reads into the sentence: "an approval", "a request for changes".
+ */
+function selfAuthoredNote(s: FlowViewState, verdict: string): string {
+  return `You opened this ${e(s.vocabulary.changeRequestNoun)} — ${e(s.vocabulary.platformName)} does not accept ${verdict} from its author.`;
+}
+
 function renderClean(s: FlowViewState): string {
+  // Two reasons never to offer the approval. The author's own is refused by the
+  // platform (see selfAuthoredNote). A changeset spans several change requests,
+  // so there is no single one to approve — changesetReview.ts handles 'approve'
+  // as 'backToDashboard', meaning the green button approved nothing and quietly
+  // navigated away.
+  const approvable = !s.selfAuthored && !s.changeset;
   const totalFiltered = s.candidates.reduce((n, c) => n + c.count, 0);
   const bucketLine = (c: CandidateBucket): { label: string; why: string } =>
     c.reason === 'belowSeverityFloor'
@@ -937,8 +969,9 @@ function renderClean(s: FlowViewState): string {
     </div>`
         : ''
     }
-    <div class="actions-row" style="justify-content:center">
-      <button class="btn btn-ok" id="approve">Approve ${e(s.vocabulary.changeRequestNoun)}</button>
+    ${s.selfAuthored ? `<div class="self-note">${selfAuthoredNote(s, 'an approval')}</div>` : ''}
+    <div class="actions-row actions-center">
+      ${approvable ? `<button class="btn btn-ok" id="approve">Approve ${e(s.vocabulary.changeRequestNoun)}</button>` : ''}
       <button class="btn" id="lower-bar">Lower the bar and re-run</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
     </div>
@@ -1005,7 +1038,13 @@ function renderSummary(s: FlowViewState): string {
       <label><input type="checkbox" id="opt-thread" ${s.postThread ? 'checked' : ''}> Post as single review thread</label>
       ${
         s.supportsRequestChanges
-          ? `<label><input type="checkbox" id="opt-changes" ${s.requestChanges ? 'checked' : ''}> Request changes</label>`
+          // Two different absences. A provider without the capability shows
+          // nothing — there is no such verdict to explain. The author of this
+          // change request has the verdict but cannot cast it, so the option
+          // stays visible, off and disabled, carrying the reason.
+          ? s.selfAuthored
+            ? `<label class="opt-off"><input type="checkbox" id="opt-changes" disabled> Request changes</label><span class="opt-why">${selfAuthoredNote(s, 'a request for changes')}</span>`
+            : `<label><input type="checkbox" id="opt-changes" ${s.requestChanges ? 'checked' : ''}> Request changes</label>`
           : ''
       }
     </div>

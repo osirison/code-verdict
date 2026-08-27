@@ -118,7 +118,7 @@ describe('the same state renders each platform in its own words', () => {
     meta: '',
     scopeCounts: { you: 1, them: 0 },
     stats: { waitingOnYou: 1, aiCoverage: { reviewed: 1, total: 2 }, pipelinesFailing: 1, projectsInPod: 3 },
-    fetchedAgo: '2m ago',
+    fetchedLabel: '14:32',
     projects: [{ id: '9101', label: 'core', count: 1 }],
     changesets: [{ id: 'cs', name: 'Rate limiting', memberCount: 2, projectCount: 2, state: 'ready to merge', stateClass: 'pill-ok' as const }],
     rows: [{

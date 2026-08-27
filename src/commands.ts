@@ -1,5 +1,5 @@
 /**
- * The 19 `Verdict:` commands, as specified in
+ * The 21 `Verdict:` commands, as specified in
  * `spec/specs/Code Verdict - naming & commands.md`. package.json must
  * contribute exactly this set — enforced by commands.test.ts.
  */
@@ -20,9 +20,11 @@ export const COMMANDS = {
   editCriteria: 'codeVerdict.editCriteria',
   newPod: 'codeVerdict.newPod',
   switchPod: 'codeVerdict.switchPod',
+  deletePod: 'codeVerdict.deletePod',
   addProject: 'codeVerdict.addProject',
   refresh: 'codeVerdict.refresh',
   signIn: 'codeVerdict.signIn',
+  showApiTrace: 'codeVerdict.showApiTrace',
 } as const;
 
 export type CommandId = (typeof COMMANDS)[keyof typeof COMMANDS];
@@ -30,10 +32,10 @@ export type CommandId = (typeof COMMANDS)[keyof typeof COMMANDS];
 export const ALL_COMMAND_IDS: readonly CommandId[] = Object.values(COMMANDS);
 
 /**
- * Commands the naming doc's 19-command table does not reserve a palette entry
+ * Commands the naming doc's 21-command table does not reserve a palette entry
  * for. They are registered at runtime and reachable from keybindings, menus
  * and other screens — never contributed to `contributes.commands`, so the
- * palette keeps showing exactly the specified 19.
+ * palette keeps showing exactly the specified 21.
  */
 export const INTERNAL_COMMANDS = {
   postedReviews: 'codeVerdict.internal.postedReviews',

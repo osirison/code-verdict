@@ -63,7 +63,13 @@ export interface DashboardViewState {
     pipelinesFailing: number;
     projectsInPod: number;
   };
-  fetchedAgo: string;
+  /**
+   * When this data was fetched, as a wall clock — not an age. The age was
+   * computed from a `fetchedAt` stamped milliseconds earlier in the same
+   * refresh, so it always read "0m ago" and never moved, which is what made
+   * the ⟳ button look dead. See `formatClock` in dashboardState.ts.
+   */
+  fetchedLabel: string;
   podOptions?: Array<{ id: string; name: string; active: boolean; meta: string }>;
   projects: Array<{ id: string; label: string; count: number }>;
   changesets?: Array<{
@@ -133,6 +139,16 @@ header { position: relative; display: flex; align-items: center; gap: 14px; padd
 .head-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 .head-right .tool { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); border: 1px solid var(--line2); border-radius: 4px; background: none; padding: 4px 9px; cursor: pointer; }
 .head-right .tool:hover { background: var(--hover); }
+/* Refresh acknowledgement (bug 5): the click has to show something before
+   the fetch returns, or a repaint that lands on identical data is
+   indistinguishable from a dead button. Class toggle only — a style
+   attribute is silently dropped by this page's CSP (issue #45) — and the
+   spin keyframes come from the shared base CSS. Nothing clears "busy": the
+   repaint replaces #db-body (or the whole document), and the fresh markup
+   simply has no such class. */
+.head-right .tool.busy { color: var(--fg-dimmer); border-color: var(--line); }
+.refresh-glyph { display: inline-block; }
+.head-right .tool.busy .refresh-glyph { animation: spin .9s linear infinite; }
 
 .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }
 .stat { background: var(--bg); padding: 14px 20px; }
@@ -233,7 +249,7 @@ export function renderDashboardBody(state: DashboardViewState): string {
     </div>`
     }
     <div class="head-right">
-      <button class="tool" id="refresh" title="Refresh">⟳ ${e(state.fetchedAgo)}</button>
+      <button class="tool" id="refresh" title="Refresh"><span class="refresh-glyph">⟳</span> <span>${e(state.fetchedLabel)}</span></button>
       <button class="tool" id="filters">Filters</button>
     </div>
   </header>`;
@@ -398,7 +414,16 @@ const SCRIPT = `
     menu.toggleAttribute('hidden', !open);
   };
 
-  document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
+  // Mark the button busy before posting, never after the reply: the whole
+  // complaint about ⟳ was that pressing it appeared to do nothing, and the
+  // reply may repaint identical data. The class needs no clearing — the
+  // repaint rebuilds this button from scratch.
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('#refresh');
+    if (!btn) return;
+    btn.classList.add('busy');
+    post({ type: 'refresh' });
+  });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#filters')) post({ type: 'filters' }); });
   document.addEventListener('click', (ev) => {
     if (!ev.target.closest('#pod-switch')) return;
