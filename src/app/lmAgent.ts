@@ -12,29 +12,50 @@ import type { ChangeRequestDiff } from '../platform/types';
 import type { AgentDescriptor } from './agents';
 import { AgentTrace, type AgentProgressCallback, type AgentTimeoutReason, type AgentTraceSink } from './agentTrace';
 import { changesetHeadSha, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
+import { renderReviewContextPrompt, type ReviewContext, type ReviewContextEntry } from './reviewContext';
 
 export type { AgentProgressCallback, AgentRunProgress, AgentTraceSink } from './agentTrace';
 
 const LM_PREFIX = 'lm:';
 
-// Issue #36: a flat total-duration timeout cancels a review that is still
-// actively streaming — a large diff on a slower model easily runs past 90s
-// with the model working the whole time. Split into two independent limits:
+// Issue #36 opened this: a flat total-duration timeout cancels a review that
+// is still actively streaming. The fix then added an inactivity window but
+// kept an absolute ceiling beside it, and the ceiling reproduced the very
+// bug the issue was about, ten minutes later — a run streaming healthily the
+// whole time was still cancelled, and the panel blamed
+// `copilot.request.timeout`. A wall-clock bound cannot tell a productive run
+// from a hung one, so neither limit is one any more:
 //
 // - INACTIVITY: reset on every fragment. A model that keeps producing
 //   output keeps the request alive no matter how long the run takes overall.
 //   The issue's own worked example is a model that streams one fragment
 //   every ~60s; 90s gives that pattern real margin (not a knife's-edge tie)
 //   while still recovering a genuinely stuck request in reasonable time.
-//   It is also strictly more forgiving than the old flat 90s cutoff — any
-//   run the old code allowed to finish, this allows too.
-// - CEILING: an absolute backstop that is *not* reset by activity, so a
-//   model that streams filler forever (or a run that's just pathologically
-//   large) can't hold the extension open indefinitely. 10 minutes is
-//   generous enough that a real, healthy review — even a large multi-file
-//   diff — should never hit it; if it does, something is actually wrong.
+// - CEILING: a checkpoint, not a kill. On expiry it asks one question — did
+//   anything arrive during this window? If yes it re-arms for another full
+//   window; only a window that passed with no output at all cancels. So it
+//   bounds a run that has gone quiet over a long horizon and never a run
+//   that is still producing. With both windows at their defaults inactivity
+//   always fires first, which is intended: the ceiling is the bound that is
+//   left when a caller turns inactivity off for a model that thinks in
+//   multi-minute silences.
+//
+// Both are settings — `codeVerdict.agentRun.*`, read in the UI layer and
+// handed down as `RunAgentOptions.timeouts`, because nothing below `src/ui`
+// reads `workspace.getConfiguration`. Zero disables either window.
 export const INACTIVITY_TIMEOUT_MS = 90_000;
 export const CEILING_TIMEOUT_MS = 10 * 60_000;
+
+/** Both windows in milliseconds; `<= 0` disables that one. */
+export interface AgentRunTimeouts {
+  inactivityMs: number;
+  ceilingMs: number;
+}
+
+export const DEFAULT_AGENT_RUN_TIMEOUTS: AgentRunTimeouts = {
+  inactivityMs: INACTIVITY_TIMEOUT_MS,
+  ceilingMs: CEILING_TIMEOUT_MS,
+};
 
 // Reused across runs so we don't spawn a new "Code Verdict: Agent Trace"
 // output channel on every review — VS Code shows one entry per channel in
@@ -51,6 +72,8 @@ export interface RunAgentOptions {
   onProgress?: AgentProgressCallback;
   /** Overrides the default output-channel sink — tests inject a plain in-memory one instead of touching `vscode`. */
   trace?: AgentTraceSink;
+  /** The configured windows. Omitted falls back to the defaults above, which is what an unconfigured caller wants. */
+  timeouts?: AgentRunTimeouts;
 }
 
 export async function discoverLmAgents(): Promise<AgentDescriptor[]> {
@@ -81,10 +104,17 @@ export class AgentRunError extends Error {
   }
 }
 
+/**
+ * `context` carries what the change is for (title, description, linked work
+ * items). It sits between the criteria and the diffs so intent is read before
+ * evidence, and `renderReviewContextPrompt` is what states that it is intent
+ * rather than more surface to review.
+ */
 export async function runLmAgent(
   agentId: string,
   diff: ChangeRequestDiff,
   criteria: Criteria,
+  context?: ReviewContext,
   options?: RunAgentOptions,
 ): Promise<AgentReviewResponse> {
   const prompt = [
@@ -92,9 +122,24 @@ export async function runLmAgent(
     `Respond with a single JSON object matching this contract: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": "${diff.headSha}", "items": [{ "id", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "suggestion"?: {"old","new"} }], "candidates": [] }`,
     `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
+    renderReviewContextPrompt(context ? [{ context }] : []),
     ...diff.files.map((f) => `--- ${f.newPath}\n${f.diff}`),
   ].join('\n\n');
   return runPrompt(agentId, prompt, options);
+}
+
+/**
+ * The context blocks the changeset prompt carries, each labelled with the same
+ * identifiers the member's diffs carry below it. Exported because the triage
+ * screen asks `reviewContextTruncatedForPrompt` whether this prompt was cut,
+ * and the total budget counts the labels too — answering that against a set
+ * relabelled for the screen would report on a prompt that was never sent.
+ */
+export function changesetContextEntries(members: readonly ChangesetAgentMember[]): ReviewContextEntry[] {
+  return members.flatMap((member) => (member.context
+    // vocab-ok: the agent prompt's wire format — the same labels the response parser reads back
+    ? [{ context: member.context, label: `for projectId=${member.ref.repoId} mrIid=${member.ref.number}` }]
+    : []));
 }
 
 export async function runLmChangesetAgent(
@@ -112,6 +157,8 @@ export async function runLmChangesetAgent(
     'Every item must use the exact projectId and mrIid labels supplied below. The file and line must identify an added line in that member diff.',
     `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
+    // One block per member that has context, all of them before any diff.
+    renderReviewContextPrompt(changesetContextEntries(members)),
     ...members.flatMap((member) => member.diff.files.map((file) => [
       // vocab-ok: the agent prompt's wire format — the response parser reads these exact field names back
       `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${file.newPath}`,
@@ -183,19 +230,39 @@ async function streamText<T>(
     throw new AgentRunError(message, requestId, false);
   }
 
+  const timeouts = options?.timeouts ?? DEFAULT_AGENT_RUN_TIMEOUTS;
   const tokenSource = new vscode.CancellationTokenSource();
   let timeoutReason: AgentTimeoutReason | undefined;
-  const scheduleTimeout = (reason: AgentTimeoutReason, ms: number) =>
-    setTimeout(() => {
-      timeoutReason = reason;
-      tokenSource.cancel();
-    }, ms);
+  /** `ms <= 0` is the setting's documented "no limit" — arm nothing at all. */
+  const schedule = (ms: number, onExpiry: () => void): ReturnType<typeof setTimeout> | undefined =>
+    ms > 0 ? setTimeout(onExpiry, ms) : undefined;
+  const cancelWith = (reason: AgentTimeoutReason) => {
+    timeoutReason = reason;
+    tokenSource.cancel();
+  };
 
-  const ceiling = scheduleTimeout('ceiling', CEILING_TIMEOUT_MS);
-  let inactivity = scheduleTimeout('inactivity', INACTIVITY_TIMEOUT_MS);
-  const resetInactivity = () => {
+  // The ceiling re-arms itself for as long as output keeps arriving, so its
+  // handle is reassigned rather than fixed; `finally` clears whichever one is
+  // pending at the end.
+  let producedThisCeiling = false;
+  let ceiling: ReturnType<typeof setTimeout> | undefined;
+  const armCeiling = () => {
+    producedThisCeiling = false;
+    ceiling = schedule(timeouts.ceilingMs, () => {
+      if (producedThisCeiling) {
+        armCeiling();
+        return;
+      }
+      cancelWith('ceiling');
+    });
+  };
+  armCeiling();
+
+  let inactivity = schedule(timeouts.inactivityMs, () => cancelWith('inactivity'));
+  const onFragment = () => {
+    producedThisCeiling = true;
     clearTimeout(inactivity);
-    inactivity = scheduleTimeout('inactivity', INACTIVITY_TIMEOUT_MS);
+    inactivity = schedule(timeouts.inactivityMs, () => cancelWith('inactivity'));
   };
 
   try {
@@ -207,17 +274,19 @@ async function streamText<T>(
     let text = '';
     for await (const fragment of response.text) {
       text += fragment;
-      resetInactivity();
+      onFragment();
       const progress = trace.fragment(fragment);
       options?.onProgress?.(progress);
     }
     return finish(text, trace);
   } catch (e) {
     if (tokenSource.token.isCancellationRequested) {
+      // Two limits, two sentences: which window ran out tells the reviewer
+      // whether to lengthen the short one or the long one.
       const message =
         timeoutReason === 'ceiling'
-          ? `agent exceeded the ${CEILING_TIMEOUT_MS / 1000}s overall time limit`
-          : `agent stalled: no output for ${INACTIVITY_TIMEOUT_MS / 1000}s`;
+          ? `agent produced nothing for a full ${timeouts.ceilingMs / 1000}s run window`
+          : `agent stalled: no output for ${timeouts.inactivityMs / 1000}s`;
       trace.failure(message, timeoutReason);
       throw new AgentRunError(message, requestId, true, timeoutReason);
     }

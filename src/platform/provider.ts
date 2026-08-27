@@ -60,6 +60,15 @@ export interface Vocabulary {
   ciNoun: string;
   /** "pipelines" / "checks" */
   ciNounPlural: string;
+  /**
+   * What the platform calls a `WorkItem` — "issue" today on every provider,
+   * "ticket" or "work item" on the trackers a fourth one would speak to. The
+   * triage screen names the linked items the agent was given, and that line is
+   * chrome like any other.
+   */
+  workItemNoun: string;
+  /** "issues" / "tickets". Explicit for the same reason as the plural above. */
+  workItemNounPlural: string;
   /** "!2841" / "#123" */
   formatCrRef(number: string): string;
 }
@@ -107,6 +116,8 @@ export const NEUTRAL_VOCABULARY: Vocabulary = {
   groupNoun: 'group',
   ciNoun: 'run',
   ciNounPlural: 'runs',
+  workItemNoun: 'work item',
+  workItemNounPlural: 'work items',
   formatCrRef: (number) => `#${number}`,
 };
 

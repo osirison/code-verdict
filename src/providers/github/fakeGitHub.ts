@@ -87,6 +87,7 @@ const ISSUES: Record<string, unknown[]> = {
     {
       number: 1180,
       title: 'Tenants can exhaust the shared bucket',
+      body: 'One tenant can spend the whole shared bucket in a burst and starve the rest.\n\nWanted: a per-tenant limit that degrades to the shared bucket when unset.',
       state: 'open',
       assignee: { login: 'dana' },
       milestone: { title: 'Q3 hardening' },

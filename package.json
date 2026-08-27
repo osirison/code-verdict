@@ -204,6 +204,18 @@
           "default": "terse",
           "description": "Voice of the generated summary comment."
         },
+        "codeVerdict.agentRun.inactivitySeconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 90,
+          "description": "Give up on a review when no output has arrived from the agent for this many seconds. The clock restarts on every fragment, so a run that keeps streaming is never cut off however long it takes overall. Raise it for a model that thinks in long silences; 0 removes this limit and leaves the ceiling below as the only one."
+        },
+        "codeVerdict.agentRun.ceilingSeconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 600,
+          "description": "Long-horizon check on a review run. Every time this many seconds pass, the run is checked once: output arrived during the window and it continues, nothing arrived at all and it is cancelled. It never stops a run that is still producing, however long that run has been going. 0 removes the check."
+        },
         "codeVerdict.notifications.quietMode": {
           "type": "boolean",
           "default": false,

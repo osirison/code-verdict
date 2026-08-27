@@ -351,6 +351,11 @@ describe('listing', () => {
     expect(items.map((i) => i.number)).toEqual(['1180']);
   });
 
+  it('maps the issue body onto the neutral description the review context reads', async () => {
+    const [item] = await connect().listWorkItems(['acme/core']);
+    expect(item?.description).toContain('starve the rest');
+  });
+
   it('reports a repository with no open pull requests as empty, not as an error', async () => {
     await expect(connect().listOpenChangeRequests(['acme/api-gateway'])).resolves.toEqual([]);
   });

@@ -12,8 +12,14 @@ import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor } from '../app/agents';
 import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS, discoverLmAgents, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, discoverLmAgents, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
 import type { PodStore } from '../app/pods';
+import {
+  buildReviewContext,
+  reviewContextTruncatedForPrompt,
+  type ReviewContext,
+  type ReviewContextEntry,
+} from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
 import { ReviewRunStore } from '../app/reviewRuns';
 import type { KeyValueStore, SecretStore } from '../app/storage';
@@ -37,11 +43,14 @@ import type { Category, Review, ReviewItem, Severity } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
-import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
+import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef, WorkItem } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
+import { agentRunTimeouts } from './agentRunOptions';
+import { RunLiveness } from './runLiveness';
+import { changesetTrailer } from './changesetOptions';
 import { escapeHtml } from './theme';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
@@ -185,6 +194,14 @@ export class ReviewFlowPanel {
    */
   private cr?: ChangeRequest;
   private diff?: ChangeRequestDiff;
+  /**
+   * What this change is for, built once in `load()` and read twice: the agent
+   * prompt gets it, and the triage screen renders the same structure rather
+   * than deriving its own — so the reviewer sees exactly what the model saw.
+   */
+  private reviewContext?: ReviewContext;
+  /** Collapsed until asked for: the findings are what the triage screen is for. */
+  private contextOpen = false;
   private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
   private agentId: string = DEMO_AGENT_DESCRIPTOR.id;
   private agentOpen = false;
@@ -197,6 +214,7 @@ export class ReviewFlowPanel {
   private runStep = 0;
   private runError?: { message: string; requestId: string; partialCount: number; code: string };
   private runToken = 0;
+  private readonly runLive = new RunLiveness();
   private summaryText = '';
   private finalNote = '';
   private postThread = true;
@@ -285,6 +303,7 @@ export class ReviewFlowPanel {
     this.runToken += 1;
     this.runSteps = [];
     this.runStep = 0;
+    this.runLive.clear();
     this.runError = undefined;
     // Full per-MR reset: nothing (verdicts, threads, summary text, the
     // partial-failure ledger) may leak from one MR into another.
@@ -296,6 +315,11 @@ export class ReviewFlowPanel {
     // handler while the fetch is still in flight.
     this.cr = undefined;
     this.diff = undefined;
+    // Same reason as cr and diff above: last MR's intent under this ref's
+    // header is a wrong answer, and feeding it to this ref's agent run is a
+    // worse one.
+    this.reviewContext = undefined;
+    this.contextOpen = false;
     this.review = undefined;
     this.response = undefined;
     this.threads = {};
@@ -344,6 +368,12 @@ export class ReviewFlowPanel {
       const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
       const diffPromise = connection.getChangeRequestDiff(ref);
       const agentsPromise = discoverLmAgents();
+      // The work items resolve whatever the description links. A review that
+      // cannot start because that list 404'd is worse than one running on the
+      // description alone, so this one degrades to [] instead of rejecting —
+      // which also covers the unhandled-rejection concern the two catches
+      // above exist for.
+      const workItemsPromise = connection.listWorkItems([ref.repoId]).catch((): WorkItem[] => []);
       diffPromise.catch(() => undefined);
       agentsPromise.catch(() => undefined);
       const crs = await crsPromise;
@@ -357,7 +387,9 @@ export class ReviewFlowPanel {
       this.cr = cr;
       this.diff = await diffPromise;
       this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await agentsPromise)];
+      const workItems = await workItemsPromise;
       if (this.disposed || loadToken !== this.loadSeq) return;
+      this.reviewContext = buildReviewContext(cr, workItems, { trailer: changesetTrailer() });
       if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
         this.agentId = pod.agentId;
       }
@@ -508,6 +540,7 @@ export class ReviewFlowPanel {
     this.screen = 'running';
     this.runError = undefined;
     this.runStep = 0;
+    this.runLive.clear();
     const pod = this.pod();
     pod.agentId = this.agentId;
     await this.deps.podStore.upsert(pod);
@@ -536,9 +569,18 @@ export class ReviewFlowPanel {
       'Items ready',
     ];
     this.runStep = 2;
+    // The log parks here for the whole request, so the liveness line under it
+    // is what tells the reviewer the run is alive rather than hung.
+    this.runLive.start();
     this.render();
+    const timeouts = agentRunTimeouts();
     try {
-      const response = await runLmAgent(this.agentId, this.diff, pod.criteria);
+      const response = await runLmAgent(this.agentId, this.diff, pod.criteria, this.reviewContext, {
+        timeouts,
+        onProgress: (progress) => {
+          if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
+        },
+      });
       if (this.disposed || token !== this.runToken) return;
       this.finishRun(response);
     } catch (e) {
@@ -548,7 +590,11 @@ export class ReviewFlowPanel {
         message: err.message,
         requestId: err.requestId,
         partialCount: 0,
-        code: err.timedOut ? `copilot.request.timeout · ${err.timeoutReason === 'ceiling' ? CEILING_TIMEOUT_MS : INACTIVITY_TIMEOUT_MS}ms` : 'copilot.request.error',
+        // The window that actually ran out, not the shipped default — a
+        // reviewer who lengthened it needs the code to name their number.
+        code: err.timedOut
+          ? `copilot.request.timeout · ${err.timeoutReason === 'ceiling' ? timeouts.ceilingMs : timeouts.inactivityMs}ms`
+          : 'copilot.request.error',
       };
       this.render();
     }
@@ -698,6 +744,9 @@ export class ReviewFlowPanel {
         // today — reachable once streaming partial parses land.
         this.runError = undefined;
         this.screen = 'agent';
+        break;
+      case 'toggleReviewContext':
+        this.contextOpen = !this.contextOpen;
         break;
       case 'setMode':
         this.mode = m.mode;
@@ -916,7 +965,12 @@ export class ReviewFlowPanel {
     const entry = list[list.length - 1] as { label: string; text: string };
     try {
       const hunk = this.diff?.files.find((f) => f.newPath === item.file)?.diff;
-      entry.text = await runFollowUpPrompt(this.agentId, followUpPrompt(item, question, hunk));
+      // Shares `streamText`, so it gets the same configured windows: a model
+      // slow enough to need a longer one on the review is the same model
+      // answering the follow-up.
+      entry.text = await runFollowUpPrompt(this.agentId, followUpPrompt(item, question, hunk), {
+        timeouts: agentRunTimeouts(),
+      });
     } catch (e) {
       const error = e instanceof AgentRunError ? e.message : toScmError(e).message;
       entry.text = `The agent could not answer: ${error}`;
@@ -1164,6 +1218,10 @@ export class ReviewFlowPanel {
       produced > 0
         ? Math.round((history.reduce((n, r) => n + r.counts.accepted, 0) / produced) * 100)
         : undefined;
+    // The same one-entry array `runLmAgent` wraps this context in for the
+    // prompt: the truncation notice has to answer for the prompt that was
+    // sent, and the budget it is measured against counts entry labels too.
+    const contextEntries: ReviewContextEntry[] = this.reviewContext ? [{ context: this.reviewContext }] : [];
     const state: FlowViewState = {
       vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
@@ -1186,6 +1244,7 @@ export class ReviewFlowPanel {
       criteria: pod.criteria,
       runSteps: this.runSteps,
       runStep: this.runStep,
+      runLive: this.runLive.snapshot(),
       runError: this.runError,
       mode: this.mode,
       items,
@@ -1196,6 +1255,13 @@ export class ReviewFlowPanel {
           .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines))
         : undefined,
       counts,
+      context: contextEntries.length > 0
+        ? {
+            open: this.contextOpen,
+            truncated: reviewContextTruncatedForPrompt(contextEntries),
+            entries: contextEntries,
+          }
+        : undefined,
       stale: this.staleHead
         ? {
             newHead: this.staleHead,

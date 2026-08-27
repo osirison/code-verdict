@@ -40,6 +40,19 @@ function trailerPattern(trailer: string): RegExp {
   return new RegExp(`^${escapeRegExp(key)}:?\\s*#(\\d+)\\s*$`, 'gim');
 }
 
+/**
+ * Every work item the description links through the trailer convention, in
+ * source order and deduplicated. Exported because the review context
+ * (`reviewContext.ts`) resolves the same links for the agent prompt, and this
+ * format's parser stays beside the convention it belongs to — an inlined
+ * re-implementation of it once failed into a plausible wrong answer rather
+ * than a crash, which is far more expensive than one export.
+ */
+export function linkedWorkItemNumbers(description: string | undefined, trailer?: string): string[] {
+  const matches = [...(description ?? '').matchAll(trailerPattern(trailer?.trim() || DEFAULT_TRAILER))];
+  return [...new Set(matches.flatMap((match) => (match[1] ? [match[1]] : [])))];
+}
+
 function memberKey(ref: { repoId: string; number: string }): string {
   return `${ref.repoId}!${ref.number}`;
 }
@@ -72,15 +85,12 @@ export function detectChangesets(
   options: ChangesetDetectionOptions = {},
 ): DetectedChangeset[] {
   const trailer = options.trailer?.trim() || DEFAULT_TRAILER;
-  const pattern = trailerPattern(trailer);
   const trailerKey = trailer.replace(/:$/, '');
 
   const groups = new Map<string, ChangeRequest[]>();
   const claimed = new Set<string>();
   for (const changeRequest of changeRequests) {
-    const matches = [...(changeRequest.description ?? '').matchAll(pattern)];
-    const issueNumbers = new Set(matches.flatMap((match) => match[1] ? [match[1]] : []));
-    for (const issueNumber of issueNumbers) {
+    for (const issueNumber of linkedWorkItemNumbers(changeRequest.description, trailer)) {
       const members = groups.get(issueNumber) ?? [];
       members.push(changeRequest);
       groups.set(issueNumber, members);

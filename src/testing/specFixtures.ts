@@ -23,6 +23,8 @@ export const GITLAB_VOCABULARY: Vocabulary = {
   groupNoun: 'group',
   ciNoun: 'pipeline',
   ciNounPlural: 'pipelines',
+  workItemNoun: 'issue',
+  workItemNounPlural: 'issues',
   formatCrRef: (number) => `!${number}`,
 };
 
@@ -36,6 +38,8 @@ export const GITHUB_VOCABULARY: Vocabulary = {
   groupNoun: 'organization',
   ciNoun: 'check',
   ciNounPlural: 'checks',
+  workItemNoun: 'issue',
+  workItemNounPlural: 'issues',
   formatCrRef: (number) => `#${number}`,
 };
 

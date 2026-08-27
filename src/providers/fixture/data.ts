@@ -313,6 +313,7 @@ export const WORK_ITEMS: WorkItem[] = [
     repoId: '9102',
     number: '1180',
     title: 'Key rotation, end to end',
+    description: 'Rotate signing keys without a restart.\n\nThe gateway must accept both the outgoing and incoming key for one TTL, and the console must render the new expiry field.',
     state: 'open',
     assignee: { username: 'kai' },
     milestone: '26.08',

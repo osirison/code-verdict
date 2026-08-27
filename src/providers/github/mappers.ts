@@ -59,6 +59,7 @@ export interface GhPull {
 export interface GhIssue {
   number: number;
   title: string;
+  body?: string | null;
   state: 'open' | 'closed';
   assignee?: GhUser | null;
   milestone?: { title: string } | null;
@@ -163,6 +164,7 @@ export function toWorkItem(repoId: string, issue: GhIssue): WorkItem {
     repoId,
     number: String(issue.number),
     title: issue.title,
+    description: issue.body ?? undefined,
     state: issue.state,
     assignee: issue.assignee ? toUserRef(issue.assignee) : undefined,
     milestone: issue.milestone?.title,

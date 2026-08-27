@@ -7,7 +7,9 @@ import type { CandidateBucket } from '../domain/agentResponse';
 import type { Category, Criteria, ReviewItem, Severity, Verdict } from '../domain/types';
 import type { AgentDescriptor } from '../app/agents';
 import type { HunkLine } from '../domain/diffHunks';
+import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { Vocabulary } from './vocab';
+import { cap, countOf } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
 
@@ -22,6 +24,22 @@ export interface SubmitProgressView {
   stage: 'comments' | 'summary' | 'verdict';
   posted: number;
   total: number;
+}
+
+/**
+ * Proof the run is alive, for the running screen. The canned five-step log
+ * parks on step 2 for the whole request, so a healthy multi-minute review and
+ * a dead one used to look identical — that is half of what the timeout report
+ * was about, the other half being that the run was then cancelled. These are
+ * `AgentRunProgress` counters, straight from the fragments as they land.
+ */
+export interface RunLivenessView {
+  /** Epoch ms the request started, so the page can tick its own clock between fragments. */
+  startedAt: number;
+  /** Elapsed at render time — the renderer stays pure rather than reading the clock itself. */
+  elapsedMs: number;
+  fragmentsReceived: number;
+  charsReceived: number;
 }
 
 export interface FlowHeaderInfo {
@@ -49,6 +67,31 @@ export interface TriageItemView {
    * Only sides that resolve to a real added-line anchor appear here.
    */
   crossTargets?: Array<{ repoId: string; number: string; location: string; active: boolean }>;
+}
+
+/**
+ * What the agent was told this change is for, as the triage screen shows it.
+ * `entries` are the same `ReviewContext` values `renderReviewContextPrompt`
+ * was built from — never a second derivation, which could disagree with what
+ * was actually reviewed.
+ */
+export interface ReviewContextView {
+  /**
+   * Open or collapsed. Kept in the panel rather than in a `<details>` element
+   * because the region patch (#39) replaces `#flow-body` wholesale on every
+   * verdict, which would slam an open box shut mid-triage.
+   */
+  open: boolean;
+  /**
+   * The prompt carried less than what follows — one of the context budgets cut
+   * it. The panel answers this with `reviewContextTruncatedForPrompt` over the
+   * entries the prompt itself was given, labels included: the total budget
+   * counts those, so the screen's own labels would answer for a prompt that
+   * was never sent.
+   */
+  truncated: boolean;
+  /** One block per change request under review; `label` names the member in changeset scope. */
+  entries: readonly ReviewContextEntry[];
 }
 
 export interface ChangesetReviewScope {
@@ -87,6 +130,8 @@ export interface FlowViewState {
   // running
   runSteps: string[];
   runStep: number;
+  /** Set only while an `lm:` request is in flight; the demo agent walks its own log instead. */
+  runLive?: RunLivenessView;
   runError?: { message: string; requestId: string; partialCount: number; code: string };
   // triage
   mode: 'split' | 'queue' | 'diff';
@@ -94,6 +139,8 @@ export interface FlowViewState {
   selectedId?: string;
   diffLines?: HunkLine[];
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
+  /** Absent until the change request's own fetch returns — the box renders nothing at all rather than a shell. */
+  context?: ReviewContextView;
   stale?: { newHead: string; affected: number; affectedAccepted?: number };
   changeset?: ChangesetReviewScope;
   /** Set on a single-CR review whose MR belongs to a detected changeset (§15 entry point "a member MR"). */
@@ -125,6 +172,7 @@ export type FlowMessage =
   | { type: 'cancel' }
   | { type: 'usePartial' }
   | { type: 'retryRun' }
+  | { type: 'toggleReviewContext' }
   | { type: 'setMode'; mode: 'split' | 'queue' | 'diff' }
   | { type: 'select'; itemId: string }
   | { type: 'verdict'; itemId: string; verdict: Verdict; applyFix: boolean }
@@ -233,6 +281,11 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .runlog { text-align: left; display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
 .runlog .done { color: var(--fg-dimmer); }
 .runlog .now { color: var(--fg); }
+/* The live counters under the bar. Monospace so the ticking clock and the
+   growing character count do not shuffle the line sideways every second. */
+.run-live { display: flex; align-items: center; justify-content: center; gap: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--fg-dimmer); }
+.run-live b { color: var(--fg); font-weight: 600; }
+.run-live .sep { opacity: .45; }
 .fail-card { text-align: left; border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
 .fail-title { font-size: 13.5px; font-weight: 600; color: var(--fg-hi); }
 .fail-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
@@ -255,6 +308,27 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .changeset-scope .glyph { color: var(--agent); font-size: 14px; }
 .changeset-scope strong { color: var(--fg-hi); font-weight: 600; }
 .changeset-scope a { margin-left: auto; }
+/* What the change is for. Collapsed it is one row; open it scrolls inside its
+   own height so the selected finding stays where it was. The pre-wrap that
+   keeps an author's line breaks lives here rather than on the element: this
+   page's CSP authorises nonce'd style elements only, so a style attribute
+   silently never applies (issue #45). */
+.ctx { border-bottom: 1px solid var(--line); background: var(--bg2); }
+.ctx-head { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 20px; border: none; background: none; color: var(--fg-dim); font-family: var(--font-ui); font-size: 11.5px; text-align: left; cursor: pointer; }
+.ctx-head:hover { color: var(--fg); }
+.ctx-caret { color: var(--fg-dimmer); font-size: 9px; }
+.ctx-label { color: var(--fg-hi); font-weight: 600; }
+.ctx-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+.ctx-chip { margin-left: auto; border: 1px solid var(--sev-major); border-radius: 10px; padding: 2px 8px; font-size: 10px; color: var(--sev-major); }
+.ctx-body { max-height: 260px; overflow-y: auto; padding: 0 20px 14px; display: flex; flex-direction: column; gap: 12px; }
+.ctx-note { font-size: 11px; line-height: 1.5; color: var(--fg-dimmer); }
+.ctx-cut { background: var(--sev-major-t); border-radius: 4px; padding: 7px 10px; font-size: 11.5px; line-height: 1.5; color: var(--fg); }
+.ctx-block { display: flex; flex-direction: column; gap: 7px; }
+.ctx-block-head { font-size: 12.5px; font-weight: 600; color: var(--fg-hi); overflow-wrap: anywhere; }
+.ctx-text { font-size: 12px; line-height: 1.6; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ctx-none { font-size: 11.5px; line-height: 1.5; color: var(--fg-dimmer); }
+.ctx-item { display: flex; flex-direction: column; gap: 5px; border-left: 2px solid var(--line2); padding-left: 11px; }
+.ctx-item-head { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); overflow-wrap: anywhere; }
 
 .detail { max-width: 820px; margin: 0 auto; padding: 24px 30px 120px; display: flex; flex-direction: column; gap: 16px; }
 .detail-title { font-size: 15.5px; font-weight: 600; color: var(--fg-max); }
@@ -484,6 +558,38 @@ function renderSubmitting(s: FlowViewState): string {
   </div>`;
 }
 
+/** `m:ss`. The page's own ticker in SCRIPT repeats this format — the two must agree. */
+function elapsedClock(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/**
+ * The counters as one line. Exported because the panel pushes this same
+ * string into the page between renders (`run:progress`, so a fast model does
+ * not rebuild `#flow-body` many times a second) — a second formatter over
+ * there would eventually describe the same run differently.
+ */
+export function runOutputSummary(fragmentsReceived: number, charsReceived: number): string {
+  if (fragmentsReceived === 0) return 'waiting for the first output';
+  const chars = String(charsReceived).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return `${fragmentsReceived} ${fragmentsReceived === 1 ? 'fragment' : 'fragments'} · ${chars} characters`;
+}
+
+/**
+ * `startedAt` rides in the markup so the clock keeps ticking between
+ * fragments: a model that streams once a minute would otherwise freeze the
+ * number for 60s at a time, which is exactly what read as a hung run.
+ */
+function runLiveness(live: RunLivenessView | undefined): string {
+  if (!live) return '';
+  return `<div class="run-live">
+      <span><b id="run-elapsed" data-started="${live.startedAt}">${e(elapsedClock(live.elapsedMs))}</b> elapsed</span>
+      <span class="sep">·</span>
+      <span id="run-output">${e(runOutputSummary(live.fragmentsReceived, live.charsReceived))}</span>
+    </div>`;
+}
+
 function renderRunning(s: FlowViewState): string {
   const agent = s.agents.find((a) => a.id === s.agentId);
   const pct = Math.round((Math.min(s.runStep, s.runSteps.length) / Math.max(1, s.runSteps.length)) * 100);
@@ -506,6 +612,7 @@ function renderRunning(s: FlowViewState): string {
     <div class="agent-name">${e(agent?.label ?? '')}</div>
     <div class="dim">${pct}%</div>
     <div class="progress"><div style="width:${pct}%"></div></div>
+    ${runLiveness(s.runLive)}
     <div class="runlog">
       ${s.runSteps
         .map((step, i) =>
@@ -543,7 +650,87 @@ function triageHeader(s: FlowViewState): string {
       <button data-mode="diff" class="${s.mode === 'diff' ? 'active' : ''}">In diff</button>
     </div>
   </div>
-  ${s.stale ? staleBanner(s, s.stale) : ''}`;
+  ${s.stale ? staleBanner(s, s.stale) : ''}${reviewContextPanel(s)}`;
+}
+
+/**
+ * What the change is for, on the screen where the human decides whether to
+ * keep each finding. `state.context` carries the very `ReviewContext` values
+ * the prompt was assembled from (`app/reviewContext.ts`), so the two cannot
+ * disagree: a screen showing more than the agent read, or less, would be
+ * describing a review that did not happen.
+ *
+ * Collapsed by default and height-capped when open, because findings are what
+ * this screen is for — a description the length of a design doc would push the
+ * selected one under the fold at any editor width.
+ */
+function reviewContextPanel(s: FlowViewState): string {
+  const view = s.context;
+  if (!view || view.entries.length === 0) return '';
+  const vocabulary = s.vocabulary;
+  const linked = view.entries.flatMap((entry) => entry.context.linkedItems);
+  const linkSummary =
+    linked.length === 0
+      ? `no ${vocabulary.workItemNoun} linked`
+      : `${linked.length} ${linked.length === 1 ? vocabulary.workItemNoun : vocabulary.workItemNounPlural} linked`;
+  // In changeset scope the count of blocks is what the row has to say; a
+  // single review has one block, so it can say whether that block has prose.
+  const scopeSummary =
+    view.entries.length === 1
+      ? view.entries[0]?.context.description
+        ? `${cap(vocabulary.changeRequestNoun)} description`
+        : `no ${vocabulary.changeRequestNoun} description`
+      : countOf(vocabulary, view.entries.length);
+
+  const linkedItem = (item: LinkedWorkItem): string => {
+    if (!item.resolved) {
+      // Both providers list open items only, so a closed one lands here too —
+      // the reference is genuinely all the agent got.
+      return `<div class="ctx-item"><div class="ctx-item-head">#${e(item.number)}</div>
+        <div class="ctx-none">The agent was given this reference only — the ${e(vocabulary.workItemNoun)} itself could not be read.</div></div>`;
+    }
+    const body = item.description
+      ? `<div class="ctx-text">${e(item.description)}</div>`
+      : `<div class="ctx-none">This ${e(vocabulary.workItemNoun)} has no description.</div>`;
+    // Joined from what is there: `resolved` guarantees the number alone.
+    const head = [`#${e(item.number)}`, item.state ? e(item.state) : '', item.title ? e(item.title) : '']
+      .filter((part) => part !== '')
+      .join(' · ');
+    return `<div class="ctx-item"><div class="ctx-item-head">${head}</div>${body}</div>`;
+  };
+
+  const block = (entry: ReviewContextEntry): string => {
+    const { context, label } = entry;
+    const description = context.description
+      ? `<div class="ctx-text">${e(context.description)}</div>`
+      : `<div class="ctx-none">No description on this ${e(vocabulary.changeRequestNoun)} — the agent was given the title alone.</div>`;
+    const items =
+      context.linkedItems.length === 0
+        ? `<div class="ctx-none">No ${e(vocabulary.workItemNoun)} is linked from the description — the agent was given this ${e(vocabulary.changeRequestNoun)} alone.</div>`
+        : context.linkedItems.map(linkedItem).join('');
+    return `<div class="ctx-block">
+      <div class="ctx-block-head">${label ? `${e(label)} · ` : ''}${e(context.title)}</div>
+      ${description}${items}
+    </div>`;
+  };
+
+  return `<div class="ctx">
+    <button class="ctx-head" id="ctx-toggle">
+      <span class="ctx-caret">${view.open ? '▾' : '▸'}</span>
+      <span class="ctx-label">What ${view.entries.length === 1 ? 'this change is' : 'these changes are'} for</span>
+      <span class="ctx-meta">${e(scopeSummary)} · ${e(linkSummary)}</span>
+      ${view.truncated ? '<span class="ctx-chip">agent saw a shortened copy</span>' : ''}
+    </button>
+    ${
+      view.open
+        ? `<div class="ctx-body">
+      <div class="ctx-note">Handed to the agent ahead of the diffs as intent, not as evidence — a finding still has to point at a line the diff changed.</div>
+      ${view.truncated ? '<div class="ctx-cut">The agent was given a shortened copy: some of the text below did not fit its prompt. Judge what it missed against the whole of it.</div>' : ''}
+      ${view.entries.map(block).join('')}
+    </div>`
+        : ''
+    }
+  </div>`;
 }
 
 /**
@@ -936,7 +1123,7 @@ on('run', 'run'); on('cancel', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
-on('reanchor', 'reanchor'); on('rerun', 'rerun');
+on('reanchor', 'reanchor'); on('rerun', 'rerun'); on('ctx-toggle', 'toggleReviewContext');
 
 const itemId = () => document.querySelector('[data-item]')?.dataset.item;
 const verdict = (v, applyFix) => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: v, applyFix }); };
@@ -958,6 +1145,26 @@ document.addEventListener('click', (ev) => {
   if (!p) return;
   const id = itemId();
   if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset });
+});
+// The running screen ticks its own clock. Driving it from the host would only
+// move the number when a fragment lands, and the gap between two fragments is
+// precisely when a frozen screen reads as a dead run. Format must match
+// elapsedClock() above; the guard is that neither element exists off the
+// running screen.
+setInterval(() => {
+  const el = document.getElementById('run-elapsed');
+  const started = Number(el && el.dataset.started);
+  if (!el || !started) return;
+  const total = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  el.textContent = Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+}, 1000);
+window.addEventListener('message', (ev) => {
+  const data = ev.data;
+  if (!data || data.type !== 'run:progress') return;
+  const el = document.getElementById('run-output');
+  // textContent: the counters are host-composed, but this element sits inches
+  // from model output and the rest of this page holds the same line.
+  if (el) el.textContent = data.summary;
 });
 // The agent's answer arrives as a message and is patched into place. Rendering
 // the whole document instead would rebuild the ask box mid-question: focus

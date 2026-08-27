@@ -49,6 +49,8 @@ const VOCABULARY: Vocabulary = {
   groupNoun: 'group',
   ciNoun: 'pipeline',
   ciNounPlural: 'pipelines',
+  workItemNoun: 'issue',
+  workItemNounPlural: 'issues',
   formatCrRef: (number) => `!${number}`,
 };
 

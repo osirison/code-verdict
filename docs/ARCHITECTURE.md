@@ -52,8 +52,8 @@ they are, and each provider maps its own nouns onto them:
 
 UI strings still say "merge request" and "!2841" when the pod points at GitLab, and "pull request"
 and "#123" when it points at GitHub. Each provider exposes a `Vocabulary` — `platformName`, singular
-and plural nouns for change requests, repositories and CI, plus `formatCrRef` — and the chrome
-renders from it. The *logic* never branches on provider identity.
+and plural nouns for change requests, repositories, CI and work items, plus `formatCrRef` — and the
+chrome renders from it. The *logic* never branches on provider identity.
 
 Renderers are pure functions over a state object, so they take `vocabulary` **as part of that
 state**; they never import the registry, which would couple pure rendering to module-global state

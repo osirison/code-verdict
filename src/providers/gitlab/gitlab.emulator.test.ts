@@ -66,6 +66,9 @@ describe('end-to-end flows against the emulator', () => {
       agentId: '', repos: repoIds.map((id) => ({ id, name: id, path: id })),
     };
 
+    // The neutral description is what the review context feeds the agent.
+    expect(workItems.find((item) => item.number === '1180')?.description).toContain('accept both the outgoing');
+
     const [changeset] = detectChangesets(pod, changeRequests, workItems);
     expect(changeset?.linkedIssue).toBe('#1180');
     expect(changeset?.members).toHaveLength(4);
