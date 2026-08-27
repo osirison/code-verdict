@@ -43,6 +43,7 @@ import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, Triage
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { escapeHtml } from './theme';
+import { renderMarkdown } from './markdown';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
 
@@ -938,7 +939,11 @@ export class ReviewFlowPanel {
 
   private postThreadUpdate(itemId: string, list: Array<{ label: string; text: string }>): void {
     if (this.disposed) return;
-    void this.panel.webview.postMessage({ type: 'verdict:thread', itemId, thread: list });
+    // The answer is Markdown, and the webview patches this into the open card
+    // rather than re-rendering the page. Render it here, where `renderMarkdown`
+    // lives, and send the HTML alongside the raw text.
+    const thread = list.map((entry) => ({ ...entry, html: renderMarkdown(entry.text) }));
+    void this.panel.webview.postMessage({ type: 'verdict:thread', itemId, thread });
   }
 
   private generateSummaryText(): string {

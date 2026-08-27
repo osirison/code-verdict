@@ -95,11 +95,93 @@ describe('follow-up answers patch in place (#37, #38)', () => {
     expect(html).not.toContain("String(data.itemId).replace(");
   });
 
-  it('renders model output as text, never as markup', () => {
-    // The answer is whatever the model returned; innerHTML here would be an
-    // injection sink fed by an external system.
+  it('never assigns the raw model answer as markup', () => {
+    // The patch renders Markdown now, but only from the html the host built
+    // with renderMarkdown — which escapes every character before emitting a
+    // tag. The model's own string is still only ever set as text.
+    expect(html).toContain('text.innerHTML = t.html');
     expect(html).toContain('text.textContent = t.text');
     expect(html).not.toContain('innerHTML = t.text');
+  });
+});
+
+describe('agent prose renders as markdown (#52)', () => {
+  const body = [
+    'The cache accepts a **superseded** key id.',
+    '',
+    '- rotation leaves the old id valid',
+    '- `verifyKid` never runs',
+    '',
+    '```ts',
+    'const ok = cache.get(kid);',
+    '```',
+  ].join('\n');
+
+  const withBody = (mode: FlowViewState['mode']): string => {
+    const base = state.items[0]!;
+    return renderReviewFlowBody(
+      {
+        ...state,
+        mode,
+        items: [
+          {
+            ...base,
+            thread: [{ label: 'Agent', text: 'Because **kid** is ignored.' }],
+            item: { ...base.item, body },
+          },
+        ],
+      },
+      'HVE Core / PR Review',
+    );
+  };
+
+  for (const mode of ['split', 'queue', 'diff'] as const) {
+    it(`structures the finding body in ${mode} mode`, () => {
+      const html = withBody(mode);
+
+      expect(html).toContain('<div class="prose md">');
+      expect(html).toContain('<strong class="md-strong">superseded</strong>');
+      expect(html).toContain('<ul class="md-ul">');
+      expect(html).toContain('<code class="md-code">verifyKid</code>');
+      expect(html).toContain('<pre class="md-pre" data-lang="ts">');
+      // The asterisks and backticks used to print verbatim.
+      expect(html).not.toContain('**superseded**');
+      expect(html).not.toContain('- rotation leaves');
+    });
+
+    it(`structures a thread answer in ${mode} mode`, () => {
+      expect(withBody(mode)).toContain(
+        '<div class="thread-text md"><p class="md-p">Because <strong class="md-strong">kid</strong> is ignored.</p></div>',
+      );
+    });
+  }
+
+  it('keeps block markup out of a <p>, which the browser would reparse', () => {
+    // <ul> and <pre> inside <p> is invalid: the parser closes the paragraph
+    // early and the list escapes the styled wrapper.
+    expect(withBody('split')).not.toContain('<p class="prose">');
+  });
+
+  it('ships the markdown rules in the nonced stylesheet the page already has', () => {
+    const page = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n');
+
+    expect(page).toContain('.md-pre {');
+    expect(page).toContain('.md-code {');
+  });
+
+  it('escapes markup in the body rather than passing it through', () => {
+    const base = state.items[0]!;
+    const html = renderReviewFlowBody(
+      {
+        ...state,
+        mode: 'split',
+        items: [{ ...base, thread: [], item: { ...base.item, body: '<img src=x onerror=alert(1)>' } }],
+      },
+      'HVE Core / PR Review',
+    );
+
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
   });
 });
 
