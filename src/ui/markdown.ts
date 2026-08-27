@@ -28,7 +28,7 @@ const HARD_BREAK = '\u0000';
 const STASH_OPEN = '\u0001';
 const STASH_CLOSE = '\u0002';
 
-const FENCE = /^(\s{0,3})(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/;
+const FENCE = /^(\s{0,3})(`{3,}|~{3,})(.*)$/;
 const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
 const RULE = /^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/;
 const QUOTE = /^\s{0,3}>\s?(.*)$/;
@@ -111,10 +111,45 @@ function markerAt(line: string): Marker | null {
   return null;
 }
 
+interface Fence {
+  indent: number;
+  marker: string;
+  width: number;
+  info: string;
+}
+
+/**
+ * The opening line of a fenced block, or null.
+ *
+ * The info string is matched with a single `(.*)$` rather than two competing
+ * character classes: the earlier `([^`\s]*)[^`]*$` pair overlapped, so a line
+ * that opened a fence and held a later backtick could never reach `$` and the
+ * engine retried every split point — quadratic, on a synchronous render of
+ * untrusted model output.
+ */
+function fenceAt(line: string): Fence | null {
+  const match = FENCE.exec(line);
+  if (!match) return null;
+  const [, indent = '', ticks = '', rest = ''] = match;
+  const marker = ticks[0] ?? '`';
+  // A backtick fence may not carry a backtick in its info string.
+  if (marker === '`' && rest.includes('`')) return null;
+  return { indent: indent.length, marker, width: ticks.length, info: rest.trim().split(/\s+/)[0] ?? '' };
+}
+
+/** A header row followed by a delimiter row — the only shape that opens a table. */
+function tableStartsAt(lines: string[], index: number): boolean {
+  const header = at(lines, index);
+  const divider = at(lines, index + 1);
+  if (!header.includes('|') || !divider.includes('|')) return false;
+  if (!TABLE_DIVIDER.test(divider)) return false;
+  return splitCells(divider).length === splitCells(header).length && splitCells(header).length >= 2;
+}
+
 /** A line that ends an open paragraph by starting a block of its own. */
 function startsBlock(line: string): boolean {
   return (
-    FENCE.test(line) ||
+    fenceAt(line) !== null ||
     HEADING.test(line) ||
     RULE.test(line) ||
     QUOTE.test(line) ||
@@ -166,17 +201,34 @@ function alignClass(spec: string): string {
 function safeHref(escapedUrl: string): string | null {
   const url = escapedUrl.trim();
   if (url === '') return null;
-  // Relative and anchor targets have no scheme to abuse.
-  if (/^(#|\/|\.{1,2}\/)/.test(url)) return url;
+  // A stash placeholder or a hard-break marker inside the target would be
+  // expanded after the attribute was already built. Nothing legitimate needs
+  // one, so refuse the link rather than write a marker into an href.
+  if (url.includes(STASH_OPEN) || url.includes(HARD_BREAK)) return null;
+  // Anchor and path-relative targets have no scheme to abuse. `//host` and
+  // `/\host` are neither: both resolve to a remote authority, so they are not
+  // admitted by this branch.
+  if (/^(#|\/(?![/\\])|\.{1,2}\/)/.test(url)) return url;
   if (/^(https?:\/\/|mailto:)/i.test(url)) return url;
   return null;
 }
 
 /**
- * Inline transforms run over already-escaped text. Code spans and
- * backslash-escaped characters are stashed first so their contents never see
- * an emphasis or link pass — an agent quoting `a * b` or a `snake_case` name
- * inside backticks must come out verbatim.
+ * Inline transforms run over already-escaped text, in an order chosen so that
+ * no pass ever sees markup an earlier pass generated:
+ *
+ *   1. an escaped backtick, so it cannot open or close a code span;
+ *   2. code spans, whose contents are verbatim — no escape, link or emphasis
+ *      pass touches what an agent wrote between backticks;
+ *   3. the remaining backslash escapes, so `\*` is a literal asterisk;
+ *   4. links, whose `<a>` tags are stashed while the label stays visible to
+ *      the emphasis passes — an autolink is stashed whole, because its label
+ *      is the URL and a `*` in a URL is not emphasis;
+ *   5. emphasis, over what is left, which is only ever escaped source text.
+ *
+ * Everything generated goes into the stash and comes back at the end, so a
+ * `*` or a quote inside a URL can never reach a tag or an attribute that a
+ * later regex would rewrite.
  */
 function renderInline(escaped: string): string {
   const stash: string[] = [];
@@ -186,41 +238,48 @@ function renderInline(escaped: string): string {
   };
 
   let text = escaped;
-  // Backslash escapes: `\*` is a literal asterisk, not the start of emphasis.
-  text = text.replace(/\\([\\`*_{}[\]()#+\-.!>|~])/g, (_all, ch: string) => keep(escapeHtml(ch)));
-  // Code spans, longest run of backticks first so ``a ` b`` survives.
+  text = text.replace(/\\`/g, () => keep('`'));
+  // Longest run of backticks first, so ``a ` b`` survives. A hard-break marker
+  // inside a code span is a line ending, which a code span renders as a space.
   text = text.replace(/(`+)([\s\S]+?)\1/g, (_all, _ticks: string, code: string) =>
-    keep(`<code class="md-code">${code.replace(/^ (.*) $/, '$1')}</code>`),
+    keep(`<code class="md-code">${code.split(HARD_BREAK).join(' ').replace(/^ (.*) $/, '$1')}</code>`),
   );
+  text = text.replace(/\\([\\*_{}[\]()#+\-.!>|~])/g, (_all, ch: string) => keep(escapeHtml(ch)));
   // Images degrade to their alt text — the webview has nothing remote to fetch.
   text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
   text = text.replace(
     /\[([^\]]+)\]\(([^()\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g,
     (all, label: string, url: string) => {
       const href = safeHref(url);
-      return href ? `<a class="md-link" href="${href}">${label}</a>` : all;
+      return href ? `${keep(`<a class="md-link" href="${href}">`)}${label}${keep('</a>')}` : all;
     },
   );
   // Angle autolinks arrive escaped, so match the entity form.
   text = text.replace(/&lt;((?:https?:\/\/|mailto:)\S+?)&gt;/g, (all, url: string) => {
     const href = safeHref(url);
-    return href ? `<a class="md-link" href="${href}">${url}</a>` : all;
+    return href ? keep(`<a class="md-link" href="${href}">${url}</a>`) : all;
   });
   text = text.replace(
     /\*\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*\*/g,
     '<strong class="md-strong"><em class="md-em">$1</em></strong>',
   );
   text = text.replace(/\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*/g, '<strong class="md-strong">$1</strong>');
+  // A single delimiter is deliberately line-scoped: a lone `*` in prose about
+  // code is far more common than emphasis wrapped across a soft break.
   text = text.replace(/(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])/g, '<em class="md-em">$1</em>');
   text = text.replace(/(?<![\w_])__(?!\s)([\s\S]+?)(?<!\s)__(?!\w)/g, '<strong class="md-strong">$1</strong>');
   // Underscores only bind at word edges, so `snake_case_name` stays intact.
   text = text.replace(/(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)/g, '<em class="md-em">$1</em>');
   text = text.replace(/~~(?!\s)([\s\S]+?)(?<!\s)~~/g, '<del class="md-del">$1</del>');
 
-  text = text.replace(
-    new RegExp(`${STASH_OPEN}(\\d+)${STASH_CLOSE}`, 'g'),
-    (_all, index: string) => stash[Number(index)] ?? '',
-  );
+  // Restoring is a fixed point, not one pass: a stashed code span can hold the
+  // placeholder of an escaped backtick, and String.replace never rescans what
+  // it inserted. Each stashed string can only name an earlier index, so this
+  // terminates; the bound is a guard, not a limit.
+  const placeholder = new RegExp(`${STASH_OPEN}(\\d+)${STASH_CLOSE}`, 'g');
+  for (let pass = 0; pass < 8 && text.includes(STASH_OPEN); pass += 1) {
+    text = text.replace(placeholder, (_all, index: string) => stash[Number(index)] ?? '');
+  }
   // Hard breaks were marked before escaping and swallow the newline they sit
   // on; soft breaks fold into a space, the way a paragraph reads on a page.
   return text.replace(new RegExp(`${HARD_BREAK}\\n?`, 'g'), '<br>').split('\n').join(' ');
@@ -265,10 +324,13 @@ function renderList(lines: string[], start: number): { html: string; next: numbe
     }
     const current = items[items.length - 1];
     if (!current) break;
-    // A continuation line belongs to the open item when it is indented past
-    // the marker, or — lazily — when it simply follows the item's own text
-    // with no blank line between.
-    if (pendingBlank && indentWidth(line) < first.contentIndent) break;
+    // A continuation line belongs to the open item when it is indented to the
+    // item's content column, or — lazily — when it simply follows the item's
+    // own text. An unindented line that opens a block of its own ends the
+    // list instead: absorbing it put the fence inside the last <li> and, if
+    // that fence held a blank line, tore the rest of the document apart.
+    const indented = indentWidth(line) >= first.contentIndent;
+    if (!indented && (pendingBlank || startsBlock(line) || tableStartsAt(lines, index))) break;
     if (pendingBlank) {
       loose = true;
       current.lines.push('');
@@ -300,11 +362,9 @@ function unwrapParagraph(html: string): string {
 }
 
 function renderTable(lines: string[], start: number): { html: string; next: number } | null {
-  if (start + 1 >= lines.length || !TABLE_DIVIDER.test(at(lines, start + 1))) return null;
-  if (!at(lines, start + 1).includes('|')) return null;
+  if (!tableStartsAt(lines, start)) return null;
   const header = splitCells(at(lines, start));
   const aligns = splitCells(at(lines, start + 1));
-  if (aligns.length !== header.length || header.length < 2) return null;
   const rows: string[][] = [];
   let index = start + 2;
   while (index < lines.length && !isBlank(at(lines, index)) && at(lines, index).includes('|')) {
@@ -341,12 +401,9 @@ function renderBlocks(lines: string[]): string {
       continue;
     }
 
-    const fence = FENCE.exec(line);
+    const fence = fenceAt(line);
     if (fence) {
-      const [, fenceIndent = '', ticks = '', info = ''] = fence;
-      const marker = ticks[0] ?? '`';
-      const width = ticks.length;
-      const closer = new RegExp(`^\\${marker}{${width},}\\s*$`);
+      const closer = new RegExp(`^\\${fence.marker}{${fence.width},}\\s*$`);
       const body: string[] = [];
       index += 1;
       while (index < lines.length) {
@@ -354,10 +411,10 @@ function renderBlocks(lines: string[]): string {
           index += 1;
           break;
         }
-        body.push(dedent(at(lines, index), fenceIndent.length));
+        body.push(dedent(at(lines, index), fence.indent));
         index += 1;
       }
-      const lang = info ? ` data-lang="${escapeHtml(info)}"` : '';
+      const lang = fence.info ? ` data-lang="${escapeHtml(fence.info)}"` : '';
       out.push(`<pre class="md-pre"${lang}><code>${escapeHtml(body.join('\n'))}</code></pre>`);
       continue;
     }
@@ -413,7 +470,7 @@ function renderBlocks(lines: string[]): string {
       continue;
     }
 
-    if (line.includes('|')) {
+    if (tableStartsAt(lines, index)) {
       const table = renderTable(lines, index);
       if (table) {
         out.push(table.html);
@@ -426,7 +483,7 @@ function renderBlocks(lines: string[]): string {
     while (
       index < lines.length &&
       !isBlank(at(lines, index)) &&
-      !(paragraph.length > 0 && startsBlock(at(lines, index)))
+      !(paragraph.length > 0 && (startsBlock(at(lines, index)) || tableStartsAt(lines, index)))
     ) {
       paragraph.push(at(lines, index));
       index += 1;

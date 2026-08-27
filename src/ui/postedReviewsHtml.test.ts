@@ -525,3 +525,45 @@ describe('archived posted reviews — history is append-only, the open list is t
       .not.toContain('style="');
   });
 });
+
+describe('a posted comment reads like the review card that produced it (#52)', () => {
+  it('renders the posted body and every reply as markdown', () => {
+    // The posted comment is the agent's own finding body (composeCommentDrafts
+    // sends `${headline}\n\n${item.body}`), so printing it flat here showed the
+    // same wall of asterisks the triage card no longer does.
+    const html = renderPostedReviewsHtml(
+      state(
+        [
+          row([
+            thread({
+              yourBody: '**Refresh token logged**\n\nThe path logs it in cleartext.\n\n- rotation does not help\n- `scrubSecrets` runs later',
+              replies: [{ author: 'dana', body: 'Fixed in `token.ts` — see **line 63**.', at: '2026-08-20T11:00:00.000Z', yours: false }],
+            }),
+          ]),
+        ],
+        { expandedThreadId: 'thread-1' },
+      ),
+      'nonce123',
+    );
+
+    expect(html).toContain('<strong class="md-strong">Refresh token logged</strong>');
+    expect(html).toContain('<ul class="md-ul">');
+    expect(html).toContain('<code class="md-code">scrubSecrets</code>');
+    expect(html).toContain('<code class="md-code">token.ts</code>');
+    expect(html).not.toContain('**Refresh token logged**');
+    // This panel has its own stylesheet, so the rules have to ship here too.
+    expect(html).toContain('.md-code {');
+  });
+
+  it('still escapes markup in a body it did not write', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread({ yourBody: '<img src=x onerror=alert(1)>', replies: [] })])], {
+        expandedThreadId: 'thread-1',
+      }),
+      'nonce123',
+    );
+
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+  });
+});
