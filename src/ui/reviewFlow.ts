@@ -11,11 +11,12 @@ import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
 import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
-import { AGENT_FILE_SUFFIX, discoverAgents, type SkippedDefinition } from '../app/agentDefinitions';
-import { preferredModelFor, reconcile, selectionFromPod } from '../app/podSelection';
-import { agentSearchRoots } from './agentLocations';
+import { type SkippedDefinition } from '../app/agentDefinitions';
+import { loadAgentSelection, watchAgentSources } from './agentRefresh';
+import { preferredModelFor, selectionFromPod } from '../app/podSelection';
 import { runDemoAgent } from '../app/demoAgent';
 import { AgentRunError, discoverModels, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
+import type { AgentSelectionState } from './agentRefresh';
 import type { PodStore } from '../app/pods';
 import {
   buildReviewContext,
@@ -379,8 +380,7 @@ export class ReviewFlowPanel {
       // open" message with a second, unrelated one.
       const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
       const diffPromise = connection.getChangeRequestDiff(ref);
-      const modelsPromise = discoverModels();
-      const agentsPromise = discoverAgents(agentSearchRoots());
+      const selectionPromise = loadAgentSelection(selectionFromPod(pod));
       // The work items resolve whatever the description links. A review that
       // cannot start because that list 404'd is worse than one running on the
       // description alone, so this one degrades to [] instead of rejecting —
@@ -388,8 +388,7 @@ export class ReviewFlowPanel {
       // above exist for.
       const workItemsPromise = connection.listWorkItems([ref.repoId]).catch((): WorkItem[] => []);
       diffPromise.catch(() => undefined);
-      agentsPromise.catch(() => undefined);
-      modelsPromise.catch(() => undefined);
+      selectionPromise.catch(() => undefined);
       const crs = await crsPromise;
       if (this.disposed || loadToken !== this.loadSeq) return;
       const cr = crs.find((c) => c.ref.number === ref.number);
@@ -400,20 +399,14 @@ export class ReviewFlowPanel {
       }
       this.cr = cr;
       this.diff = await diffPromise;
-      const discovered = await agentsPromise;
-      this.agents = [...BUILT_IN_AGENTS, ...discovered.agents];
-      this.skippedAgents = discovered.skipped;
-      this.models = await modelsPromise;
+
       const workItems = await workItemsPromise;
       if (this.disposed || loadToken !== this.loadSeq) return;
       this.reviewContext = buildReviewContext(cr, workItems, { trailer: changesetTrailer() });
       // One reconciliation over everything just discovered: a stored agent
       // whose file is gone, or a model that is no longer offered, falls back
       // here and says so on the screen rather than failing at run time.
-      const settled = reconcile(selectionFromPod(pod), { agents: this.agents, models: this.models });
-      this.agentId = settled.agentId;
-      this.modelId = settled.modelId;
-      this.selectionNotices = settled.notices;
+      this.applySelection(await selectionPromise);
       this.armAgentWatches();
 
       // A surviving draft re-enters triage (spec: drafts lose no work),
@@ -1245,34 +1238,27 @@ export class ReviewFlowPanel {
    * locations changing. All three land here rather than each re-implementing
    * discovery, so there is one path that re-discovers, reconciles and renders.
    */
+  private applySelection(next: AgentSelectionState): void {
+    this.agents = next.agents;
+    this.models = next.models;
+    this.skippedAgents = next.skippedAgents;
+    this.agentId = next.agentId;
+    this.modelId = next.modelId;
+    // Replace rather than append: these notices describe the current state of
+    // the pickers, and a stale one from two refreshes ago describes nothing.
+    this.selectionNotices = next.selectionNotices;
+  }
+
   private armAgentWatches(): void {
     if (this.agentWatches.length > 0) return;
-    const watcher = vscode.workspace.createFileSystemWatcher(`**/*${AGENT_FILE_SUFFIX}`);
-    this.agentWatches.push(
-      watcher,
-      watcher.onDidCreate(() => void this.refreshAgents()),
-      watcher.onDidChange(() => void this.refreshAgents()),
-      watcher.onDidDelete(() => void this.refreshAgents()),
-      vscode.lm.onDidChangeChatModels(() => void this.refreshAgents()),
-      vscode.workspace.onDidChangeConfiguration((event) => {
-        if (event.affectsConfiguration('codeVerdict.agentLocations')) void this.refreshAgents();
-      }),
-    );
+    this.agentWatches = watchAgentSources(() => void this.refreshAgents());
   }
 
   private async refreshAgents(): Promise<void> {
     if (this.disposed) return;
-    const [discovered, models] = await Promise.all([discoverAgents(agentSearchRoots()), discoverModels()]);
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
     if (this.disposed) return;
-    this.agents = [...BUILT_IN_AGENTS, ...discovered.agents];
-    this.skippedAgents = discovered.skipped;
-    this.models = models;
-    const settled = reconcile({ agentId: this.agentId, modelId: this.modelId }, { agents: this.agents, models: this.models });
-    this.agentId = settled.agentId;
-    this.modelId = settled.modelId;
-    // Replace rather than append: these notices describe the current state of
-    // the pickers, and a stale one from two refreshes ago describes nothing.
-    this.selectionNotices = settled.notices;
+    this.applySelection(next);
     // Only the selection screen shows the pickers; re-rendering mid-triage
     // would rebuild the screen under the reviewer for no visible gain.
     if (this.screen === 'agent') this.render();

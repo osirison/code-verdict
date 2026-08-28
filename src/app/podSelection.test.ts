@@ -138,3 +138,29 @@ describe('preferredModelFor', () => {
     expect(preferredModelFor(agent('a'), models)).toEqual({});
   });
 });
+
+describe('a stale `lm:` agentId is never returned as an agent id (PR #53 review)', () => {
+  it('maps an `lm:` agentId to the built-in agent even when a modelId sits beside it', () => {
+    // Reachable by running an older build over a pod a newer one migrated: it
+    // writes `agentId` back as a model id and leaves `modelId` in place.
+    // Passing the `lm:` value through would surface as "the agent
+    // lm:copilot/gpt-5 was not found", which names the wrong thing entirely.
+    expect(selectionFromPod({ agentId: 'lm:copilot/gpt-5', modelId: 'lm:copilot/sonnet' })).toEqual({
+      agentId: BUILTIN_AGENT_ID,
+      modelId: 'lm:copilot/sonnet',
+    });
+  });
+
+  it('prefers the explicit modelId over the stale one in agentId', () => {
+    expect(selectionFromPod({ agentId: 'lm:old/model', modelId: 'lm:new/model' }).modelId).toBe('lm:new/model');
+  });
+
+  it('reconciling that result raises no notice about a missing agent', () => {
+    const settled = reconcile(
+      selectionFromPod({ agentId: 'lm:copilot/gpt-5', modelId: 'lm:copilot/gpt-5' }),
+      { agents: [BUILTIN], models: [model('lm:copilot/gpt-5', 'GPT-5')] },
+    );
+    expect(settled.notices).toEqual([]);
+    expect(settled.agentId).toBe(BUILTIN_AGENT_ID);
+  });
+});

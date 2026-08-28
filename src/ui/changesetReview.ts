@@ -2,9 +2,9 @@ import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
 import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS } from '../app/agents';
-import { discoverAgents, type SkippedDefinition } from '../app/agentDefinitions';
-import { preferredModelFor, reconcile, selectionFromPod } from '../app/podSelection';
-import { agentSearchRoots } from './agentLocations';
+import { type SkippedDefinition } from '../app/agentDefinitions';
+import { loadAgentSelection, watchAgentSources, type AgentSelectionState } from './agentRefresh';
+import { preferredModelFor, selectionFromPod } from '../app/podSelection';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
@@ -16,7 +16,6 @@ import { DEMO_AGENT_ID } from '../app/demoAgent';
 import {
   AgentRunError,
   changesetContextEntries,
-  discoverModels,
   runLmChangesetAgent,
 } from '../app/lmAgent';
 import { fetchPodData } from '../app/podQuery';
@@ -111,6 +110,8 @@ export class ChangesetReviewPanel {
   private modelOpen = false;
   private selectionNotices: string[] = [];
   private skippedAgents: SkippedDefinition[] = [];
+  /** Same three sources the single-CR panel watches; this screen is the same screen. */
+  private agentWatches: vscode.Disposable[] = [];
   private agentOpen = false;
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
@@ -142,6 +143,8 @@ export class ChangesetReviewPanel {
     route.onLeave(() => {
       this.disposed = true;
       this.runToken += 1;
+      for (const watch of this.agentWatches) watch.dispose();
+      this.agentWatches = [];
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
       this.setReviewFocus(false);
@@ -183,7 +186,7 @@ export class ChangesetReviewPanel {
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');
       this.changeset = changeset;
-      const [members, models, discovered] = await Promise.all([
+      const [members, selection] = await Promise.all([
         Promise.all(changeset.members.map(async (member) => ({
           ref: member.ref,
           projectPath: member.projectPath,
@@ -192,17 +195,11 @@ export class ChangesetReviewPanel {
           // resolving each member's links off that batch costs no request.
           context: buildReviewContext(member, data.workItems, { trailer: options.trailer }),
         }))),
-        discoverModels(),
-        discoverAgents(agentSearchRoots()),
+        loadAgentSelection(selectionFromPod(pod)),
       ]);
       this.members = members;
-      this.models = models;
-      this.agents = [...BUILT_IN_AGENTS, ...discovered.agents];
-      this.skippedAgents = discovered.skipped;
-      const settled = reconcile(selectionFromPod(pod), { agents: this.agents, models: this.models });
-      this.agentId = settled.agentId;
-      this.modelId = settled.modelId;
-      this.selectionNotices = settled.notices;
+      this.applySelection(selection);
+      this.armAgentWatches();
       const draft = this.deps.workspaceState.get<ChangesetDraft>(this.draftKey());
       if (draft) {
         this.review = draft.review;
@@ -295,11 +292,22 @@ export class ChangesetReviewPanel {
         'Items ready',
       ];
       this.runStep = 2;
+      // A model-backed agent with no model must not reach the transport: an
+      // empty id there selects an arbitrary model rather than failing, because
+      // `selectChatModels({vendor: undefined, family: undefined})` matches
+      // everything. The single-CR panel makes the same check.
+      if (this.modelId === undefined) {
+        this.selectionNotices = [`${this.selectedAgent().label} needs a model, and none is selected.`];
+        this.screen = 'agent';
+        this.runLive.clear();
+        this.render();
+        return;
+      }
       // The log parks here for the whole request; the liveness line under it
       // is what says the run is alive rather than hung.
       this.runLive.start();
       this.render();
-      const response = await runLmChangesetAgent(this.selectedAgent(), this.modelId ?? '', this.members, pod.criteria, {
+      const response = await runLmChangesetAgent(this.selectedAgent(), this.modelId, this.members, pod.criteria, {
         timeouts,
         onProgress: (progress) => {
           if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
@@ -576,6 +584,28 @@ export class ChangesetReviewPanel {
     const modelId = this.review?.modelId;
     if (modelId === undefined) return undefined;
     return this.models.find((model) => model.id === modelId)?.label ?? modelId;
+  }
+
+  private applySelection(next: AgentSelectionState): void {
+    this.agents = next.agents;
+    this.models = next.models;
+    this.skippedAgents = next.skippedAgents;
+    this.agentId = next.agentId;
+    this.modelId = next.modelId;
+    this.selectionNotices = next.selectionNotices;
+  }
+
+  private armAgentWatches(): void {
+    if (this.agentWatches.length > 0) return;
+    this.agentWatches = watchAgentSources(() => void this.refreshAgents());
+  }
+
+  private async refreshAgents(): Promise<void> {
+    if (this.disposed) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    if (this.disposed) return;
+    this.applySelection(next);
+    if (this.screen === 'agent') this.render();
   }
 
   /** Never undefined: the built-in agent is always in `this.agents`. */

@@ -37,8 +37,13 @@ export interface StoredSelection {
 export function selectionFromPod(pod: StoredSelection): Selection {
   const stored = pod.agentId ?? '';
   if (stored === DEMO_AGENT_ID) return { agentId: DEMO_AGENT_ID, modelId: undefined };
-  if (stored.startsWith(LM_PREFIX) && pod.modelId === undefined) {
-    return { agentId: BUILTIN_AGENT_ID, modelId: stored };
+  // Any `lm:` value in `agentId` is a pre-split model id, whether or not a
+  // `modelId` sits beside it. The two can coexist if an older build wrote
+  // `agentId` over a pod a newer one had already migrated; passing the `lm:`
+  // value through as an agent id would then surface as "the agent
+  // lm:copilot/gpt-5 was not found", which names the wrong thing entirely.
+  if (stored.startsWith(LM_PREFIX)) {
+    return { agentId: BUILTIN_AGENT_ID, modelId: pod.modelId ?? stored };
   }
   return { agentId: stored === '' ? BUILTIN_AGENT_ID : stored, modelId: pod.modelId };
 }
