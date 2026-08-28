@@ -54,7 +54,15 @@ export interface Pod {
   sources: PodSource[];
   /** Per pod, not per change request. */
   criteria: Criteria;
+  /**
+   * The selected agent. A value starting with `lm:` is a **pre-migration
+   * model id** from before agents and models were separate things; read it
+   * through `selectionFromPod` (app/podSelection.ts), never directly, and it
+   * resolves to the built-in agent paired with that model.
+   */
   agentId: string;
+  /** The selected Copilot model. Absent on a pod saved before the split, and on a demo pod. */
+  modelId?: string;
   /** Repository snapshot (id/path/name) taken when sources were resolved. */
   repos?: Array<{ id: string; path: string; name: string }>;
   /** Signed-in username at connection time — drives "waiting on you". */
@@ -100,6 +108,8 @@ export interface Review {
   crNumber: string;
   repoId: string;
   agentId: string;
+  /** The model that produced it. Absent on a review stored before the split, and on a demo review. */
+  modelId?: string;
   criteria: Criteria;
   /** What the agent read — compare against the CR head to detect staleness. */
   headSha: string;

@@ -16,9 +16,14 @@ const state: FlowViewState = {
     removed: 91,
     title: 'Refactor token refresh',
   },
-  agents: [{ id: 'agent', label: 'HVE Core / PR Review', description: 'Reviews diffs', source: 'demo' }],
+  agents: [{ id: 'agent', label: 'HVE Core / PR Review', description: 'Reviews diffs', source: 'workspace', instructions: 'Review it.', origin: '.github/agents' }],
   agentId: 'agent',
   agentOpen: false,
+  models: [{ id: 'lm:copilot/gpt-5', label: 'GPT-5', description: 'copilot · gpt-5', vendor: 'copilot', family: 'gpt-5' }],
+  modelId: 'lm:copilot/gpt-5',
+  modelOpen: false,
+  selectionNotices: [],
+  skippedAgents: [],
   criteria: {
     severityFloor: 'minor',
     minConfidence: 70,
@@ -627,5 +632,100 @@ describe('the author is never offered a verdict on their own change request', ()
     expect(page).toContain('class="actions-row actions-center"');
     expect(page).toContain('.actions-center { justify-content: center; }');
     expect(renderReviewFlowBody(clean, 'HVE Core / PR Review')).not.toContain('style="justify-content:center"');
+  });
+});
+
+describe('the agent and model pickers (spec: review-agents)', () => {
+  const DEMO = { id: 'verdict.demo-agent', label: 'Verdict · Demo Review', description: 'Deterministic.', source: 'demo' as const, instructions: '' };
+  const BUILTIN = { id: 'agent:builtin/default', label: 'Default review', description: 'Ships with the extension.', source: 'builtin' as const, instructions: 'Review it.' };
+  const run = (over: Partial<FlowViewState>) =>
+    renderReviewFlowBody({ ...state, screen: 'agent', ...over } as FlowViewState, 'x');
+
+  it('renders both pickers, each labelled', () => {
+    const html = run({});
+    expect(html).toContain('>Agent</div>');
+    expect(html).toContain('>Model</div>');
+    expect(html).toContain('GPT-5');
+  });
+
+  it('no longer claims agents come from the Copilot workspace', () => {
+    const html = run({});
+    expect(html).not.toContain('Agents come from your Copilot workspace');
+    expect(html).not.toContain('Copilot agents in this workspace');
+  });
+
+  it('shows each agent its origin, so two agents of the same name stay apart', () => {
+    const html = run({
+      agentOpen: true,
+      agents: [
+        BUILTIN,
+        { id: 'agent:one/sec.agent.md', label: 'Security', description: 'd', source: 'workspace', instructions: 'i', origin: 'one/.github/agents' },
+        { id: 'agent:two/sec.agent.md', label: 'Security', description: 'd', source: 'workspace', instructions: 'i', origin: 'two/.github/agents' },
+      ],
+    });
+    expect(html).toContain('one/.github/agents');
+    expect(html).toContain('two/.github/agents');
+    expect(html).toContain('built-in');
+  });
+
+  it('neutralises the model picker for the demo agent, which calls no model', () => {
+    const html = run({ agents: [BUILTIN, DEMO], agentId: DEMO.id });
+    expect(html).toContain('Not used by this agent');
+    expect(html).not.toContain('id="model-toggle"');
+  });
+
+  it('states why a run is unavailable when no model exists, and disables Run', () => {
+    const html = run({ models: [], modelId: undefined });
+    expect(html).toContain('No model available');
+    expect(html).toContain('needs a Copilot model, and none is available');
+    expect(html).toMatch(/id="run"[^>]*disabled/);
+  });
+
+  it('leaves Run enabled for the demo agent even with no model', () => {
+    const html = run({ models: [], modelId: undefined, agents: [BUILTIN, DEMO], agentId: DEMO.id });
+    expect(html).not.toMatch(/id="run"[^>]*disabled/);
+  });
+
+  it('renders reconciliation notices on the screen rather than as a toast', () => {
+    const html = run({ selectionNotices: ['The agent "agent:ws/gone.agent.md" was not found, so the default review is selected.'] });
+    expect(html).toContain('agent:ws/gone.agent.md');
+    expect(html).toContain('id="dismiss-notices"');
+  });
+
+  it('reports skipped agent files as a count with the detail behind it', () => {
+    const html = run({ skippedAgents: [{ path: 'a.agent.md', reason: 'no `name` in the header' }] });
+    expect(html).toContain('1 agent file was skipped');
+    expect(html).toContain('id="show-skipped"');
+  });
+
+  it('pluralises the skipped-file count', () => {
+    const html = run({ skippedAgents: [
+      { path: 'a.agent.md', reason: 'r' },
+      { path: 'b.agent.md', reason: 'r' },
+    ] });
+    expect(html).toContain('2 agent files were skipped');
+  });
+
+  it('the picker markup writes no inline style attribute — the webview CSP drops them silently', () => {
+    const html = run({ agentOpen: true, modelOpen: true });
+    const pickers = html.slice(html.indexOf('<div class="picker-stack">'), html.indexOf('<div class="crit-grid">'));
+    expect(pickers).toContain('agent-select');
+    expect(pickers).not.toMatch(/<[^>]+\sstyle="/);
+    // NOTE: the category buttons further down this screen DO carry inline
+    // `style=` and are therefore uncoloured under the CSP. That predates this
+    // change and is left alone here rather than fixed in passing.
+  });
+});
+
+describe('a stored review says what produced it (task 7.4)', () => {
+  it('names the model beside the agent on a finding', () => {
+    const html = renderReviewFlowBody({ ...state, screen: 'triage', mode: 'split', reviewModelLabel: 'GPT-5' } as FlowViewState, 'Security Reviewer');
+    expect(html).toContain('Security Reviewer');
+    expect(html).toContain('GPT-5');
+  });
+
+  it('says the model is unknown for a review stored before models were recorded', () => {
+    const html = renderReviewFlowBody({ ...state, screen: 'triage', mode: 'split', reviewModelLabel: undefined } as FlowViewState, 'Verdict · Demo Review');
+    expect(html).toContain('model unknown');
   });
 });

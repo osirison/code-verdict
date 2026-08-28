@@ -27,6 +27,18 @@ export interface SettingsViewState {
   digestCadence: DigestCadence;
   shareRates: boolean;
   notifications: NotificationSettingView[];
+  /** Where `*.agent.md` definitions are searched, and what each one yielded. */
+  agentLocations: AgentLocationView[];
+}
+
+export interface AgentLocationView {
+  /** The path as configured, or the built-in `.github/agents` entry. */
+  label: string;
+  /** Built-in roots cannot be removed; only configured ones can. */
+  configured: boolean;
+  status: 'ok' | 'unreadable';
+  /** Agents parsed from it. Zero with status 'ok' just means an empty directory. */
+  agentCount: number;
 }
 
 /**
@@ -53,6 +65,8 @@ export type SettingsMessage =
   | { type: 'setQuietMode'; value: boolean }
   | { type: 'setDigestCadence'; value: DigestCadence }
   | { type: 'setShareRates'; value: boolean }
+  | { type: 'addAgentLocation' }
+  | { type: 'removeAgentLocation'; label: string }
   | { type: 'openSettingsJson' };
 
 const CSS = `
@@ -83,6 +97,10 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; line-height: 1.25;
 .cadence-label { color: var(--fg-dim); font-size: 11.5px; }
 .chip.compact { padding: 5px 10px; }
 .settings-head { display: flex; align-items: center; gap: 12px; }
+.location { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--row); }
+.location-path { color: var(--fg-hi); font: 12px/1.3 var(--font-mono); min-width: 0; overflow-wrap: anywhere; }
+.location-status { color: var(--fg-dimmer); font-size: 11px; margin-left: auto; flex: none; }
+.location-status.bad { color: var(--warn, var(--fg-dim)); }
 .link { border: none; background: none; color: var(--link); cursor: pointer; padding: 0; font: 11px/1 var(--font-ui); }
 pre { margin: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--code); padding: 13px 15px; color: var(--fg); font: 12px/1.75 var(--font-mono); overflow-x: auto; }
 `;
@@ -111,8 +129,23 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
       <span class="subnote">${state.quietMode ? 'Only blockers and direct mentions interrupt you.' : 'All events use their selected delivery mode.'}</span>
       <div class="cadence"><span class="cadence-label">Digest arrives</span>${DIGEST_CADENCES.map((cadence) => `<button class="chip compact ${state.digestCadence === cadence ? 'active' : ''}" data-cadence="${cadence}">${cadence}</button>`).join('')}</div>
     </section>
+    <section class="section"><div class="settings-head"><span class="label">Agents</span><button class="link" id="add-location">Add a location…</button></div>
+      <p class="subnote">Agents are <code>*.agent.md</code> files. The folders listed below are searched already; add more to search elsewhere.</p>
+      ${state.agentLocations
+        .map((location) => `<div class="location">
+          <span class="location-path">${e(location.label)}</span>
+          <span class="location-status ${location.status === 'unreadable' ? 'bad' : ''}">${
+            location.status === 'unreadable'
+              ? 'could not be read'
+              : `${location.agentCount} agent${location.agentCount === 1 ? '' : 's'}`
+          }</span>
+          ${location.configured ? `<button class="link" data-remove-location="${e(location.label)}">Remove</button>` : ''}
+        </div>`)
+        .join('')}
+      ${state.agentLocations.length === 0 ? '<span class="subnote">No workspace folder is open, so there is nowhere to search.</span>' : ''}
+    </section>
     <section class="section"><div class="label">Data &amp; privacy</div>
-      <p class="note">Diff hunks, file paths and your criteria go to the Copilot agent you selected. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
+      <p class="note">Diff hunks, file paths and your criteria go to the agent and model you selected. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
       <button class="toggle" id="share-rates"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
       <span class="subnote">${state.shareRates ? 'Aggregate rates are shared; finding text and rejection rationale stay local.' : 'Rates remain local to this VS Code profile.'}</span>
     </section>
@@ -131,6 +164,11 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
     document.querySelectorAll('[data-cadence]').forEach((button) => button.addEventListener('click', () => post({ type: 'setDigestCadence', value: button.dataset.cadence })));
     document.getElementById('share-rates')?.addEventListener('click', () => { shareRates = !shareRates; post({ type: 'setShareRates', value: shareRates }); });
     document.getElementById('open-json')?.addEventListener('click', () => post({ type: 'openSettingsJson' }));
+    document.getElementById('add-location')?.addEventListener('click', () => post({ type: 'addAgentLocation' }));
+    document.addEventListener('click', (ev) => {
+      const button = ev.target.closest('[data-remove-location]');
+      if (button) post({ type: 'removeAgentLocation', label: button.dataset.removeLocation });
+    });
   `;
   return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script, breadcrumb: { current: 'Settings' } });
 }

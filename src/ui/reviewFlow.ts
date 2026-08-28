@@ -9,10 +9,14 @@ import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
 import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
-import type { AgentDescriptor } from '../app/agents';
-import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
+import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
+import { type SkippedDefinition } from '../app/agentDefinitions';
+import { loadAgentSelection, watchAgentSources } from './agentRefresh';
+import { preferredModelFor, selectionFromPod } from '../app/podSelection';
 import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, discoverLmAgents, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, discoverModels, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
+import type { AgentSelectionState } from './agentRefresh';
 import type { PodStore } from '../app/pods';
 import {
   buildReviewContext,
@@ -202,9 +206,16 @@ export class ReviewFlowPanel {
   private reviewContext?: ReviewContext;
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
-  private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
-  private agentId: string = DEMO_AGENT_DESCRIPTOR.id;
+  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  private agentId: string = BUILTIN_AGENT_DESCRIPTOR.id;
   private agentOpen = false;
+  private models: ModelDescriptor[] = [];
+  private modelId?: string;
+  private modelOpen = false;
+  private selectionNotices: string[] = [];
+  private skippedAgents: SkippedDefinition[] = [];
+  /** File-system, model-list and settings watchers; all three feed `refreshAgents`. */
+  private agentWatches: vscode.Disposable[] = [];
   private review?: Review;
   private response?: AgentReviewResponse;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
@@ -241,6 +252,8 @@ export class ReviewFlowPanel {
       this.disposed = true;
       this.runToken += 1;
       this.stopHeadPoll();
+      for (const watch of this.agentWatches) watch.dispose();
+      this.agentWatches = [];
       this.inDiff.dispose();
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
@@ -358,16 +371,16 @@ export class ReviewFlowPanel {
     try {
       const connection = await this.connection();
       if (this.disposed || loadToken !== this.loadSeq) return;
-      // listOpenChangeRequests, getChangeRequestDiff and discoverLmAgents are
-      // independent reads — getChangeRequestDiff needs only ref, and
-      // discoverLmAgents needs nothing, so the previous sequential chain was
+      // listOpenChangeRequests, getChangeRequestDiff and the agent/model
+      // discovery are independent reads — getChangeRequestDiff needs only ref,
+      // and discovery needs nothing, so the previous sequential chain was
       // pure latency (#39). Attach a no-op catch to the last two immediately:
       // if the CR turns out to be gone below, whichever of them rejects must
       // not surface as an unhandled rejection or bury the clearer "no longer
       // open" message with a second, unrelated one.
       const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
       const diffPromise = connection.getChangeRequestDiff(ref);
-      const agentsPromise = discoverLmAgents();
+      const selectionPromise = loadAgentSelection(selectionFromPod(pod));
       // The work items resolve whatever the description links. A review that
       // cannot start because that list 404'd is worse than one running on the
       // description alone, so this one degrades to [] instead of rejecting —
@@ -375,7 +388,7 @@ export class ReviewFlowPanel {
       // above exist for.
       const workItemsPromise = connection.listWorkItems([ref.repoId]).catch((): WorkItem[] => []);
       diffPromise.catch(() => undefined);
-      agentsPromise.catch(() => undefined);
+      selectionPromise.catch(() => undefined);
       const crs = await crsPromise;
       if (this.disposed || loadToken !== this.loadSeq) return;
       const cr = crs.find((c) => c.ref.number === ref.number);
@@ -386,13 +399,15 @@ export class ReviewFlowPanel {
       }
       this.cr = cr;
       this.diff = await diffPromise;
-      this.agents = [DEMO_AGENT_DESCRIPTOR, ...(await agentsPromise)];
+
       const workItems = await workItemsPromise;
       if (this.disposed || loadToken !== this.loadSeq) return;
       this.reviewContext = buildReviewContext(cr, workItems, { trailer: changesetTrailer() });
-      if (pod.agentId && this.agents.some((a) => a.id === pod.agentId)) {
-        this.agentId = pod.agentId;
-      }
+      // One reconciliation over everything just discovered: a stored agent
+      // whose file is gone, or a model that is no longer offered, falls back
+      // here and says so on the screen rather than failing at run time.
+      this.applySelection(await selectionPromise);
+      this.armAgentWatches();
 
       // A surviving draft re-enters triage (spec: drafts lose no work),
       // including the partial-failure ledger.
@@ -543,6 +558,7 @@ export class ReviewFlowPanel {
     this.runLive.clear();
     const pod = this.pod();
     pod.agentId = this.agentId;
+    pod.modelId = this.modelId;
     await this.deps.podStore.upsert(pod);
 
     if (this.agentId === DEMO_AGENT_DESCRIPTOR.id) {
@@ -562,7 +578,7 @@ export class ReviewFlowPanel {
 
     const lmStats = diffStats(this.diff.files.map((f) => f.diff));
     this.runSteps = [
-      'Resolving agent from Copilot workspace…',
+      `Sending ${this.selectedAgent().label} to ${this.selectedModel()?.label ?? 'the model'}…`,
       `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
       'Cross-referencing module history…',
       `Scoring findings against ${getProvider(this.pod().providerId).vocabulary.repoNoun} criteria…`,
@@ -573,9 +589,23 @@ export class ReviewFlowPanel {
     // is what tells the reviewer the run is alive rather than hung.
     this.runLive.start();
     this.render();
+    // The list is re-read here, not trusted from load: a model can disappear
+    // between selecting it and pressing Run (Copilot signed out, the model
+    // retired). Failing with its name beats a bare "no longer available" from
+    // inside the transport.
+    const stillThere = await discoverModels();
+    if (this.disposed || token !== this.runToken) return;
+    if (this.modelId === undefined || !stillThere.some((m) => m.id === this.modelId)) {
+      this.selectionNotices = [`The model "${this.modelId ?? 'none selected'}" is no longer available.`];
+      this.models = stillThere;
+      this.screen = 'agent';
+      this.runLive.clear();
+      this.render();
+      return;
+    }
     const timeouts = agentRunTimeouts();
     try {
-      const response = await runLmAgent(this.agentId, this.diff, pod.criteria, this.reviewContext, {
+      const response = await runLmAgent(this.selectedAgent(), this.modelId ?? '', this.diff, pod.criteria, this.reviewContext, {
         timeouts,
         onProgress: (progress) => {
           if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
@@ -627,7 +657,8 @@ export class ReviewFlowPanel {
     this.review = createReview({
       repoId: this.ref.repoId,
       crNumber: this.ref.number,
-      agentId: response.agentId,
+      agentId: this.agentId,
+      modelId: this.modelId,
       criteria: pod.criteria,
       response,
     });
@@ -697,10 +728,33 @@ export class ReviewFlowPanel {
       case 'toggleAgentOpen':
         this.agentOpen = !this.agentOpen;
         break;
-      case 'selectAgent':
+      case 'toggleModelOpen':
+        this.modelOpen = !this.modelOpen;
+        break;
+      case 'selectModel':
+        this.modelId = m.modelId;
+        this.modelOpen = false;
+        break;
+      case 'dismissNotices':
+        this.selectionNotices = [];
+        break;
+      case 'showSkippedAgents':
+        void vscode.window.showWarningMessage(
+          `Verdict: skipped ${this.skippedAgents.length} agent file(s) — ` +
+            this.skippedAgents.map((skip) => `${skip.path} (${skip.reason})`).join('; '),
+        );
+        break;
+      case 'selectAgent': {
         this.agentId = m.agentId;
         this.agentOpen = false;
+        // An agent may name a model it was written for. Applied only here, at
+        // the moment of selection, so a reviewer who then picks a different
+        // model has the last word.
+        const preferred = preferredModelFor(this.selectedAgent(), this.models);
+        if (preferred.modelId) this.modelId = preferred.modelId;
+        if (preferred.notice) this.selectionNotices = [preferred.notice];
         break;
+      }
       case 'setFloor':
         pod.criteria.severityFloor = m.floor;
         await this.deps.podStore.upsert(pod);
@@ -955,7 +1009,10 @@ export class ReviewFlowPanel {
       await this.persistDraft();
       return;
     }
-    if (!this.agentId.startsWith('lm:')) {
+    // The guard is about the *model*: an agent with no model behind it (the
+    // demo agent, or a session with no Copilot) cannot answer, whatever the
+    // agent itself is.
+    if (this.modelId === undefined || this.selectedAgent().source === 'demo') {
       this.appendAnswer(item.id, list, label, 'This agent does not answer follow-up questions.');
       await this.persistDraft();
       return;
@@ -968,7 +1025,7 @@ export class ReviewFlowPanel {
       // Shares `streamText`, so it gets the same configured windows: a model
       // slow enough to need a longer one on the review is the same model
       // answering the follow-up.
-      entry.text = await runFollowUpPrompt(this.agentId, followUpPrompt(item, question, hunk), {
+      entry.text = await runFollowUpPrompt(this.selectedAgent(), this.modelId, followUpPrompt(item, question, hunk), {
         timeouts: agentRunTimeouts(),
       });
     } catch (e) {
@@ -1172,7 +1229,61 @@ export class ReviewFlowPanel {
   }
 
   private agentLabel(): string {
-    return this.agents.find((a) => a.id === this.agentId)?.label ?? this.agentId;
+    return this.selectedAgent().label || this.agentId;
+  }
+
+  /**
+   * Three things can invalidate the pickers while the screen is open: an
+   * agent file changing on disk, the model list changing, and the configured
+   * locations changing. All three land here rather than each re-implementing
+   * discovery, so there is one path that re-discovers, reconciles and renders.
+   */
+  private applySelection(next: AgentSelectionState): void {
+    this.agents = next.agents;
+    this.models = next.models;
+    this.skippedAgents = next.skippedAgents;
+    this.agentId = next.agentId;
+    this.modelId = next.modelId;
+    // Replace rather than append: these notices describe the current state of
+    // the pickers, and a stale one from two refreshes ago describes nothing.
+    this.selectionNotices = next.selectionNotices;
+  }
+
+  private armAgentWatches(): void {
+    if (this.agentWatches.length > 0) return;
+    this.agentWatches = watchAgentSources(() => void this.refreshAgents());
+  }
+
+  private async refreshAgents(): Promise<void> {
+    if (this.disposed) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    if (this.disposed) return;
+    this.applySelection(next);
+    // Only the selection screen shows the pickers; re-rendering mid-triage
+    // would rebuild the screen under the reviewer for no visible gain.
+    if (this.screen === 'agent') this.render();
+  }
+
+
+  /**
+   * How the stored review's model should read on the triage meta line. The
+   * label when it is still available, the bare id when it is not (better than
+   * nothing — it still names what ran), and undefined for a demo review or
+   * one stored before models were recorded, which renders as "model unknown".
+   */
+  private reviewModelLabel(): string | undefined {
+    const modelId = this.review?.modelId;
+    if (modelId === undefined) return undefined;
+    return this.models.find((model) => model.id === modelId)?.label ?? modelId;
+  }
+
+  /** Never undefined: the built-in agent is always in `this.agents`. */
+  private selectedAgent(): AgentDescriptor {
+    return this.agents.find((a) => a.id === this.agentId) ?? BUILTIN_AGENT_DESCRIPTOR;
+  }
+
+  private selectedModel(): ModelDescriptor | undefined {
+    return this.models.find((m) => m.id === this.modelId);
   }
 
   /**
@@ -1241,6 +1352,12 @@ export class ReviewFlowPanel {
       agents: this.agents,
       agentId: this.agentId,
       agentOpen: this.agentOpen,
+      models: this.models,
+      modelId: this.modelId,
+      modelOpen: this.modelOpen,
+      reviewModelLabel: this.reviewModelLabel(),
+      selectionNotices: this.selectionNotices,
+      skippedAgents: this.skippedAgents,
       criteria: pod.criteria,
       runSteps: this.runSteps,
       runStep: this.runStep,
