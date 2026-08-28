@@ -16,7 +16,8 @@
 ## 3. Unanchored findings and summary routing (design D4, migration step 2)
 
 - [ ] 3.1 Add `anchored: boolean` to `ReviewItem` in `src/domain/types.ts`. Absent on a stored review reads as `true`.
-- [ ] 3.2 Set `anchored` at parse time in `src/domain/agentResponse.ts` by testing the item's file and line against the diff's added lines — never from a field the agent supplies.
+- [ ] 3.2 Set `anchored` at parse time in `src/domain/agentResponse.ts` by testing whether the item's **file** is among the diff's paths — never from a field the agent supplies, and never by testing the line. Testing the line would mark a drifted finding unanchored and reroute to the summary what `src/domain/anchor.ts` today repairs and posts inline.
+- [ ] 3.2a Test the drift case explicitly: a finding on a diff file whose line no longer matches an added line stays `anchored: true`, still goes through the existing anchor matcher, and still posts inline. This is the regression the file-vs-line distinction exists to prevent.
 - [ ] 3.3 Drop, before triage, any item whose file matches neither a diff path nor an attachment path. This is what makes the "finding cites the auto-derived context" scenario enforceable rather than merely instructed.
 - [ ] 3.4 Filter `composeCommentDrafts` in `src/app/submit.ts` to `anchored` items only.
 - [ ] 3.5 Extend `composeSummaryBody` to append accepted unanchored findings under their own heading, each naming file and line.
@@ -87,7 +88,7 @@
 
 ## 11. Settings and docs
 
-- [ ] 11.1 Add to `package.json`: `codeVerdict.context.sectionBudget`, `.totalBudget`, `.maxLinkedItems`, `.includeDescription`, `.includeLinkedItems`, and `codeVerdict.contextUsage.enabled`.
+- [ ] 11.1 Add to `package.json`: `codeVerdict.context.sectionBudget`, `.totalBudget`, `.maxLinkedItems`, `.includeTitle`, `.includeDescription`, `.includeLinkedItems`, and `codeVerdict.contextUsage.enabled`. One toggle per auto-derived source, title included — the spec requires a persistent default for each.
 - [ ] 11.2 Add a "Context" section to `src/ui/settingsHtml.ts` and `src/ui/settings.ts` for the budgets and the per-source defaults, following the existing `ConfigurationTarget` pattern in that file.
 - [ ] 11.3 Document in `README.md`: what an attachment is, that attached files are reviewable evidence while the change request's own text is not, that a finding outside the diff lands in the summary, and that the effort level is prompt instructions rather than a provider setting.
 - [ ] 11.4 Update `spec/specs/Code Verdict - naming & commands.md` — the settings list at line 60 and any statement that only the diff is sent.

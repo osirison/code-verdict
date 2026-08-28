@@ -95,7 +95,7 @@ Findings are validated after parse: an item whose `file` matches neither a diff 
 
 `ReviewCommentDraft` needs a `DiffAnchor` and no unanchored path exists. Rather than inventing one (a new provider method, implemented twice, with two more contract tests), an accepted finding whose file is not in the diff is appended to the summary body under its own heading, naming file and line.
 
-`ReviewItem` gains `anchored: boolean` — set at parse time by testing the finding's file and line against the diff, not asserted by the agent. `composeCommentDrafts` filters to `anchored` items; `composeSummaryBody` gains the rest. Triage marks unanchored findings, and the "apply fix" affordance is withheld for them because a suggestion block has no line to attach to.
+`ReviewItem` gains `anchored: boolean` — set at parse time by testing whether the finding's **file** is among the diff's paths, not asserted by the agent. **File, not file-and-line.** A finding on a diff file whose line has drifted off an added line is exactly what `src/domain/anchor.ts` exists to repair (exact / moved / lost); testing the line here would mark it unanchored and silently reroute to the summary a finding that today posts inline after re-anchoring. Line placement stays entirely with the existing anchor matcher, untouched by this change. `composeCommentDrafts` filters to `anchored` items; `composeSummaryBody` gains the rest. Triage marks unanchored findings, and the "apply fix" affordance is withheld for them because a suggestion block has no line to attach to.
 
 *Alternative rejected:* posting them as inline comments anchored to the diff's first line. It puts a comment about `schema.sql` on an unrelated line of `auth.ts`, which is worse than a summary entry.
 
@@ -154,7 +154,7 @@ Per the CSP note in Context, chips and the indicator use classes only. The usage
 ## Migration Plan
 
 1. Land the three-zone prompt (D1) with an empty attachment list. No behaviour changes: `none` effort adds nothing and zero attachments emit no `<attachments>` element, so prompts stay byte-identical. This isolates the riskiest edit behind a no-op.
-2. Land `ReviewItem.anchored` and the summary routing (D4) while nothing can yet produce an unanchored finding, so the path is tested before it is reachable.
+2. Land `ReviewItem.anchored` and the summary routing (D4). With `anchored` file-based and task 3.3 dropping findings whose file is neither a diff path nor an attachment, nothing can yet produce an unanchored finding — every file the agent can legitimately cite is a diff path until attachments land in step 3. So the path is tested before it is reachable.
 3. Land attachments, the context area and the indicator.
 4. Land the effort control.
 5. Stored reviews from before this change have no `anchored` field; absent reads as `true`, which is correct — every finding they hold came from a diff.

@@ -52,7 +52,7 @@ Both are modelled on the Copilot panel because that is where the reviewer alread
 | `src/ui/reviewFlow.ts`, `src/ui/changesetReview.ts` | Attachment state, the picker Quick Pick, `#` resolution, effort persistence. |
 | `src/domain/agentResponse.ts` | An item may cite a file outside the diff; parsing must accept it and mark it. |
 | `src/app/submit.ts` | Accepted findings with no diff anchor are folded into the summary body instead of becoming `ReviewCommentDraft`s. |
-| `src/domain/types.ts` | `ReviewItem` records whether it is anchored in the diff; `Pod` records effort per model id. |
+| `src/domain/types.ts` | `ReviewItem` records whether its file is in the diff; `Review` records the effort level that produced it; `Pod` records effort per model id. |
 | `package.json` | Budget settings, `codeVerdict.context.*` toggles, `codeVerdict.contextUsage.enabled`. |
 
 Not affected: the provider layer and `submitReview` itself (the summary is an existing channel), the timeout and trace machinery, and every screen after triage.
