@@ -12,6 +12,7 @@ import type { Vocabulary } from './vocab';
 import { cap, countOf } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage } from './theme';
+import { MARKDOWN_CSS, renderMarkdown } from './markdown';
 
 export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'submitting' | 'done';
 
@@ -454,6 +455,7 @@ textarea.summary { width: 100%; min-height: 96px; border: none; background: var(
 .posts-as { margin-left: auto; font-size: 11px; color: var(--fg-dimmer); }
 
 .done-col { max-width: 560px; margin: 80px auto; text-align: center; display: flex; flex-direction: column; gap: 16px; }
+${MARKDOWN_CSS}
 `;
 
 function sevChip(severity: Severity): string {
@@ -891,7 +893,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
     <div class="detail-title">${e(item.title)}</div>
     <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span> · ${e(modelLabel ?? 'model unknown')}</div>
     ${cross}
-    <p class="prose">${e(item.body)}</p>
+    <div class="prose md">${renderMarkdown(item.body)}</div>
     <div class="code-card">
       <div class="code-head"><span>${e(item.file)}:${item.line}</span><a href="#" id="open-editor" data-file="${e(item.file)}" data-line="${item.line}">Open in editor</a></div>
       <div class="code-body">${e(item.code)}</div>
@@ -913,7 +915,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
     </div>
     <div class="thread-list" data-thread-for="${e(view.item.id)}">${view.thread
       .map(
-        (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
+        (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text md">${renderMarkdown(t.text)}</div></div>`,
       )
       .join('')}</div>
     <div class="ask-row">
@@ -970,7 +972,7 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
         <div class="qtitle">${e(selected.item.title)}</div>
         <div class="detail-meta">${selected.projectLabel && selected.refLabel ? `<span class="agent-fg">${e(selected.projectLabel)} · ${e(selected.refLabel)}</span> · ` : ''}${e(selected.item.file)}:${selected.item.line}</div>
         <div class="code-card"><div class="code-body">${e(selected.item.code)}</div></div>
-        <p class="prose">${e(selected.item.body)}</p>
+        <div class="prose md">${renderMarkdown(selected.item.body)}</div>
         <div class="presets">
           <button class="chip preset" data-preset="explain">Explain the risk</button>
           <button class="chip preset" data-preset="fix">Show me a fix</button>
@@ -979,7 +981,7 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
         </div>
         <div class="thread-list" data-thread-for="${e(selected.item.id)}">${selected.thread
           .map(
-            (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text">${e(t.text)}</div></div>`,
+            (t) => `<div class="thread-entry"><div class="thread-label">${e(t.label)}</div><div class="thread-text md">${renderMarkdown(t.text)}</div></div>`,
           )
           .join('')}</div>`
           : ''
@@ -1006,10 +1008,10 @@ function renderTriageDiff(s: FlowViewState): string {
   const suggestion = item.suggestion
     ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a ${e(s.vocabulary.platformName)} suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
     : '';
-  const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text">${e(entry.text)}</div></div>`).join('');
+  const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text md">${renderMarkdown(entry.text)}</div></div>`).join('');
   const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
     <div class="peek-head">${sevChip(item.severity)}${movedChip(selected)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
-    <div class="peek-body"><p class="prose">${e(item.body)}</p>${suggestion}${thread}
+    <div class="peek-body"><div class="prose md">${renderMarkdown(item.body)}</div>${suggestion}${thread}
       <div class="peek-actions">
         <button class="btn btn-ok" id="accept">${item.suggestion ? 'Accept &amp; apply' : 'Accept'}</button>
         ${item.suggestion ? '<button class="btn" id="accept-comment">Accept, comment only</button>' : ''}
@@ -1305,9 +1307,13 @@ window.addEventListener('message', (ev) => {
     label.className = 'thread-label';
     label.textContent = t.label;
     const text = document.createElement('div');
-    text.className = 'thread-text';
-    // textContent, not innerHTML: this is model output.
-    text.textContent = t.text;
+    text.className = 'thread-text md';
+    // innerHTML, and only because the host sent HTML that renderMarkdown had
+    // already produced: it escapes every character of the model's answer
+    // before generating a tag, so nothing here can carry live markup. The
+    // raw text is the fallback if an older host sends no html field.
+    if (typeof t.html === 'string') text.innerHTML = t.html;
+    else text.textContent = t.text;
     entry.append(label, text);
     return entry;
   }));

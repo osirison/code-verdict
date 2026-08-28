@@ -8,6 +8,7 @@ import { selectedPostedRow } from './postedReviewsState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
 import { escapeHtml as e, renderPage } from './theme';
+import { MARKDOWN_CSS, renderMarkdown } from './markdown';
 import { cap, type Vocabulary } from './vocab';
 
 export interface PostedRow {
@@ -160,6 +161,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 .skel-meta { width: 150px; height: 10px; margin-top: 4px; }
 .skel-badge { width: 90px; height: 18px; }
 .skel-count { width: 60px; height: 14px; }
+${MARKDOWN_CSS}
 `;
 
 function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number, vocabulary: Vocabulary): string {
@@ -175,7 +177,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
     ${
       expanded
         ? `<div class="th-body">
-      <div class="entry entry-you"><div class="entry-label">you · posted comment</div>${e(t.yourBody)}</div>
+      <div class="entry entry-you md"><div class="entry-label">you · posted comment</div>${renderMarkdown(t.yourBody)}</div>
       ${t.replies
         .map(
           // The entry class is chosen per reply, not fixed to .entry-author:
@@ -184,7 +186,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
           // conceding your point back to you. .entry-you is the same treatment
           // the posted comment above gets, which is what makes the alternation
           // legible as a conversation.
-          (r) => `<div class="entry ${r.yours ? 'entry-you' : 'entry-author'}"><div class="entry-label">${r.yours ? 'you' : `@${e(r.author)}`} · ${e(formatAge(r.at, now))} ago</div>${e(r.body)}</div>`,
+          (r) => `<div class="entry md ${r.yours ? 'entry-you' : 'entry-author'}"><div class="entry-label">${r.yours ? 'you' : `@${e(r.author)}`} · ${e(formatAge(r.at, now))} ago</div>${renderMarkdown(r.body)}</div>`,
         )
         .join('')}
       ${t.status === 'stale' ? `<div class="stale-note">⚠ Line moved in new commits — ${e(vocabulary.platformName)} dropped the anchor.</div>` : ''}
