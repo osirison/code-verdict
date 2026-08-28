@@ -145,9 +145,22 @@ export type Credential =
   | { kind: 'session'; accessToken: string }
   | { kind: 'none' };
 
+/**
+ * Why this connection exists.
+ *
+ * Background work runs on a schedule nobody asked for; an interactive
+ * connection is serving someone who is waiting. A platform that meters
+ * requests may hold a reserve back from the first so the second still gets
+ * through — the neutral layer states the intent and never learns what any
+ * platform does with it. Providers that meter nothing ignore it.
+ */
+export type ConnectionIntent = 'interactive' | 'background';
+
 export interface ConnectionConfig {
   instanceUrl: string;
   credential: Credential;
+  /** Defaults to `interactive`: unstated intent must never be the cheap one. */
+  intent?: ConnectionIntent;
 }
 
 /**

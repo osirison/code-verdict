@@ -308,6 +308,13 @@
           ],
           "default": "End of day"
         },
+        "codeVerdict.notifications.pollIntervalSeconds": {
+          "type": "number",
+          "minimum": 30,
+          "maximum": 900,
+          "default": 60,
+          "description": "Shortest gap between background checks for updates, in seconds. This is a floor, not the interval: one check costs several requests per watched repository plus one per review awaiting replies, so the effective gap grows with the size of the pod to keep background polling inside the platform's hourly request budget."
+        },
         "codeVerdict.shareAcceptRejectRates": {
           "type": "boolean",
           "default": false,

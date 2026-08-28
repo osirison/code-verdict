@@ -33,14 +33,25 @@ export interface NotificationCenterDeps {
   sinks: NotificationSinks;
   /** Injectable clock for tests. */
   now?(): Date;
+  /**
+   * How wide a gap between snapshots still counts as a live signal. Defaults to
+   * `STALE_SNAPSHOT_MS`, and the notifier widens it because the poll interval
+   * is no longer a constant: an interval past this window would re-baseline on
+   * every poll, which is not "fewer notifications" but none at all, silently.
+   */
+  staleAfterMs?(): number;
 }
 
 /**
  * A diff across a gap this long is stale news, not a live signal — the
  * pod was inactive (switched away, laptop asleep) and bursting the whole
  * backlog as toasts would be a flood. Re-baseline silently instead.
+ *
+ * The floor, not the value: a caller that polls on a derived cadence has to
+ * widen it to fit, or every one of its polls looks like a pod waking up. See
+ * `staleAfterMs`.
  */
-const STALE_SNAPSHOT_MS = 10 * 60_000;
+export const STALE_SNAPSHOT_MS = 10 * 60_000;
 
 export class NotificationCenter {
   private readonly snapshots = new Map<string, NotificationSnapshot>();
@@ -64,7 +75,8 @@ export class NotificationCenter {
   observe(podId: string, snapshot: NotificationSnapshot, ctx: DeriveContext): void {
     const prev = this.snapshots.get(podId);
     this.snapshots.set(podId, snapshot);
-    if (!prev || snapshot.fetchedAt - prev.fetchedAt > STALE_SNAPSHOT_MS) return;
+    const staleAfter = this.deps.staleAfterMs?.() ?? STALE_SNAPSHOT_MS;
+    if (!prev || snapshot.fetchedAt - prev.fetchedAt > staleAfter) return;
     for (const event of deriveEvents(prev, snapshot, ctx)) this.notify(event);
   }
 

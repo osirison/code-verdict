@@ -38,9 +38,14 @@ vi.mock('vscode', () => ({
   commands: { executeCommand: vi.fn() },
 }));
 
-/** The four segments in the order they were created: verdict, agent, keys, bell. */
+/** The review segments in creation order: verdict, agent, keys, bell. */
 function segments(): [FakeItem, FakeItem, FakeItem, FakeItem] {
-  return items.slice(-4) as unknown as [FakeItem, FakeItem, FakeItem, FakeItem];
+  return items.slice(0, 4) as unknown as [FakeItem, FakeItem, FakeItem, FakeItem];
+}
+
+/** The fifth: background polling paused, hidden whenever it is running. */
+function pausedSegment(): FakeItem {
+  return items[4] as unknown as FakeItem;
 }
 
 const review = {
@@ -125,6 +130,36 @@ describe('status bar segments (spec §14)', () => {
     expect(bell.visible).toBe(true);
     bar.setNotifications(0);
     expect(bell.visible).toBe(false);
+    bar.dispose();
+  });
+
+  it('hides the paused segment until polling actually stops', async () => {
+    const { VerdictStatusBar } = await import('./sidebar.js');
+    const bar = new VerdictStatusBar();
+    const paused = pausedSegment();
+
+    // Polling running is the ordinary state, and the ordinary state gets no
+    // segment — a permanent "everything is fine" indicator is noise.
+    expect(paused.visible).toBe(false);
+    expect(paused.priority).toBeLessThan(segments()[3].priority);
+    bar.dispose();
+  });
+
+  it('names the platform and the wait while polling is paused, then clears', async () => {
+    const { VerdictStatusBar } = await import('./sidebar.js');
+    const bar = new VerdictStatusBar();
+    const paused = pausedSegment();
+
+    bar.setPollPaused({ platformName: 'GitHub', resumesAt: Date.now() + 12 * 60_000 });
+    expect(paused.visible).toBe(true);
+    expect(paused.text).toBe('$(clock) Verdict: updates paused');
+    // The question during the pause is "until when?", which is why this lives
+    // on a surface that stays up rather than in a toast.
+    expect(paused.tooltip).toContain('GitHub');
+    expect(paused.tooltip).toContain('about 12 minutes');
+
+    bar.setPollPaused(undefined);
+    expect(paused.visible).toBe(false);
     bar.dispose();
   });
 

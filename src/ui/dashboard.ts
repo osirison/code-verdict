@@ -6,7 +6,7 @@ import type { PodStore } from '../app/pods';
 import { fetchPodData, repoIdsOf } from '../app/podQuery';
 import type { SecretStore } from '../app/storage';
 import type { DashboardMessage } from './dashboardHtml';
-import { escapeHtml, renderDashboardBody, renderDashboardHtml, renderDashboardLoadingHtml, renderFallbackHtml } from './dashboardHtml';
+import { renderDashboardBody, renderDashboardHtml, renderDashboardLoadingHtml, renderFallbackHtml, renderLoadFailure } from './dashboardHtml';
 import type { DashboardDeps } from './dashboardState';
 import { toViewState } from './dashboardState';
 import { AppSurface, type AppRoute } from './appSurface';
@@ -155,10 +155,10 @@ export class DashboardPanel {
       }
     } catch (e) {
       if (!canRender()) return;
-      const message = escapeHtml(e instanceof Error ? e.message : String(e));
-      this.route.setHtml(renderFallbackHtml(
-        `<p>Could not load the pod: ${message}</p><p>Is the emulator running? (<code>npm run emulator</code>)</p>`,
-      ));
+      // The failure is told in the provider's own nouns, the same way the
+      // loading skeleton above resolves them.
+      const vocabulary = tryGetProvider(pod.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY;
+      this.route.setHtml(renderFallbackHtml(renderLoadFailure(e, vocabulary)));
     }
   }
 }

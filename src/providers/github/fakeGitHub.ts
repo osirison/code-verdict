@@ -4,18 +4,39 @@
  *
  * Response shapes follow real payloads captured during design: pull requests
  * carry `head.sha` / `draft` / `requested_reviewers`; review comments carry
- * `commit_id` + `path` + `line` + `side`; checks come from
- * `/commits/{sha}/check-runs` with `status` + `conclusion`.
+ * `commit_id` + `path` + `line` + `side`; workflow runs come from
+ * `/actions/runs` with `status` + `conclusion` + `head_branch`.
+ *
+ * The workflow-run payloads below were captured on 2026-08-26 from
+ * api.github.com (`vercel/next.js`, `microsoft/vscode`, unauthenticated) and
+ * trimmed to the fields a response really carries in that position — including
+ * `conclusion: null` on a run still `in_progress`, and a `name` that is the
+ * run's display name rather than a workflow or job name.
  *
  * `failReviewPositionOnBatch` is what exercises the provider's two-phase
  * submit: the batched review 422s the way GitHub does when one comment's
  * position is stale, forcing the per-comment fallback.
+ *
+ * Every GET answers with an `etag` and honours `If-None-Match` with a 304,
+ * because that is what the client's whole rate-limit budget now rests on.
+ * Conditional requests are RFC 9110, not a GitHub invention, so the mechanism
+ * is not something to capture — but the surrounding detail is, and it was:
+ * against api.github.com on 2026-08-26 the validator came back
+ * `W/"4258f9258a…"` (weak, quoted, hex), and the 304 repeated `etag`, `link`
+ * and every `x-ratelimit-*` header the 200 carried. The digest below is a
+ * fixture-local hash rather than GitHub's own — only its shape is copied.
  */
 import type { FetchLike, FetchResponseLike } from './http';
 
 export interface RequestLog {
   /** Every path requested, in order. GraphQL appears as `/graphql`. */
   paths: string[];
+  /** Full URLs, for a test that has to see the query string (per_page). */
+  urls?: string[];
+  /** The `If-None-Match` sent with each request, `null` where none was. */
+  validators?: Array<string | null>;
+  /** The status served for each request — how the issued/charged split is read. */
+  statuses?: number[];
 }
 
 export interface FakeGitHubOptions {
@@ -124,16 +145,119 @@ const FILES = [
   },
 ];
 
-const CHECK_RUNS = [
-  {
-    id: 93178061854,
-    name: 'ci',
-    status: 'completed',
-    conclusion: 'success',
-    html_url: 'https://github.com/acme/core/actions/runs/1/job/1',
-    started_at: '2026-08-20T09:50:00Z',
-  },
-];
+/**
+ * `GET /repos/{owner}/{repo}/actions/runs` — newest first, every branch, as
+ * the live endpoint orders it. api-gateway has none: a repository with Actions
+ * off answers 200 with an empty list, not an error.
+ */
+const WORKFLOW_RUNS: Record<string, unknown[]> = {
+  'acme/core': [
+    {
+      id: 32918212053,
+      name: 'CI',
+      head_branch: 'feat/rate-limit',
+      head_sha: HEAD_SHA,
+      path: '.github/workflows/ci.yml',
+      display_title: 'Add per-tenant rate limiting',
+      run_number: 412,
+      event: 'pull_request',
+      status: 'completed',
+      conclusion: 'failure',
+      html_url: 'https://github.com/acme/core/actions/runs/32918212053',
+      created_at: '2026-08-20T09:58:00Z',
+      updated_at: '2026-08-20T10:06:12Z',
+      run_attempt: 1,
+      run_started_at: '2026-08-20T09:58:04Z',
+    },
+    {
+      id: 32914104866,
+      name: 'CI',
+      head_branch: 'main',
+      head_sha: '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091',
+      path: '.github/workflows/ci.yml',
+      display_title: 'Merge pull request #2838',
+      run_number: 411,
+      event: 'push',
+      status: 'completed',
+      conclusion: 'success',
+      html_url: 'https://github.com/acme/core/actions/runs/32914104866',
+      created_at: '2026-08-20T08:31:00Z',
+      updated_at: '2026-08-20T08:39:44Z',
+      run_attempt: 1,
+      run_started_at: '2026-08-20T08:31:02Z',
+    },
+  ],
+  'acme/auth-service': [
+    {
+      id: 32920670894,
+      // A workflow whose `run-name:` sets this per run — the reason the mapper
+      // never reads `name` as a job name.
+      name: 'Rotate signing keys (attempt 2)',
+      head_branch: 'feat/rotate',
+      head_sha: 'aa11bb22cc33dd44ee55ff6677889900aabbccdd',
+      path: '.github/workflows/keys.yml',
+      run_number: 88,
+      event: 'push',
+      status: 'in_progress',
+      // Null until the run completes — captured, not assumed.
+      conclusion: null,
+      html_url: 'https://github.com/acme/auth-service/actions/runs/32920670894',
+      created_at: '2026-08-20T09:12:00Z',
+      updated_at: '2026-08-20T09:12:30Z',
+      run_attempt: 1,
+      run_started_at: '2026-08-20T09:12:03Z',
+    },
+  ],
+  'acme/api-gateway': [],
+};
+
+/**
+ * A weak validator over the body, in the shape api.github.com sends. The digest
+ * is FNV-1a rather than GitHub's algorithm — what a test can assert is that the
+ * same body yields the same validator and a changed body does not.
+ */
+function weakEtag(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `W/"${hash.toString(16).padStart(8, '0')}${text.length.toString(16)}"`;
+}
+
+function headerOf(headers: Record<string, string> | undefined, name: string): string | null {
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (key.toLowerCase() === wanted) return value;
+  }
+  return null;
+}
+
+/** The same 200, with the validator the client will send back next time. */
+function withEtag(res: FetchResponseLike, text: string, etag: string): FetchResponseLike {
+  return {
+    ok: res.ok,
+    status: res.status,
+    headers: { get: (name) => (name.toLowerCase() === 'etag' ? etag : res.headers.get(name)) },
+    json: () => Promise.resolve(JSON.parse(text) as unknown),
+    text: () => Promise.resolve(text),
+  };
+}
+
+/**
+ * A 304: no body at all, and `ok` false — `Response.ok` is 200-299, which is
+ * why an unhandled 304 would reach the error mapper. Every other header the
+ * 200 carried is repeated, as api.github.com repeats them.
+ */
+function notModified(res: FetchResponseLike, etag: string): FetchResponseLike {
+  return {
+    ok: false,
+    status: 304,
+    headers: { get: (name) => (name.toLowerCase() === 'etag' ? etag : res.headers.get(name)) },
+    json: () => Promise.reject(new Error('a 304 carries no body')),
+    text: () => Promise.resolve(''),
+  };
+}
 
 function json(body: unknown, headers: Record<string, string> = {}): FetchResponseLike {
   const text = JSON.stringify(body);
@@ -184,11 +308,10 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
   );
   let commentAttempt = 0;
 
-  return async (rawUrl, init = {}) => {
+  const route: FetchLike = async (rawUrl, init = {}) => {
     const method = init.method ?? 'GET';
     const url = new URL(rawUrl);
     const path = url.pathname.replace(/^\/api\/v3/, '');
-    options.log?.paths.push(path);
     const isWrite = method !== 'GET';
 
     if (isWrite && options.failAllWrites) {
@@ -218,9 +341,12 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
 
     if (tail === '/pulls' && method === 'GET') return json(PULLS[repoId] ?? [], extraHeaders);
     if (tail === '/issues' && method === 'GET') return json(ISSUES[repoId] ?? [], extraHeaders);
-    if (tail === '/commits' && method === 'GET') return json([{ sha: HEAD_SHA }], extraHeaders);
-    if (/^\/commits\/[^/]+\/check-runs$/.test(tail)) {
-      return json({ total_count: CHECK_RUNS.length, check_runs: CHECK_RUNS }, extraHeaders);
+    if (tail === '/actions/runs' && method === 'GET') {
+      // The endpoint honours per_page, and the provider asks for exactly the
+      // limit it wants — a fake that ignored it would hide an unbounded fetch.
+      const perPage = Number(url.searchParams.get('per_page') ?? '30');
+      const runs = (WORKFLOW_RUNS[repoId] ?? []).slice(0, Number.isFinite(perPage) ? perPage : 30);
+      return json({ total_count: (WORKFLOW_RUNS[repoId] ?? []).length, workflow_runs: runs }, extraHeaders);
     }
 
     const pullMatch = tail.match(/^\/pulls\/(\d+)(.*)$/);
@@ -303,6 +429,31 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
     }
 
     return error(404, 'Not Found', extraHeaders);
+  };
+
+  // The conditional layer sits outside every route, so one implementation
+  // covers all of them: hash the 200 the route would have served, and serve a
+  // 304 instead when the client sends that same validator back.
+  return async (rawUrl, init = {}) => {
+    const method = init.method ?? 'GET';
+    const sent = headerOf(init.headers, 'if-none-match');
+    options.log?.paths.push(new URL(rawUrl).pathname.replace(/^\/api\/v3/, ''));
+    options.log?.urls?.push(rawUrl);
+    options.log?.validators?.push(sent);
+
+    const res = await route(rawUrl, init);
+    if (method !== 'GET' || res.status !== 200) {
+      options.log?.statuses?.push(res.status);
+      return res;
+    }
+    const text = await res.text();
+    const etag = weakEtag(text);
+    if (sent === etag) {
+      options.log?.statuses?.push(304);
+      return notModified(res, etag);
+    }
+    options.log?.statuses?.push(200);
+    return withEtag(res, text, etag);
   };
 }
 
