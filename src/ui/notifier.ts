@@ -177,14 +177,29 @@ export class VerdictNotifier implements vscode.Disposable {
     void this.poll();
   }
 
-  /** ReviewFlow's `onReviewReady` — a local event, no poll involved. */
-  reviewReady(info: { ref?: ChangeRequestRef; refLabel: string; itemCount: number }): void {
+  /**
+   * A run finished — a local event, no poll involved. It now arrives from the
+   * run manager rather than from a panel, which means it can land while the
+   * reviewer is on a different pod entirely.
+   *
+   * The ref is dropped in that case. "Start triage" resolves a ref against the
+   * *active* pod, so carrying one from another pod would open a change request
+   * that pod cannot see; the notification still names the review, and clicking
+   * it reveals the surface instead. The title says which pod, because "Review
+   * ready on !2841" is confusing when !2841 is not in the pod on screen.
+   */
+  reviewReady(info: { ref?: ChangeRequestRef; refLabel: string; itemCount: number; podId?: string }): void {
     const items =
       info.itemCount === 0 ? 'no items' : `${info.itemCount} item${info.itemCount === 1 ? '' : 's'}`;
+    const activePod = this.deps.podStore.activePod;
+    const otherPod =
+      info.podId !== undefined && activePod !== undefined && info.podId !== activePod.id
+        ? this.deps.podStore.list().find((pod) => pod.id === info.podId)
+        : undefined;
     this.center.notify({
       key: 'agentFinished',
-      title: `Review ready · ${items} on ${info.refLabel}`,
-      crRef: info.ref,
+      title: `Review ready · ${items} on ${info.refLabel}${otherPod ? ` (${otherPod.name})` : ''}`,
+      crRef: otherPod ? undefined : info.ref,
     });
   }
 

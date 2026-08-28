@@ -140,6 +140,10 @@ export class DashboardPanel {
           repoIdsOf(candidate).length,
         ),
       }));
+      // The one place that already knows which change requests are still open,
+      // for the repositories this pod covers. A retained review for one that
+      // closed is not going to be re-opened to read.
+      void this.deps.pruneRetained?.(repoIdsOf(pod), data.changeRequests.map((cr) => cr.ref));
       const state = toViewState(
         { ...data, podOptions },
         Date.now(),

@@ -9,6 +9,7 @@ import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
 import {
   renderSidebarHtml,
   type SidebarActiveReview,
+  type SidebarActiveRun,
   type SidebarMessage,
   type SidebarPendingReview,
   type SidebarSetup,
@@ -42,6 +43,8 @@ export interface VerdictSidebarDeps {
   createChangeset?: () => void;
   selectFinding?: (itemId: string) => void;
   selectThread?: (threadId: string) => void;
+  /** The ✕ on a run row — stop that review and free its slot. */
+  cancelRun?: (key: string) => void;
   useDemoPod?: () => void;
   onPodChanged?: () => void;
 }
@@ -54,6 +57,7 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   private threads?: SidebarThreads;
   private setup?: SidebarSetup;
   private activeRoute?: string;
+  private activeRuns: SidebarActiveRun[] = [];
 
   constructor(
     private readonly podStore: PodStore,
@@ -87,6 +91,16 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
 
   setActiveRoute(route?: string): void {
     this.activeRoute = route;
+    void this.render();
+  }
+
+  /**
+   * Reviews in flight. Shown whatever screen the sidebar is on: a background
+   * run the reviewer cannot see is a run they will not know finished, and one
+   * they cannot stop from where they are is one they have to navigate to first.
+   */
+  setActiveRuns(runs: readonly SidebarActiveRun[]): void {
+    this.activeRuns = [...runs];
     void this.render();
   }
 
@@ -124,6 +138,7 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
         activeReview: this.activeReview,
         pendingReview: this.pendingReview,
         activeRoute: this.activeRoute,
+        activeRuns: this.activeRuns,
         codicons: this.codicons(view.webview),
       },
       crypto.randomBytes(16).toString('hex'),
@@ -226,6 +241,9 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       case 'selectFinding':
         this.deps.selectFinding?.(message.itemId);
         break;
+      case 'cancelRun':
+        this.deps.cancelRun?.(message.key);
+        break;
       case 'selectThread':
         this.deps.selectThread?.(message.threadId);
         break;
@@ -266,6 +284,7 @@ export class VerdictStatusBar {
   private readonly keys: vscode.StatusBarItem;
   private readonly bell: vscode.StatusBarItem;
   private readonly paused: vscode.StatusBarItem;
+  private readonly runs: vscode.StatusBarItem;
 
   constructor() {
     // Descending priority keeps the segments in spec order, left to right.
@@ -274,6 +293,9 @@ export class VerdictStatusBar {
     this.keys = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 88);
     this.bell = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 87);
     this.paused = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 86);
+    // Below the paused segment, so the segments stay in spec order left to right.
+    this.runs = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 85);
+    this.runs.command = INTERNAL_COMMANDS.showActiveRuns;
     this.keys.text = '$(keyboard) ? keys';
     this.keys.tooltip = 'Verdict keyboard map';
     this.keys.command = INTERNAL_COMMANDS.keyboardHelp;
@@ -281,6 +303,22 @@ export class VerdictStatusBar {
     this.bell.command = INTERNAL_COMMANDS.showNotifications;
     this.setActiveReview(undefined);
     this.verdict.show();
+  }
+
+  /**
+   * How many reviews are in flight. Independent of every other segment: a run
+   * belongs to the extension now, not to whatever review happens to be open, so
+   * this is the one place a reviewer working somewhere else can see that
+   * something is happening. Hidden at zero, like the bell.
+   */
+  setActiveRuns(count: number): void {
+    if (count === 0) {
+      this.runs.hide();
+      return;
+    }
+    this.runs.text = `$(sync~spin) ${count}`;
+    this.runs.tooltip = `${count} review${count === 1 ? '' : 's'} running — click to list them or cancel one`;
+    this.runs.show();
   }
 
   /**
@@ -350,5 +388,6 @@ export class VerdictStatusBar {
     this.keys.dispose();
     this.bell.dispose();
     this.paused.dispose();
+    this.runs.dispose();
   }
 }

@@ -8,10 +8,15 @@ import { connectionForPod } from './app/connections';
 import { deleteTokenIfUnused } from './app/storage';
 import { fetchPodData, repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
-import { getProvider, listRealProviders } from './platform/registry';
+import { getProvider, listRealProviders, tryGetProvider } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
+import { ReviewRunManager, sweepInterruptedRuns, type RunInput, type RunnerOptions } from './app/reviewRunManager';
+import { pruneClosedRetained } from './app/retainedReview';
+import { runDemoAgent } from './app/demoAgent';
+import { runDemoChangesetAgent } from './app/combinedAgent';
+import { runLmAgent, runLmChangesetAgent } from './app/lmAgent';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
 import { setApiTraceSink } from './app/apiTrace';
@@ -79,6 +84,60 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const reviewHistory = new ReviewHistory(context.globalState);
   const reviewRuns = new ReviewRunStore(context.globalState);
 
+  // Before anything paints. A `vscode.lm` stream cannot be reattached after the
+  // extension host stops, so whatever was running when the last window closed is
+  // gone; recording it as interrupted is how the change request avoids reading
+  // exactly as it would have if no review had ever been started on it.
+  void sweepInterruptedRuns(context.globalState);
+
+  /**
+   * Runs live here, for the window's lifetime — not on the panel that started
+   * them. Constructed before any panel so a review triggered from one screen is
+   * still running when the reviewer is on another.
+   */
+  const runManager = new ReviewRunManager({
+    workspaceState: context.workspaceState,
+    globalState: context.globalState,
+    runners: {
+      lm: (input: RunInput, options: RunnerOptions) =>
+        input.target.kind === 'cr'
+          ? runLmAgent(
+              input.agent,
+              input.modelId ?? '',
+              input.target.diff,
+              input.criteria,
+              input.target.reviewContext,
+              options,
+            )
+          : runLmChangesetAgent(input.agent, input.modelId ?? '', input.target.members, input.criteria, options),
+      demo: (input: RunInput) =>
+        input.target.kind === 'cr'
+          ? runDemoAgent(input.target.diff, input.criteria)
+          : runDemoChangesetAgent(
+              input.target.members,
+              input.criteria,
+              tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
+            ),
+    },
+    onChange: () => {
+      // The run list, the status-bar count and the dashboard pills all read
+      // live run state, so one fan-out keeps them from drifting apart.
+      const active = runManager.active();
+      sidebar.setActiveRuns(
+        active.map((record) => ({
+          key: record.key,
+          label: record.input.refLabel,
+          state: record.status === 'queued' ? ('queued' as const) : ('running' as const),
+          elapsedMs: Date.now() - (record.startedAt ?? record.queuedAt),
+        })),
+      );
+      statusBar.setActiveRuns(active.filter((record) => record.status === 'running').length);
+      void DashboardPanel.refreshIfOpen();
+    },
+    onRunRecorded: () => repaintReviewSurfaces(),
+    onReviewReady: (info) => notifier.reviewReady(info),
+  });
+
   const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
 
   /**
@@ -107,18 +166,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secrets,
     workspaceState: context.workspaceState,
     globalState: context.globalState,
+    runs: runManager,
     onSubmitted: () => repaintReviewSurfaces(),
-    // A finished run changes the same four views a submit does — the clean
-    // run that used to leave the dashboard reading "not run" forever most of
-    // all — so it repaints them the same way.
-    onRunRecorded: () => repaintReviewSurfaces(),
     onSidebarState: (state?: SidebarActiveReview) => {
       sidebar.setActiveReview(state);
       statusBar.setActiveReview(state);
     },
     onSidebarPending: (state?: SidebarPendingReview) => sidebar.setPendingReview(state),
-    onReviewReady: (info: { ref: { repoId: string; number: string }; refLabel: string; itemCount: number }) =>
-      notifier.reviewReady(info),
     // §15 entry point "a member MR" — resolved after the review paints.
     changesetForCr: async (ref: { repoId: string; number: string }) => {
       const found = (await detectForActivePod()).find((changeset) =>
@@ -168,6 +222,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ChangesetReviewPanel.selectItem(itemId);
     },
     selectThread: (threadId) => PostedReviewsPanel.selectThread(threadId),
+    cancelRun: (key) => runManager.cancel(key),
     useDemoPod: () => void useDemoPod(),
     onPodChanged: () => {
       void DashboardPanel.refreshIfOpen();
@@ -195,6 +250,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     secrets,
     workspaceState: context.workspaceState,
     globalState: context.globalState,
+    runs: runManager,
     openSingle: (ref: { repoId: string; number: string }) => void ReviewFlowPanel.open(flowDeps, ref),
     openDashboard: () => void openDashboard(),
     onSubmitted: () => repaintReviewSurfaces(),
@@ -202,8 +258,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sidebar.setActiveReview(state);
       statusBar.setActiveReview(state);
     },
-    onReviewReady: (info: { label: string; itemCount: number }) =>
-      notifier.reviewReady({ refLabel: info.label, itemCount: info.itemCount }),
   };
 
   const changesetPanelDeps = {
@@ -277,7 +331,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     reviewRuns: () => reviewRuns.byRef(),
+    activeRuns: () =>
+      new Map(
+        runManager
+          .active()
+          .map((record) => [record.key, record.status === 'queued' ? ('queued' as const) : ('running' as const)]),
+      ),
     onPodChanged: () => sidebar.refresh(),
+    pruneRetained: (repoIds, openRefs) =>
+      void pruneClosedRetained(context.workspaceState, repoIds, openRefs),
     changesetOptions,
     openCr: (ref, submitted) => {
       if (submitted) {
@@ -298,6 +360,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     await DashboardPanel.show(podStore, secrets, dashboardDeps);
+  };
+
+  /**
+   * What is running, and a way to stop one. A quick pick rather than a screen:
+   * the reviewer reaches this from the status bar while working on something
+   * else, and the whole question is "what is going, and do I still want it".
+   */
+  const showActiveRuns = async (): Promise<void> => {
+    const active = runManager.active();
+    if (active.length === 0) {
+      void vscode.window.showInformationMessage('Verdict: no reviews are running.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      active.map((record) => ({
+        label: record.input.refLabel,
+        description: record.status === 'queued'
+          ? 'queued — waiting for a free slot'
+          : `running for ${Math.round((Date.now() - (record.startedAt ?? record.queuedAt)) / 1000)}s`,
+        detail: record.input.agentLabel,
+        key: record.key,
+      })),
+      { title: 'Verdict: reviews running', placeHolder: 'Pick one to cancel it' },
+    );
+    if (picked) runManager.cancel(picked.key);
   };
 
   const bootstrapFromDebugBypass = async (): Promise<void> => {
@@ -398,6 +485,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     if (confirmed !== 'Delete') return;
 
+    // Its runs have nowhere to land: the pod that named the target is gone.
+    // A pod *switch* deliberately does not do this — a run keeps the pod it was
+    // triggered under, which is what the snapshot in `RunInput` is for.
+    runManager.cancelForPod(target.id);
     await podStore.remove(target.id);
     // Keyed by pod id and naming repositories only that pod resolved: orphaned
     // the moment it goes.
@@ -577,6 +668,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(INTERNAL_COMMANDS.showNotifications, () =>
       void notifier.showPending(),
     ),
+    vscode.commands.registerCommand(INTERNAL_COMMANDS.cancelRun, (key?: string) => {
+      if (typeof key === 'string') runManager.cancel(key);
+    }),
+    // The status bar's running-review segment: list what is in flight, and let
+    // one be cancelled from the pick. Reachable with no Verdict screen open,
+    // which is the state a background run is most likely to be in.
+    vscode.commands.registerCommand(INTERNAL_COMMANDS.showActiveRuns, () => void showActiveRuns()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       // A cadence change re-aims the pending digest flush; per-event modes
       // and quiet hours are read at delivery time and need no push.

@@ -8,16 +8,12 @@ import { preferredModelFor, selectionFromPod } from '../app/podSelection';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
-import { changesetHeadSha, parseChangesetHeadSha, runDemoChangesetAgent } from '../app/combinedAgent';
+import { changesetHeadSha, parseChangesetHeadSha } from '../app/combinedAgent';
 import { connectionForPod } from '../app/connections';
 import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
 import { DEMO_AGENT_ID } from '../app/demoAgent';
-import {
-  AgentRunError,
-  changesetContextEntries,
-  runLmChangesetAgent,
-} from '../app/lmAgent';
+import { changesetContextEntries } from '../app/lmAgent';
 import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
@@ -26,25 +22,27 @@ import {
   changesetDraftKeyFor,
   clearChangesetSubmitLedger,
   readRetained,
+  runKeyForChangeset,
   screenForRetained,
   type ChangesetDraft,
 } from '../app/retainedReview';
+import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { composeSummary, type AgentVoice } from '../domain/summary';
-import { allDecided, clearVerdict, createReview, nextUndecided, setVerdict, verdictCounts } from '../domain/reviewState';
+import { allDecided, clearVerdict, nextUndecided, setVerdict, verdictCounts } from '../domain/reviewState';
 import type { Category, Review, Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
 import { repoCountOf } from './vocab';
-import { agentRunTimeouts } from './agentRunOptions';
+import { agentRunConcurrency, agentRunTimeouts } from './agentRunOptions';
 import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowHtml } from './reviewFlowHtml';
-import { RunLiveness } from './runLiveness';
+import { livenessView } from './runLiveness';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarActiveReview } from './sidebarHtml';
 
@@ -53,12 +51,12 @@ export interface ChangesetReviewDeps {
   secrets: SecretStore;
   workspaceState: KeyValueStore;
   globalState: KeyValueStore;
+  /** Where runs live — see `ReviewFlowDeps.runs`. The panel watches, never owns. */
+  runs: ReviewRunManager;
   openSingle: (ref: { repoId: string; number: string }) => void;
   openDashboard: () => void;
   onSubmitted?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
-  /** The combined agent finished — the notification engine's local event. */
-  onReviewReady?: (info: { label: string; itemCount: number }) => void;
 }
 
 export class ChangesetReviewPanel {
@@ -120,11 +118,11 @@ export class ChangesetReviewPanel {
   private review?: Review;
   private selectedId?: string;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
-  private runSteps: string[] = [];
-  private runStep = 0;
-  private runError?: { message: string; requestId: string; partialCount: number; code: string };
-  private runToken = 0;
-  private readonly runLive = new RunLiveness();
+  /** This panel's view of the run, mirrored from the manager (see `ReviewFlowPanel`). */
+  private runRecord?: RunRecord;
+  private runWatch?: vscode.Disposable;
+  private newRunFromResult = false;
+  private retained?: ReturnType<typeof readRetained<ChangesetDraft>>;
   private summaryText = '';
   private finalNote = '';
   private postThread = true;
@@ -141,7 +139,9 @@ export class ChangesetReviewPanel {
   ) {
     route.onLeave(() => {
       this.disposed = true;
-      this.runToken += 1;
+      // Unsubscribed, not cancelled — see `ReviewFlowPanel`'s onLeave.
+      this.runWatch?.dispose();
+      this.runWatch = undefined;
       for (const watch of this.agentWatches) watch.dispose();
       this.agentWatches = [];
       this.focusWatch?.dispose();
@@ -199,16 +199,14 @@ export class ChangesetReviewPanel {
       this.members = members;
       this.applySelection(selection);
       this.armAgentWatches();
-      const draft = this.deps.workspaceState.get<ChangesetDraft>(this.draftKey());
-      if (draft) {
-        this.review = draft.review;
-        this.threads = draft.threads;
-        this.summaryText = draft.summaryText;
-        this.finalNote = draft.finalNote;
-        this.submitState = draft.submitState;
-        this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
-        this.screen = 'triage';
-        this.markStaleMembers(draft.review);
+      // Same precedence as the single-change-request panel: a run happening now,
+      // then a failure nobody has seen, then the completed review.
+      this.watchRun();
+      this.enterRetained();
+      const record = this.deps.runs.get(this.runKey());
+      if (record && record.status !== 'succeeded') {
+        this.runRecord = record;
+        this.screen = 'running';
       }
       if (this.pendingSelectId && this.review?.items.some((item) => item.id === this.pendingSelectId)) {
         this.selectedId = this.pendingSelectId;
@@ -256,105 +254,107 @@ export class ChangesetReviewPanel {
     } satisfies ChangesetDraft);
   }
 
+  /** The manager's key for this changeset. */
+  private runKey(): string {
+    return runKeyForChangeset(this.changesetId);
+  }
+
+  /**
+   * Start a review of the whole changeset, or attach to the one already running
+   * on it. Same shape as the single-change-request panel: the selection is
+   * persisted as a preference, the run carries its own copy.
+   */
   private async run(): Promise<void> {
-    const token = ++this.runToken;
-    this.screen = 'running';
-    this.runError = undefined;
-    this.runStep = 0;
-    this.runLive.clear();
     const pod = this.pod();
     const runVocabulary = getProvider(pod.providerId).vocabulary;
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
     await this.deps.podStore.upsert(pod);
-    // Read once, outside the try: the failure card names the window that ran
-    // out, and the catch cannot re-read a value the try scope owned.
-    const timeouts = agentRunTimeouts();
-    try {
-      if (this.agentId === DEMO_AGENT_ID) {
-        const result = runDemoChangesetAgent(this.members, pod.criteria, runVocabulary);
-        this.runSteps = result.steps;
-        for (let index = 0; index <= result.steps.length; index += 1) {
-          if (this.disposed || token !== this.runToken) return;
-          this.runStep = index;
-          this.render();
-          await new Promise((resolve) => setTimeout(resolve, 260));
-        }
-        if (!this.disposed && token === this.runToken) this.finishRun(result.response);
-        return;
-      }
-      this.runSteps = [
+    if (this.disposed) return;
+
+    const demo = this.agentId === DEMO_AGENT_ID;
+    // A model-backed agent with no model must not reach the transport: an empty
+    // id there selects an arbitrary model rather than failing.
+    if (!demo && this.modelId === undefined) {
+      this.selectionNotices = [`${this.selectedAgent().label} needs a model, and none is selected.`];
+      this.screen = 'agent';
+      this.render();
+      return;
+    }
+
+    const input: RunInput = {
+      target: { kind: 'changeset', changesetId: this.changesetId, members: this.members },
+      refLabel: this.changeset.name,
+      podId: pod.id,
+      criteria: pod.criteria,
+      agent: this.selectedAgent(),
+      agentLabel: this.selectedAgent().label || this.agentId,
+      modelId: demo ? undefined : this.modelId,
+      timeouts: agentRunTimeouts(),
+      steps: [
         'Resolving agent from Copilot workspace…',
         `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
         'Cross-referencing contracts between repositories…',
         `Scoring findings against ${runVocabulary.repoNoun} criteria…`,
         'Items ready',
-      ];
-      this.runStep = 2;
-      // A model-backed agent with no model must not reach the transport: an
-      // empty id there selects an arbitrary model rather than failing, because
-      // `selectChatModels({vendor: undefined, family: undefined})` matches
-      // everything. The single-CR panel makes the same check.
-      if (this.modelId === undefined) {
-        this.selectionNotices = [`${this.selectedAgent().label} needs a model, and none is selected.`];
-        this.screen = 'agent';
-        this.runLive.clear();
-        this.render();
-        return;
-      }
-      // The log parks here for the whole request; the liveness line under it
-      // is what says the run is alive rather than hung.
-      this.runLive.start();
-      this.render();
-      const response = await runLmChangesetAgent(this.selectedAgent(), this.modelId, this.members, pod.criteria, {
-        timeouts,
-        onProgress: (progress) => {
-          if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
-        },
-      });
-      if (!this.disposed && token === this.runToken) this.finishRun(response);
-    } catch (error) {
-      if (this.disposed || token !== this.runToken) return;
-      const failure = error instanceof AgentRunError ? error : new AgentRunError(String(error), '------', false);
-      this.runError = {
-        message: failure.message,
-        requestId: failure.requestId,
-        partialCount: 0,
-        // The window that actually ran out, not the shipped default — a
-        // reviewer who lengthened it needs the code to name their number.
-        code: failure.timedOut
-          ? `copilot.request.timeout · ${failure.timeoutReason === 'ceiling' ? timeouts.ceilingMs : timeouts.inactivityMs}ms`
-          : 'copilot.request.error',
-      };
-      this.render();
-    }
+      ],
+      demo,
+    };
+
+    this.newRunFromResult = false;
+    this.runRecord = this.deps.runs.trigger(input, agentRunConcurrency());
+    this.screen = 'running';
+    this.render();
   }
 
-  private finishRun(response: AgentReviewResponse): void {
-    this.response = response;
-    this.deps.onReviewReady?.({ label: this.changeset.name, itemCount: response.items.length });
-    if (response.items.length === 0) {
-      this.review = undefined;
-      this.screen = 'clean';
+  /** Mirror the manager's state for this changeset onto the screen. */
+  private watchRun(): void {
+    this.runWatch?.dispose();
+    this.runWatch = this.deps.runs.subscribe((record) => {
+      if (this.disposed || record.key !== this.runKey()) return;
+      this.runRecord = record;
+      if (record.status === 'succeeded') {
+        this.deps.runs.acknowledge(record.key);
+        this.runRecord = undefined;
+        this.enterRetained();
+      } else if (record.status === 'cancelled') {
+        this.runRecord = undefined;
+        if (!this.enterRetained()) this.screen = 'agent';
+      }
       this.render();
-      return;
-    }
-    this.review = createReview({
-      repoId: 'changeset',
-      crNumber: this.changeset.id,
-      agentId: this.agentId,
-      modelId: this.modelId,
-      criteria: this.pod().criteria,
-      response,
     });
-    this.threads = {};
-    this.submitState = undefined;
-    this.submitError = undefined;
-    this.stale = undefined;
-    this.selectedId = this.review.items[0]?.id;
-    this.screen = 'triage';
-    void this.persist();
-    this.render();
+  }
+
+  /**
+   * Load the retained review for this changeset, and say whether there was one.
+   * The clean branch used to persist nothing at all, so a reload after a clean
+   * re-run walked back into the *previous* run's findings; a clean record is
+   * what stops that as well as making the clean screen re-openable.
+   */
+  private enterRetained(): boolean {
+    const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(this.draftKey()));
+    if (!retained) {
+      this.review = undefined;
+      return false;
+    }
+    const draft = retained.draft;
+    this.retained = retained;
+    this.review = retained.outcome === 'clean' ? undefined : draft.review;
+    this.threads = draft.threads;
+    this.summaryText = draft.summaryText;
+    this.finalNote = draft.finalNote;
+    this.submitState = draft.submitState;
+    this.screen = screenForRetained(retained);
+    if (this.review) {
+      this.selectedId = nextUndecided(this.review)?.id ?? this.review.items[0]?.id;
+      this.markStaleMembers(this.review);
+    } else {
+      this.stale = undefined;
+    }
+    if (this.screen === 'done' && !this.doneSentence) {
+      this.doneSentence = 'This review was submitted.';
+    }
+    return true;
   }
 
   private async onMessage(message: FlowMessage): Promise<void> {
@@ -389,9 +389,22 @@ export class ChangesetReviewPanel {
       }
       case 'setInstructions': pod.criteria.extraInstructions = message.text; await this.deps.podStore.upsert(pod); break;
       case 'run': void this.run(); return;
-      case 'cancel': this.runToken += 1; this.screen = 'agent'; break;
+      // Really stops the request now, and frees its slot for a queued review.
+      case 'cancel': this.deps.runs.cancel(this.runKey()); return;
       case 'retryRun': case 'rerun': void this.run(); return;
-      case 'usePartial': this.runError = undefined; this.screen = 'agent'; break;
+      case 'usePartial':
+        this.deps.runs.acknowledge(this.runKey());
+        this.runRecord = undefined;
+        if (!this.enterRetained()) this.screen = 'agent';
+        break;
+      case 'newRun':
+        // The pickers, over a result that stays exactly where it is.
+        this.newRunFromResult = this.retained !== undefined;
+        this.screen = 'agent';
+        break;
+      case 'backToResult':
+        if (!this.enterRetained()) this.screen = 'agent';
+        break;
       case 'toggleReviewContext': this.contextOpen = !this.contextOpen; break;
       case 'setMode': this.mode = message.mode; break;
       case 'select': this.selectedId = message.itemId; break;
@@ -708,10 +721,17 @@ export class ChangesetReviewPanel {
       agentOpen: this.agentOpen,
       criteria: pod.criteria,
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
-      runSteps: this.runSteps,
-      runStep: this.runStep,
-      runLive: this.runLive.snapshot(),
-      runError: this.runError,
+      runSteps: this.runRecord?.steps ?? [],
+      runStep: this.runRecord?.step ?? 0,
+      runLive: livenessView(this.runRecord),
+      runError: this.runRecord?.status === 'failed' && this.runRecord.failure
+        ? { ...this.runRecord.failure, partialCount: 0 }
+        : undefined,
+      runQueued: this.runRecord?.status === 'queued',
+      retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
+      retainedMeta: this.retained
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel, modelLabel: this.reviewModelLabel() }
+        : undefined,
       mode: this.mode,
       items,
       selectedId: this.selectedId,

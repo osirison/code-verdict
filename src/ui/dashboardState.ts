@@ -89,6 +89,12 @@ export interface DashboardDeps {
   changesetOptions?: () => ChangesetDetectionOptions;
   /** Notify sibling views after the dashboard changes the active pod. */
   onPodChanged?: () => void;
+  /**
+   * Drop retained reviews for change requests that have closed. Hung off this
+   * refresh because it is the one that already knows which are still open, for
+   * exactly the repositories the answer is valid for.
+   */
+  pruneRetained?: (repoIds: readonly string[], openRefs: readonly { repoId: string; number: string }[]) => void;
 }
 
 export interface DashboardPodOption {

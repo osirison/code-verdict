@@ -23,6 +23,13 @@
 export interface KeyValueStore {
   get<T>(key: string): T | undefined;
   update(key: string, value: unknown): Thenable<void>;
+  /**
+   * Every key currently stored. Optional because most callers reach for a key
+   * they already know; retention is the exception — it has to find records for
+   * change requests that closed, which nothing else is holding a key for.
+   * `vscode.Memento` provides it; a test double need not.
+   */
+  keys?(): readonly string[];
 }
 
 export interface SecretStore {

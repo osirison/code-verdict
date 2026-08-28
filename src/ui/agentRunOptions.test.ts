@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CEILING_TIMEOUT_MS, INACTIVITY_TIMEOUT_MS } from '../app/lmAgent';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { agentRunTimeouts } from './agentRunOptions';
+import { agentRunConcurrency, agentRunTimeouts, DEFAULT_MAX_CONCURRENT_RUNS } from './agentRunOptions';
 
 const settings = vi.hoisted(() => ({ values: {} as Record<string, unknown> }));
 
@@ -47,6 +47,40 @@ describe('agentRunTimeouts', () => {
   });
 });
 
+describe('agentRunConcurrency', () => {
+  beforeEach(() => {
+    settings.values = {};
+  });
+
+  it('falls back to the shipped cap when the setting is unset', () => {
+    expect(agentRunConcurrency()).toBe(DEFAULT_MAX_CONCURRENT_RUNS);
+  });
+
+  it('reads a configured cap', () => {
+    settings.values = { 'agentRun.maxConcurrent': 6 };
+    expect(agentRunConcurrency()).toBe(6);
+  });
+
+  it('reads 0 as the documented "no limit", not as "never run anything"', () => {
+    settings.values = { 'agentRun.maxConcurrent': 0 };
+    expect(agentRunConcurrency()).toBe(0);
+  });
+
+  it('falls back rather than to 0 for a value that is not a usable count', () => {
+    // The distinction matters: reading a typo as "unlimited" would let one
+    // mistyped digit start twenty simultaneous model requests.
+    for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY, 'three', null]) {
+      settings.values = { 'agentRun.maxConcurrent': value };
+      expect(agentRunConcurrency()).toBe(DEFAULT_MAX_CONCURRENT_RUNS);
+    }
+  });
+
+  it('floors a fractional cap to a whole number of runs', () => {
+    settings.values = { 'agentRun.maxConcurrent': 2.5 };
+    expect(agentRunConcurrency()).toBe(2);
+  });
+});
+
 // package.json cannot import the constants, so agreement is enforced here —
 // the same mechanism `commands.test.ts` uses for the changeset settings. A
 // manifest default that drifts from the code's would ship one number in the
@@ -67,5 +101,10 @@ describe('the manifest contributes what this reader expects', () => {
   it('floors both at 0, which is the reader\'s documented "no limit"', () => {
     expect(properties['codeVerdict.agentRun.inactivitySeconds']?.minimum).toBe(0);
     expect(properties['codeVerdict.agentRun.ceilingSeconds']?.minimum).toBe(0);
+  });
+
+  it('defaults and floors the concurrency cap the same way', () => {
+    expect(properties['codeVerdict.agentRun.maxConcurrent']?.default).toBe(DEFAULT_MAX_CONCURRENT_RUNS);
+    expect(properties['codeVerdict.agentRun.maxConcurrent']?.minimum).toBe(0);
   });
 });

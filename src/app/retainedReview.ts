@@ -20,6 +20,7 @@
  * — six fields against one — so the result fields live here once.
  */
 import { crKey } from './postedReviews';
+import type { KeyValueStore } from './storage';
 import type { ChangesetSubmitState } from './changesetSubmit';
 import type { CandidateBucket } from '../domain/agentResponse';
 import type { Review } from '../domain/types';
@@ -37,6 +38,45 @@ export function draftKeyFor(ref: { repoId: string; number: string }): string {
 /** The changeset equivalent, under its own prefix. */
 export function changesetDraftKeyFor(changesetId: string): string {
   return `codeVerdict.changesetDraft.${changesetId}`;
+}
+
+const DRAFT_PREFIX = 'codeVerdict.draft.';
+
+/**
+ * Drop retained reviews for change requests that are no longer open.
+ *
+ * Records are per target, so the store grows with change requests reviewed
+ * rather than with runs performed — but a long-lived workspace still
+ * accumulates one per change request that ever got a review, and a merged
+ * change request is never going to be re-opened to read it.
+ *
+ * Scoped to the repositories the caller just listed. A key belonging to a
+ * repository this poll did not cover is left alone: absence from *these*
+ * results says nothing about whether it is open, and deleting on that would let
+ * one pod's refresh quietly destroy another's reviews.
+ *
+ * Changeset records are never pruned here. A changeset is derived locally, not
+ * fetched, so "no longer open" has no answer this function could read.
+ */
+export async function pruneClosedRetained(
+  store: KeyValueStore,
+  repoIds: readonly string[],
+  openRefs: readonly { repoId: string; number: string }[],
+): Promise<number> {
+  const keys = store.keys?.();
+  if (!keys) return 0;
+  const covered = new Set(repoIds);
+  const open = new Set(openRefs.map((ref) => `${ref.repoId}!${ref.number}`));
+  let dropped = 0;
+  for (const key of keys) {
+    if (!key.startsWith(DRAFT_PREFIX)) continue;
+    const ref = key.slice(DRAFT_PREFIX.length);
+    const repoId = ref.slice(0, ref.lastIndexOf('!'));
+    if (repoId === '' || !covered.has(repoId) || open.has(ref)) continue;
+    await store.update(key, undefined);
+    dropped += 1;
+  }
+  return dropped;
 }
 
 /**

@@ -143,6 +143,16 @@ export interface FlowViewState {
   /** Set only while an `lm:` request is in flight; the demo agent walks its own log instead. */
   runLive?: RunLivenessView;
   runError?: { message: string; requestId: string; partialCount: number; code: string };
+  /** Waiting for a concurrency slot: accepted and held, not failed. */
+  runQueued?: boolean;
+  /**
+   * A completed review is still held for this target and is reachable from the
+   * screen currently showing. True only where the two coexist — the pickers
+   * opened over a result, and a re-run in flight that has not replaced it yet.
+   */
+  retainedAvailable?: boolean;
+  /** When the shown review ran, and what produced it. Absent while none is retained. */
+  retainedMeta?: { ranAt?: string; agentLabel?: string; modelLabel?: string };
   // triage
   mode: 'split' | 'queue' | 'diff';
   items: TriageItemView[];
@@ -204,6 +214,10 @@ export type FlowMessage =
   | { type: 'openInEditor'; file: string; line: number }
   | { type: 'reanchor' }
   | { type: 'rerun' }
+  /** Open the pickers over a retained review, without disturbing it (D7b). */
+  | { type: 'newRun' }
+  /** Back from the pickers, or from a run in flight, to the review still held. */
+  | { type: 'backToResult' }
   | { type: 'generateSummary' }
   | { type: 'editSummary'; text: string }
   | { type: 'regenerate' }
@@ -723,6 +737,15 @@ function renderRunning(s: FlowViewState): string {
       </div>
     </div>`;
   }
+  if (s.runQueued) {
+    return `<div class="run-col">
+      <div class="spinner"></div>
+      <div class="agent-name">${e(agent?.label ?? '')}</div>
+      <div class="dim">Waiting for a free slot — this review starts as soon as an earlier one finishes.</div>
+      ${retainedRow(s)}
+      <div class="actions-row actions-center"><button class="btn" id="cancel-run">Cancel</button></div>
+    </div>`;
+  }
   return `<div class="run-col">
     <div class="spinner"></div>
     <div class="agent-name">${e(agent?.label ?? '')}</div>
@@ -740,7 +763,39 @@ function renderRunning(s: FlowViewState): string {
         )
         .join('')}
     </div>
+    ${retainedRow(s)}
   </div>`;
+}
+
+/**
+ * The way back to a review this run may replace but has not yet. Rendered only
+ * where both exist, which is the point: a re-run must not hide the findings it
+ * is re-running, because it might fail and leave them as the only answer there
+ * is.
+ */
+function retainedRow(s: FlowViewState): string {
+  if (!s.retainedAvailable) return '';
+  return `<div class="actions-row actions-center">
+    <button class="btn" id="back-to-result">Back to the review you have</button>
+  </div>`;
+}
+
+/** "This ran at 10:14 with Security Reviewer" — what a re-opened result says about itself. */
+function retainedMetaLine(s: FlowViewState): string {
+  const meta = s.retainedMeta;
+  if (!meta) return '';
+  const parts = [
+    meta.ranAt ? `Ran ${e(formatRanAt(meta.ranAt))}` : '',
+    meta.agentLabel ? e(meta.agentLabel) : '',
+    meta.modelLabel ? e(meta.modelLabel) : '',
+  ].filter((part) => part !== '');
+  return parts.length > 0 ? `<p class="dim">${parts.join(' · ')}</p>` : '';
+}
+
+function formatRanAt(iso: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso;
+  return at.toLocaleString();
 }
 
 // ---- §5 Triage ---------------------------------------------------------------
@@ -765,6 +820,7 @@ function triageHeader(s: FlowViewState): string {
       <button data-mode="queue" class="${s.mode === 'queue' ? 'active' : ''}">Queue</button>
       <button data-mode="diff" class="${s.mode === 'diff' ? 'active' : ''}">In diff</button>
     </div>
+    <button class="btn" id="new-run" title="Pick a different agent or model and review again. These findings stay until the new run succeeds.">Run a new review</button>
   </div>
   ${s.stale ? staleBanner(s, s.stale) : ''}${reviewContextPanel(s)}`;
 }
@@ -1085,9 +1141,11 @@ function renderClean(s: FlowViewState): string {
     </div>`
         : ''
     }
+    ${retainedMetaLine(s)}
     ${s.selfAuthored ? `<div class="self-note">${selfAuthoredNote(s, 'an approval')}</div>` : ''}
     <div class="actions-row actions-center">
       ${approvable ? `<button class="btn btn-ok" id="approve">Approve ${e(s.vocabulary.changeRequestNoun)}</button>` : ''}
+      <button class="btn" id="new-run">Run a new review</button>
       <button class="btn" id="lower-bar">Lower the bar and re-run</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
     </div>
@@ -1192,8 +1250,10 @@ function renderDone(s: FlowViewState): string {
     <div class="ok-circle">✓</div>
     <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
     <p class="lede">${e(s.doneSentence)}</p>
+    ${retainedMetaLine(s)}
     <div class="actions-row" style="justify-content:center">
       <button class="btn btn-accent" id="track-replies">Track replies</button>
+      <button class="btn" id="new-run">Run a new review</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
       <button class="btn" id="open-mr">Open ${e(s.vocabulary.changeRequestAbbrev)} in ${e(s.vocabulary.platformName)}</button>
     </div>
@@ -1240,9 +1300,10 @@ document.addEventListener('input', (ev) => {
 });
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-cat]'); if (b) post({ type: 'toggleCategory', category: b.dataset.cat }); });
 document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'setInstructions', text: ev.target.value }); });
-on('run', 'run'); on('cancel', 'cancel');
+on('run', 'run'); on('cancel', 'cancel'); on('cancel-run', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
+on('new-run', 'newRun'); on('back-to-result', 'backToResult');
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
 on('reanchor', 'reanchor'); on('rerun', 'rerun'); on('ctx-toggle', 'toggleReviewContext');
 
