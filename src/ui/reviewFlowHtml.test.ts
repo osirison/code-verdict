@@ -811,3 +811,75 @@ describe('a stored review says what produced it (task 7.4)', () => {
     expect(html).toContain('model unknown');
   });
 });
+
+/**
+ * A completed review is what its target opens on, and re-running never
+ * destroys it first. These are the screens that has to be true on.
+ */
+describe('a retained review, and the way back to it', () => {
+  const body = (over: Partial<FlowViewState>): string =>
+    renderReviewFlowBody({ ...state, ...over } as FlowViewState, 'Security Reviewer');
+
+  it('offers a new review from triage, saying the findings survive it', () => {
+    const html = body({ screen: 'triage', mode: 'split' });
+    expect(html).toContain('id="new-run"');
+    expect(html).toContain('Run a new review');
+    // The promise the control makes, spelled out where it is made.
+    expect(html).toContain('stay until the new run succeeds');
+  });
+
+  it('offers a new review from a clean result, and says when it ran', () => {
+    const html = body({
+      screen: 'clean',
+      retainedMeta: { ranAt: '2026-08-28T09:15:00.000Z', agentLabel: 'Security Reviewer', modelLabel: 'GPT-5' },
+    });
+    expect(html).toContain('id="new-run"');
+    expect(html).toContain('Security Reviewer');
+    expect(html).toContain('GPT-5');
+    expect(html).toContain('Ran ');
+  });
+
+  it('offers a new review from a submitted result', () => {
+    const html = body({ screen: 'done', doneSentence: '3 inline comments posted.' });
+    expect(html).toContain('id="new-run"');
+    expect(html).toContain('3 inline comments posted.');
+  });
+
+  it('renders no meta line for a record that never stored when it ran', () => {
+    // A record written before the result fields existed. Nothing to say beats
+    // an empty label or a fabricated timestamp.
+    expect(body({ screen: 'clean', retainedMeta: undefined })).not.toContain('Ran ');
+  });
+
+  it('keeps the retained review reachable from a run in flight', () => {
+    const html = body({ screen: 'running', runSteps: ['One', 'Two'], runStep: 1, retainedAvailable: true });
+    expect(html).toContain('id="back-to-result"');
+    expect(html).toContain('Back to the review you have');
+  });
+
+  it('offers no way back when there is no retained review to go back to', () => {
+    const html = body({ screen: 'running', runSteps: ['One', 'Two'], runStep: 1, retainedAvailable: false });
+    expect(html).not.toContain('id="back-to-result"');
+  });
+
+  it('says a queued run is waiting for a slot, not that it is failing', () => {
+    const html = body({ screen: 'running', runQueued: true, runSteps: [], runStep: 0 });
+    expect(html).toContain('Waiting for a free slot');
+    expect(html).toContain('id="cancel-run"');
+    // Accepted and held: nothing here may read as an error.
+    expect(html).not.toContain('fail-card');
+  });
+
+  it('writes no inline style attribute in any of the new markup', () => {
+    // The webview CSP is `style-src 'nonce-…'`: an inline style attribute is
+    // dropped silently, so it never applies and nothing reports it.
+    const html = body({
+      screen: 'running',
+      runQueued: true,
+      runSteps: [],
+      runStep: 0,
+      retainedAvailable: true,
+    });
+    expect(html).not.toMatch(/<[^>]+\sstyle="/);
+  });
+});

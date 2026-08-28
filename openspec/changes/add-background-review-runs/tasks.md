@@ -12,7 +12,7 @@
 - [x] 2.3 Replace the clean-run deletion (`src/ui/reviewFlow.ts:652`) with a `clean` record write.
 - [x] 2.3a Make the changeset clean branch (`src/ui/changesetReview.ts:337`) write a `clean` record too — today it persists nothing, so a reload after a clean re-run re-enters triage on the previous run's findings. Cover that case with a test.
 - [x] 2.4 Replace both post-submit deletions (`src/ui/reviewFlow.ts:1183` and `src/ui/changesetReview.ts:563`) with a write that clears only the ledger fields (`failedKeys`, `summaryPosted`, `verdictApplied`, `threadsAccum`, `postedIndividually`, `postedCount`) and sets `submittedAt`.
-- [ ] 2.5 Tests: a clean run leaves a re-openable record; a successful submit leaves a record with `submittedAt` and an empty ledger; a retry after a partial failure still refuses to re-post what landed.
+- [x] 2.5 Tests: a clean run leaves a re-openable record; a successful submit leaves a record with `submittedAt` and an empty ledger; a retry after a partial failure still refuses to re-post what landed.
 
 ## 3. The run manager
 
@@ -50,8 +50,8 @@
 - [x] 5.4 Rewrite `load()`'s routing to the four ordered arms in D9, including the retained-record table in D7b.
 - [x] 5.5 Add `{ type: 'newRun' }` to `FlowMessage` and the "Run a new review" control to the `triage`, `clean` and `done` screens; it opens the pickers pre-selected from the record and keeps a way back to the review (D7b). Leave the existing `rerun` message as it is.
 - [x] 5.6 Render the retained review beside a run in flight on the running screen, with a control back to it (D7c).
-- [ ] 5.7 Confirm the staleness path still runs on open against a retained record (`isStale`, `markMoved`) — an old record must arrive labelled.
-- [ ] 5.8 Tests in `src/ui/reviewFlowHtml.test.ts` and the panel tests: each of the three retained-record shapes renders its screen and carries the control; the running screen renders both; no new markup uses an inline `style=` attribute (webview CSP).
+- [x] 5.7 Confirm the staleness path still runs on open against a retained record (`isStale`, `markMoved`) — an old record must arrive labelled.
+- [x] 5.8 Tests in `src/ui/reviewFlowHtml.test.ts` and the panel tests: each of the three retained-record shapes renders its screen and carries the control; the running screen renders both; no new markup uses an inline `style=` attribute (webview CSP).
 
 ## 6. Concurrency setting
 
@@ -63,13 +63,13 @@
 - [x] 7.1 Sidebar: an active-runs section listing target, state, elapsed and a cancel control, fed by the manager's `onChange`.
 - [x] 7.2 Status bar: a running-review count segment, hidden at zero the way the bell already is.
 - [x] 7.3 Dashboard and changeset rows: a `Running…` / `Queued` pill from one extra map in `DashboardDeps`, keyed as `reviewRuns` already is.
-- [ ] 7.4 Tests: the section and pills appear and clear with the manager's state; nothing is rendered at zero active runs.
+- [x] 7.4 Tests: the section and pills appear and clear with the manager's state; nothing is rendered at zero active runs.
 
 ## 8. Wiring, retention and verification
 
 - [x] 8.1 Construct the manager in `activate()`, wire `onRunRecorded`, `onReviewReady` and the `repaintReviewSurfaces` fan-out into it rather than through the panel deps, and run the sweep before the first render.
 - [x] 8.2 Cancel a pod's runs from the existing `deletePod` handler.
 - [x] 8.3 Drop retained records for change requests that are no longer open, on the poll that already lists them (`fetchPodData`).
-- [ ] 8.4 Update `spec/specs/Code Verdict - naming & commands.md` with the cancel-run command and the new setting.
-- [ ] 8.5 Run `npm run typecheck`, `npm run lint` and `npm test`, and report the output.
+- [x] 8.4 Update `spec/specs/Code Verdict - naming & commands.md` with the cancel-run command and the new setting.
+- [x] 8.5 Run `npm run typecheck`, `npm run lint` and `npm test`, and report the output.
 - [ ] 8.6 Manual pass in the Extension Development Host (see `docs/agent-notes/f5-extension-development-host.md`): start a review, navigate to the dashboard, start a second review on another change request, confirm both finish and both notify; re-open each and confirm the findings are there; cancel one mid-run and confirm the queued one starts; close and re-open the window with a run in flight and confirm the target reads interrupted; re-run one with a different agent and confirm the previous review stayed put until the new one landed.
