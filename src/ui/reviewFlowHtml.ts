@@ -5,7 +5,7 @@
  */
 import type { CandidateBucket } from '../domain/agentResponse';
 import type { Category, Criteria, ReviewItem, Severity, Verdict } from '../domain/types';
-import type { AgentDescriptor } from '../app/agents';
+import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
 import type { HunkLine } from '../domain/diffHunks';
 import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { Vocabulary } from './vocab';
@@ -115,6 +115,15 @@ export interface FlowViewState {
   agents: AgentDescriptor[];
   agentId: string;
   agentOpen: boolean;
+  /** Copilot chat models. Empty when Copilot is absent — the screen says so rather than showing an empty picker. */
+  models: ModelDescriptor[];
+  /** Unset when no model is available, and whenever the demo agent is selected. */
+  modelId?: string;
+  modelOpen: boolean;
+  /** What reconciliation silently changed — a stale agent or model. Rendered on the screen, not as a toast. */
+  selectionNotices: string[];
+  /** Agent files that could not be parsed. Reported as a count with the detail behind it. */
+  skippedAgents: Array<{ path: string; reason: string }>;
   criteria: Criteria;
   /** "56% accepted in this pod" — undefined hides the tuning link. */
   acceptRate?: number;
@@ -139,6 +148,13 @@ export interface FlowViewState {
   selectedId?: string;
   diffLines?: HunkLine[];
   counts: { accepted: number; rejected: number; skipped: number; undecided: number };
+  /**
+   * The model that produced the findings currently in triage, resolved from
+   * the *stored* review rather than the live picker — reopening a review must
+   * say what ran it, not what happens to be selected now. Undefined for a
+   * review stored before models were separate, and for a demo review.
+   */
+  reviewModelLabel?: string;
   /** Absent until the change request's own fetch returns — the box renders nothing at all rather than a shell. */
   context?: ReviewContextView;
   stale?: { newHead: string; affected: number; affectedAccepted?: number };
@@ -164,6 +180,10 @@ export interface FlowViewState {
 export type FlowMessage =
   | { type: 'toggleAgentOpen' }
   | { type: 'selectAgent'; agentId: string }
+  | { type: 'toggleModelOpen' }
+  | { type: 'selectModel'; modelId: string }
+  | { type: 'dismissNotices' }
+  | { type: 'showSkippedAgents' }
   | { type: 'setFloor'; floor: Severity }
   | { type: 'setConfidence'; value: number }
   | { type: 'toggleCategory'; category: Category }
@@ -260,6 +280,13 @@ h1 { font-size: 19px; font-weight: 600; color: var(--fg-max); }
 .agent-menu-foot { border-top: 1px solid var(--line2); padding: 8px 12px; font-size: 11px; color: var(--link); }
 .agent-sub { font-size: 11.5px; color: var(--fg-dim); margin-top: 8px; }
 .agent-sub a { margin-left: 8px; }
+.agent-origin { font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-dimmer); margin-left: auto; }
+.agent-row.inert { cursor: default; opacity: .6; }
+.agent-row.inert:hover { border-color: var(--line2); }
+.picker-stack { display: flex; flex-direction: column; gap: 10px; }
+.picker-label { font-size: 11px; color: var(--fg-dim); margin-bottom: 5px; }
+.notice { display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--line2); border-left: 2px solid var(--agent); border-radius: 4px; background: var(--bg2); padding: 8px 11px; font-size: 11.5px; color: var(--fg-dim); }
+.notice .dismiss { margin-left: auto; color: var(--fg-dimmer); cursor: pointer; background: none; border: none; font-family: var(--font-ui); font-size: 11.5px; }
 
 .crit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .crit-label { font-size: 11px; color: var(--fg-dim); margin-bottom: 6px; }
@@ -443,8 +470,104 @@ function subline(h: FlowHeaderInfo): string {
 
 // ---- §3 Run review ---------------------------------------------------------
 
+/** The origin badge on a picker row — where this agent came from. */
+function agentOrigin(a: AgentDescriptor): string {
+  if (a.source === 'builtin') return 'built-in';
+  if (a.source === 'demo') return 'demo';
+  return a.origin ?? a.source;
+}
+
+function agentPicker(s: FlowViewState, agent: AgentDescriptor | undefined): string {
+  return `<div class="agent-select">
+      <div class="picker-label">Agent</div>
+      <button class="agent-row" id="agent-toggle">
+        <span class="agent-dot"></span>
+        <span class="agent-name">${e(agent?.label ?? 'Select an agent')}</span>
+        <span class="agent-badge">${e(agentOrigin(agent ?? BUILTIN_FALLBACK))}</span>
+        <span class="agent-caret">${s.agentOpen ? '▲' : '▼'}</span>
+      </button>
+      ${
+        s.agentOpen
+          ? `<div class="agent-menu">
+        <div class="agent-menu-head">Agents</div>
+        ${s.agents
+          .map(
+            (a) => `<div class="agent-option ${a.id === s.agentId ? 'active' : ''}" data-agent="${e(a.id)}">
+            <span>${a.id === s.agentId ? '✓' : '&nbsp;'}</span>
+            <span class="agent-name">${e(a.label)}</span>
+            <span class="desc">${e(a.description)}</span>
+            <span class="agent-origin">${e(agentOrigin(a))}</span>
+          </div>`,
+          )
+          .join('')}
+        <div class="agent-menu-foot">Agents are <code>*.agent.md</code> files — add more locations in Settings.</div>
+      </div>`
+          : ''
+      }
+      <div class="agent-sub">${e(agent?.description ?? '')}${s.acceptRate !== undefined ? `<a href="#" id="tuning-link">${s.acceptRate}% accepted in this pod →</a>` : ''}</div>
+    </div>`;
+}
+
+/**
+ * The model half. Hidden behaviour differs from the agent picker in two ways
+ * the spec calls for: the demo agent neutralises it (it calls no model), and
+ * an empty model list states why rather than offering an empty menu.
+ */
+function modelPicker(s: FlowViewState, agent: AgentDescriptor | undefined): string {
+  if (agent?.source === 'demo') {
+    return `<div class="agent-select">
+      <div class="picker-label">Model</div>
+      <button class="agent-row inert" id="model-inert" disabled>
+        <span class="agent-name">Not used by this agent</span>
+        <span class="agent-origin">the demo agent generates findings from the diff</span>
+      </button>
+    </div>`;
+  }
+  if (s.models.length === 0) {
+    return `<div class="agent-select">
+      <div class="picker-label">Model</div>
+      <button class="agent-row inert" id="model-inert" disabled>
+        <span class="agent-name">No model available</span>
+        <span class="agent-origin">sign in to Copilot, or pick the demo agent</span>
+      </button>
+    </div>`;
+  }
+  const model = s.models.find((m) => m.id === s.modelId) ?? s.models[0];
+  return `<div class="agent-select">
+      <div class="picker-label">Model</div>
+      <button class="agent-row" id="model-toggle">
+        <span class="agent-name">${e(model?.label ?? 'Select a model')}</span>
+        <span class="agent-badge">copilot</span>
+        <span class="agent-caret">${s.modelOpen ? '▲' : '▼'}</span>
+      </button>
+      ${
+        s.modelOpen
+          ? `<div class="agent-menu">
+        <div class="agent-menu-head">Copilot models in this workspace</div>
+        ${s.models
+          .map(
+            (m) => `<div class="agent-option ${m.id === s.modelId ? 'active' : ''}" data-model="${e(m.id)}">
+            <span>${m.id === s.modelId ? '✓' : '&nbsp;'}</span>
+            <span class="agent-name">${e(m.label)}</span>
+            <span class="desc">${e(m.description)}</span>
+          </div>`,
+          )
+          .join('')}
+      </div>`
+          : ''
+      }
+    </div>`;
+}
+
+/** Only reached when `s.agents` is somehow empty; keeps `agentOrigin` total. */
+const BUILTIN_FALLBACK: AgentDescriptor = {
+  id: '', label: '', description: '', source: 'builtin', instructions: '',
+};
+
 function renderRunReview(s: FlowViewState): string {
   const agent = s.agents.find((a) => a.id === s.agentId) ?? s.agents[0];
+  const needsModel = agent !== undefined && agent.source !== 'demo';
+  const runBlocked = needsModel && s.models.length === 0;
   const catHint = (() => {
     const on = s.criteria.categories;
     if (on.length === 0) return 'Pick at least one category — the agent has nothing to look for.';
@@ -462,34 +585,21 @@ function renderRunReview(s: FlowViewState): string {
     }
     <div>
       <h1>Run an AI review</h1>
-      <p class="lede">Agents come from your Copilot workspace. Criteria are saved per ${e(s.vocabulary.repoNoun)} and follow every run.</p>
+      <p class="lede">The agent is what to look for; the model is what runs it. Criteria are saved per ${e(s.vocabulary.repoNoun)} and follow every run.</p>
     </div>
-    <div class="agent-select">
-      <button class="agent-row" id="agent-toggle">
-        <span class="agent-dot"></span>
-        <span class="agent-name">${e(agent?.label ?? 'Select an agent')}</span>
-        <span class="agent-badge">${agent?.source === 'demo' ? 'workspace' : 'copilot'}</span>
-        <span class="agent-caret">${s.agentOpen ? '▲' : '▼'}</span>
-      </button>
-      ${
-        s.agentOpen
-          ? `<div class="agent-menu">
-        <div class="agent-menu-head">Copilot agents in this workspace</div>
-        ${s.agents
-          .map(
-            (a) => `<div class="agent-option ${a.id === s.agentId ? 'active' : ''}" data-agent="${e(a.id)}">
-            <span>${a.id === s.agentId ? '✓' : '&nbsp;'}</span>
-            <span class="agent-name">${e(a.label)}</span>
-            <span class="desc">${e(a.description)}</span>
-            <span class="agent-badge">${a.source === 'demo' ? 'workspace' : 'copilot'}</span>
-          </div>`,
-          )
-          .join('')}
-        <div class="agent-menu-foot">Manage agents in Copilot settings…</div>
-      </div>`
-          : ''
-      }
-      <div class="agent-sub">${e(agent?.description ?? '')}${s.acceptRate !== undefined ? `<a href="#" id="tuning-link">${s.acceptRate}% accepted in this pod →</a>` : ''}</div>
+    ${
+      s.selectionNotices.length > 0
+        ? `<div class="notice"><span>${s.selectionNotices.map((n) => e(n)).join(' ')}</span><button class="dismiss" id="dismiss-notices">Dismiss</button></div>`
+        : ''
+    }
+    ${
+      s.skippedAgents.length > 0
+        ? `<div class="notice"><span>${s.skippedAgents.length} agent ${s.skippedAgents.length === 1 ? 'file was' : 'files were'} skipped because ${s.skippedAgents.length === 1 ? 'it could' : 'they could'} not be read.</span><button class="dismiss" id="show-skipped">Show which</button></div>`
+        : ''
+    }
+    <div class="picker-stack">
+      ${agentPicker(s, agent)}
+      ${modelPicker(s, agent)}
     </div>
     <div class="crit-grid">
       <div>
@@ -524,9 +634,13 @@ function renderRunReview(s: FlowViewState): string {
       <textarea class="extra" id="extra" placeholder="Terse. No praise. Cite the rule or CVE class.">${e(s.criteria.extraInstructions)}</textarea>
     </div>
     <div class="footer-row">
-      <button class="btn btn-brand" id="run">Run review</button>
+      <button class="btn btn-brand" id="run"${runBlocked ? ' disabled' : ''}>Run review</button>
       <button class="btn" id="cancel">Cancel</button>
-      <span class="footer-hint">${s.header.fileCount} files, +${s.header.added} −${s.header.removed} go to the agent — never the whole repo.</span>
+      <span class="footer-hint">${
+        runBlocked
+          ? e(`${agent?.label ?? 'This agent'} needs a Copilot model, and none is available.`)
+          : `${s.header.fileCount} files, +${s.header.added} −${s.header.removed} go to the agent — never the whole repo.`
+      }</span>
     </div>
   </div>`;
 }
@@ -759,7 +873,7 @@ function movedChip(view?: TriageItemView): string {
   return view?.lineMoved ? '<span class="pill pill-warn">⚠ line moved</span>' : '';
 }
 
-function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabulary, repoLabels?: Record<string, string>): string {
+function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabulary, repoLabels?: Record<string, string>, modelLabel?: string): string {
   const item = view.item;
   const owner = view.projectLabel && view.refLabel ? `<span class="agent-fg">${e(view.projectLabel)} · ${e(view.refLabel)}</span> · ` : '';
   const targetControl = (span: NonNullable<ReviewItem['spans']>[number]): string => {
@@ -775,7 +889,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
   return `
     <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${movedChip(view)}</div>
     <div class="detail-title">${e(item.title)}</div>
-    <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span></div>
+    <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span> · ${e(modelLabel ?? 'model unknown')}</div>
     ${cross}
     <p class="prose">${e(item.body)}</p>
     <div class="code-card">
@@ -815,7 +929,7 @@ function renderTriageSplit(s: FlowViewState, agentLabel: string): string {
   const all = s.counts.undecided === 0;
   return `${triageHeader(s)}
   <div class="detail" data-item="${e(selected?.item.id ?? '')}" data-repo-id="${e(selected?.item.repoId ?? '')}" data-cr-number="${e(selected?.item.crNumber ?? '')}">
-    ${selected ? itemDetail(selected, agentLabel, s.vocabulary, s.changeset?.repoLabels) : '<p class="prose">No review items.</p>'}
+    ${selected ? itemDetail(selected, agentLabel, s.vocabulary, s.changeset?.repoLabels, s.reviewModelLabel) : '<p class="prose">No review items.</p>'}
   </div>
   <div class="action-bar">
     <button class="btn btn-ok" id="accept">Accept<span class="key">A</span></button>
@@ -1108,8 +1222,13 @@ const on = (id, type, extra) => document.addEventListener('click', (ev) => {
 on('agent-toggle', 'toggleAgentOpen');
 document.addEventListener('click', (ev) => {
   const el = ev.target.closest('.agent-option');
-  if (el) post({ type: 'selectAgent', agentId: el.dataset.agent });
+  if (!el) return;
+  if (el.dataset.model) post({ type: 'selectModel', modelId: el.dataset.model });
+  else if (el.dataset.agent) post({ type: 'selectAgent', agentId: el.dataset.agent });
 });
+on('model-toggle', 'toggleModelOpen');
+on('dismiss-notices', 'dismissNotices');
+on('show-skipped', 'showSkippedAgents');
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-floor]'); if (b) post({ type: 'setFloor', floor: b.dataset.floor }); });
 document.addEventListener('change', (ev) => { if (ev.target.id === 'conf') post({ type: 'setConfidence', value: Number(ev.target.value) }); });
 document.addEventListener('input', (ev) => {

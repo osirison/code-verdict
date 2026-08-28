@@ -5,9 +5,12 @@ import type { PodStore } from '../app/pods';
 import { readToken, type SecretStore } from '../app/storage';
 import { COMMANDS } from '../commands';
 import { NOTIFICATION_EVENTS, type NotificationMode } from '../domain/notifications';
+import { discoverAgents } from '../app/agentDefinitions';
+import { agentSearchRoots } from './agentLocations';
 import {
   formatConnectionStatus,
   renderSettingsHtml,
+  type AgentLocationView,
   type SettingsMessage,
   type SettingsViewState,
 } from './settingsHtml';
@@ -76,6 +79,7 @@ export class SettingsPanel {
       quietMode: config.get<boolean>('notifications.quietMode', false),
       digestCadence: config.get<SettingsViewState['digestCadence']>('notifications.digestCadence', 'End of day'),
       shareRates: config.get<boolean>('shareAcceptRejectRates', false),
+      agentLocations: await this.agentLocationViews(),
       notifications: NOTIFICATION_EVENTS.map((event) => ({
         key: event.key,
         // The static table stays neutral ("CI run"); the settings list can name
@@ -89,9 +93,53 @@ export class SettingsPanel {
     this.panel.webview.html = renderSettingsHtml(state, crypto.randomBytes(16).toString('hex'));
   }
 
+  /**
+   * One row per searched directory, built by running the real discovery — a
+   * count derived any other way would report on a search that never happened.
+   * `discoverAgents` reports a skip for a configured root it cannot read and
+   * stays silent about a missing `.github/agents`, which is the same
+   * distinction these rows draw.
+   */
+  private async agentLocationViews(): Promise<AgentLocationView[]> {
+    const roots = agentSearchRoots();
+    return Promise.all(roots.map(async (root) => {
+      const { agents, skipped } = await discoverAgents([root]);
+      const unreadable = skipped.some((skip) => skip.reason === 'the location could not be read');
+      return {
+        label: root.label,
+        configured: root.source === 'location',
+        status: unreadable ? ('unreadable' as const) : ('ok' as const),
+        agentCount: agents.length,
+      };
+    }));
+  }
+
   private async onMessage(message: SettingsMessage): Promise<void> {
     const config = vscode.workspace.getConfiguration('codeVerdict');
     switch (message.type) {
+      case 'addAgentLocation': {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: 'Search this folder for agents',
+        });
+        const folder = picked?.[0];
+        if (!folder) break;
+        const current = config.get<string[]>('agentLocations') ?? [];
+        if (current.includes(folder.fsPath)) break;
+        await config.update('agentLocations', [...current, folder.fsPath], vscode.ConfigurationTarget.Global);
+        break;
+      }
+      case 'removeAgentLocation': {
+        const current = config.get<string[]>('agentLocations') ?? [];
+        await config.update(
+          'agentLocations',
+          current.filter((entry) => entry.trim() !== message.label),
+          vscode.ConfigurationTarget.Global,
+        );
+        break;
+      }
       case 'rotateToken':
         await vscode.commands.executeCommand(COMMANDS.signIn);
         break;

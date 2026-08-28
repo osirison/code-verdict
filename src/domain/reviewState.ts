@@ -9,6 +9,8 @@ export function createReview(input: {
   repoId: string;
   crNumber: string;
   agentId: string;
+  /** The model that ran it. Absent for the demo agent, which calls none. */
+  modelId?: string;
   criteria: Criteria;
   response: AgentReviewResponse;
 }): Review {
@@ -16,6 +18,7 @@ export function createReview(input: {
     repoId: input.repoId,
     crNumber: input.crNumber,
     agentId: input.agentId,
+    modelId: input.modelId,
     criteria: input.criteria,
     headSha: input.response.headSha,
     items: input.response.items,

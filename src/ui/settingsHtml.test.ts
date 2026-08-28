@@ -11,6 +11,7 @@ const state: SettingsViewState = {
   quietMode: false,
   digestCadence: 'End of day',
   shareRates: false,
+  agentLocations: [{ label: '.github/agents', configured: false, status: 'ok', agentCount: 2 }],
   notifications: [
     { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', mode: 'Interrupt' },
     { key: 'replyPosted', label: 'Reply on a comment you posted', hint: 'An author replied to your review.', mode: 'Interrupt' },
@@ -70,5 +71,48 @@ describe('formatConnectionStatus', () => {
     expect(
       formatConnectionStatus({ username: 'you', scopes: ['api', 'read_user'], tokenExpiresInDays: 1 }),
     ).toBe('connected as @you · api, read_user scopes · token expires in 1 day');
+  });
+});
+
+describe('the Agents section (spec: review-agents — Additional agent locations)', () => {
+  const render = (locations: SettingsViewState['agentLocations']) =>
+    renderSettingsHtml({ ...state, agentLocations: locations }, 'n');
+
+  it('lists each searched location with what it yielded', () => {
+    const html = render([
+      { label: '.github/agents', configured: false, status: 'ok', agentCount: 2 },
+      { label: '/home/me/agents', configured: true, status: 'ok', agentCount: 1 },
+    ]);
+    expect(html).toContain('.github/agents');
+    expect(html).toContain('2 agents');
+    expect(html).toContain('/home/me/agents');
+    expect(html).toContain('1 agent<');
+  });
+
+  it('names an unreadable location without hiding the others', () => {
+    const html = render([
+      { label: '/gone', configured: true, status: 'unreadable', agentCount: 0 },
+      { label: '.github/agents', configured: false, status: 'ok', agentCount: 3 },
+    ]);
+    expect(html).toContain('/gone');
+    expect(html).toContain('could not be read');
+    expect(html).toContain('3 agents');
+  });
+
+  it('offers Remove only for a configured location, never for the built-in one', () => {
+    const html = render([
+      { label: '.github/agents', configured: false, status: 'ok', agentCount: 0 },
+      { label: '/home/me/agents', configured: true, status: 'ok', agentCount: 0 },
+    ]);
+    expect(html).toContain('data-remove-location="/home/me/agents"');
+    expect(html).not.toContain('data-remove-location=".github/agents"');
+  });
+
+  it('says so when there is nowhere to search', () => {
+    expect(render([])).toContain('No workspace folder is open');
+  });
+
+  it('offers a way to add one', () => {
+    expect(render([])).toContain('id="add-location"');
   });
 });

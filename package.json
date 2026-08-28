@@ -138,7 +138,15 @@
         "codeVerdict.agent": {
           "type": "string",
           "default": "",
-          "description": "Id of the Copilot workspace agent used for reviews."
+          "description": "Id of the review agent. Agents are *.agent.md files; the model that runs one is stored per pod, not here."
+        },
+        "codeVerdict.agentLocations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra directories to search for *.agent.md agent definitions, absolute or workspace-relative. Searched in addition to each workspace folder's default agent folder, never instead of it."
         },
         "codeVerdict.severityFloor": {
           "type": "string",

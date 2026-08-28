@@ -1,7 +1,10 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import type { AgentDescriptor } from '../app/agents';
-import { DEMO_AGENT_DESCRIPTOR } from '../app/agents';
+import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS } from '../app/agents';
+import { discoverAgents, type SkippedDefinition } from '../app/agentDefinitions';
+import { preferredModelFor, reconcile, selectionFromPod } from '../app/podSelection';
+import { agentSearchRoots } from './agentLocations';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
@@ -13,7 +16,7 @@ import { DEMO_AGENT_ID } from '../app/demoAgent';
 import {
   AgentRunError,
   changesetContextEntries,
-  discoverLmAgents,
+  discoverModels,
   runLmChangesetAgent,
 } from '../app/lmAgent';
 import { fetchPodData } from '../app/podQuery';
@@ -101,8 +104,13 @@ export class ChangesetReviewPanel {
   private focusWatch?: vscode.Disposable;
   private changeset!: DetectedChangeset;
   private members: ChangesetAgentMember[] = [];
-  private agents: AgentDescriptor[] = [DEMO_AGENT_DESCRIPTOR];
-  private agentId = DEMO_AGENT_ID;
+  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  private agentId = BUILTIN_AGENT_DESCRIPTOR.id;
+  private models: ModelDescriptor[] = [];
+  private modelId?: string;
+  private modelOpen = false;
+  private selectionNotices: string[] = [];
+  private skippedAgents: SkippedDefinition[] = [];
   private agentOpen = false;
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
@@ -175,7 +183,7 @@ export class ChangesetReviewPanel {
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');
       this.changeset = changeset;
-      const [members, agents] = await Promise.all([
+      const [members, models, discovered] = await Promise.all([
         Promise.all(changeset.members.map(async (member) => ({
           ref: member.ref,
           projectPath: member.projectPath,
@@ -184,12 +192,17 @@ export class ChangesetReviewPanel {
           // resolving each member's links off that batch costs no request.
           context: buildReviewContext(member, data.workItems, { trailer: options.trailer }),
         }))),
-        discoverLmAgents(),
+        discoverModels(),
+        discoverAgents(agentSearchRoots()),
       ]);
       this.members = members;
-      this.agents = [DEMO_AGENT_DESCRIPTOR, ...agents];
-      const podAgent = pod.agentId;
-      if (podAgent && this.agents.some((agent) => agent.id === podAgent)) this.agentId = podAgent;
+      this.models = models;
+      this.agents = [...BUILT_IN_AGENTS, ...discovered.agents];
+      this.skippedAgents = discovered.skipped;
+      const settled = reconcile(selectionFromPod(pod), { agents: this.agents, models: this.models });
+      this.agentId = settled.agentId;
+      this.modelId = settled.modelId;
+      this.selectionNotices = settled.notices;
       const draft = this.deps.workspaceState.get<ChangesetDraft>(this.draftKey());
       if (draft) {
         this.review = draft.review;
@@ -256,6 +269,7 @@ export class ChangesetReviewPanel {
     const pod = this.pod();
     const runVocabulary = getProvider(pod.providerId).vocabulary;
     pod.agentId = this.agentId;
+    pod.modelId = this.modelId;
     await this.deps.podStore.upsert(pod);
     // Read once, outside the try: the failure card names the window that ran
     // out, and the catch cannot re-read a value the try scope owned.
@@ -285,7 +299,7 @@ export class ChangesetReviewPanel {
       // is what says the run is alive rather than hung.
       this.runLive.start();
       this.render();
-      const response = await runLmChangesetAgent(this.agentId, this.members, pod.criteria, {
+      const response = await runLmChangesetAgent(this.selectedAgent(), this.modelId ?? '', this.members, pod.criteria, {
         timeouts,
         onProgress: (progress) => {
           if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
@@ -321,7 +335,8 @@ export class ChangesetReviewPanel {
     this.review = createReview({
       repoId: 'changeset',
       crNumber: this.changeset.id,
-      agentId: response.agentId,
+      agentId: this.agentId,
+      modelId: this.modelId,
       criteria: this.pod().criteria,
       response,
     });
@@ -339,7 +354,23 @@ export class ChangesetReviewPanel {
     const pod = this.pod();
     switch (message.type) {
       case 'toggleAgentOpen': this.agentOpen = !this.agentOpen; break;
-      case 'selectAgent': this.agentId = message.agentId; this.agentOpen = false; break;
+      case 'selectAgent': {
+        this.agentId = message.agentId;
+        this.agentOpen = false;
+        const preferred = preferredModelFor(this.selectedAgent(), this.models);
+        if (preferred.modelId) this.modelId = preferred.modelId;
+        if (preferred.notice) this.selectionNotices = [preferred.notice];
+        break;
+      }
+      case 'toggleModelOpen': this.modelOpen = !this.modelOpen; break;
+      case 'selectModel': this.modelId = message.modelId; this.modelOpen = false; break;
+      case 'dismissNotices': this.selectionNotices = []; break;
+      case 'showSkippedAgents':
+        void vscode.window.showWarningMessage(
+          `Verdict: skipped ${this.skippedAgents.length} agent file(s) — `
+            + this.skippedAgents.map((skip) => `${skip.path} (${skip.reason})`).join('; '),
+        );
+        break;
       case 'setFloor': pod.criteria.severityFloor = message.floor; await this.deps.podStore.upsert(pod); break;
       case 'setConfidence': pod.criteria.minConfidence = message.value; await this.deps.podStore.upsert(pod); break;
       case 'toggleCategory': {
@@ -531,7 +562,25 @@ export class ChangesetReviewPanel {
   }
 
   private agentLabel(): string {
-    return this.agents.find((agent) => agent.id === this.agentId)?.label ?? this.agentId;
+    return this.selectedAgent().label || this.agentId;
+  }
+
+
+  /**
+   * How the stored review's model should read on the triage meta line. The
+   * label when it is still available, the bare id when it is not (better than
+   * nothing — it still names what ran), and undefined for a demo review or
+   * one stored before models were recorded, which renders as "model unknown".
+   */
+  private reviewModelLabel(): string | undefined {
+    const modelId = this.review?.modelId;
+    if (modelId === undefined) return undefined;
+    return this.models.find((model) => model.id === modelId)?.label ?? modelId;
+  }
+
+  /** Never undefined: the built-in agent is always in `this.agents`. */
+  private selectedAgent(): AgentDescriptor {
+    return this.agents.find((agent) => agent.id === this.agentId) ?? BUILTIN_AGENT_DESCRIPTOR;
   }
 
   /**
@@ -613,6 +662,12 @@ export class ChangesetReviewPanel {
       },
       agents: this.agents,
       agentId: this.agentId,
+      models: this.models,
+      modelId: this.modelId,
+      modelOpen: this.modelOpen,
+      reviewModelLabel: this.reviewModelLabel(),
+      selectionNotices: this.selectionNotices,
+      skippedAgents: this.skippedAgents,
       agentOpen: this.agentOpen,
       criteria: pod.criteria,
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,

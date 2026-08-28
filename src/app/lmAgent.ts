@@ -9,7 +9,7 @@ import type { AgentReviewResponse } from '../domain/agentResponse';
 import { AgentResponseError, parseAgentReviewResponse } from '../domain/agentResponse';
 import type { Criteria } from '../domain/types';
 import type { ChangeRequestDiff } from '../platform/types';
-import type { AgentDescriptor } from './agents';
+import type { AgentDescriptor, ModelDescriptor } from './agents';
 import { AgentTrace, type AgentProgressCallback, type AgentTimeoutReason, type AgentTraceSink } from './agentTrace';
 import { changesetHeadSha, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
 import { renderReviewContextPrompt, type ReviewContext, type ReviewContextEntry } from './reviewContext';
@@ -76,14 +76,22 @@ export interface RunAgentOptions {
   timeouts?: AgentRunTimeouts;
 }
 
-export async function discoverLmAgents(): Promise<AgentDescriptor[]> {
+/**
+ * The Copilot chat models available to this session. These are *models*, not
+ * agents: what runs a review, not what the review is. The id format is
+ * unchanged from when each of these was itself listed as an agent, so
+ * `AgentTrace`'s vendor/family split and every pod holding an `lm:` value
+ * keep working.
+ */
+export async function discoverModels(): Promise<ModelDescriptor[]> {
   try {
     const models = await vscode.lm.selectChatModels();
     return models.map((m) => ({
       id: `${LM_PREFIX}${m.vendor}/${m.family}`,
       label: m.name,
       description: `${m.vendor} · ${m.family}`,
-      source: 'copilot' as const,
+      vendor: m.vendor,
+      family: m.family,
     }));
   } catch {
     // No Copilot in this session (e.g. emulator-only debugging).
@@ -111,21 +119,27 @@ export class AgentRunError extends Error {
  * rather than more surface to review.
  */
 export async function runLmAgent(
-  agentId: string,
+  agent: AgentDescriptor,
+  modelId: string,
   diff: ChangeRequestDiff,
   criteria: Criteria,
   context?: ReviewContext,
   options?: RunAgentOptions,
 ): Promise<AgentReviewResponse> {
   const prompt = [
-    'You are a code review agent. Review ONLY the diffs below.',
+    // Element zero is the ONLY agent-controlled part of this array. Everything
+    // after it is built here, from these inputs, exactly as it was before
+    // agents were selectable — which is what makes it impossible for an agent
+    // body to displace the contract, drop the criteria, or change the diffs.
+    // The built-in agent's instructions are the literal that used to sit here.
+    agent.instructions,
     `Respond with a single JSON object matching this contract: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": "${diff.headSha}", "items": [{ "id", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "suggestion"?: {"old","new"} }], "candidates": [] }`,
     `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
     renderReviewContextPrompt(context ? [{ context }] : []),
     ...diff.files.map((f) => `--- ${f.newPath}\n${f.diff}`),
-  ].join('\n\n');
-  return runPrompt(agentId, prompt, options);
+  ].filter((part) => part !== '').join('\n\n');
+  return runPrompt(modelId, prompt, options);
 }
 
 /**
@@ -143,7 +157,8 @@ export function changesetContextEntries(members: readonly ChangesetAgentMember[]
 }
 
 export async function runLmChangesetAgent(
-  agentId: string,
+  agent: AgentDescriptor,
+  modelId: string,
   members: readonly ChangesetAgentMember[],
   criteria: Criteria,
   options?: RunAgentOptions,
@@ -151,7 +166,13 @@ export async function runLmChangesetAgent(
   const headSha = changesetHeadSha(members);
   const contract = '{ "id", "projectId", "mrIid", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "cross"?: true, "spans"?: [{"projectId","location","role"}], "suggestion"?: {"old","new"} }';
   const prompt = [
-    'You are a code review agent. Review this changeset as one distributed unit. Review ONLY the labelled diffs below.',
+    // Same rule as `runLmAgent`: the agent goes first and owns nothing after
+    // it. The changeset framing below is system-owned — it describes the
+    // labelling contract the response parser enforces, not a persona — so it
+    // stays whichever agent is selected. Its old "You are a code review
+    // agent." opener has moved into the agent, which is what now supplies it.
+    agent.instructions,
+    'Review this changeset as one distributed unit. Review ONLY the labelled diffs below.',
     'Find both normal per-repository issues and failures that exist only between repositories. A cross-repository item must set cross=true and name both sides in spans[].',
     `Respond with one JSON object: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": ${JSON.stringify(headSha)}, "items": [${contract}], "candidates": [] }`,
     'Every item must use the exact projectId and mrIid labels supplied below. The file and line must identify an added line in that member diff.',
@@ -164,8 +185,8 @@ export async function runLmChangesetAgent(
       `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${file.newPath}`,
       file.diff,
     ].join('\n'))),
-  ].join('\n\n');
-  return validateChangesetResponse(await runPrompt(agentId, prompt, options), members);
+  ].filter((part) => part !== '').join('\n\n');
+  return validateChangesetResponse(await runPrompt(modelId, prompt, options), members);
 }
 
 /**
@@ -174,19 +195,24 @@ export async function runLmChangesetAgent(
  * and trace machinery through `streamText` and skips the parse entirely.
  */
 export async function runFollowUpPrompt(
-  agentId: string,
+  agent: AgentDescriptor,
+  modelId: string,
   prompt: string,
   options?: RunAgentOptions,
 ): Promise<string> {
-  return streamText(agentId, prompt, options, (text, trace) => {
+  // The agent's instructions lead here too, so the answer keeps the persona
+  // that produced the finding being asked about. An agent with no
+  // instructions contributes nothing and the prompt is what it always was.
+  const withPersona = [agent.instructions, prompt].filter((part) => part !== '').join('\n\n');
+  return streamText(modelId, withPersona, options, (text, trace) => {
     trace.rawText(text, true);
     trace.success(0);
     return text.trim();
   });
 }
 
-export async function runPrompt(agentId: string, prompt: string, options?: RunAgentOptions): Promise<AgentReviewResponse> {
-  return streamText(agentId, prompt, options, (text, trace) => {
+export async function runPrompt(modelId: string, prompt: string, options?: RunAgentOptions): Promise<AgentReviewResponse> {
+  return streamText(modelId, prompt, options, (text, trace) => {
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start < 0 || end <= start) {
@@ -212,12 +238,12 @@ export async function runPrompt(agentId: string, prompt: string, options?: RunAg
  * failure. Everything about timeouts, cancellation and tracing lives here once.
  */
 async function streamText<T>(
-  agentId: string,
+  modelId: string,
   prompt: string,
   options: RunAgentOptions | undefined,
   finish: (text: string, trace: AgentTrace) => T,
 ): Promise<T> {
-  const [vendor, family] = agentId.slice(LM_PREFIX.length).split('/');
+  const [vendor, family] = modelId.slice(LM_PREFIX.length).split('/');
   const requestId = Math.random().toString(16).slice(2, 8);
   const trace = new AgentTrace(options?.trace ?? defaultTraceSink(), requestId, vendor ?? '', family ?? '');
   trace.prompt(prompt);
@@ -225,7 +251,7 @@ async function streamText<T>(
   const models = await vscode.lm.selectChatModels({ vendor, family });
   const model = models[0];
   if (!model) {
-    const message = `Agent ${agentId} is no longer available`;
+    const message = `Model ${modelId} is no longer available`;
     trace.failure(message);
     throw new AgentRunError(message, requestId, false);
   }

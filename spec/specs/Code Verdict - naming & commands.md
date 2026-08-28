@@ -42,7 +42,7 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Ask agent about this item | `codeVerdict.askAgent` | `⌘↩` / `Ctrl+Enter` |
 | Verdict: Generate summary | `codeVerdict.generateSummary` | Enabled once every item is triaged |
 | Verdict: Submit review | `codeVerdict.submitReview` | |
-| Verdict: Select review agent | `codeVerdict.selectAgent` | Lists Copilot workspace agents |
+| Verdict: Select review agent | `codeVerdict.selectAgent` | Opens the tuning panel; the agent and model pickers are on the run screen |
 | Verdict: Edit review criteria | `codeVerdict.editCriteria` | Severity floor, categories, confidence |
 | Verdict: New pod | `codeVerdict.newPod` | |
 | Verdict: Switch pod | `codeVerdict.switchPod` | Quick pick |
@@ -57,7 +57,7 @@ elsewhere. Nothing is bound by default outside that context.
 
 ## Settings namespace
 
-`codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.severityFloor`,
+`codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.agentLocations`, `codeVerdict.severityFloor`,
 `codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
 `codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
 `codeVerdict.pods`.
