@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, BUILTIN_AGENT_ID } from './agents';
 import { reconcile } from './podSelection';
@@ -227,5 +229,22 @@ describe('re-discovery after the filesystem changes (spec: Agent set changes whi
     dirs.set('/ws/a', [['new.agent.md', 1]]);
     files.set('/ws/a/new.agent.md', VALID);
     expect((await discoverAgents([root])).agents).toHaveLength(1);
+  });
+});
+
+describe('the real agent file committed in this repository', () => {
+  it('parses under the strict subset — tools list, quoted description and all', () => {
+    // The realistic input: a file written for VS Code's own custom-agent
+    // format, carrying keys this parser does not read. If the subset were too
+    // strict to accept it, the format would be wrong, not the file.
+    const text = readFileSync(join(process.cwd(), '.github/agents/openspec.agent.md'), 'utf8');
+    const result = parseAgentFile(text, 'agent:ws/openspec.agent.md', '.github/agents', 'workspace');
+    expect(result).toHaveProperty('agent');
+    const { agent } = result as { agent: { label: string; description: string; instructions: string } };
+    expect(agent.label).toBe('OpenSpec');
+    expect(agent.description).toContain('Manages OpenSpec changes');
+    // The body starts after the header, and the header's own keys are not in it.
+    expect(agent.instructions).toContain('# OpenSpec Agent');
+    expect(agent.instructions.startsWith('name:')).toBe(false);
   });
 });
