@@ -156,3 +156,75 @@ describe('refresh label', () => {
     expect(early.fetchedLabel).not.toBe(later.fetchedLabel);
   });
 });
+
+/**
+ * Live run state on a row. A run in flight outranks every recorded outcome,
+ * because it is about to replace one — showing last week's verdict on a row
+ * whose review is running says the wrong thing about what is being waited for.
+ */
+describe('a row whose review is running', () => {
+  const now = Date.parse('2026-08-25T12:00:00.000Z');
+  const run = (over: Partial<ReviewRun> = {}): ReviewRun => ({
+    repoId: '9101',
+    crNumber: '1',
+    outcome: 'findings',
+    findingCount: 3,
+    agentLabel: 'Copilot',
+    ranAt: '2026-08-25T10:00:00.000Z',
+    ...over,
+  });
+
+  it('says a review is running, over whatever the last one concluded', () => {
+    const state = toViewState(
+      data(['1']),
+      now,
+      new Set(),
+      undefined,
+      new Map([['9101!1', run()]]),
+      new Map([['9101!1', 'running']]),
+    );
+    expect(state.rows[0]?.ai.label).toBe('running…');
+  });
+
+  it('says a review is queued, over a submitted review', () => {
+    const state = toViewState(
+      data(['1']),
+      now,
+      new Set(['9101!1']),
+      undefined,
+      new Map(),
+      new Map([['9101!1', 'queued']]),
+    );
+    expect(state.rows[0]?.ai.label).toBe('queued');
+  });
+
+  it('goes back to the recorded outcome once the run is over', () => {
+    const state = toViewState(data(['1']), now, new Set(), undefined, new Map([['9101!1', run()]]), new Map());
+    expect(state.rows[0]?.ai.label).toBe('3 findings');
+  });
+
+  it('says an interrupted run was interrupted, not that it found nothing', () => {
+    // Falling through to the finding count would report a confident
+    // "0 findings" about a run that never produced one.
+    const state = toViewState(
+      data(['1']),
+      now,
+      new Set(),
+      undefined,
+      new Map([['9101!1', run({ outcome: 'interrupted', findingCount: 0 })]]),
+    );
+    expect(state.rows[0]?.ai.label).toBe('interrupted');
+  });
+
+  it('leaves rows with no run in flight alone', () => {
+    const state = toViewState(
+      data(['1', '2']),
+      now,
+      new Set(),
+      undefined,
+      new Map(),
+      new Map([['9101!1', 'running']]),
+    );
+    expect(state.rows.map((row) => row.ai.label)).toEqual(['running…', 'not run']);
+  });
+});

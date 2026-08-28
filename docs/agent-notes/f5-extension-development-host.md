@@ -68,8 +68,14 @@ real session directory.
 `activate()` neither throws nor spins. Requiring the bundle with `Module._load` patched to return a
 permissive Proxy for `require('vscode')`, then calling `activate(context)` with
 `extensionMode: 2`, exercises the same debug-bypass branch F5 takes. A healthy run resolves in tens
-of milliseconds and registers 25 commands and ~30 subscriptions. This separates "the extension is
-broken" from "the window is dying" in seconds, without a display.
+of milliseconds; as of the background-review-runs change it registers 29 commands, 36 subscriptions
+and 6 status-bar items. This separates "the extension is broken" from "the window is dying" in
+seconds, without a display.
+
+Treat those counts as a floor that grows, not a fixture: what matters is that `activate()` resolves
+rather than throwing or hanging, and that a command you have just added appears in the list. The
+stub needs `Memento.keys()` since retention reads it, and `lm.selectChatModels` returning `[]` is
+enough — nothing on the activation path awaits a model.
 
 ## Two shell traps hit while doing this
 

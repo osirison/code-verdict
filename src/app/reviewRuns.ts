@@ -18,8 +18,14 @@ import type { KeyValueStore } from './storage';
  * `clean` = the agent ran and returned nothing; `findings` = it ran and left
  * N items waiting for triage. Both are "reviewed" for coverage purposes; only
  * a `ReviewHistory` entry is "submitted".
+ *
+ * `interrupted` = it was still running when the extension host stopped. A
+ * `vscode.lm` stream cannot be reattached afterwards, so the run is genuinely
+ * gone; recording it is how the change request avoids silently reading
+ * whatever it read before, which is indistinguishable from never having run.
+ * It is neither reviewed nor submitted, and counts towards no coverage.
  */
-export type ReviewRunOutcome = 'clean' | 'findings';
+export type ReviewRunOutcome = 'clean' | 'findings' | 'interrupted';
 
 export interface ReviewRun {
   repoId: string;

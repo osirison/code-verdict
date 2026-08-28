@@ -74,6 +74,26 @@ export interface RunAgentOptions {
   trace?: AgentTraceSink;
   /** The configured windows. Omitted falls back to the defaults above, which is what an unconfigured caller wants. */
   timeouts?: AgentRunTimeouts;
+  /**
+   * The caller's own stop signal, linked to the internal source below. Without
+   * it a caller could only stop *listening* — the request kept streaming, spent
+   * its tokens, and the answer was dropped on arrival. That was tolerable while
+   * a run belonged to the panel that started it; with runs holding a slot in a
+   * concurrency budget it is not, because a run nobody is waiting for would
+   * still keep the next one out.
+   */
+  cancellation?: AgentCancellationToken;
+}
+
+/**
+ * The one piece of `vscode.CancellationToken` this module uses. Declared
+ * structurally rather than imported as a type so a caller can hand in a real
+ * one and a test can hand in an object literal — `vscode.CancellationToken`
+ * satisfies it.
+ */
+export interface AgentCancellationToken {
+  readonly isCancellationRequested: boolean;
+  onCancellationRequested(listener: () => void): { dispose(): void };
 }
 
 /**
@@ -104,8 +124,16 @@ export class AgentRunError extends Error {
     message: string,
     readonly requestId: string,
     readonly timedOut: boolean,
-    /** Set only when `timedOut` — which of the two limits (see above) cancelled the run. */
+    /** Set when the request was cancelled — which limit ran out, or `'caller'`. */
     readonly timeoutReason?: AgentTimeoutReason,
+    /**
+     * The reviewer stopped it. Kept separate from `timedOut` because the two
+     * mean opposite things to whoever reads the result: a timeout is a failure
+     * to report and offer a retry for, a cancellation is the outcome that was
+     * asked for. Both arrive here as a cancelled token, so without this flag
+     * the only way to tell them apart is the message text.
+     */
+    readonly cancelled: boolean = false,
   ) {
     super(message);
     this.name = 'AgentRunError';
@@ -285,6 +313,15 @@ async function streamText<T>(
   armCeiling();
 
   let inactivity = schedule(timeouts.inactivityMs, () => cancelWith('inactivity'));
+  // The caller's signal joins the same source the two windows use, so there is
+  // one way to stop a request and one place that classifies why it stopped.
+  // Checked first as well as subscribed: a token that was already cancelled
+  // before the run started fires no event, and would otherwise stream to
+  // completion for a caller that had already given up.
+  const callerCancel = options?.cancellation;
+  const callerSubscription = callerCancel?.onCancellationRequested(() => cancelWith('caller'));
+  if (callerCancel?.isCancellationRequested) cancelWith('caller');
+
   const onFragment = () => {
     producedThisCeiling = true;
     clearTimeout(inactivity);
@@ -307,6 +344,14 @@ async function streamText<T>(
     return finish(text, trace);
   } catch (e) {
     if (tokenSource.token.isCancellationRequested) {
+      if (timeoutReason === 'caller') {
+        // Not a failure: the reviewer asked for this. Reported as its own
+        // outcome so the caller does not offer to lengthen a window that had
+        // nothing to do with it.
+        const message = 'run cancelled';
+        trace.failure(message, 'caller');
+        throw new AgentRunError(message, requestId, false, 'caller', true);
+      }
       // Two limits, two sentences: which window ran out tells the reviewer
       // whether to lengthen the short one or the long one.
       const message =
@@ -327,6 +372,7 @@ async function streamText<T>(
   } finally {
     clearTimeout(ceiling);
     clearTimeout(inactivity);
+    callerSubscription?.dispose();
     tokenSource.dispose();
   }
 }

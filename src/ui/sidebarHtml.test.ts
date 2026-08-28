@@ -407,3 +407,57 @@ describe('changeset scope in the sidebar (spec §15)', () => {
     expect(scoped).toContain('finding-dot major');
   });
 });
+
+/**
+ * Reviews in flight, shown whatever screen the sidebar is on. A background run
+ * the reviewer cannot see is a run they will not know finished.
+ */
+describe('the active-run list', () => {
+  it('lists each run with its elapsed time and a way to cancel it', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [
+        { key: '9101!2841', label: '!2841', state: 'running', elapsedMs: 42_000 },
+        { key: '9101!2900', label: '!2900', state: 'queued', elapsedMs: 3_000 },
+      ],
+    }, 'nonce123');
+    expect(html).toContain('Running · 1 of 2');
+    expect(html).toContain('!2841');
+    // A stopwatch, not a duration phrase.
+    expect(html).toContain('0:42');
+    // A queued run says so instead of showing a clock for work not started.
+    expect(html).toContain('queued');
+    expect(html).toContain('data-cancel-run="9101!2841"');
+    expect(html).toContain('data-cancel-run="9101!2900"');
+  });
+
+  it('renders nothing at all when no review is running', () => {
+    // An empty section is a claim there is something to see.
+    const html = renderSidebarHtml({ ...state, activeRuns: [] }, 'nonce123');
+    // `.run-list` is in the stylesheet whatever happens; the section is what
+    // must be absent.
+    expect(html).not.toContain('<div class="run-list">');
+    expect(html).not.toContain('Running ·');
+  });
+
+  it('renders nothing when the caller has never reported any runs', () => {
+    expect(renderSidebarHtml(state, 'nonce123')).not.toContain('<div class="run-list">');
+  });
+
+  it('formats a run past a minute as minutes and seconds', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{ key: 'k', label: '!1', state: 'running', elapsedMs: 727_000 }],
+    }, 'nonce123');
+    expect(html).toContain('12:07');
+  });
+
+  it('escapes a label rather than letting a change request title reach the DOM', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{ key: 'k', label: '<img src=x onerror=alert(1)>', state: 'running', elapsedMs: 0 }],
+    }, 'nonce123');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img');
+  });
+});

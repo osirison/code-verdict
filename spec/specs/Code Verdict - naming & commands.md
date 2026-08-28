@@ -55,12 +55,32 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.
 
+### Internal commands
+
+Not in the palette — reached from a control, a keybinding, or a status-bar segment.
+
+| Id | Reached from |
+| --- | --- |
+| `codeVerdict.internal.postedReviews` | Sidebar row, dashboard rows, "Track replies" |
+| `codeVerdict.internal.acceptCommentOnly` | `⇧A` |
+| `codeVerdict.internal.undoVerdict` | `U` |
+| `codeVerdict.internal.jumpSeverity` | `1`–`4` |
+| `codeVerdict.internal.keyboardHelp` | `?`, and the status bar's `? keys` |
+| `codeVerdict.internal.showNotifications` | The status bar's `🔔 n` |
+| `codeVerdict.internal.cancelRun` | The ✕ on a sidebar run row |
+| `codeVerdict.internal.showActiveRuns` | The status bar's running-review segment — lists what is in flight, cancels one from the pick |
+
 ## Settings namespace
 
 `codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.agentLocations`, `codeVerdict.severityFloor`,
 `codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
 `codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
-`codeVerdict.pods`.
+`codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`, `codeVerdict.agentRun.ceilingSeconds`,
+`codeVerdict.agentRun.maxConcurrent`.
+
+The three `agentRun` settings share one convention: `0` removes that limit. For the two windows
+that means "never time out on this"; for `maxConcurrent` it means "run as many reviews at once as
+are triggered".
 
 The access token is never a setting — it lives in the VS Code secret store.
 

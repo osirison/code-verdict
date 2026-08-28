@@ -83,6 +83,19 @@ export interface SidebarPendingReview {
   removed: number;
 }
 
+/**
+ * One review in flight. Shown outside the run screen because that is the whole
+ * point of a background run: the reviewer is somewhere else, and still needs to
+ * know something is happening and be able to stop it.
+ */
+export interface SidebarActiveRun {
+  key: string;
+  label: string;
+  state: 'running' | 'queued';
+  /** Milliseconds since it was triggered, formatted by the renderer. */
+  elapsedMs: number;
+}
+
 /** Spec §9: the posted-reviews thread list. */
 export interface SidebarThread {
   id: string;
@@ -113,6 +126,8 @@ export interface SidebarViewState {
   threads?: SidebarThreads;
   activeReview?: SidebarActiveReview;
   pendingReview?: SidebarPendingReview;
+  /** Reviews running or waiting for a slot. Rendered above whatever screen shows. */
+  activeRuns?: SidebarActiveRun[];
   /** Detected changesets — the nav row shows "N open" and opens the first (spec §15). */
   changesets?: Array<{ id: string; name: string }>;
   activeRoute?: string;
@@ -129,6 +144,7 @@ export type SidebarMessage =
   | { type: 'openTuning' }
   | { type: 'openSettings' }
   | { type: 'selectFinding'; itemId: string }
+  | { type: 'cancelRun'; key: string }
   | { type: 'selectThread'; threadId: string }
   | { type: 'openPostedReviewTab' }
   | { type: 'useDemoPod' }
@@ -153,7 +169,17 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .nav-count { color: var(--fg-dimmer); font-family: var(--font-mono); font-size: 10.5px; }
 .divider { border-top: 1px solid var(--line); margin-top: 4px; }
 .section { padding: 11px 12px 8px; color: var(--fg-dimmer); font-size: 10px; font-weight: 500; letter-spacing: .09em; text-transform: uppercase; }
-.pod-list, .list { display: flex; flex-direction: column; padding-bottom: 8px; }
+.pod-list, .list, .run-list { display: flex; flex-direction: column; padding-bottom: 8px; }
+/* One review in flight. The dot pulses only while a run is actually streaming;
+   a queued one is still, because nothing is happening on it yet. */
+.run-row { display: flex; align-items: center; gap: 8px; padding: 5px 12px; }
+.run-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: run-pulse 1.4s ease-in-out infinite; }
+.run-dot.queued { background: var(--fg-dimmer); animation: none; }
+.run-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.run-meta { flex: none; color: var(--fg-dimmer); font-family: var(--font-mono); font-size: 10.5px; }
+.run-cancel { flex: none; background: none; border: 0; color: var(--fg-dimmer); cursor: pointer; padding: 0 2px; font-size: 11px; }
+.run-cancel:hover { color: var(--fg); }
+@keyframes run-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 /* The row is two controls, so the selection background moves to the wrapper —
    otherwise the delete button sits outside the highlight it belongs to. */
 .pod-row-wrap { display: flex; align-items: stretch; width: 100%; }
@@ -350,6 +376,36 @@ function renderPending(pending: SidebarPendingReview): string {
   <div class="empty">No review items yet. Pick an agent and run the review.</div></section>`;
 }
 
+/**
+ * Reviews in flight, above whatever screen the sidebar is showing.
+ *
+ * Nothing at all when nothing is running: an empty section is a claim that
+ * there is something to see. Elapsed rather than a percentage, because a run
+ * that has parked on the same step for two minutes is exactly the case the
+ * reviewer needs to notice.
+ */
+function renderActiveRuns(runs: readonly SidebarActiveRun[]): string {
+  if (runs.length === 0) return '';
+  const rows = runs
+    .map(
+      (run) => `<div class="run-row">
+      <span class="run-dot ${run.state === 'queued' ? 'queued' : ''}"></span>
+      <span class="run-label">${escapeHtml(run.label)}</span>
+      <span class="run-meta">${run.state === 'queued' ? 'queued' : escapeHtml(formatElapsed(run.elapsedMs))}</span>
+      <button class="run-cancel" data-cancel-run="${escapeHtml(run.key)}" title="Cancel this review">✕</button>
+    </div>`,
+    )
+    .join('');
+  const running = runs.filter((run) => run.state === 'running').length;
+  return `<div class="divider"></div><div class="section">Running · ${running} of ${runs.length}</div><div class="run-list">${rows}</div>`;
+}
+
+/** `0:42`, `12:07` — a stopwatch, not a duration phrase. */
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
 /** Spec §9: status summary over the thread list. No counters, no filter pills. */
 function renderThreads(threads: SidebarThreads): string {
   const e = escapeHtml;
@@ -458,6 +514,7 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
   const body = `<main class="side">
     <header class="head"><span class="brand">Verdict</span><span class="head-tools"><button class="icon-btn" id="refresh" title="Refresh">${icon('refresh')}</button><span class="icon-btn">${icon('ellipsis')}</span></span></header>
     <nav class="nav" aria-label="Verdict navigation">${navRows}</nav>
+    ${renderActiveRuns(state.activeRuns ?? [])}
     ${screen === 'setup' ? '' : `<div class="divider"></div><div class="section">Pods</div><div class="pod-list">${podRows}</div>`}
     ${main}
     <footer class="foot">${footer}</footer>
@@ -467,6 +524,9 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
     const vscode = window.verdictVscode;
     const post = (message) => vscode.postMessage(message);
     document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
+    document.querySelectorAll('[data-cancel-run]').forEach((button) => {
+      button.addEventListener('click', () => post({ type: 'cancelRun', key: button.dataset.cancelRun }));
+    });
     document.getElementById('dashboard')?.addEventListener('click', () => post({ type: 'openDashboard' }));
     document.getElementById('changesets')?.addEventListener('click', () => post({ type: 'openChangesets', firstId: ${JSON.stringify(state.changesets?.[0]?.id)} }));
     document.getElementById('posted-reviews')?.addEventListener('click', () => post({ type: 'openPostedReviews' }));

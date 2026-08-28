@@ -49,6 +49,10 @@ export const INTERNAL_COMMANDS = {
   keyboardHelp: 'codeVerdict.internal.keyboardHelp',
   /** The status bar's `🔔 n` segment — list what is waiting, then clear it. */
   showNotifications: 'codeVerdict.internal.showNotifications',
+  /** The sidebar's per-run ✕ — stop one review, freeing its slot for the next. */
+  cancelRun: 'codeVerdict.internal.cancelRun',
+  /** The status bar's running-review segment — list what is in flight, cancel from the pick. */
+  showActiveRuns: 'codeVerdict.internal.showActiveRuns',
 } as const;
 
 export type InternalCommandId = (typeof INTERNAL_COMMANDS)[keyof typeof INTERNAL_COMMANDS];

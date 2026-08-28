@@ -224,6 +224,12 @@
           "default": 600,
           "description": "Long-horizon check on a review run. Every time this many seconds pass, the run is checked once: output arrived during the window and it continues, nothing arrived at all and it is cancelled. It never stops a run that is still producing, however long that run has been going. 0 removes the check."
         },
+        "codeVerdict.agentRun.maxConcurrent": {
+          "type": "number",
+          "minimum": 0,
+          "default": 3,
+          "description": "How many reviews may run at once. Reviews beyond this wait their turn and start as earlier ones finish, so triggering one never refuses or cancels another. Each running review costs a separate model request against your Copilot allowance, which is what this limit is for. 0 removes the limit."
+        },
         "codeVerdict.notifications.quietMode": {
           "type": "boolean",
           "default": false,

@@ -14,8 +14,7 @@ import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
-import { runDemoAgent } from '../app/demoAgent';
-import { AgentRunError, discoverModels, runFollowUpPrompt, runLmAgent } from '../app/lmAgent';
+import { AgentRunError, discoverModels, runFollowUpPrompt } from '../app/lmAgent';
 import type { AgentSelectionState } from './agentRefresh';
 import type { PodStore } from '../app/pods';
 import {
@@ -25,10 +24,17 @@ import {
   type ReviewContextEntry,
 } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
-import { ReviewRunStore } from '../app/reviewRuns';
+import {
+  clearSubmitLedger,
+  draftKeyFor,
+  readRetained,
+  runKeyForCr,
+  screenForRetained,
+  type SessionDraft,
+} from '../app/retainedReview';
+import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
-import type { AgentReviewResponse } from '../domain/agentResponse';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
 import { diffStats, parseHunks } from '../domain/diffHunks';
 import { composeSummary } from '../domain/summary';
@@ -36,7 +42,6 @@ import type { AgentVoice } from '../domain/summary';
 import {
   allDecided,
   clearVerdict,
-  createReview,
   firstOfSeverity,
   isStale,
   nextUndecided,
@@ -52,8 +57,8 @@ import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
-import { agentRunTimeouts } from './agentRunOptions';
-import { RunLiveness } from './runLiveness';
+import { agentRunConcurrency, agentRunTimeouts } from './agentRunOptions';
+import { livenessView } from './runLiveness';
 import { changesetTrailer } from './changesetOptions';
 import { escapeHtml } from './theme';
 import { renderMarkdown } from './markdown';
@@ -104,42 +109,20 @@ function followUpPrompt(item: ReviewItem, question: string, hunk: string | undef
     .join('\n');
 }
 
-interface SessionDraft {
-  review: Review;
-  threads: Record<string, Array<{ label: string; text: string }>>;
-  summaryText: string;
-  finalNote: string;
-  /** Partial-failure ledger — must survive reloads so a retry never re-posts what already landed (spec §7). */
-  failedKeys?: string[];
-  summaryPosted?: boolean;
-  verdictApplied?: boolean;
-  /** itemId → thread id for comments that already landed, across attempts. */
-  threadsAccum?: Record<string, string>;
-  /** Sticky: once any comment posted on its own, the review is not one review. */
-  postedIndividually?: boolean;
-  /** Comments already posted, so a retry does not lose the running total. */
-  postedCount?: number;
-}
-
 export interface ReviewFlowDeps {
   podStore: PodStore;
   secrets: SecretStore;
   workspaceState: KeyValueStore;
   globalState: KeyValueStore;
-  onSubmitted?: () => void;
   /**
-   * A review RUN was recorded — a different event from `onSubmitted`, and
-   * deliberately not folded into it: nothing has been posted to the platform
-   * yet, and a clean run never will be. Fired after the store write resolves
-   * so whatever repaints on the far side reads the run that just landed, not
-   * the state before it.
+   * Where runs live. The panel triggers one and subscribes to it; it does not
+   * own it, and closing the panel does not end it — which is the whole point.
    */
-  onRunRecorded?: () => void;
+  runs: ReviewRunManager;
+  onSubmitted?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
   /** Spec §3: identity and agent, before any findings exist. */
   onSidebarPending?: (state?: SidebarPendingReview) => void;
-  /** The agent finished a run — the notification engine's local event. */
-  onReviewReady?: (info: { ref: ChangeRequestRef; refLabel: string; itemCount: number }) => void;
   /**
    * Which detected changeset (if any) this MR belongs to — resolved lazily
    * after first paint so the entry-point chip never slows a review open.
@@ -218,15 +201,23 @@ export class ReviewFlowPanel {
   /** File-system, model-list and settings watchers; all three feed `refreshAgents`. */
   private agentWatches: vscode.Disposable[] = [];
   private review?: Review;
-  private response?: AgentReviewResponse;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
   private mode: 'split' | 'queue' | 'diff' = 'split';
   private selectedId?: string;
-  private runSteps: string[] = [];
-  private runStep = 0;
-  private runError?: { message: string; requestId: string; partialCount: number; code: string };
-  private runToken = 0;
-  private readonly runLive = new RunLiveness();
+  /**
+   * The run this panel is looking at, mirrored from the manager. It is a view,
+   * not the run: the panel closing or navigating elsewhere drops this field and
+   * touches nothing the manager holds.
+   */
+  private runRecord?: RunRecord;
+  /** The completed review this change request currently shows, if any. */
+  private retained?: ReturnType<typeof readRetained<SessionDraft>>;
+  private runWatch?: vscode.Disposable;
+  /**
+   * The reviewer opened the pickers from a result that is still retained. The
+   * agent screen then owes them a way back to it — nothing has replaced it.
+   */
+  private newRunFromResult = false;
   private summaryText = '';
   private finalNote = '';
   private postThread = true;
@@ -251,7 +242,12 @@ export class ReviewFlowPanel {
   ) {
     route.onLeave(() => {
       this.disposed = true;
-      this.runToken += 1;
+      // Deliberately NOT cancelling the run. Leaving the screen used to end it
+      // — the reviewer who glanced at the dashboard came back to the agent
+      // picker with nothing to show for the minutes the model had spent. The
+      // panel unsubscribes; the run carries on and finishes headlessly.
+      this.runWatch?.dispose();
+      this.runWatch = undefined;
       this.stopHeadPoll();
       for (const watch of this.agentWatches) watch.dispose();
       this.agentWatches = [];
@@ -305,20 +301,19 @@ export class ReviewFlowPanel {
   }
 
   private draftKey(): string {
-    return `codeVerdict.draft.${this.ref.repoId}!${this.ref.number}`;
+    return draftKeyFor(this.ref);
   }
 
   private loadSeq = 0;
 
   private async load(ref: ChangeRequestRef): Promise<void> {
     const loadToken = ++this.loadSeq;
-    // Cancel any in-flight run for the previous MR — its completion must
-    // never land findings under this ref's review or draft key.
-    this.runToken += 1;
-    this.runSteps = [];
-    this.runStep = 0;
-    this.runLive.clear();
-    this.runError = undefined;
+    // Navigating to another change request no longer cancels the run on the one
+    // being left. It cannot land under the wrong ref either: the manager keys
+    // every run by its target, so a result can only ever reach the record for
+    // the change request it was triggered for.
+    this.runRecord = undefined;
+    this.newRunFromResult = false;
     // Full per-MR reset: nothing (verdicts, threads, summary text, the
     // partial-failure ledger) may leak from one MR into another.
     this.ref = ref;
@@ -335,7 +330,7 @@ export class ReviewFlowPanel {
     this.reviewContext = undefined;
     this.contextOpen = false;
     this.review = undefined;
-    this.response = undefined;
+    this.retained = undefined;
     this.threads = {};
     this.selectedId = undefined;
     this.summaryText = '';
@@ -410,27 +405,20 @@ export class ReviewFlowPanel {
       this.applySelection(await selectionPromise);
       this.armAgentWatches();
 
-      // A surviving draft re-enters triage (spec: drafts lose no work),
-      // including the partial-failure ledger.
-      const draft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
-      if (draft && draft.review.headSha) {
-        this.review = draft.review;
-        this.threads = draft.threads;
-        this.summaryText = draft.summaryText;
-        this.finalNote = draft.finalNote;
-        this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
-        this.summaryPosted = draft.summaryPosted ?? false;
-        this.verdictApplied = draft.verdictApplied ?? false;
-        this.threadsAccum = { ...draft.threadsAccum };
-        this.postedIndividually = draft.postedIndividually ?? false;
-        this.postedCount = draft.postedCount ?? 0;
-        this.screen = 'triage';
-        this.selectedId = nextUndecided(draft.review)?.id ?? draft.review.items[0]?.id;
-        // The diff just fetched is the branch as it stands now, so the same
-        // fetch that detects the moved head also says which findings moved.
-        this.staleHead = isStale(draft.review, cr.headSha) ? cr.headSha : undefined;
-        this.staleItemIds = this.staleHead ? this.markMoved(this.diff) : new Set();
-      } else {
+      // What this change request opens on, in order of precedence. A run
+      // happening right now outranks everything, because it is about to replace
+      // it; then a failure nobody has seen yet; then the completed review, which
+      // is the common case and the one that used to be thrown away.
+      this.watchRun();
+      const hadRetained = this.enterRetained();
+      const record = this.deps.runs.get(this.runKey());
+      if (record && (record.status === 'queued' || record.status === 'running')) {
+        this.attachRun(record);
+        this.screen = 'running';
+      } else if (record?.status === 'failed') {
+        this.attachRun(record);
+        this.screen = 'running';
+      } else if (!hadRetained) {
         this.screen = 'agent';
       }
       this.render();
@@ -550,152 +538,188 @@ export class ReviewFlowPanel {
 
   // ---- running ----------------------------------------------------------------
 
+  /** The manager's key for this panel's change request. */
+  private runKey(): string {
+    return runKeyForCr(this.ref);
+  }
+
+  /**
+   * Start a review, or attach to the one already running on this change
+   * request. The panel does not own what happens next: it hands the manager
+   * everything the run needs and watches the record that comes back.
+   *
+   * The selection is written to the pod first and separately. That is a
+   * preference — what to pre-select next time — and it is deliberately not part
+   * of the run, which carries its own copy in the snapshot below and is
+   * therefore untouched by anything the reviewer changes afterwards.
+   */
   private async run(): Promise<void> {
     if (!this.diff) return;
-    const token = ++this.runToken;
-    this.screen = 'running';
-    this.runError = undefined;
-    this.runStep = 0;
-    this.runLive.clear();
     const pod = this.pod();
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
     await this.deps.podStore.upsert(pod);
+    if (this.disposed) return;
 
-    if (this.agentId === DEMO_AGENT_DESCRIPTOR.id) {
-      const { response, steps } = runDemoAgent(this.diff, pod.criteria);
-      this.runSteps = steps;
-      // Walk the log like the spec's progress screen — a log, not a spinner.
-      for (let i = 0; i <= steps.length; i++) {
-        if (this.disposed || token !== this.runToken) return;
-        this.runStep = i;
+    const demo = this.agentId === DEMO_AGENT_DESCRIPTOR.id;
+    if (!demo) {
+      // A model-backed agent with no model must not reach the transport: an
+      // empty id there selects an arbitrary model rather than failing, because
+      // `selectChatModels({vendor: undefined, family: undefined})` matches
+      // everything.
+      const stillThere = await discoverModels();
+      if (this.disposed) return;
+      if (this.modelId === undefined || !stillThere.some((model) => model.id === this.modelId)) {
+        this.selectionNotices = [`The model "${this.modelId ?? 'none selected'}" is no longer available.`];
+        this.models = stillThere;
+        this.screen = 'agent';
         this.render();
-        await new Promise((resolve) => setTimeout(resolve, 320));
+        return;
       }
-      if (this.disposed || token !== this.runToken) return;
-      this.finishRun(response);
-      return;
     }
 
-    const lmStats = diffStats(this.diff.files.map((f) => f.diff));
-    this.runSteps = [
-      `Sending ${this.selectedAgent().label} to ${this.selectedModel()?.label ?? 'the model'}…`,
-      `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
-      'Cross-referencing module history…',
-      `Scoring findings against ${getProvider(this.pod().providerId).vocabulary.repoNoun} criteria…`,
-      'Items ready',
-    ];
-    this.runStep = 2;
-    // The log parks here for the whole request, so the liveness line under it
-    // is what tells the reviewer the run is alive rather than hung.
-    this.runLive.start();
-    this.render();
-    // The list is re-read here, not trusted from load: a model can disappear
-    // between selecting it and pressing Run (Copilot signed out, the model
-    // retired). Failing with its name beats a bare "no longer available" from
-    // inside the transport.
-    const stillThere = await discoverModels();
-    if (this.disposed || token !== this.runToken) return;
-    if (this.modelId === undefined || !stillThere.some((m) => m.id === this.modelId)) {
-      this.selectionNotices = [`The model "${this.modelId ?? 'none selected'}" is no longer available.`];
-      this.models = stillThere;
-      this.screen = 'agent';
-      this.runLive.clear();
-      this.render();
-      return;
-    }
-    const timeouts = agentRunTimeouts();
-    try {
-      const response = await runLmAgent(this.selectedAgent(), this.modelId ?? '', this.diff, pod.criteria, this.reviewContext, {
-        timeouts,
-        onProgress: (progress) => {
-          if (!this.disposed && token === this.runToken) this.runLive.record(progress, this.panel.webview);
-        },
-      });
-      if (this.disposed || token !== this.runToken) return;
-      this.finishRun(response);
-    } catch (e) {
-      if (this.disposed || token !== this.runToken) return;
-      const err = e instanceof AgentRunError ? e : new AgentRunError(String(e), '------', false);
-      this.runError = {
-        message: err.message,
-        requestId: err.requestId,
-        partialCount: 0,
-        // The window that actually ran out, not the shipped default — a
-        // reviewer who lengthened it needs the code to name their number.
-        code: err.timedOut
-          ? `copilot.request.timeout · ${err.timeoutReason === 'ceiling' ? timeouts.ceilingMs : timeouts.inactivityMs}ms`
-          : 'copilot.request.error',
-      };
-      this.render();
-    }
-  }
-
-  private finishRun(response: AgentReviewResponse): void {
-    const pod = this.pod();
-    this.response = response;
-    this.deps.onReviewReady?.({
-      ref: this.ref,
+    const lmStats = diffStats(this.diff.files.map((file) => file.diff));
+    const input: RunInput = {
+      target: { kind: 'cr', ref: this.ref, diff: this.diff, reviewContext: this.reviewContext },
       refLabel: this.refLabel(),
-      itemCount: response.items.length,
-    });
-    // Both branches, not just the submit path: a run that came back clean was
-    // written nowhere at all, so the dashboard kept saying "not run" for a
-    // change request the agent had already cleared, and ⟳ kept showing the
-    // same thing — the whole reason the refresh button read as dead.
-    // Fire-and-forget like `persistDraft` below, for the same reason: the
-    // paint must not wait on globalState. Not `.catch()`ed — a failed write
-    // is a real fault and belongs in the extension-host log, not swallowed.
-    void this.recordRun(response);
-    if (response.items.length === 0) {
-      // The superseded draft must not resurrect a dead review on next open.
-      void this.deps.workspaceState.update(this.draftKey(), undefined);
-      this.review = undefined;
-      this.screen = 'clean';
-      this.render();
-      return;
-    }
-    this.review = createReview({
-      repoId: this.ref.repoId,
-      crNumber: this.ref.number,
-      agentId: this.agentId,
-      modelId: this.modelId,
+      podId: pod.id,
       criteria: pod.criteria,
-      response,
-    });
-    this.threads = {};
-    // A fresh run supersedes any previous submit attempt's ledger.
-    this.submitError = undefined;
-    this.failedKeys = undefined;
-    this.summaryPosted = false;
-    this.verdictApplied = false;
-    this.threadsAccum = {};
-    this.postedIndividually = false;
-    this.postedCount = 0;
-    this.selectedId = this.review.items[0]?.id;
-    this.staleHead = undefined;
-    this.screen = 'triage';
-    void this.persistDraft();
+      agent: this.selectedAgent(),
+      agentLabel: this.agentLabel(),
+      modelId: demo ? undefined : this.modelId,
+      timeouts: agentRunTimeouts(),
+      steps: [
+        `Sending ${this.selectedAgent().label} to ${this.selectedModel()?.label ?? 'the model'}…`,
+        `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
+        'Cross-referencing module history…',
+        `Scoring findings against ${getProvider(pod.providerId).vocabulary.repoNoun} criteria…`,
+        'Items ready',
+      ],
+      demo,
+    };
+
+    this.newRunFromResult = false;
+    this.attachRun(this.deps.runs.trigger(input, agentRunConcurrency()));
+    this.screen = 'running';
     this.render();
   }
 
   /**
-   * Record the outcome of a run and only then tell the rest of the extension
-   * to repaint: the callback fans out to views that read this very store, so
-   * firing it before the write resolves would repaint them onto the previous
-   * run. The agent label is resolved here rather than in the store so the
-   * dashboard can name the agent offline, the way `ReviewHistory` does.
+   * Mirror a run's state onto this panel. Subscribed rather than awaited, so a
+   * run that was already going when the reviewer arrived paints from wherever
+   * it has got to rather than from its beginning.
    */
-  private async recordRun(response: AgentReviewResponse): Promise<void> {
-    await new ReviewRunStore(this.deps.globalState).record({
-      repoId: this.ref.repoId,
-      crNumber: this.ref.number,
-      outcome: response.items.length === 0 ? 'clean' : 'findings',
-      findingCount: response.items.length,
-      agentLabel: this.agentLabel(),
-      ranAt: new Date().toISOString(),
+  private watchRun(): void {
+    this.runWatch?.dispose();
+    this.runWatch = this.deps.runs.subscribe((record) => {
+      if (this.disposed || record.key !== this.runKey()) return;
+      this.attachRun(record);
+      this.renderRunState(record);
     });
-    this.deps.onRunRecorded?.();
+  }
+
+  private attachRun(record: RunRecord): void {
+    this.runRecord = record;
+  }
+
+  /**
+   * What a state change means for the screen. Only `succeeded` moves it: the
+   * manager has already written the retained review by then, so the panel reads
+   * it back rather than being handed findings out of band — one writer, and no
+   * way for an open panel to disagree with a closed one.
+   */
+  private renderRunState(record: RunRecord): void {
+    if (record.status === 'succeeded') {
+      this.deps.runs.acknowledge(record.key);
+      this.runRecord = undefined;
+      // Re-entering through load() would refetch the change request for no
+      // reason; the record is on disk and everything else is already in hand.
+      this.enterRetained();
+      this.render();
+      return;
+    }
+    if (record.status === 'cancelled') {
+      this.runRecord = undefined;
+      // Back to whatever was there before — a retained review, or the pickers.
+      if (!this.enterRetained()) this.screen = 'agent';
+      this.render();
+      return;
+    }
+    this.render();
+  }
+
+  /**
+   * Start the pickers from what produced the review being shown, not from
+   * whatever the pod happens to hold. The two diverge as soon as any other run
+   * writes the pod's selection — a changeset review writes the same two fields
+   * — and "re-run this with a different agent" is a comparison against *this*
+   * review, so it has to start from this review's agent.
+   *
+   * A selection that no longer exists is not forced: the picker keeps what it
+   * has and says why, the way `applySelection` reports a vanished agent.
+   */
+  private preselectFromRetained(): void {
+    const retained = this.retained;
+    if (!retained) return;
+    const notices: string[] = [];
+    if (this.agents.some((agent) => agent.id === retained.agentId)) {
+      this.agentId = retained.agentId;
+    } else if (retained.agentLabel) {
+      notices.push(`The agent that produced this review, "${retained.agentLabel}", is no longer available.`);
+    }
+    if (retained.modelId !== undefined) {
+      if (this.models.some((model) => model.id === retained.modelId)) {
+        this.modelId = retained.modelId;
+      } else {
+        notices.push(`The model that produced this review, "${retained.modelId}", is no longer available.`);
+      }
+    }
+    if (notices.length > 0) this.selectionNotices = notices;
+  }
+
+  /**
+   * Load the retained review for this change request onto the screen, and say
+   * whether there was one. This is the whole of "a completed review is what a
+   * target opens on": one reader, used by `load()`, by a finished run, and by a
+   * cancelled one.
+   */
+  private enterRetained(): boolean {
+    const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(this.draftKey()));
+    if (!retained) {
+      // Cleared, not merely left: a change request with no record must not
+      // inherit the previous one's, which is what the header line and the
+      // clean screen's buckets are drawn from.
+      this.retained = undefined;
+      this.review = undefined;
+      return false;
+    }
+    const draft = retained.draft;
+    this.retained = retained;
+    this.review = retained.outcome === 'clean' ? undefined : draft.review;
+    this.threads = draft.threads;
+    this.summaryText = draft.summaryText;
+    this.finalNote = draft.finalNote;
+    this.failedKeys = draft.failedKeys ? new Set(draft.failedKeys) : undefined;
+    this.summaryPosted = draft.summaryPosted ?? false;
+    this.verdictApplied = draft.verdictApplied ?? false;
+    this.threadsAccum = { ...draft.threadsAccum };
+    this.postedIndividually = draft.postedIndividually ?? false;
+    this.postedCount = draft.postedCount ?? 0;
+    this.screen = screenForRetained(retained);
+    if (this.review) {
+      this.selectedId = nextUndecided(this.review)?.id ?? this.review.items[0]?.id;
+      // The diff in hand is the branch as it stands now, so the same fetch that
+      // detects a moved head also says which findings moved.
+      this.staleHead = isStale(this.review, this.cr?.headSha ?? this.review.headSha) ? this.cr?.headSha : undefined;
+      this.staleItemIds = this.staleHead && this.diff ? this.markMoved(this.diff) : new Set();
+    } else {
+      this.staleHead = undefined;
+      this.staleItemIds = new Set();
+    }
+    if (this.screen === 'done' && !this.doneSentence) {
+      this.doneSentence = 'This review was submitted.';
+    }
+    return true;
   }
 
   // ---- messages ------------------------------------------------------------------
@@ -780,9 +804,19 @@ export class ReviewFlowPanel {
         void this.run();
         return;
       case 'cancel':
-        this.runToken += 1;
-        this.screen = 'agent';
-        break;
+        // Two meanings on one message, because the failure screen's "Switch
+        // agent" reuses it. A live run is stopped — really stopped, request and
+        // slot both. A run that has already failed has nothing left to cancel,
+        // so this is the reviewer dismissing the failure and asking for the
+        // pickers; without the second branch the button did nothing at all.
+        if (this.runRecord && this.runRecord.status !== 'queued' && this.runRecord.status !== 'running') {
+          this.deps.runs.acknowledge(this.runKey());
+          this.runRecord = undefined;
+          this.screen = 'agent';
+          break;
+        }
+        this.deps.runs.cancel(this.runKey());
+        return;
       case 'retryRun':
         void this.run();
         return;
@@ -797,8 +831,22 @@ export class ReviewFlowPanel {
       case 'usePartial':
         // The demo agent never produces partials; the lm path reports 0
         // today — reachable once streaming partial parses land.
-        this.runError = undefined;
+        this.deps.runs.acknowledge(this.runKey());
+        this.runRecord = undefined;
+        if (!this.enterRetained()) this.screen = 'agent';
+        break;
+      case 'newRun':
+        // Open the pickers over a result that stays exactly where it is. Only a
+        // run that succeeds replaces it, which is what makes a cancelled or
+        // failed re-run cost the reviewer nothing.
+        this.newRunFromResult = this.retained !== undefined;
+        this.preselectFromRetained();
         this.screen = 'agent';
+        break;
+      case 'backToResult':
+        // The way back from the pickers, and from a run in flight, to the
+        // review that is still retained.
+        if (!this.enterRetained()) this.screen = 'agent';
         break;
       case 'toggleReviewContext':
         this.contextOpen = !this.contextOpen;
@@ -1180,7 +1228,18 @@ export class ReviewFlowPanel {
         // verdict that already landed, so its result carries no flag.
         requestedChanges: this.verdictApplied,
       });
-      await this.deps.workspaceState.update(this.draftKey(), undefined);
+      // Not a deletion. Clearing the ledger is the whole of what this is
+      // entitled to do — nothing that landed may be posted twice — and
+      // deleting the record took the review with it, so a submitted change
+      // request re-opened on the agent picker with no trace of what was
+      // posted. `submittedAt` is what routes it to the done screen instead.
+      const submittedDraft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
+      if (submittedDraft) {
+        await this.deps.workspaceState.update(
+          this.draftKey(),
+          clearSubmitLedger(submittedDraft, new Date().toISOString()),
+        );
+      }
       this.submitError = undefined;
       this.failedKeys = undefined;
       // "as one review thread" only when a single review really was created:
@@ -1364,10 +1423,19 @@ export class ReviewFlowPanel {
       selectionNotices: this.selectionNotices,
       skippedAgents: this.skippedAgents,
       criteria: pod.criteria,
-      runSteps: this.runSteps,
-      runStep: this.runStep,
-      runLive: this.runLive.snapshot(),
-      runError: this.runError,
+      runSteps: this.runRecord?.steps ?? [],
+      runStep: this.runRecord?.step ?? 0,
+      runLive: livenessView(this.runRecord),
+      runError: this.runRecord?.status === 'failed' && this.runRecord.failure
+        ? { ...this.runRecord.failure, partialCount: 0 }
+        : undefined,
+      runQueued: this.runRecord?.status === 'queued',
+      // The retained review stays reachable from the pickers and from a run in
+      // flight: neither of them has replaced it yet.
+      retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
+      retainedMeta: this.retained
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.agentLabel(), modelLabel: this.reviewModelLabel() }
+        : undefined,
       mode: this.mode,
       items,
       selectedId: this.selectedId,
@@ -1395,8 +1463,11 @@ export class ReviewFlowPanel {
             ).length,
           }
         : undefined,
-      candidates: this.response?.candidates ?? [],
-      filesRead: this.response?.stats?.filesRead ?? this.diff?.files.length ?? 0,
+      // From the retained record, not from a live response: the response object
+      // is gone once the run is over, and these two are the whole content of
+      // the clean screen, which has to survive being re-opened.
+      candidates: this.retained?.candidates ?? [],
+      filesRead: this.retained?.filesRead ?? this.diff?.files.length ?? 0,
       summaryText: this.summaryText,
       finalNote: this.finalNote,
       postThread: this.postThread,

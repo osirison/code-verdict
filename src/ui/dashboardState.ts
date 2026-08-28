@@ -34,18 +34,33 @@ export function formatClock(at: number): string {
 }
 
 /**
- * Precedence, strictly: submitted (it is on the platform) > clean (the agent
- * ran and found nothing) > findings waiting for triage > never run. Only the
- * first of those is a `ReviewHistory` entry; the middle two come from the
- * run store, which is why a clean run used to read "not run" forever.
+ * Precedence, strictly: happening now > submitted (it is on the platform) >
+ * clean (the agent ran and found nothing) > findings waiting for triage >
+ * interrupted > never run. Only the second of those is a `ReviewHistory`
+ * entry; the rest come from the run store, which is why a clean run used to
+ * read "not run" forever.
+ *
+ * A run in flight outranks every recorded outcome because it is about to
+ * replace one: showing last week's verdict on a row whose review is running
+ * says the wrong thing about what the reviewer is waiting for.
  *
  * Labels are sized for the 104px "AI review" column: at 11px mono a pill fits
  * about eleven characters inside its 8px padding, so "N findings" and "no
  * findings" fit and "N findings ready" would not.
  */
-function aiPill(submitted: boolean, run: ReviewRun | undefined): DashboardRow['ai'] {
+function aiPill(
+  submitted: boolean,
+  run: ReviewRun | undefined,
+  active: 'running' | 'queued' | undefined,
+): DashboardRow['ai'] {
+  if (active) return { label: active === 'queued' ? 'queued' : 'running…', cls: 'pill-agent' };
   if (submitted) return { label: 'submitted', cls: 'pill-agent' };
   if (run?.outcome === 'clean') return { label: 'no findings', cls: 'pill-ok' };
+  // Neither reviewed nor unreviewed: something ran and was lost with the
+  // window. Said plainly, because the alternative — falling through to the
+  // finding count — reports a confident "0 findings" about a run that never
+  // produced one.
+  if (run?.outcome === 'interrupted') return { label: 'interrupted', cls: 'pill' };
   if (run) return { label: `${run.findingCount} finding${run.findingCount === 1 ? '' : 's'}`, cls: 'pill-warn' };
   return { label: 'not run', cls: 'pill' };
 }
@@ -59,6 +74,12 @@ export interface DashboardDeps {
    * and is never a submitted review.
    */
   reviewRuns?: () => ReadonlyMap<string, ReviewRun>;
+  /**
+   * Which of those refs has a review in flight right now. Read separately from
+   * `reviewRuns` because it is live state, not a recorded outcome: it outranks
+   * whatever the last run concluded, and it clears on its own.
+   */
+  activeRuns?: () => ReadonlyMap<string, 'running' | 'queued'>;
   /** Row click: submitted rows open Posted reviews, others Run review (§2). */
   openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
   openChangeset?: (changesetId: string) => void;
@@ -68,6 +89,12 @@ export interface DashboardDeps {
   changesetOptions?: () => ChangesetDetectionOptions;
   /** Notify sibling views after the dashboard changes the active pod. */
   onPodChanged?: () => void;
+  /**
+   * Drop retained reviews for change requests that have closed. Hung off this
+   * refresh because it is the one that already knows which are still open, for
+   * exactly the repositories the answer is valid for.
+   */
+  pruneRetained?: (repoIds: readonly string[], openRefs: readonly { repoId: string; number: string }[]) => void;
 }
 
 export interface DashboardPodOption {
@@ -86,6 +113,8 @@ export function toViewState(
   submittedRefs: ReadonlySet<string>,
   changesetOptions?: ChangesetDetectionOptions,
   reviewRuns: ReadonlyMap<string, ReviewRun> = new Map(),
+  /** Targets with a review in flight or waiting for a slot, keyed the same way. */
+  activeRuns: ReadonlyMap<string, 'running' | 'queued'> = new Map(),
 ): DashboardViewState {
   const pod = data.pod;
   const you = pod.username;
@@ -124,7 +153,7 @@ export function toViewState(
       branch: cr.sourceBranch,
       project: repoLabel(pod, cr.ref.repoId),
       scope,
-      ai: aiPill(submitted, run),
+      ai: aiPill(submitted, run, activeRuns.get(refKey)),
       submitted,
       ciStatus: cr.ci?.status,
       age: formatAge(cr.updatedAt, now),
