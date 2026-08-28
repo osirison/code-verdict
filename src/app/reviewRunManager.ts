@@ -545,11 +545,21 @@ export class ReviewRunManager {
       filesRead: response.stats?.filesRead,
     });
 
+    // The write comes FIRST, before anything is told the run succeeded.
+    // `settle` notifies synchronously, and a panel watching this target reacts
+    // by reading the record back off the store — the one-writer rule in D7. Told
+    // first, it would read the *previous* run's review, or an empty screen, and
+    // nothing would repaint when the write landed a microtask later.
+    await this.deps.workspaceState.update(recordKeyFor(input.target), retained);
+    // Cancelled while that write was in flight: the reviewer asked for this run
+    // to stop, and `cancel` has already settled the record and freed its slot.
+    // The retained review is written either way — the work was done and paid
+    // for — but the run must not also report itself as succeeded.
+    if (!this.isRunning(key)) return;
     this.settle(record, { status: 'succeeded', response });
 
     // Read-modify-write with no `await` between the pair, per the contract in
     // `storage.ts` — two runs can finish in the same tick.
-    await this.deps.workspaceState.update(recordKeyFor(input.target), retained);
     await this.runs.record({
       repoId: identity.repoId,
       crNumber: identity.crNumber,

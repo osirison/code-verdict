@@ -35,7 +35,6 @@ import {
 import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
-import type { AgentReviewResponse } from '../domain/agentResponse';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
 import { diffStats, parseHunks } from '../domain/diffHunks';
 import { composeSummary } from '../domain/summary';
@@ -202,7 +201,6 @@ export class ReviewFlowPanel {
   /** File-system, model-list and settings watchers; all three feed `refreshAgents`. */
   private agentWatches: vscode.Disposable[] = [];
   private review?: Review;
-  private response?: AgentReviewResponse;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
   private mode: 'split' | 'queue' | 'diff' = 'split';
   private selectedId?: string;
@@ -332,7 +330,7 @@ export class ReviewFlowPanel {
     this.reviewContext = undefined;
     this.contextOpen = false;
     this.review = undefined;
-    this.response = undefined;
+    this.retained = undefined;
     this.threads = {};
     this.selectedId = undefined;
     this.summaryText = '';
@@ -651,6 +649,35 @@ export class ReviewFlowPanel {
   }
 
   /**
+   * Start the pickers from what produced the review being shown, not from
+   * whatever the pod happens to hold. The two diverge as soon as any other run
+   * writes the pod's selection — a changeset review writes the same two fields
+   * — and "re-run this with a different agent" is a comparison against *this*
+   * review, so it has to start from this review's agent.
+   *
+   * A selection that no longer exists is not forced: the picker keeps what it
+   * has and says why, the way `applySelection` reports a vanished agent.
+   */
+  private preselectFromRetained(): void {
+    const retained = this.retained;
+    if (!retained) return;
+    const notices: string[] = [];
+    if (this.agents.some((agent) => agent.id === retained.agentId)) {
+      this.agentId = retained.agentId;
+    } else if (retained.agentLabel) {
+      notices.push(`The agent that produced this review, "${retained.agentLabel}", is no longer available.`);
+    }
+    if (retained.modelId !== undefined) {
+      if (this.models.some((model) => model.id === retained.modelId)) {
+        this.modelId = retained.modelId;
+      } else {
+        notices.push(`The model that produced this review, "${retained.modelId}", is no longer available.`);
+      }
+    }
+    if (notices.length > 0) this.selectionNotices = notices;
+  }
+
+  /**
    * Load the retained review for this change request onto the screen, and say
    * whether there was one. This is the whole of "a completed review is what a
    * target opens on": one reader, used by `load()`, by a finished run, and by a
@@ -659,6 +686,10 @@ export class ReviewFlowPanel {
   private enterRetained(): boolean {
     const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(this.draftKey()));
     if (!retained) {
+      // Cleared, not merely left: a change request with no record must not
+      // inherit the previous one's, which is what the header line and the
+      // clean screen's buckets are drawn from.
+      this.retained = undefined;
       this.review = undefined;
       return false;
     }
@@ -773,8 +804,17 @@ export class ReviewFlowPanel {
         void this.run();
         return;
       case 'cancel':
-        // Really stops it now: the request is cancelled and its slot freed, so
-        // a queued review can start. It used to only stop this panel listening.
+        // Two meanings on one message, because the failure screen's "Switch
+        // agent" reuses it. A live run is stopped — really stopped, request and
+        // slot both. A run that has already failed has nothing left to cancel,
+        // so this is the reviewer dismissing the failure and asking for the
+        // pickers; without the second branch the button did nothing at all.
+        if (this.runRecord && this.runRecord.status !== 'queued' && this.runRecord.status !== 'running') {
+          this.deps.runs.acknowledge(this.runKey());
+          this.runRecord = undefined;
+          this.screen = 'agent';
+          break;
+        }
         this.deps.runs.cancel(this.runKey());
         return;
       case 'retryRun':
@@ -800,6 +840,7 @@ export class ReviewFlowPanel {
         // run that succeeds replaces it, which is what makes a cancelled or
         // failed re-run cost the reviewer nothing.
         this.newRunFromResult = this.retained !== undefined;
+        this.preselectFromRetained();
         this.screen = 'agent';
         break;
       case 'backToResult':
@@ -1392,6 +1433,9 @@ export class ReviewFlowPanel {
       // The retained review stays reachable from the pickers and from a run in
       // flight: neither of them has replaced it yet.
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
+      retainedMeta: this.retained
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.agentLabel(), modelLabel: this.reviewModelLabel() }
+        : undefined,
       mode: this.mode,
       items,
       selectedId: this.selectedId,
@@ -1419,8 +1463,11 @@ export class ReviewFlowPanel {
             ).length,
           }
         : undefined,
-      candidates: this.response?.candidates ?? [],
-      filesRead: this.response?.stats?.filesRead ?? this.diff?.files.length ?? 0,
+      // From the retained record, not from a live response: the response object
+      // is gone once the run is over, and these two are the whole content of
+      // the clean screen, which has to survive being re-opened.
+      candidates: this.retained?.candidates ?? [],
+      filesRead: this.retained?.filesRead ?? this.diff?.files.length ?? 0,
       summaryText: this.summaryText,
       finalNote: this.finalNote,
       postThread: this.postThread,

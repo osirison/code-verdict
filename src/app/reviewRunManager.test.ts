@@ -195,6 +195,28 @@ describe('a run completes with nobody watching', () => {
     });
   });
 
+  it('writes the retained review before telling anyone the run succeeded', async () => {
+    // A panel watching its own run reacts to `succeeded` by reading the record
+    // back off the store. Notified first, it would read the PREVIOUS run's
+    // review — or an empty screen — and nothing would repaint when the write
+    // landed a microtask later.
+    const workspaceState = memoryStore();
+    const seenAtNotify: Array<SessionDraft | undefined> = [];
+    const { runs } = manager({
+      workspaceState,
+      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      onChange: (record) => {
+        if (record.status === 'succeeded') {
+          seenAtNotify.push(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'));
+        }
+      },
+    });
+
+    runs.trigger(crInput('2841'), 3);
+    await vi.waitFor(() => expect(seenAtNotify).toHaveLength(1));
+    expect(seenAtNotify[0]?.review.items).toHaveLength(2);
+  });
+
   it('records the run before telling anything to repaint', async () => {
     // The callback fans out to views that read this very store; firing it
     // first repaints them onto the previous run.

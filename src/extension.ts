@@ -91,6 +91,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void sweepInterruptedRuns(context.globalState);
 
   /**
+   * The last status seen per run, so a progress emission — four a second on a
+   * streaming run — cannot be mistaken for a state change.
+   */
+  const lastRunStatus = new Map<string, string>();
+
+  /**
    * Runs live here, for the window's lifetime — not on the panel that started
    * them. Constructed before any panel so a review triggered from one screen is
    * still running when the reviewer is on another.
@@ -119,19 +125,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
             ),
     },
-    onChange: () => {
-      // The run list, the status-bar count and the dashboard pills all read
-      // live run state, so one fan-out keeps them from drifting apart.
+    onChange: (record) => {
+      // The run list and the status-bar count read live run state, so one
+      // fan-out keeps them from drifting apart. Both are cheap: local state,
+      // rendered into a webview.
       const active = runManager.active();
       sidebar.setActiveRuns(
-        active.map((record) => ({
-          key: record.key,
-          label: record.input.refLabel,
-          state: record.status === 'queued' ? ('queued' as const) : ('running' as const),
-          elapsedMs: Date.now() - (record.startedAt ?? record.queuedAt),
+        active.map((run) => ({
+          key: run.key,
+          label: run.input.refLabel,
+          state: run.status === 'queued' ? ('queued' as const) : ('running' as const),
+          elapsedMs: Date.now() - (run.startedAt ?? run.queuedAt),
         })),
       );
-      statusBar.setActiveRuns(active.filter((record) => record.status === 'running').length);
+      statusBar.setActiveRuns(active.filter((run) => run.status === 'running').length);
+
+      // The dashboard is NOT cheap: `refreshIfOpen` refetches the whole pod.
+      // Progress arrives at the 250 ms floor, so refreshing on every emission
+      // would issue four platform fetches a second per streaming run — worse
+      // than the burst the notifier's focus throttle exists to prevent. Only a
+      // status change moves a row's pill, so only a status change refreshes.
+      const previous = lastRunStatus.get(record.key);
+      if (previous === record.status) return;
+      lastRunStatus.set(record.key, record.status);
+      if (record.status !== 'queued' && record.status !== 'running') lastRunStatus.delete(record.key);
       void DashboardPanel.refreshIfOpen();
     },
     onRunRecorded: () => repaintReviewSurfaces(),

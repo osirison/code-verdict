@@ -29,7 +29,6 @@ import {
 import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
-import type { AgentReviewResponse } from '../domain/agentResponse';
 import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { composeSummary, type AgentVoice } from '../domain/summary';
@@ -114,7 +113,6 @@ export class ChangesetReviewPanel {
   private contextOpen = false;
   private screen: FlowScreen = 'agent';
   private mode: 'split' | 'queue' | 'diff' = 'split';
-  private response?: AgentReviewResponse;
   private review?: Review;
   private selectedId?: string;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
@@ -325,6 +323,26 @@ export class ChangesetReviewPanel {
     });
   }
 
+  /** Start the pickers from what produced the shown review — see `ReviewFlowPanel`. */
+  private preselectFromRetained(): void {
+    const retained = this.retained;
+    if (!retained) return;
+    const notices: string[] = [];
+    if (this.agents.some((agent) => agent.id === retained.agentId)) {
+      this.agentId = retained.agentId;
+    } else if (retained.agentLabel) {
+      notices.push(`The agent that produced this review, "${retained.agentLabel}", is no longer available.`);
+    }
+    if (retained.modelId !== undefined) {
+      if (this.models.some((model) => model.id === retained.modelId)) {
+        this.modelId = retained.modelId;
+      } else {
+        notices.push(`The model that produced this review, "${retained.modelId}", is no longer available.`);
+      }
+    }
+    if (notices.length > 0) this.selectionNotices = notices;
+  }
+
   /**
    * Load the retained review for this changeset, and say whether there was one.
    * The clean branch used to persist nothing at all, so a reload after a clean
@@ -334,6 +352,7 @@ export class ChangesetReviewPanel {
   private enterRetained(): boolean {
     const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(this.draftKey()));
     if (!retained) {
+      this.retained = undefined;
       this.review = undefined;
       return false;
     }
@@ -389,8 +408,18 @@ export class ChangesetReviewPanel {
       }
       case 'setInstructions': pod.criteria.extraInstructions = message.text; await this.deps.podStore.upsert(pod); break;
       case 'run': void this.run(); return;
-      // Really stops the request now, and frees its slot for a queued review.
-      case 'cancel': this.deps.runs.cancel(this.runKey()); return;
+      // Two meanings on one message — see `ReviewFlowPanel`. A live run is
+      // stopped; a failed one is dismissed back to the pickers, which is what
+      // the failure screen's "Switch agent" asks for.
+      case 'cancel':
+        if (this.runRecord && this.runRecord.status !== 'queued' && this.runRecord.status !== 'running') {
+          this.deps.runs.acknowledge(this.runKey());
+          this.runRecord = undefined;
+          this.screen = 'agent';
+          break;
+        }
+        this.deps.runs.cancel(this.runKey());
+        return;
       case 'retryRun': case 'rerun': void this.run(); return;
       case 'usePartial':
         this.deps.runs.acknowledge(this.runKey());
@@ -398,8 +427,10 @@ export class ChangesetReviewPanel {
         if (!this.enterRetained()) this.screen = 'agent';
         break;
       case 'newRun':
-        // The pickers, over a result that stays exactly where it is.
+        // The pickers, over a result that stays exactly where it is, started
+        // from what produced it — see `ReviewFlowPanel.preselectFromRetained`.
         this.newRunFromResult = this.retained !== undefined;
+        this.preselectFromRetained();
         this.screen = 'agent';
         break;
       case 'backToResult':
@@ -730,7 +761,7 @@ export class ChangesetReviewPanel {
       runQueued: this.runRecord?.status === 'queued',
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
-        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel, modelLabel: this.reviewModelLabel() }
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel() }
         : undefined,
       mode: this.mode,
       items,
@@ -745,8 +776,9 @@ export class ChangesetReviewPanel {
           }
         : undefined,
       stale: this.stale,
-      candidates: this.response?.candidates ?? [],
-      filesRead: this.response?.stats?.filesRead ?? totalFiles,
+      // From the retained record — see `ReviewFlowPanel`.
+      candidates: this.retained?.candidates ?? [],
+      filesRead: this.retained?.filesRead ?? totalFiles,
       summaryText: this.summaryText,
       finalNote: this.finalNote,
       postThread: this.postThread,
