@@ -26,6 +26,13 @@ import {
 } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
 import { ReviewRunStore } from '../app/reviewRuns';
+import {
+  clearSubmitLedger,
+  draftKeyFor,
+  readRetained,
+  screenForRetained,
+  type SessionDraft,
+} from '../app/retainedReview';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
@@ -102,23 +109,6 @@ function followUpPrompt(item: ReviewItem, question: string, hunk: string | undef
   ]
     .filter((line) => line !== '')
     .join('\n');
-}
-
-interface SessionDraft {
-  review: Review;
-  threads: Record<string, Array<{ label: string; text: string }>>;
-  summaryText: string;
-  finalNote: string;
-  /** Partial-failure ledger — must survive reloads so a retry never re-posts what already landed (spec §7). */
-  failedKeys?: string[];
-  summaryPosted?: boolean;
-  verdictApplied?: boolean;
-  /** itemId → thread id for comments that already landed, across attempts. */
-  threadsAccum?: Record<string, string>;
-  /** Sticky: once any comment posted on its own, the review is not one review. */
-  postedIndividually?: boolean;
-  /** Comments already posted, so a retry does not lose the running total. */
-  postedCount?: number;
 }
 
 export interface ReviewFlowDeps {
@@ -305,7 +295,7 @@ export class ReviewFlowPanel {
   }
 
   private draftKey(): string {
-    return `codeVerdict.draft.${this.ref.repoId}!${this.ref.number}`;
+    return draftKeyFor(this.ref);
   }
 
   private loadSeq = 0;
@@ -1180,7 +1170,18 @@ export class ReviewFlowPanel {
         // verdict that already landed, so its result carries no flag.
         requestedChanges: this.verdictApplied,
       });
-      await this.deps.workspaceState.update(this.draftKey(), undefined);
+      // Not a deletion. Clearing the ledger is the whole of what this is
+      // entitled to do — nothing that landed may be posted twice — and
+      // deleting the record took the review with it, so a submitted change
+      // request re-opened on the agent picker with no trace of what was
+      // posted. `submittedAt` is what routes it to the done screen instead.
+      const submittedDraft = this.deps.workspaceState.get<SessionDraft>(this.draftKey());
+      if (submittedDraft) {
+        await this.deps.workspaceState.update(
+          this.draftKey(),
+          clearSubmitLedger(submittedDraft, new Date().toISOString()),
+        );
+      }
       this.submitError = undefined;
       this.failedKeys = undefined;
       // "as one review thread" only when a single review really was created:

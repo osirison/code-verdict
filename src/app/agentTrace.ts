@@ -21,12 +21,15 @@ export interface AgentTraceSink {
 }
 
 /**
- * Which window ran out — lets a caller branch on the cause instead of parsing
- * the message, and name the right setting in the failure card. `'ceiling'` is
- * the long checkpoint window, which cancels only when nothing at all arrived
- * during it (see the limits comment in `lmAgent.ts`), not a wall-clock cap.
+ * Why the request was cancelled — lets a caller branch on the cause instead of
+ * parsing the message, and name the right setting in the failure card.
+ * `'ceiling'` is the long checkpoint window, which cancels only when nothing at
+ * all arrived during it (see the limits comment in `lmAgent.ts`), not a
+ * wall-clock cap. `'caller'` is not a limit at all: the reviewer asked for the
+ * run to stop, so there is no window to lengthen and nothing to report as a
+ * failure.
  */
-export type AgentTimeoutReason = 'inactivity' | 'ceiling';
+export type AgentTimeoutReason = 'inactivity' | 'ceiling' | 'caller';
 
 /**
  * Snapshot handed to a caller's progress callback as fragments arrive.

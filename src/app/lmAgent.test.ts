@@ -273,6 +273,141 @@ describe('runPrompt timeouts (issue #36)', () => {
   });
 });
 
+/**
+ * A caller could previously only stop *listening*: the request kept streaming
+ * and the answer was dropped on arrival. With runs holding a slot in a
+ * concurrency budget, a run nobody waits for must actually stop.
+ */
+describe('caller cancellation (spec: cancelling a run stops the work it is doing)', () => {
+  /** A caller-side token the test can trip, shaped like `vscode.CancellationToken`. */
+  function callerToken(): FakeToken & { cancel(): void } {
+    const listeners: Array<() => void> = [];
+    const token = {
+      isCancellationRequested: false,
+      onCancellationRequested: (listener: () => void) => {
+        listeners.push(listener);
+        return { dispose: () => {} };
+      },
+      cancel(): void {
+        if (token.isCancellationRequested) return;
+        token.isCancellationRequested = true;
+        for (const listener of [...listeners]) listener();
+      },
+    };
+    return token;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sendRequest.mockReset();
+    selectChatModels.mockClear();
+    selectChatModels.mockImplementation(async () => [{ sendRequest }]);
+    createOutputChannel.mockClear();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('ends a healthy stream when the caller cancels, and reports it as cancelled rather than timed out', async () => {
+    const { runPrompt, AgentRunError } = await import('./lmAgent.js');
+    // Streaming steadily the whole time: neither window is anywhere near
+    // expiring, so nothing but the caller's token can end this run.
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, Array.from({ length: 50 }, () => ({ delayMs: 10_000, text: 'x' }))),
+    );
+    const caller = callerToken();
+    const sink = fakeSink();
+    const outcome = await (async () => {
+      const p = settle(runPrompt('lm:acme/turbo', 'the prompt', { trace: sink, cancellation: caller }));
+      await vi.advanceTimersByTimeAsync(25_000);
+      caller.cancel();
+      await vi.advanceTimersByTimeAsync(1_000);
+      return p;
+    })();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error).toBeInstanceOf(AgentRunError);
+    const err = outcome.error as InstanceType<typeof AgentRunError>;
+    expect(err.cancelled).toBe(true);
+    // The distinction the flag exists for: a reviewer who stopped the run must
+    // not be told to lengthen a window that had nothing to do with it.
+    expect(err.timedOut).toBe(false);
+    expect(err.timeoutReason).toBe('caller');
+    expect(err.message).toMatch(/cancelled/);
+    expect(sink.lines.some((l) => l.includes('(caller limit)'))).toBe(true);
+  });
+
+  it('never streams for a token that was already cancelled before the run started', async () => {
+    const { runPrompt } = await import('./lmAgent.js');
+    let fragmentsYielded = 0;
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) => ({
+      text: {
+        [Symbol.asyncIterator]() {
+          return {
+            async next(): Promise<IteratorResult<string>> {
+              // A stream that would run forever if the token were not honoured.
+              const cancelled = await raceCancellation(10_000, token);
+              if (cancelled) throw new Error('Canceled by test fake');
+              fragmentsYielded += 1;
+              return { value: 'x', done: false };
+            },
+          };
+        },
+      },
+    }));
+    const caller = callerToken();
+    caller.cancel();
+    const outcome = await (async () => {
+      const p = settle(runPrompt('lm:acme/turbo', 'the prompt', { trace: fakeSink(), cancellation: caller }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      return p;
+    })();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect((outcome.error as { cancelled?: boolean }).cancelled).toBe(true);
+    // An already-cancelled token fires no event, so subscribing alone would
+    // have let this stream run to completion.
+    expect(fragmentsYielded).toBe(0);
+  });
+
+  it('changes nothing for a token that is never cancelled', async () => {
+    const { runPrompt } = await import('./lmAgent.js');
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [
+        { delayMs: 10_000, text: '{"schemaVersion":"1","agentId":"a","agentLabel":"b","headSha":"abc","items":[]}' },
+      ]),
+    );
+    const promise = runPrompt('lm:acme/turbo', 'the prompt', { trace: fakeSink(), cancellation: callerToken() });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect((await promise).headSha).toBe('abc');
+  });
+
+  it('still reports a stalled run as a timeout when no caller token is involved', async () => {
+    const { runPrompt } = await import('./lmAgent.js');
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [
+        { delayMs: 10_000, text: 'partial' },
+        { delayMs: 24 * 60 * 60 * 1000, text: 'never arrives' },
+      ]),
+    );
+    const caller = callerToken();
+    const outcome = await (async () => {
+      const p = settle(runPrompt('lm:acme/turbo', 'the prompt', { trace: fakeSink(), cancellation: caller }));
+      await vi.advanceTimersByTimeAsync(150_000);
+      return p;
+    })();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    const err = outcome.error as { timedOut: boolean; cancelled: boolean; timeoutReason?: string };
+    expect(err.timedOut).toBe(true);
+    expect(err.cancelled).toBe(false);
+    expect(err.timeoutReason).toBe('inactivity');
+  });
+});
+
 describe('agent trace (issue #35)', () => {
   beforeEach(() => {
     vi.useFakeTimers();

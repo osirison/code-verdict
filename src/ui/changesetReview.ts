@@ -22,6 +22,13 @@ import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
+import {
+  changesetDraftKeyFor,
+  clearChangesetSubmitLedger,
+  readRetained,
+  screenForRetained,
+  type ChangesetDraft,
+} from '../app/retainedReview';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import type { AgentReviewResponse } from '../domain/agentResponse';
@@ -40,14 +47,6 @@ import { renderReviewFlowHtml } from './reviewFlowHtml';
 import { RunLiveness } from './runLiveness';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarActiveReview } from './sidebarHtml';
-
-interface ChangesetDraft {
-  review: Review;
-  threads: Record<string, Array<{ label: string; text: string }>>;
-  summaryText: string;
-  finalNote: string;
-  submitState?: ChangesetSubmitState;
-}
 
 export interface ChangesetReviewDeps {
   podStore: PodStore;
@@ -174,7 +173,7 @@ export class ChangesetReviewPanel {
   }
 
   private draftKey(): string {
-    return `codeVerdict.changesetDraft.${this.changesetId}`;
+    return changesetDraftKeyFor(this.changesetId);
   }
 
   private async load(): Promise<void> {
@@ -560,7 +559,15 @@ export class ChangesetReviewPanel {
         requestedChanges: result.state.requestChangesRefs.includes(`${member.ref.repoId}!${member.ref.number}`),
       });
     }
-    await this.deps.workspaceState.update(this.draftKey(), undefined);
+    // Same reason as the single-change-request path: the ledger is transient,
+    // the review it was attached to is not.
+    const submittedDraft = this.deps.workspaceState.get<ChangesetDraft>(this.draftKey());
+    if (submittedDraft) {
+      await this.deps.workspaceState.update(
+        this.draftKey(),
+        clearChangesetSubmitLedger(submittedDraft, new Date().toISOString()),
+      );
+    }
     const counts = verdictCounts(this.review);
     this.doneSentence = `${counts.accepted} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}. ${counts.rejected} dismissed findings stayed local.`;
     this.submitError = undefined;

@@ -146,6 +146,7 @@ export class DashboardPanel {
         submitted,
         this.deps.changesetOptions?.(),
         this.deps.reviewRuns?.(),
+        this.deps.activeRuns?.(),
       );
       // Patch the region in place rather than replacing the whole document
       // (#39) — falling back to setHtml only when the page has not yet
