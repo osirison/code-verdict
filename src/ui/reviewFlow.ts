@@ -25,6 +25,7 @@ import {
 } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
 import {
+  carryRetainedResult,
   clearSubmitLedger,
   draftKeyFor,
   readRetained,
@@ -32,6 +33,7 @@ import {
   screenForRetained,
   type SessionDraft,
 } from '../app/retainedReview';
+import { CoalescedDraftWriter } from '../app/draftWriter';
 import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
@@ -235,13 +237,20 @@ export class ReviewFlowPanel {
   private readonly inDiff = new InDiffEditor();
   private inDiffKey = '';
   private focusWatch?: vscode.Disposable;
+  /** Coalesces the panel's draft writes and guards them against a newer run's record (D9). */
+  private readonly draftWriter: CoalescedDraftWriter;
+  private windowFocusWatch?: vscode.Disposable;
 
   private constructor(
     private readonly route: AppRoute,
     private readonly deps: ReviewFlowDeps,
   ) {
+    this.draftWriter = new CoalescedDraftWriter(deps.workspaceState);
     route.onLeave(() => {
       this.disposed = true;
+      // Flush point (D9): the panel is going away — land any pending draft
+      // write while the record it snapshotted still has an owner.
+      this.draftWriter.flushQuietly();
       // Deliberately NOT cancelling the run. Leaving the screen used to end it
       // — the reviewer who glanced at the dashboard came back to the agent
       // picker with nothing to show for the minutes the model had spent. The
@@ -254,6 +263,8 @@ export class ReviewFlowPanel {
       this.inDiff.dispose();
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
+      this.windowFocusWatch?.dispose();
+      this.windowFocusWatch = undefined;
       this.deps.onSidebarState?.();
       this.deps.onSidebarPending?.();
       this.setReviewFocus(false);
@@ -264,9 +275,18 @@ export class ReviewFlowPanel {
     // in the file in-diff mode opens beside the review, where a keystroke
     // meant for the editor would silently record a verdict.
     this.setReviewFocus(route.panel.active !== false);
-    this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
-      this.setReviewFocus(event.webviewPanel.active),
-    );
+    this.focusWatch = route.panel.onDidChangeViewState?.((event) => {
+      this.setReviewFocus(event.webviewPanel.active);
+      // Flush point (D9): the tab stopped being visible. The reviewer may
+      // close the window without ever coming back to it, and a pending
+      // coalesced write must not be what that costs them.
+      if (!event.webviewPanel.visible) this.draftWriter.flushQuietly();
+    });
+    // Flush point (D9): the whole editor window lost focus — the closest
+    // signal there is to "the reviewer walked away".
+    this.windowFocusWatch = vscode.window.onDidChangeWindowState((state) => {
+      if (!state.focused) this.draftWriter.flushQuietly();
+    });
     // The document reloaded underneath this route (issue #39 follow-up) —
     // e.g. "Developer: Reload Webviews" recreates the webview from the
     // stored (possibly stale) html. This panel's state is already in
@@ -518,9 +538,26 @@ export class ReviewFlowPanel {
     }
   }
 
-  private async persistDraft(): Promise<void> {
+  /**
+   * Queue this panel's state for persistence. Writes are coalesced (D9): a
+   * burst of triage actions collapses into one `workspaceState.update`,
+   * landed by the writer's window or by the flush points — before submit, on
+   * dispose, when the tab stops being visible, when the window loses focus.
+   *
+   * The put carries the run manager's result fields forward from the RAW
+   * record this panel loaded (`this.retained.draft`, never the normalized
+   * view — see `carryRetainedResult`). Without that this whole-key put would
+   * erase `ranAt`, and the writer's generation guard — which keys on `ranAt`
+   * — would read every later write as belonging to a different run and drop
+   * it.
+   */
+  private persistDraft(): void {
     if (!this.review) return;
-    await this.deps.workspaceState.update(this.draftKey(), {
+    // `this.review` only ever originates from the record `enterRetained`
+    // read, so `this.retained` names the generation this write belongs to.
+    // If that invariant breaks, the guard below drops writes silently.
+    this.draftWriter.schedule(this.draftKey(), {
+      ...carryRetainedResult(this.retained?.draft),
       review: this.review,
       threads: this.threads,
       summaryText: this.summaryText,
@@ -533,7 +570,7 @@ export class ReviewFlowPanel {
       threadsAccum: Object.keys(this.threadsAccum).length > 0 ? this.threadsAccum : undefined,
       postedIndividually: this.postedIndividually || undefined,
       postedCount: this.postedCount || undefined,
-    } satisfies SessionDraft);
+    } satisfies SessionDraft, this.retained?.draft.ranAt);
   }
 
   // ---- running ----------------------------------------------------------------
@@ -632,6 +669,12 @@ export class ReviewFlowPanel {
     if (record.status === 'succeeded') {
       this.deps.runs.acknowledge(record.key);
       this.runRecord = undefined;
+      // The manager has just replaced this target's retained record (it
+      // writes before it settles); a pending draft write snapshots a review
+      // that no longer exists. The generation guard would drop it at flush
+      // time — cancelling here stops `enterRetained`'s flush from even
+      // attempting it (task 4.4).
+      this.draftWriter.cancelFor(this.draftKey());
       // Re-entering through load() would refetch the change request for no
       // reason; the record is on disk and everything else is already in hand.
       this.enterRetained();
@@ -684,6 +727,11 @@ export class ReviewFlowPanel {
    * cancelled one.
    */
   private enterRetained(): boolean {
+    // A pending coalesced write may hold newer triage than the store; land it
+    // first, or this read would revert the screen to the pre-burst state (a
+    // cancelled re-run re-entering the review is the reachable case). The
+    // flush's get/update pair is synchronous, so the read below sees it.
+    this.draftWriter.flushQuietly();
     const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(this.draftKey()));
     if (!retained) {
       // Cleared, not merely left: a change request with no record must not
@@ -866,13 +914,13 @@ export class ReviewFlowPanel {
         if (auto) {
           this.selectedId = nextUndecided(this.review, m.itemId)?.id ?? this.selectedId;
         }
-        await this.persistDraft();
+        this.persistDraft();
         break;
       }
       case 'undo':
         if (!this.review) return;
         this.review = clearVerdict(this.review, m.itemId);
-        await this.persistDraft();
+        this.persistDraft();
         break;
       case 'move': {
         if (!this.review) return;
@@ -949,7 +997,7 @@ export class ReviewFlowPanel {
         }
         this.staleHead = undefined;
         this.staleItemIds = new Set();
-        await this.persistDraft();
+        this.persistDraft();
         break;
       }
       case 'rerun':
@@ -959,18 +1007,18 @@ export class ReviewFlowPanel {
         if (!this.review || !allDecided(this.review)) return;
         this.summaryText = this.generateSummaryText();
         this.screen = 'summary';
-        await this.persistDraft();
+        this.persistDraft();
         break;
       case 'editSummary':
         this.summaryText = m.text;
-        await this.persistDraft();
+        this.persistDraft();
         return;
       case 'regenerate':
         this.summaryText = this.generateSummaryText();
         break;
       case 'setNote':
         this.finalNote = m.text;
-        await this.persistDraft();
+        this.persistDraft();
         return;
       case 'toggleOption':
         if (m.option === 'postThread') this.postThread = !this.postThread;
@@ -1055,7 +1103,7 @@ export class ReviewFlowPanel {
     const canned = preset === 'freeform' ? undefined : item.answers?.[preset];
     if (canned !== undefined) {
       this.appendAnswer(item.id, list, label, canned);
-      await this.persistDraft();
+      this.persistDraft();
       return;
     }
     // The guard is about the *model*: an agent with no model behind it (the
@@ -1063,7 +1111,7 @@ export class ReviewFlowPanel {
     // agent itself is.
     if (this.modelId === undefined || this.selectedAgent().source === 'demo') {
       this.appendAnswer(item.id, list, label, 'This agent does not answer follow-up questions.');
-      await this.persistDraft();
+      this.persistDraft();
       return;
     }
 
@@ -1082,7 +1130,7 @@ export class ReviewFlowPanel {
       entry.text = `The agent could not answer: ${error}`;
     }
     this.postThreadUpdate(item.id, list);
-    await this.persistDraft();
+    this.persistDraft();
   }
 
   /** Appends and pushes it to the webview without rebuilding the document. */
@@ -1133,6 +1181,10 @@ export class ReviewFlowPanel {
     if (this.submitting) return;
     this.submitting = true;
     this.submitProgress = undefined;
+    // Flush point (D9): the persisted state must reflect every decision made
+    // up to here before the submit begins — a crash mid-submit then resumes
+    // from the state the reviewer actually sent.
+    await this.draftWriter.flush();
     this.screen = 'submitting';
     this.render();
     const pod = this.pod();
@@ -1194,8 +1246,10 @@ export class ReviewFlowPanel {
         this.submitError = first?.message ?? 'submit failed';
         this.screen = 'summary';
         // The ledger must survive a reload — a later retry may only post
-        // the remainder (spec §7).
-        await this.persistDraft();
+        // the remainder (spec §7) — so this one write does not wait out the
+        // coalescing window: schedule and flush in the same breath.
+        this.persistDraft();
+        await this.draftWriter.flush();
         this.render();
         return;
       }

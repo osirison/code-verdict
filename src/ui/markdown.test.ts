@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { MARKDOWN_CSS, renderMarkdown } from './markdown';
+import { describe, expect, it, vi } from 'vitest';
+import { MARKDOWN_CSS, renderMarkdown, renderMarkdownUncached } from './markdown';
+import { memoize } from '../domain/memo';
 
 describe('renderMarkdown — safety', () => {
   it('escapes markup before generating any of its own', () => {
@@ -341,6 +342,55 @@ describe('renderMarkdown — an agent finding end to end', () => {
     expect(html).toContain('<li class="md-li">There is no backup, so the loss is unrecoverable.</li>');
     expect(html).toContain('<pre class="md-pre" data-lang="ts">');
     expect(html).not.toContain('**');
+  });
+});
+
+describe('renderMarkdown — memoization (D10)', () => {
+  const FIXTURES = [
+    '',
+    '   \n  ',
+    'one\ntwo\n\nthree',
+    '<script>alert(1)</script> and <img src=x onerror=1>',
+    '# H\n\n- a\n\n```js\nx\n```\n\n| a | b |\n|:-:|--:|\n| 1 | 2 |\n',
+    [
+      '`applyPatch` writes the file before validating the hunk header, so a malformed',
+      'patch truncates the target.',
+      '',
+      '**Why it matters**',
+      '',
+      '1. The write is not atomic — a partial patch leaves the file short.',
+      '2. There is no backup, so the loss is unrecoverable.',
+    ].join('\n'),
+  ];
+
+  it('matches the unmemoized render for every fixture', () => {
+    for (const fixture of FIXTURES) {
+      expect(renderMarkdown(fixture)).toBe(renderMarkdownUncached(fixture));
+    }
+  });
+
+  it('does not recompute a repeated input — a counting spy on the real render step', () => {
+    // Wrapped independently, with its own cache, rather than through the
+    // shared production `renderMarkdown`: other tests in this file may have
+    // already warmed that cache for the same text, which would make "not yet
+    // cached" an unsafe assumption here.
+    const step = vi.fn(renderMarkdownUncached);
+    const wrapped = memoize(step);
+    const text = '**bold** and a [link](https://example.com)';
+
+    expect(wrapped(text)).toBe(renderMarkdownUncached(text));
+    wrapped(text);
+    expect(step).toHaveBeenCalledTimes(1);
+  });
+
+  it('computes a second, distinct input instead of reusing the first result', () => {
+    const step = vi.fn(renderMarkdownUncached);
+    const wrapped = memoize(step);
+
+    wrapped('one');
+    wrapped('two');
+
+    expect(step).toHaveBeenCalledTimes(2);
   });
 });
 

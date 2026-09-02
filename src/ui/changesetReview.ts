@@ -19,6 +19,7 @@ import type { PodStore } from '../app/pods';
 import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
 import {
+  carryRetainedResult,
   changesetDraftKeyFor,
   clearChangesetSubmitLedger,
   readRetained,
@@ -26,6 +27,7 @@ import {
   screenForRetained,
   type ChangesetDraft,
 } from '../app/retainedReview';
+import { CoalescedDraftWriter } from '../app/draftWriter';
 import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
@@ -129,14 +131,21 @@ export class ChangesetReviewPanel {
   private submitState?: ChangesetSubmitState;
   private stale?: { newHead: string; affected: number; affectedAccepted: number };
   private doneSentence = '';
+  /** Coalesces the panel's draft writes and guards them against a newer run's record (D9). */
+  private readonly draftWriter: CoalescedDraftWriter;
+  private windowFocusWatch?: vscode.Disposable;
 
   private constructor(
     private readonly route: AppRoute,
     private readonly deps: ChangesetReviewDeps,
     private readonly changesetId: string,
   ) {
+    this.draftWriter = new CoalescedDraftWriter(deps.workspaceState);
     route.onLeave(() => {
       this.disposed = true;
+      // Flush point (D9): the panel is going away — land any pending draft
+      // write while the record it snapshotted still has an owner.
+      this.draftWriter.flushQuietly();
       // Unsubscribed, not cancelled — see `ReviewFlowPanel`'s onLeave.
       this.runWatch?.dispose();
       this.runWatch = undefined;
@@ -144,6 +153,8 @@ export class ChangesetReviewPanel {
       this.agentWatches = [];
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
+      this.windowFocusWatch?.dispose();
+      this.windowFocusWatch = undefined;
       this.setReviewFocus(false);
       this.deps.onSidebarState?.();
       if (ChangesetReviewPanel.current === this) ChangesetReviewPanel.current = undefined;
@@ -152,9 +163,16 @@ export class ChangesetReviewPanel {
     // existence — same rule as ReviewFlowPanel, or A/R/S would fire in
     // whatever editor sits beside the review.
     this.setReviewFocus(route.panel.active !== false);
-    this.focusWatch = route.panel.onDidChangeViewState?.((event) =>
-      this.setReviewFocus(event.webviewPanel.active),
-    );
+    this.focusWatch = route.panel.onDidChangeViewState?.((event) => {
+      this.setReviewFocus(event.webviewPanel.active);
+      // Flush point (D9): the tab stopped being visible — same rationale as
+      // `ReviewFlowPanel`.
+      if (!event.webviewPanel.visible) this.draftWriter.flushQuietly();
+    });
+    // Flush point (D9): the whole editor window lost focus.
+    this.windowFocusWatch = vscode.window.onDidChangeWindowState((state) => {
+      if (!state.focused) this.draftWriter.flushQuietly();
+    });
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
   }
 
@@ -241,15 +259,25 @@ export class ChangesetReviewPanel {
     };
   }
 
-  private async persist(): Promise<void> {
+  /**
+   * Queue this panel's state for persistence — coalesced and generation-
+   * guarded exactly like `ReviewFlowPanel.persistDraft`, and carrying the run
+   * manager's result fields forward from the raw record for the same reason:
+   * this is a whole-key put over the retained-review key, and a put that
+   * lists only the triage fields erases `ranAt` — the field the guard reads.
+   */
+  private persist(): void {
     if (!this.review) return;
-    await this.deps.workspaceState.update(this.draftKey(), {
+    // `this.review` only ever originates from the record `enterRetained`
+    // read, so `this.retained` names the generation this write belongs to.
+    this.draftWriter.schedule(this.draftKey(), {
+      ...carryRetainedResult(this.retained?.draft),
       review: this.review,
       threads: this.threads,
       summaryText: this.summaryText,
       finalNote: this.finalNote,
       submitState: this.submitState,
-    } satisfies ChangesetDraft);
+    } satisfies ChangesetDraft, this.retained?.draft.ranAt);
   }
 
   /** The manager's key for this changeset. */
@@ -314,6 +342,10 @@ export class ChangesetReviewPanel {
       if (record.status === 'succeeded') {
         this.deps.runs.acknowledge(record.key);
         this.runRecord = undefined;
+        // The manager just replaced this changeset's retained record; a
+        // pending draft write snapshots the review it replaced (task 4.4 —
+        // same reasoning as `ReviewFlowPanel.renderRunState`).
+        this.draftWriter.cancelFor(this.draftKey());
         this.enterRetained();
       } else if (record.status === 'cancelled') {
         this.runRecord = undefined;
@@ -350,6 +382,9 @@ export class ChangesetReviewPanel {
    * what stops that as well as making the clean screen re-openable.
    */
   private enterRetained(): boolean {
+    // A pending coalesced write may hold newer triage than the store; land it
+    // first so this read cannot revert the screen (see `ReviewFlowPanel`).
+    this.draftWriter.flushQuietly();
     const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(this.draftKey()));
     if (!retained) {
       this.retained = undefined;
@@ -446,10 +481,10 @@ export class ChangesetReviewPanel {
         if (vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true)) {
           this.selectedId = nextUndecided(this.review, message.itemId)?.id ?? this.selectedId;
         }
-        await this.persist();
+        this.persist();
         break;
       }
-      case 'undo': if (this.review) { this.review = clearVerdict(this.review, message.itemId); await this.persist(); } break;
+      case 'undo': if (this.review) { this.review = clearVerdict(this.review, message.itemId); this.persist(); } break;
       case 'move': {
         const ids = this.review?.items.map((item) => item.id) ?? [];
         const current = Math.max(0, ids.indexOf(this.selectedId ?? ''));
@@ -465,7 +500,7 @@ export class ChangesetReviewPanel {
         if (message.preset === 'freeform' || !list.some((entry) => entry.label === label)) {
           list.push({ label, text: message.preset === 'freeform' ? `On "${message.text?.trim()}": compare both repository contracts before changing either side.` : item.answers?.[message.preset] ?? 'The combined diff provides no further detail.' });
         }
-        await this.persist();
+        this.persist();
         break;
       }
       case 'openInEditor':
@@ -480,11 +515,11 @@ export class ChangesetReviewPanel {
         if (!this.review || !allDecided(this.review)) return;
         this.summaryText = this.generateSummary();
         this.screen = 'summary';
-        await this.persist();
+        this.persist();
         break;
-      case 'editSummary': this.summaryText = message.text; await this.persist(); return;
+      case 'editSummary': this.summaryText = message.text; this.persist(); return;
       case 'regenerate': this.summaryText = this.generateSummary(); break;
-      case 'setNote': this.finalNote = message.text; await this.persist(); return;
+      case 'setNote': this.finalNote = message.text; this.persist(); return;
       case 'toggleOption': if (message.option === 'postThread') this.postThread = !this.postThread; else this.requestChanges = !this.requestChanges; break;
       case 'submit': case 'retrySubmit': void this.submit(); return;
       case 'copyMarkdown': await vscode.env.clipboard.writeText(composeSummaryBody(this.summaryText, this.finalNote)); return;
@@ -512,7 +547,7 @@ export class ChangesetReviewPanel {
             ? { ...candidate, repoId: member.ref.repoId, crNumber: member.ref.number, file: anchor.file, line: anchor.line, code: anchor.text }
             : candidate),
         };
-        await this.persist();
+        this.persist();
         break;
       }
       case 'reviewSingle': if (message.repoId && message.number) this.deps.openSingle({ repoId: message.repoId, number: message.number }); return;
@@ -542,6 +577,9 @@ export class ChangesetReviewPanel {
 
   private async submit(): Promise<void> {
     if (!this.review || this.screen !== 'summary' || !allDecided(this.review)) return;
+    // Flush point (D9): the persisted state must reflect every decision made
+    // up to here before the submit begins.
+    await this.draftWriter.flush();
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
     const issueRef = this.changeset.linkedIssue ? ` (${this.changeset.linkedIssue})` : '';
@@ -559,7 +597,10 @@ export class ChangesetReviewPanel {
     const connection = await connectionForPod(pod, this.deps.secrets);
     const result = await performChangesetSubmit(connection, plans, this.submitState);
     this.submitState = result.state;
-    await this.persist();
+    // The submit ledger must survive a reload — a retry may only post the
+    // remainder — so this write does not wait out the coalescing window.
+    this.persist();
+    await this.draftWriter.flush();
     if (!result.complete) {
       this.submitError = result.failures[0]?.message ?? `Some ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural} rejected the review`;
       this.render();
