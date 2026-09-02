@@ -1,6 +1,6 @@
 ## Purpose
 
-Defines the state the extension holds on behalf of every screen: one shared, freshness-tracked copy of the platform data a pod is made of, rather than a separate copy fetched by each screen that needs it. It settles when that data is re-fetched, what happens when two screens want it at once, what happens when a re-fetch finds nothing new, and how a reviewer's triage decisions stay durable when their writes are batched.
+Defines the state the extension holds on behalf of every screen: one shared, freshness-tracked copy of the platform data a pod is made of, rather than a separate copy fetched by each screen that needs it. It sets out when that data is re-fetched, what happens when two screens want it at once, what happens when a re-fetch finds nothing new, and how a reviewer's triage decisions stay durable when their writes are batched.
 
 ## ADDED Requirements
 
@@ -34,13 +34,19 @@ The system SHALL hold one shared copy of a pod's platform data — its open chan
 
 ### Requirement: A screen opens on held data and revalidates behind it
 
-When data for a screen is already held, the system SHALL show it immediately and revalidate in the background, rather than making the reviewer wait for a fresh fetch. When no data is held, the system SHALL show the screen's loading state rather than a blank screen.
+When data for a screen is already held, the system SHALL show it immediately rather than making the reviewer wait for a fresh fetch. Held data that is outside the freshness window SHALL be revalidated in the background once shown; held data inside the window SHALL NOT be. When no data is held, the system SHALL show the screen's loading state rather than a blank screen.
 
-#### Scenario: Re-opening a screen visited earlier
+#### Scenario: Re-opening a screen whose data has gone stale
 
-- **WHEN** the reviewer returns to a screen whose data is already held
+- **WHEN** the reviewer returns to a screen whose data is held but outside the freshness window
 - **THEN** the screen shows that data immediately, without a loading state
 - **AND** a revalidation is issued behind it
+
+#### Scenario: Re-opening a screen whose data is still fresh
+
+- **WHEN** the reviewer returns to a screen whose data is held and inside the freshness window
+- **THEN** the screen shows that data immediately
+- **AND** no revalidation is issued
 
 #### Scenario: Revalidation finds newer data
 

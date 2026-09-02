@@ -44,6 +44,18 @@ A redraw SHALL preserve scroll position, keyboard focus, text-selection and care
 - **WHEN** an update arrives while the reviewer is typing in the summary, a note or a reply
 - **THEN** the text they have typed is still there, the field still has focus, and the caret is where they left it
 
+#### Scenario: Text the system itself replaces
+
+- **WHEN** the reviewer has typed into a field and then takes an action that makes the system rewrite that field's text, such as regenerating the summary
+- **THEN** the rewritten text is what the field shows
+- **AND** the typed text it replaced is not restored over it
+
+#### Scenario: A field the reviewer is composing in a list that updates
+
+- **WHEN** the reviewer is part-way through composing a reply to one thread and another thread on the same screen changes
+- **THEN** the composed reply is still there, with its focus and caret
+- **AND** it is cleared only when it has been sent successfully
+
 #### Scenario: Expanded sections
 
 - **WHEN** the reviewer has expanded a section and an unrelated part of the screen updates

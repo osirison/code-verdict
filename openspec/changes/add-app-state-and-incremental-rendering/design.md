@@ -27,7 +27,7 @@ See proposal.md — Why for the motivation and the measurements. What follows is
 - One shared, freshness-tracked copy of pod data, read by every screen, provider-agnostic.
 - Every screen updates in place; navigation swaps content inside one resident document.
 - Preserve what the reviewer was doing across every repaint and every route change.
-- Land in phases that are individually shippable and individually revertable.
+- Land in phases that are individually shippable and individually revertible.
 
 **Non-Goals:**
 
@@ -42,7 +42,7 @@ See proposal.md — Why for the motivation and the measurements. What follows is
 
 ### D1 — One `AppStore` in `src/app/`, with the pub/sub shape already in the codebase
 
-A single `AppStore` owns pod-scoped platform data. It lives in `src/app/`, imports no `vscode`, takes `KeyValueStore` and a connection factory as constructor dependencies, and exposes `subscribe(listener): Disposable`-shaped unsubscription using the same `Set<listener>` pattern as `ReviewRunManager`. It holds only the neutral domain types the provider interface returns.
+A single `AppStore` owns pod-scoped platform data. It lives in `src/app/`, imports no `vscode`, takes `PodStore`, a `SecretStore`, a `ReviewHistory`, a `baseSeconds: () => number` provider and an intent-taking connection factory as constructor dependencies (D2, D5), and exposes `subscribe(listener): Disposable`-shaped unsubscription using the same `Set<listener>` pattern as `ReviewRunManager`. It holds only the neutral domain types the provider interface returns.
 
 *Alternative rejected — `vscode.EventEmitter`.* It disposes cleanly with `context.subscriptions` and is idiomatic, but it would be the first `vscode` import in the store layer of `src/app/`, and it makes the store untestable without the `vscode` shim that the existing app-layer tests deliberately avoid.
 
@@ -52,7 +52,7 @@ A single `AppStore` owns pod-scoped platform data. It lives in `src/app/`, impor
 
 ### D2 — Freshness window is the pod's own poll interval
 
-`pollIntervalMs(pod)` (`src/app/pollSchedule.ts:73-85`) already computes how often a pod may be polled without exceeding `BACKGROUND_REQUESTS_PER_HOUR`, scaling with repository count. The store reuses it as its freshness window. Data younger than that window is served without a fetch; older data is served immediately and revalidated behind.
+`pollIntervalMs({ repoCount, submittedReviews, baseSeconds })` (`src/app/pollSchedule.ts:73-85`) already computes how often a pod may be polled without exceeding `BACKGROUND_REQUESTS_PER_HOUR`, scaling with repository count. It does **not** take a pod, so the store supplies each input: `repoCount` from the pod's repository ids, `submittedReviews` from an injected `ReviewHistory` intersected with the change requests in the held entry (the derivation already at `src/ui/notifier.ts:334-338`), and `baseSeconds` from an injected `() => number` so the store makes no `vscode` configuration read of its own. The store reuses the result as its freshness window. Data younger than that window is served without a fetch; older data is served immediately and revalidated behind.
 
 *Alternative rejected — a fixed constant (30s).* For a large pod that is below the interval `pollSchedule.ts` exists to enforce, so it would double the request rate for exactly the pods the budget protects.
 
@@ -62,17 +62,19 @@ Per pod the store holds `{ data, fetchedAt, inFlight? }`. A read either returns 
 
 The `refreshSeq`/`canRender()` guards already in `dashboard.ts:100-101` and `sidebar.ts:152,169` remain: they protect against a late fetch overwriting a newer paint, which single-flight does not address.
 
+**Single-flight coalesces within an intent, not across one.** The connection factory takes a per-fetch `ConnectionIntent`: a scheduled revalidation and one started behind held data declare `background`; a fetch a screen is waiting on declares `interactive`. The rate floor is fixed when the connection is built (`RATE_FLOORS`, `src/providers/github/http.ts:69, 315`), so a shared fetch carries exactly one floor for every caller that joins it. A foreground read that joined a background revalidation would be refused at 50 remaining where today it is served down to 5 — so it does not join: an interactive read that finds only a background fetch in flight starts its own. A background tick joining an in-flight interactive fetch is free and does join, because that fetch was already spending to the lower floor. This costs at most one extra request in a narrow window and preserves the reserve `#50` built.
+
 ### D4 — Change detection by structural equality on the neutral types
 
 Before notifying, the store compares the new snapshot to the held one and drops the notification if they are equivalent. Comparison is over the neutral shapes only — change requests, work items, CI runs — with volatile fields the UI does not show (fetch timestamps) excluded from the comparison.
 
-This generalises two throttles the codebase already hand-rolled: the run-status transition check in `src/extension.ts:143-151` (explicitly there to avoid "four platform fetches a second") and the head-SHA check in `src/ui/reviewFlow.ts:508-513`. Both move into or defer to the store.
+This is the same discipline the codebase already hand-rolled in two places, but neither of those moves into the store. The run-status transition check (`src/extension.ts:143-151`, explicitly there to avoid "four platform fetches a second") **stays where it is**: the store holds pod platform data, never run records, so there is nothing for it to fold into. What changes is its cost — it now gates a repaint from held data instead of a pod fetch. The head-SHA check (`src/ui/reviewFlow.ts:508-513`) also stays, per D5 and task 6.5.
 
 *Alternative rejected — a monotonic revision counter bumped on every fetch.* Cheaper to compare, but it cannot tell "fetched again" from "changed", which is the entire point.
 
 ### D5 — The notifier's poll becomes the store's revalidation driver
 
-`VerdictNotifier` currently runs the only real poll loop (`src/ui/notifier.ts:173-178, 305-383`) and fetches pod data solely to derive notification events, which are already change-detected by `NotificationCenter.observe` (`src/app/notificationCenter.ts:75-81`). It stops fetching directly: it asks the store to revalidate and consumes the result. Its self-rescheduling timer, its `polling` re-entrancy guard, and its window-focus re-poll stay where they are — the store owns caching, not scheduling.
+`VerdictNotifier` currently runs the only real poll loop (`src/ui/notifier.ts:173-178, 305-383`) and fetches pod data solely to derive notification events, which are already change-detected by `NotificationCenter.observe` (`src/app/notificationCenter.ts:75-81`). It stops fetching **pod data** directly: it asks the store to revalidate and consumes the result. Its per-review `listThreads` fan-out (`src/ui/notifier.ts:339-352`) and its last-good thread cache stay in the notifier, on a connection it still obtains itself — threads are per change request, not pod-keyed, and the store holds pod data only. Its self-rescheduling timer, its `polling` re-entrancy guard, and its window-focus re-poll stay where they are: the store owns caching, not scheduling.
 
 The review flow's separate 45-second head poll (`src/ui/reviewFlow.ts:73, 234, 477`) stays as it is. It watches a different thing (the diff's head SHA) on a different cadence, and it already diffs before repainting.
 
@@ -102,7 +104,15 @@ Today every route entry assigns a whole document. The shell becomes one document
 - **Expanded/collapsed and scrolled-container state**, captured from elements carrying a stable id and an `open`/expanded data attribute, restored after the patch — the state `innerHTML` replacement would otherwise discard.
 - **A per-route snapshot**, kept in the webview, taken when a route is left and reapplied when it is entered, so going back to a screen restores its scroll position and expanded sections.
 
-The existing restraint stays: focus and selection are restored, `value` is never restored, because a re-rendered value is the panel's own state and overwriting it with a stale typed value would clobber a regenerated summary.
+**The restraint on `value` stays, and its premise is made true.** Focus and selection are restored; `value` never is, because overwriting a re-rendered value with a stale typed one would clobber a regenerated summary. But the premise that "a re-rendered value is the panel's own state" is false today for every editable on these screens, which is why the requirement *text typed and not yet committed survives a redraw* has no mechanism without this decision. `#summary-text`, `#final-note` and `#extra` commit on `change` (`src/ui/reviewFlowHtml.ts:1302, 1394, 1396`), which fires on blur, so mid-typing text lives only in the DOM and a `flow-body` patch re-renders the last blurred value over it. `#ask` (`src/ui/reviewFlowHtml.ts:979`) and the posted-reviews reply input (`src/ui/postedReviewsHtml.ts:201`) are worse: the panel holds no copy of their text at all, and the reply input has no `id`, so `REGIONS_SCRIPT` cannot even restore its focus.
+
+The fix is to make the host hold every editable's in-progress text, so a re-render always emits current text and no `value` restore is ever needed:
+
+- **Fields the panel already owns** — `#summary-text`, `#final-note`, `#extra` — commit on debounced `input` instead of `change`. `editSummary` and `setNote` already `return` without rendering (`src/ui/reviewFlow.ts:964-973`), so per-keystroke messages cost nothing on screen. `setInstructions` (`:799-801`) must do the same: today it `break`s into the tail render at `:1028`, and it calls `podStore.upsert`, a read-modify-write that D9 deliberately does not coalesce. Its per-keystroke message updates the in-memory criteria only; the `upsert` stays on blur.
+- **Fields the panel does not own** — `#ask` and the reply inputs — gain a panel-side draft, per finding and per thread, posted the same way and rendered back into the field. The reply input also gains a stable `id`.
+- **Clearing stays deliberate.** `src/ui/postedReviewsHtml.ts:401-405` documents that the reply field is blanked by the refresh that follows a successful send, and that a failed send leaves the text for a retry. Once the host holds the draft, that stops happening for free: a successful reply clears the draft explicitly, a failed one keeps it.
+
+This is why the mechanism is uniform rather than a special case in `REGIONS_SCRIPT`: a conditional restore comparing `defaultValue` was the obvious alternative, and it fails on the two fields the panel does not own, where `defaultValue` is always empty and there is nothing to compare against.
 
 *Alternative rejected — the webview's `getState`/`setState` API.* It is currently unused (`acquireVsCodeApi()` is called only for `postMessage`). It persists across a webview reload, which is more than is needed, and it would be a second place route state lives beside the panel classes' own fields.
 
@@ -113,7 +123,8 @@ The existing restraint stays: focus and selection are restored, `value` is never
 Two properties make this safe rather than merely faster:
 
 - **The write is a whole-key put, not a read-modify-write.** `persistDraft` calls `update(key, {…})` with no preceding `get` (`src/ui/reviewFlow.ts:523`), so deferring it does not interleave with the `storage.ts:6-21` contract. The read-modify-write callers (`ReviewRunStore.record`, `ThreadFlags`, `PodStore`) are not coalesced and keep their synchronous pairing untouched.
-- **A generation guard preserves the one-writer rule.** The draft key is also the retained-review key (see Context), and the run manager overwrites it wholesale when a re-run succeeds. A pending coalesced write must never land on top of that. The panel records the identity of the record it loaded — the run's `ranAt` plus target — and the deferred write re-reads the key and drops itself if what is stored is from a different run. The read and the update are adjacent with no `await` between them, as the contract requires. The panel additionally cancels any pending write when it observes a `succeeded` settle for its own target, which it already subscribes to.
+- **The writer must stop erasing the field the guard reads.** `persistDraft` puts a fixed set of keys and omits every `RetainedResult` field the run manager wrote — `outcome`, `ranAt`, `agentId`, `agentLabel`, `modelId`, `submittedAt`, `candidates`, `filesRead`. That is already a live defect independent of this change: `ranAt` is rendered as the "Ran …" line (`src/ui/reviewFlow.ts:1437` -> `src/ui/reviewFlowHtml.ts:788`), so today the first triage action on a target silently removes it, and `readRetained`'s `outcome ?? 'findings'` fallback (`src/app/retainedReview.ts:229`) hides the rest. The coalesced writer carries those fields forward into every put, taken from the **raw stored record** the panel holds (`this.retained.draft`), not from the normalized view — writing the normalized view back would materialize `readRetained`'s inferred fallbacks into storage, which the archived design deliberately kept in the reader. `changesetReview`'s own draft write (`src/ui/changesetReview.ts:243-253`) drops the identical fields and needs the same carry-forward.
+- **A generation guard then preserves the one-writer rule.** The draft key is also the retained-review key (see Context), and the run manager overwrites it wholesale when a re-run succeeds. A pending coalesced write must never land on top of that. The panel records the `ranAt` and target of the record it loaded; the deferred write re-reads the key and drops itself if the stored `ranAt` differs. This only works because of the bullet above — without the carry-forward the panel's own first write sets `ranAt` to `undefined`, every later write would read "a different run", and the coalescing would discard exactly the triage it exists to save. The read and the update are adjacent with no `await` between them, as the contract requires. The panel additionally cancels any pending write when it observes a `succeeded` settle for its own target, which it already subscribes to.
 
 The observable durability contract is in `specs/app-state/spec.md` — *Triage decisions are durable even though their writes are batched*. The window is an implementation detail; the flush points are not.
 
@@ -127,12 +138,12 @@ The observable durability contract is in `specs/app-state/spec.md` — *Triage d
 
 ### D11 — Four phases, each shippable on its own
 
-1. **Cheap wins, no architecture change.** Memoize the three derivations (D10). Make `setActiveReview`/`setThreads`/`setActiveRoute`/`setPendingReview` patch the sidebar's own regions from held state instead of calling `render()`. Take `testConnection()` off the settings message tail. Coalesce `persistDraft` with its guard (D9).
-2. **The store.** Introduce `AppStore` (D1–D4), move `fetchPodData` call sites behind it, replace `repaintReviewSurfaces` with subscriptions, point the notifier at it (D5).
-3. **Region patching everywhere.** Migrate `changesetReview`, `changeset`, `settings`, `tuning`, `onboarding` and the sidebar; convert their inline handlers to delegated ones; make posted-review thread actions patch one thread.
+1. **Cheap wins, no architecture change.** Memoize the three derivations (D10). Make `setActiveReview`/`setThreads`/`setActiveRoute`/`setPendingReview` patch the sidebar's own regions from held state instead of calling `render()`. Take `testConnection()` off the settings message tail. Make the coalesced writer carry the `RetainedResult` fields forward, then add its guard (D9) — in that order, and the carry-forward repairs a live defect on its own.
+2. **The store.** Introduce `AppStore` (D1–D4), move `fetchPodData` call sites behind it, replace `repaintReviewSurfaces` with subscriptions, point the notifier's pod-data fetch at it (D5).
+3. **Region patching everywhere, and the text it would otherwise destroy.** Migrate `changesetReview`, `changeset`, `settings`, `tuning`, `onboarding` and the sidebar; convert their inline handlers to delegated ones; make posted-review thread actions patch one thread. The in-progress-text work in D8 lands **here, not in phase 4**: this phase is what makes `changesetReview` patch the region holding the summary, note and ask fields, and what makes a thread action patch the region holding a half-typed reply. Shipping the patching without it would turn a rare loss into a routine one.
 4. **The resident shell.** Union the CSS and scripts, swap `#app-route`, add per-route view-state retention (D7, D8).
 
-Phase 1 is worth shipping alone: it removes three network requests per triage click and a connection test per settings toggle. Phase 3 depends on the delegated-handler conversion, which is also what phase 4 needs, so 3 before 4 is not optional.
+Phase 1 is worth shipping alone: it removes three network requests per triage click and a connection test per settings toggle, and repairs the record-field erasure. Phase 3 depends on the delegated-handler conversion, which is also what phase 4 needs, so 3 before 4 is not optional.
 
 ## Risks / Trade-offs
 
@@ -144,13 +155,15 @@ Phase 1 is worth shipping alone: it removes three network requests per triage cl
 - **Change detection is too fine and costs more than it saves** → snapshots are lists of small records; comparison is bounded by the same list sizes already sorted, filtered and mapped on every render today.
 - **The shell's first paint gets larger** → ~60–70 KB assigned once per panel lifetime, and the panel is `retainContextWhenHidden` so it is rarely recreated. Measure the first-paint size in phase 4 and keep it in the test suite as a bound.
 - **The store outlives a pod's relevance and holds stale data** → entries are keyed by pod id and bounded by `PodStore`'s list; a pod removed from the store drops its entry.
+- **The coalesced writer silently drops a reviewer's triage** → the failure mode if D9's carry-forward is skipped: the guard reads `ranAt`, the writer erases it, and every write after the first discards itself. The carry-forward is therefore a prerequisite of the guard, not an adjacent tidy-up, and task 4.3 orders them.
+- **A UI read is charged at the background rate floor** → the reason single-flight does not coalesce across intents (D3). If that carve-out is later judged not worth the extra request, the consequence must be stated where it is removed, not discovered when a reviewer cannot open a review because polling spent the budget.
 - **Phase 2 changes who fetches, so a fetch that used to happen no longer does** → subscriptions replace the `repaintReviewSurfaces` fan-out one surface at a time, each with a test asserting the surface still updates on the events it used to be told about.
 
 ## Migration Plan
 
 Each phase is a separate commit series behind no flag — there is no persisted format change and no user-visible contract change to gate. Rollback is `git revert` of a phase.
 
-The one format-adjacent concern is D9: the draft record's shape does not change, so a downgrade reads records written by the coalesced writer without any migration. The generation guard reads `ranAt`, which `add-background-review-runs` already writes (D7a).
+The one format-adjacent concern is D9. The draft record's shape does not change, so a downgrade reads records written by the coalesced writer without any migration — but the *content* changes in one direction only: the coalesced writer now preserves the `RetainedResult` fields that today's `persistDraft` drops, so a record that has been triaged keeps its `ranAt`, `outcome` and agent labels where it previously lost them. That is a repair, and a downgrade tolerates it because `readRetained` already treats every one of those fields as optional (`src/app/retainedReview.ts:229-235`).
 
 Phase ordering is fixed by dependency: 1 is independent; 2 depends on nothing but is easiest to verify after 1 removes the noisiest fetch; 3 requires the delegated-handler conversion; 4 requires 3.
 
