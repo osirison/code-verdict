@@ -11,6 +11,7 @@ import {
   visiblePostedRows,
 } from './postedReviewsState';
 import type { ChangeRequest } from '../platform/types';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 function thread(overrides: Partial<PostedThreadView> = {}): PostedThreadView {
   return {
@@ -351,7 +352,7 @@ describe('loading skeleton and region patching (issue #39)', () => {
       state([], { loading: true, rows: [], pendingRows: [{ refLabel: '!2841', project: 'core', age: '2d' }] }),
       'nonce123',
     );
-    expect(html).not.toContain('style="');
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('guards skeleton rows against selecting a non-existent review — pendingRows carry no ref', () => {
@@ -580,10 +581,10 @@ describe('archived posted reviews — history is append-only, the open list is t
         }),
         'n',
       );
-      expect(html).not.toContain('style="');
+      expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     }
     expect(renderPostedReviewsHtml(state(buildPostedRows([source('100')], []), { archivedCount: 1 }), 'n'))
-      .not.toContain('style="');
+      .not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 });
 

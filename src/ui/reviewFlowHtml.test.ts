@@ -5,6 +5,7 @@ import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewCon
 import { parseHunks } from '../domain/diffHunks';
 import type { FlowScreen, FlowViewState, ReviewContextView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, runOutputSummary } from './reviewFlowHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: FlowViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -557,7 +558,7 @@ describe('loading skeleton and region patching (issue #39)', () => {
     // Every value comes from a class in this page's own nonce'd CSS (issue
     // #45) — a nonce authorises style elements, never a style attribute, so
     // anything set that way is dropped before layout.
-    expect(html.slice(html.indexOf('<body>'))).not.toContain('style="');
+    expect(html.slice(html.indexOf('<body>'))).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     // this.cr is not yet assigned at this point, so nothing item-specific renders.
     expect(html).not.toContain('data-item=');
   });
@@ -716,7 +717,7 @@ describe('the context the agent was given, on the screen where the human decides
   });
 
   it('carries no style attribute — a nonce authorises style elements only (#45)', () => {
-    expect(render({})).not.toContain('style="');
+    expect(render({})).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('labels one block per member in changeset scope', () => {
@@ -1017,7 +1018,7 @@ describe('the agent and model pickers (spec: review-agents)', () => {
     const html = run({ agentOpen: true, modelOpen: true });
     const pickers = html.slice(html.indexOf('<div class="picker-stack">'), html.indexOf('<div class="crit-grid">'));
     expect(pickers).toContain('agent-select');
-    expect(html).not.toMatch(/<[^>]+\sstyle="/);
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     // The fixture's one active category ('security') gets a coloured class
     // in place of the style="…" this used to carry directly.
     expect(html).toContain('class="cat cat-on-security"');
@@ -1243,7 +1244,7 @@ describe('a retained review, and the way back to it', () => {
       runStep: 0,
       retainedAvailable: true,
     });
-    expect(html).not.toMatch(/<[^>]+\sstyle="/);
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 });
 
@@ -1345,27 +1346,27 @@ describe('no screen writes an inline style attribute (issue #45, task 8.5)', () 
   it('renders none of the seven screens with a style attribute', () => {
     for (const screen of Object.keys(SCREEN_STATES) as FlowScreen[]) {
       const html = renderReviewFlowBody(SCREEN_STATES[screen], 'HVE Core / PR Review');
-      expect(html, `screen: ${screen}`).not.toMatch(/<[^>]+\sstyle="/);
+      expect(html, `screen: ${screen}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     }
   });
 
   it('covers the variants FlowScreen alone does not reach: every triage mode, a failed or queued run, and the pre-load pages', () => {
     for (const mode of ['split', 'queue', 'diff'] as const) {
       const html = renderReviewFlowBody({ ...state, screen: 'triage', mode }, 'HVE Core / PR Review');
-      expect(html, `triage mode: ${mode}`).not.toMatch(/<[^>]+\sstyle="/);
+      expect(html, `triage mode: ${mode}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     }
     const runError = renderReviewFlowBody(
       { ...state, screen: 'running', runError: { message: 'boom', requestId: 'r1', partialCount: 2, code: 'E_TIMEOUT' } },
       'HVE Core / PR Review',
     );
-    expect(runError).not.toMatch(/<[^>]+\sstyle="/);
+    expect(runError).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     const runQueued = renderReviewFlowBody(
       { ...state, screen: 'running', runQueued: true, runSteps: [], runStep: 0 },
       'HVE Core / PR Review',
     );
-    expect(runQueued).not.toMatch(/<[^>]+\sstyle="/);
-    expect(renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n')).not.toMatch(/<[^>]+\sstyle="/);
-    expect(renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n')).not.toMatch(/<[^>]+\sstyle="/);
+    expect(runQueued).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    expect(renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    expect(renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 });
 

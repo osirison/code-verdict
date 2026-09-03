@@ -674,8 +674,14 @@ export function renderPage(opts: {
   const backScript = opts.embedded ? '' : APP_BACK_SCRIPT;
   // REGIONS_SCRIPT needs the vscode API to post `verdictReady`, so acquire it
   // for every full (non-embedded) page — not only when the caller supplies
-  // its own script or a breadcrumb, as before #39.
-  const bootstrap = opts.script || opts.breadcrumb || !opts.embedded
+  // its own script or a breadcrumb, as before #39 — and for an embedded page
+  // that opted into regions, which the sidebar does. Without that last arm an
+  // embedded caller passing `regions: true` and no script of its own emits
+  // REGIONS_SCRIPT with no `window.verdictVscode` to post `verdictReady`
+  // through: it throws, never arms, and because "not ready" falls back to a
+  // full assignment the screen degrades to rebuilding itself on every change
+  // with nothing anywhere reporting why.
+  const bootstrap = opts.script || opts.breadcrumb || opts.regions || !opts.embedded
     ? `window.verdictVscode=acquireVsCodeApi();${backScript}${opts.script ?? ''}${keysScript}${regionsScript}`
     : `${keysScript}${regionsScript}`;
   const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';

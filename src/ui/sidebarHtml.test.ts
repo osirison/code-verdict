@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { renderSidebarHtml, type SidebarScreen, type SidebarViewState } from './sidebarHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: SidebarViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -527,7 +528,7 @@ describe('no sidebar screen writes an inline style attribute (issue #45, task 8.
     // that text is not a style attribute — only a `<tag …style="` match is.
     for (const screen of Object.keys(SCREEN_STATES) as SidebarScreen[]) {
       const html = renderSidebarHtml(SCREEN_STATES[screen], 'n');
-      expect(html, `screen: ${screen}`).not.toMatch(/<[^>]+\sstyle="/);
+      expect(html, `screen: ${screen}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     }
   });
 

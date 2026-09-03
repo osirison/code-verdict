@@ -6,6 +6,7 @@ import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Pod } from '../domain/types';
 import { deriveTuningState } from './tuningState';
 import { renderTuningHtml } from './tuningHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const handlers = vi.hoisted(() => ({
   message: undefined as ((message: unknown) => void) | undefined,
@@ -216,12 +217,12 @@ describe('agent tuning fidelity (spec §10)', () => {
 describe('no style attribute anywhere on the tuning screen (issue #45, task 8.5)', () => {
   it('writes no inline style attribute in the empty scorecard', () => {
     const state = deriveTuningState([], DEFAULT_CRITERIA, 'No review agent selected');
-    expect(renderTuningHtml(state, 'n')).not.toMatch(/<[^>]+\sstyle="/);
+    expect(renderTuningHtml(state, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('writes no inline style attribute with charts and suggestions populated', () => {
     const state = deriveTuningState(history, DEFAULT_CRITERIA, 'HVE Core · PR Review');
-    expect(renderTuningHtml(state, 'n')).not.toMatch(/<[^>]+\sstyle="/);
+    expect(renderTuningHtml(state, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('quantises the accept-rate bar to the nearest 5% class rather than a style="width:…" attribute', () => {
