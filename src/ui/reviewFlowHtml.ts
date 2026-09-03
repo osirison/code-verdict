@@ -11,7 +11,7 @@ import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { Vocabulary } from './vocab';
 import { cap, countOf } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
-import { renderPage } from './theme';
+import { renderPage, type RouteAssets } from './theme';
 import { MARKDOWN_CSS, renderMarkdown } from './markdown';
 
 export type FlowScreen = 'agent' | 'running' | 'triage' | 'clean' | 'summary' | 'submitting' | 'done';
@@ -293,6 +293,46 @@ const FLOOR_HINTS: Record<Severity, string> = {
   blocker: 'Blockers only — fastest pass, misses test gaps.',
 };
 
+/**
+ * One rule per category — a closed set (`Category`) — generated from
+ * `CATEGORY_COLOR` rather than hand-listed a second time, so the two cannot
+ * drift. Replaces the `style="color:…;background:…"` attribute `catPill`
+ * and the criteria screen's category toggle used to write directly: the
+ * page CSP (`style-src 'nonce-…'`) drops a style attribute silently, a
+ * nonce covering only the `<style>` element (issue #45).
+ */
+const CATEGORY_PILL_CSS = (Object.keys(CATEGORY_COLOR) as Category[])
+  .map((c) => `.pill-cat-${c} { color: ${CATEGORY_COLOR[c]}; background: color-mix(in srgb, ${CATEGORY_COLOR[c]} 13%, transparent); }`)
+  .join('\n');
+/** The same colours, plus the transparent border the "on" toggle chip needs — kept apart from `CATEGORY_PILL_CSS` because a pill never carries a border to clear. */
+const CATEGORY_TOGGLE_CSS = (Object.keys(CATEGORY_COLOR) as Category[])
+  .map((c) => `.cat.cat-on-${c} { color: ${CATEGORY_COLOR[c]}; background: color-mix(in srgb, ${CATEGORY_COLOR[c]} 13%, transparent); border-color: transparent; }`)
+  .join('\n');
+
+/**
+ * One rule per severity — a closed set (`Severity`) — generated from
+ * `SEVERITIES`, setting the `--item-sev` custom property the in-diff
+ * triage view reads for its border colour. Replaces a
+ * `style="--item-sev:…"` attribute, dropped by the same CSP (issue #45).
+ */
+const ITEM_SEV_CSS = SEVERITIES
+  .map((sev) => `.item-sev-${sev} { --item-sev: ${sev === 'nit' ? 'var(--fg-dim)' : `var(--sev-${sev})`}; }`)
+  .join('\n');
+
+/**
+ * A continuous value (submit/run progress here) cannot each get a named
+ * class, so it is quantised to the nearest 5% instead — the only width a
+ * data-driven bar can take under this CSP, which drops the `style="width:…"`
+ * attribute these bars used to carry (issue #45). 5 points is under what a
+ * 4-6px bar can show; the cost lands at the edges — a true value under 2.5%
+ * rounds down to an invisible 0%-wide bar instead of a hairline sliver.
+ */
+const WIDTH_STEP = 5;
+function widthClass(pct: number): string {
+  return `w-${Math.max(0, Math.min(100, Math.round(pct / WIDTH_STEP) * WIDTH_STEP))}`;
+}
+const WIDTH_CSS = Array.from({ length: 100 / WIDTH_STEP + 1 }, (_, i) => `.w-${i * WIDTH_STEP} { width: ${i * WIDTH_STEP}%; }`).join('\n');
+
 const CSS = `
 .wrap { max-width: 760px; margin: 0 auto; padding: 26px 30px; display: flex; flex-direction: column; gap: 22px; }
 .wrap-wide { max-width: 840px; }
@@ -333,6 +373,7 @@ h1 { font-size: 19px; font-weight: 600; color: var(--fg-max); }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 .cats { display: flex; flex-wrap: wrap; gap: 8px; }
 .cat { font-size: 11px; padding: 6px 11px; border-radius: 14px; border: 1px solid var(--line2); color: var(--fg-dimmer); background: none; cursor: pointer; font-family: var(--font-ui); }
+${CATEGORY_TOGGLE_CSS}
 textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); font-size: 12px; line-height: 1.7; background: var(--bg2); color: var(--fg); border: 1px solid var(--line2); border-radius: 5px; padding: 10px 12px; resize: vertical; outline: none; }
 .footer-row { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding-top: 18px; }
 .footer-hint { margin-left: auto; font-size: 11px; color: var(--fg-dimmer); }
@@ -341,8 +382,13 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .spinner { width: 14px; height: 14px; border: 2px solid var(--agent); border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto; }
 .progress { height: 4px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--agent); transition: width .5s ease; }
+${WIDTH_CSS}
 .runlog { text-align: left; display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
 .runlog .done { color: var(--fg-dimmer); }
+/* A step not yet reached, dimmed under its "done" colour. A second class
+   rather than folding into '.runlog .done' above: that rule is shared with
+   the completed steps' checkmark line, which must stay at full opacity. */
+.runlog .step-future { opacity: .4; }
 .runlog .now { color: var(--fg); }
 /* The live counters under the bar. Monospace so the ticking clock and the
    growing character count do not shuffle the line sideways every second. */
@@ -406,6 +452,16 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .sugg-add { background: var(--add-bg); color: var(--add-fg); padding: 4px 12px; font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; }
 .presets { display: flex; flex-wrap: wrap; gap: 8px; }
 .preset:hover { border-color: var(--agent); }
+${CATEGORY_PILL_CSS}
+/* Only the final-note presets sit directly under a textarea with no other
+   gap — the other two '.presets' rows follow an element that already
+   carries space below it. A modifier rather than folding into '.presets'
+   itself, which those two would then also pick up. */
+.note-presets { margin-top: 8px; }
+/* Was style="align-self:center;font-size:11px" on #clear-note — dropped
+   silently by the same CSP (issue #45); one instance, so a modifier class
+   beside '.dimmer' rather than a second selector list to keep in sync. */
+.clear-note { align-self: center; font-size: 11px; }
 .thread-entry { border-left: 2px solid var(--agent); background: var(--agent-f); padding: 10px 14px; }
 .thread-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--agent); margin-bottom: 4px; font-family: var(--font-mono); }
 .thread-text { font-size: 12.5px; line-height: 1.6; color: var(--fg); }
@@ -456,6 +512,7 @@ textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); f
 .peek-count { margin-left: auto; color: var(--fg-dimmer); font: 10.5px/1 var(--font-mono); }
 .peek-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 14px; }
 .peek-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+${ITEM_SEV_CSS}
 .ask-link { margin-left: auto; color: var(--agent); }
 
 .clean-col { max-width: 660px; margin: 0 auto; padding: 40px 30px; display: flex; flex-direction: column; gap: 18px; text-align: center; }
@@ -498,7 +555,7 @@ function sevChip(severity: Severity): string {
 }
 
 function catPill(category: Category): string {
-  return `<span class="pill" style="color:${CATEGORY_COLOR[category]};background:color-mix(in srgb, ${CATEGORY_COLOR[category]} 13%, transparent)">${e(ALL_CATEGORY_LABELS[category])}</span>`;
+  return `<span class="pill pill-cat-${category}">${e(ALL_CATEGORY_LABELS[category])}</span>`;
 }
 
 function subline(h: FlowHeaderInfo): string {
@@ -657,10 +714,9 @@ function renderRunReview(s: FlowViewState): string {
         ${(Object.keys(ALL_CATEGORY_LABELS) as Category[])
           .map((c) => {
             const on = s.criteria.categories.includes(c);
-            const style = on
-              ? `style="color:${CATEGORY_COLOR[c]};background:color-mix(in srgb, ${CATEGORY_COLOR[c]} 13%, transparent);border-color:transparent"`
-              : '';
-            return `<button class="cat" data-cat="${c}" ${style}>${e(ALL_CATEGORY_LABELS[c])}${on ? ' ✓' : ''}</button>`;
+            // A class per category (a closed set), not the style="…" this used to
+            // write directly — the page CSP drops a style attribute silently (#45).
+            return `<button class="cat ${on ? `cat-on-${c}` : ''}" data-cat="${c}">${e(ALL_CATEGORY_LABELS[c])}${on ? ' ✓' : ''}</button>`;
           })
           .join('')}
       </div>
@@ -703,7 +759,7 @@ function renderSubmitting(s: FlowViewState): string {
     <div class="spinner"></div>
     <div class="agent-name">Submitting your review</div>
     <div class="dim">${pct}%</div>
-    <div class="progress"><div style="width:${pct}%"></div></div>
+    <div class="progress"><div class="${widthClass(pct)}"></div></div>
     <div class="runlog"><div class="now">· ${e(line)}</div></div>
     <div class="dim">Leave this open — closing it will not stop what has already been posted.</div>
   </div>`;
@@ -771,7 +827,7 @@ function renderRunning(s: FlowViewState): string {
     <div class="spinner"></div>
     <div class="agent-name">${e(agent?.label ?? '')}</div>
     <div class="dim">${pct}%</div>
-    <div class="progress"><div style="width:${pct}%"></div></div>
+    <div class="progress"><div class="${widthClass(pct)}"></div></div>
     ${runLiveness(s.runLive)}
     <div class="runlog">
       ${s.runSteps
@@ -780,7 +836,7 @@ function renderRunning(s: FlowViewState): string {
             ? `<div class="done">✓ ${e(step)}</div>`
             : i === s.runStep
               ? `<div class="now">· ${e(step)}</div>`
-              : `<div class="done" style="opacity:.4">${e(step)}</div>`,
+              : `<div class="done step-future">${e(step)}</div>`,
         )
         .join('')}
     </div>
@@ -1081,12 +1137,15 @@ function renderTriageDiff(s: FlowViewState): string {
   if (!selected) return `${triageHeader(s)}<div class="detail"><p class="prose">No review items.</p></div>`;
   const itemIndex = Math.max(0, s.items.findIndex((view) => view.item.id === selected.item.id));
   const item = selected.item;
-  const severityColor = item.severity === 'nit' ? 'var(--fg-dim)' : `var(--sev-${item.severity})`;
+  // A class per severity (a closed set), not the style="--item-sev:…" this
+  // used to write directly — the page CSP drops a style attribute silently,
+  // a nonce covering only the <style> element (#45).
+  const sevClass = `item-sev-${item.severity}`;
   const suggestion = item.suggestion
     ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a ${e(s.vocabulary.platformName)} suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
     : '';
   const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text md">${renderMarkdown(entry.text)}</div></div>`).join('');
-  const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
+  const widget = `<div class="peek-widget ${sevClass}" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}">
     <div class="peek-head">${sevChip(item.severity)}${movedChip(selected)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
     <div class="peek-body"><div class="prose md">${renderMarkdown(item.body)}</div>${suggestion}${thread}
       <div class="peek-actions">
@@ -1101,7 +1160,7 @@ function renderTriageDiff(s: FlowViewState): string {
     const lineNumber = line.newLine ?? line.oldLine;
     const flagged = line.newLine === item.line;
     const prefix = line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' ';
-    return `<div class="diff-line ${line.kind} ${flagged ? 'diff-flagged' : ''}" style="--item-sev:${severityColor}"><span class="diff-gutter">${lineNumber ?? ''}</span><span class="diff-prefix">${prefix}</span><span class="diff-text">${e(line.text)}</span></div>${flagged ? widget : ''}`;
+    return `<div class="diff-line ${line.kind} ${flagged ? 'diff-flagged' : ''} ${sevClass}"><span class="diff-gutter">${lineNumber ?? ''}</span><span class="diff-prefix">${prefix}</span><span class="diff-text">${e(line.text)}</span></div>${flagged ? widget : ''}`;
   }).join('');
   return `${triageHeader(s)}<div class="diff-wrap">
     <div class="diff-file-head"><span class="diff-file-path">${selected.projectLabel && selected.refLabel ? `${e(selected.projectLabel)} · ${e(selected.refLabel)} · ` : ''}${e(item.file)}</span><span class="diff-file-count">${itemIndex + 1} of ${s.items.length}</span><button class="diff-nav" id="prev-item" title="Previous finding">↑ prev</button><button class="diff-nav" id="next-item" title="Next finding">↓ next</button></div>
@@ -1222,11 +1281,11 @@ function renderSummary(s: FlowViewState): string {
     <div>
       <div class="crit-label">Final instructions</div>
       <textarea class="extra" id="final-note" placeholder="Anything the author should know before they read the comments — merge conditions, follow-up issues, what you deliberately did not review.">${e(s.finalNote)}</textarea>
-      <div class="presets" style="margin-top:8px">
+      <div class="presets note-presets">
         <button class="chip" data-note="Merge once both blockers are fixed; the minor items can follow up.">Merge conditions</button>
         <button class="chip" data-note="Scope note: only the changed files were reviewed — the migration path was not.">Scope note</button>
         <button class="chip" data-note="Good change overall — pushing back only on the items above.">Thanks + push back</button>
-        <a href="#" id="clear-note" class="dimmer" style="align-self:center;font-size:11px">clear</a>
+        <a href="#" id="clear-note" class="dimmer clear-note">clear</a>
       </div>
     </div>
     <div class="options-row">
@@ -1272,7 +1331,7 @@ function renderDone(s: FlowViewState): string {
     <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
     <p class="lede">${e(s.doneSentence)}</p>
     ${retainedMetaLine(s)}
-    <div class="actions-row" style="justify-content:center">
+    <div class="actions-row actions-center">
       <button class="btn btn-accent" id="track-replies">Track replies</button>
       <button class="btn" id="new-run">Run a new review</button>
       <button class="btn" id="back-dash">Back to dashboard</button>
@@ -1382,7 +1441,11 @@ on('run', 'run'); on('cancel', 'cancel'); on('cancel-run', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
 on('new-run', 'newRun'); on('back-to-result', 'backToResult');
-document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
+// Anchored under #mode (task 8.1): the settings screen's notification
+// buttons also carry data-mode, and every screen's listeners share one
+// resident shell document — a bare button[data-mode] here would post a junk
+// setMode for every notification-mode click over there.
+document.addEventListener('click', (ev) => { const b = ev.target.closest('#mode button[data-mode]'); if (b) post({ type: 'setMode', mode: b.dataset.mode }); });
 on('reanchor', 'reanchor'); on('rerun', 'rerun'); on('ctx-toggle', 'toggleReviewContext');
 
 const itemId = () => document.querySelector('[data-item]')?.dataset.item;
@@ -1521,6 +1584,11 @@ document.addEventListener('click', (ev) => {
 
 // Keyboard (spec §12 Triage group) — active while the review tab has focus.
 document.addEventListener('keydown', (ev) => {
+  // Checked at keydown time, not registration time: this script lives in the
+  // resident shell for the panel's whole lifetime (task 8.3) while routes
+  // swap through #app-route. Without the guard, j/k and 1-4 would post
+  // move/jumpSeverity from every other screen and swallow those keys there.
+  if (!document.querySelector('.route-flow')) return;
   if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // never hijack Cmd/Ctrl chords
   const map = { a: () => verdict('accepted', !ev.shiftKey ? true : false), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); } };
@@ -1536,6 +1604,13 @@ document.addEventListener('keydown', (ev) => {
  * and the region patch — one source of markup, no duplication. Wrapped by
  * both in the same `id="flow-body"` container.
  */
+/**
+ * This screen's contribution to the resident shell (design D7, task 8.3).
+ * Shared by the review flow and the changeset-review routes — both render
+ * through this module, so they are one entry in the union, not two.
+ */
+export const REVIEW_FLOW_ROUTE: RouteAssets = { className: 'route-flow', css: CSS, script: SCRIPT };
+
 export function renderReviewFlowBody(s: FlowViewState, agentLabel: string): string {
   return s.screen === 'agent'
     ? renderRunReview(s)
@@ -1580,6 +1655,7 @@ export function renderReviewFlowHtml(s: FlowViewState, agentLabel: string, nonce
     body,
     script: SCRIPT,
     breadcrumb: { current: reviewFlowCrumb(s) },
+    routeClass: REVIEW_FLOW_ROUTE.className,
   });
 }
 
@@ -1607,6 +1683,7 @@ export function renderReviewFlowLoadingHtml(header: { refLabel: string; projectP
     body,
     script: SCRIPT,
     breadcrumb: { current: header.refLabel },
+    routeClass: REVIEW_FLOW_ROUTE.className,
   });
 }
 
@@ -1642,5 +1719,6 @@ export function renderReviewFlowErrorHtml(
     body,
     script: SCRIPT,
     breadcrumb: { current: header.refLabel },
+    routeClass: REVIEW_FLOW_ROUTE.className,
   });
 }

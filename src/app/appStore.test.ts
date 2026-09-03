@@ -503,3 +503,88 @@ describe('entries are pod-keyed and bounded to PodStore (task 5.5)', () => {
     expect(world.connections).toBe(2);
   });
 });
+
+describe('a stale result arriving late never overwrites a newer one', () => {
+  it('a slow background revalidation landing after a forced refresh is discarded', async () => {
+    const world = makeWorld();
+    const { store, clock, pods } = await storeFor(world);
+    await store.read(pods[0]!).fetch;
+    clock.t += WINDOW_MS;
+
+    // A stale read starts a background revalidation, held open at the gate.
+    const slow = gate();
+    world.gate = slow.promise;
+    const stale = store.read(pods[0]!);
+    expect(stale.data).toBeDefined();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The reviewer presses ⟳ before it lands: a newer interactive fetch
+    // starts (it must not join the background flight — D3) and completes.
+    world.gate = undefined;
+    clock.t += 1_000;
+    world.crs = [cr('2', { title: 'The newer result' })];
+    await store.forceRefresh(pods[0]!);
+    expect(store.peek('a')?.changeRequests[0]?.title).toBe('The newer result');
+
+    // Now the slow flight lands, carrying the older snapshot.
+    world.crs = [cr('1', { title: 'The stale result' })];
+    slow.open();
+    await stale.fetch?.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The later result stays; the earlier one is discarded (its start time
+    // predates the installed fetch), and a fresh read serves the newer copy
+    // without fetching again.
+    expect(store.peek('a')?.changeRequests[0]?.title).toBe('The newer result');
+    const after = store.read(pods[0]!);
+    expect(after.fetch).toBeUndefined();
+    expect(after.data?.changeRequests[0]?.title).toBe('The newer result');
+  });
+});
+
+describe('held state is provider-agnostic', () => {
+  it('pods of two providers read the same store the same way, and hold only the neutral shape', async () => {
+    const podA = podOf('a');
+    const podB = { ...podOf('b', ['r2']), providerId: 'gitlab' };
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(podA);
+    await podStore.upsert(podB);
+    let connections = 0;
+    const store = new AppStore({
+      podStore,
+      secrets: {} as unknown as SecretStore,
+      reviewHistory: { list: () => [] } as unknown as ReviewHistory,
+      baseSeconds: () => 60,
+      // The factory is the only place a provider is resolved; the store
+      // itself never looks at `providerId` (and, per the ESLint boundary in
+      // eslint.config.mjs, could not import a concrete provider if it tried).
+      connectionFor: async (pod: Pod) => {
+        connections += 1;
+        return {
+          listOpenChangeRequests: async () => [
+            cr('1', { title: `Served for ${pod.providerId}` }),
+          ],
+          listWorkItems: async () => [],
+          listCiRuns: async () => [],
+        } as unknown as Connection;
+      },
+      now: () => T0,
+    });
+
+    const dataA = await store.read(podA).fetch!;
+    const dataB = await store.read(podB).fetch!;
+
+    // Each pod got its own provider's data through the identical read path.
+    expect(dataA.changeRequests[0]?.title).toBe('Served for github');
+    expect(dataB.changeRequests[0]?.title).toBe('Served for gitlab');
+    // Both are served from held state under the same freshness rules.
+    expect(store.read(podA).fetch).toBeUndefined();
+    expect(store.read(podB).fetch).toBeUndefined();
+    expect(connections).toBe(2);
+    // What is held is exactly the neutral PodData shape — no provider field
+    // beyond the pod's own configuration reaches the held state.
+    for (const held of [store.peek('a')!, store.peek('b')!]) {
+      expect(Object.keys(held).sort()).toEqual(['changeRequests', 'ciRuns', 'fetchedAt', 'pod', 'workItems']);
+    }
+  });
+});

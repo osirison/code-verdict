@@ -508,6 +508,27 @@ describe('the changeset screen reads the pod through the store (task 6.2)', () =
     });
   });
 
+  it('navigating between the dashboard and the changeset screen inside the window issues no pod fetch', async () => {
+    const s = await setup();
+    await openDashboard(s);
+    const before = { ...world.calls };
+
+    // Dashboard → changeset → dashboard → changeset, all inside the
+    // freshness window. The pod data every screen needs is served held; the
+    // only platform traffic is the changeset screen's per-member diffs,
+    // which are per change request — the store never holds them (task 6.2's
+    // deliberate boundary), so each entry to that screen re-fetches its own.
+    await openChangeset(s);
+    await openDashboard(s);
+    await openChangeset(s);
+    await flush();
+
+    expect(world.calls.changeRequests).toBe(before.changeRequests);
+    expect(world.calls.workItems).toBe(before.workItems);
+    expect(world.calls.ciRuns).toBe(before.ciRuns);
+    expect(world.calls.diffs).toBe(4);
+  });
+
   describe('the region patch (task 7.3)', () => {
     /** Arms the route the way REGIONS_SCRIPT does on a real page load. */
     function armReady(): void {

@@ -71,19 +71,19 @@
 ## 8. The resident shell (D7)
 
 - [x] 7.6a Every document that can be the loaded page must carry the attributes the delegated handlers read. Found in review of 7.6: the changeset loading skeleton ships the same script and arms the same region handshake, but omitted `data-changeset-id` from its `<main>`. Because the completing `load()` patches only `#cs-body`, a cold open left a `<main>` that never gained it, and openFinding/reviewTogether/removeChangeset posted `changesetId: undefined` for the life of the screen. Both documents now come from one `shell()`, so they cannot diverge; a test compares the two shells directly.
-- [ ] 8.1 Audit every screen's CSS for unprefixed selectors that would collide once unioned. Record what changed.
-- [ ] 8.2 Scope each route's CSS under a route ancestor class, and add `#app-route` as the swappable body container in `renderPage` (`src/ui/theme.ts:449-490`).
-- [ ] 8.3 Build the shell document once per panel lifetime: the union of every route's CSS and bootstrap script, assigned via `setHtml` on first paint and on `onReload` (`src/ui/appSurface.ts:9-21`). No new "force full" signal.
-- [ ] 8.4 Make `AppSurface.activate` (`src/ui/appSurface.ts:147-158`) patch `#app-route` and the breadcrumb on a route change instead of the incoming route assigning a document.
-- [ ] 8.5 Verify no renderer emits an inline `style="…"` attribute — the CSP (`default-src 'none'; style-src 'nonce-…'`) drops them silently. Add a test asserting the rendered HTML of every screen contains no `style="` attribute.
-- [ ] 8.6 Tests: navigating between two routes assigns `webview.html` exactly once across both; two routes rendered into one document each still satisfy their own existing `*Html.test.ts` assertions; a webview reload reassigns the shell and restores the current route.
-- [ ] 8.7 Add a first-paint size bound: assert the shell document is under a stated character budget, so a future screen cannot grow it unnoticed.
+- [x] 8.1 Audit every screen's CSS for unprefixed selectors that would collide once unioned. Record what changed.
+- [x] 8.2 Scope each route's CSS under a route ancestor class, and add `#app-route` as the swappable body container in `renderPage` (`src/ui/theme.ts:449-490`).
+- [x] 8.3 Build the shell document once per panel lifetime: the union of every route's CSS and bootstrap script, assigned via `setHtml` on first paint and on `onReload` (`src/ui/appSurface.ts:9-21`). No new "force full" signal.
+- [x] 8.4 Make `AppSurface.activate` (`src/ui/appSurface.ts:147-158`) patch `#app-route` and the breadcrumb on a route change instead of the incoming route assigning a document.
+- [x] 8.5 Verify no renderer emits an inline `style="…"` attribute — the CSP (`default-src 'none'; style-src 'nonce-…'`) drops them silently. Add a test asserting the rendered HTML of every screen contains no `style="` attribute.
+- [x] 8.6 Tests: navigating between two routes assigns `webview.html` exactly once across both; two routes rendered into one document each still satisfy their own existing `*Html.test.ts` assertions; a webview reload reassigns the shell and restores the current route.
+- [x] 8.7 Add a first-paint size bound: assert the shell document is under a stated character budget, so a future screen cannot grow it unnoticed.
 
 ## 9. Per-route view state and in-progress text (D8)
 
-- [ ] 9.1 Extend `REGIONS_SCRIPT` (`src/ui/theme.ts:387-427`) to snapshot and restore expanded/collapsed state and per-container scroll positions for elements carrying a stable id, alongside the focus, selection and window-scroll it already handles.
+- [x] 9.1 Extend `REGIONS_SCRIPT` (`src/ui/theme.ts:387-427`) to snapshot and restore expanded/collapsed state and per-container scroll positions for elements carrying a stable id, alongside the focus, selection and window-scroll it already handles.
 
-- [ ] 9.2 Keep the existing restraint in `REGIONS_SCRIPT`: restore focus and selection, never `value`. Task 9.3 is what makes that restraint safe, by making the re-rendered value current instead of stale.
+- [x] 9.2 Keep the existing restraint in `REGIONS_SCRIPT`: restore focus and selection, never `value`. Task 9.3 is what makes that restraint safe, by making the re-rendered value current instead of stale.
 
 - [x] 9.3 Make the host hold every editable's in-progress text, so a re-render never paints over what the reviewer is typing (D8).
   - Commit `#summary-text`, `#final-note` and `#extra` on debounced `input` rather than `change` (`src/ui/reviewFlowHtml.ts:1394, 1396, 1302`) — `change` fires on blur, so today mid-typing text exists only in the DOM.
@@ -93,17 +93,30 @@
   - These writes ride the coalescing writer from task 4.1, so they add no extra `workspaceState` traffic.
 
 - [x] 9.3a Flush pending text commits on blur, not only on a click in the page. Not in the original plan — the debounce introduced by 9.3 is only flushed by a capture-phase click, and `codeVerdict.submitReview` reaches submit from the palette without any click landing in the webview, so a submit within the debounce window would post a summary that stale to the platform. Blur is the one signal every such path shares. Also added a test that the emitted page script parses, since neither `tsc` nor `eslint` looks inside these template literals.
-- [ ] 9.4 Add a per-route snapshot kept in the webview, taken on leaving a route and reapplied on entering it, so returning to a screen restores its scroll position and expanded sections.
+- [x] 9.4 Add a per-route snapshot kept in the webview, taken on leaving a route and reapplied on entering it, so returning to a screen restores its scroll position and expanded sections.
 
-- [ ] 9.5 Document the convention that a renderer's stateful element needs a stable id to be restored.
+- [x] 9.5 Document the convention that a renderer's stateful element needs a stable id to be restored.
 
-- [ ] 9.6 Tests in `src/ui/dashboardScript.test.ts` (jsdom, in the shape of the existing region-patch test at `:86-99`): a patch preserves scroll position, an open section and a focused field's caret; leaving and returning to a route restores its scroll and expanded sections; a patch never restores a stale field value over a regenerated one.
+- [x] 9.6 Tests in `src/ui/dashboardScript.test.ts` (jsdom, in the shape of the existing region-patch test at `:86-99`): a patch preserves scroll position, an open section and a focused field's caret; leaving and returning to a route restores its scroll and expanded sections; a patch never restores a stale field value over a regenerated one.
 
-- [ ] 9.7 Tests for 9.3, covering both directions of the requirement: a patch arriving between keystrokes leaves the typed text, focus and caret intact in the summary field, the note field and a reply field; a `regenerate` still replaces the summary text rather than preserving what was typed; a reply that sends successfully ends empty; a reply that fails keeps its text.
+- [x] 9.7 Tests for 9.3, covering both directions of the requirement: a patch arriving between keystrokes leaves the typed text, focus and caret intact in the summary field, the note field and a reply field; a `regenerate` still replaces the summary text rather than preserving what was typed; a reply that sends successfully ends empty; a reply that fails keeps its text.
 
 ## 10. Verification
 
+- [x] 8.5a Quantise the sidebar's stacked progress segments cumulatively, not one by one. Found while reviewing 8.5: three widths each rounded to the step can stack, so 1/1/1 of 3 items rendered as 105% — progress that is not there. Rounding the running boundary makes each width a difference of rounded values, so the total is one rounding and is within half a step. Pinned by an invariant test over six count distributions, which fails at 3.57 > 2.5 under the old form.
 - [ ] 10.1 Confirm every scenario in `specs/app-state/spec.md` and `specs/ui-responsiveness/spec.md` has a test, and list which test covers which scenario.
-- [ ] 10.2 Re-run the three `background-review-runs` invariants as explicit tests against the new persistence path: a retained review survives a restart; it is replaced only by a run that succeeds; an in-flight run interrupted by a restart is still reported as interrupted. Include the case the coalescing makes reachable: a pending write held across a re-run that succeeds must not resurrect the previous run's verdicts.
-- [ ] 10.3 Count platform calls for a full triage session against a fake connection — open dashboard, open a review, record ten verdicts, submit — and record the before/after numbers in the change's completion notes.
+- [x] 10.2 Re-run the three `background-review-runs` invariants as explicit tests against the new persistence path: a retained review survives a restart; it is replaced only by a run that succeeds; an in-flight run interrupted by a restart is still reported as interrupted. Include the case the coalescing makes reachable: a pending write held across a re-run that succeeds must not resurrect the previous run's verdicts.
+- [x] 10.3 Count platform calls for a full triage session against a fake connection — open dashboard, open a review, record ten verdicts, submit — and record the before/after numbers in the change's completion notes.
+
+  **Recorded.** Measured after, derived before; the derivation is stated rather than guessed, because the pre-change path no longer exists in the tree to run.
+
+  | Step | Before | After |
+  | --- | --- | --- |
+  | Open the dashboard | 3 (one pod fetch) | 3 cold, 0 within the freshness window |
+  | Open a review with the sidebar showing | 3 (sidebar refetch) + the CR lookup and diff | the CR lookup and diff only |
+  | Ten verdicts | 30 | **0** |
+  | One settings toggle | 1 connection test | 0 |
+  | Three surfaces repainting on one event | 9 | 0 held / 3 shared past the window |
+
+  The ten-verdict figure is the one that mattered: every render fired `onSidebarState`, which reached `setActiveReview`, which called `render()`, which called `fetchPodData` — three list calls per verdict, for data no verdict changes. Asserted, not estimated, by `src/ui/reviewFlow.test.ts` "a full triage session (task 10.3)" (zero calls across the loop) and `src/ui/sidebar.test.ts` (ten `setActiveReview` calls leave the counters untouched). The before figures come from the same counters against the call graph that phase 1 replaced.
 - [ ] 10.4 Run the full suite and the extension's lint/build; report failures with their output rather than summarising them.

@@ -387,24 +387,99 @@ const KEYS_SCRIPT = `
 export const REGIONS_SCRIPT = `
 ;(() => {
   window.verdictVscode.postMessage({ type: 'verdictReady' });
+
+  // The DOM state a patch would otherwise discard (design D8, task 9.1):
+  // window scroll, per-container scroll and <details> expansion, captured
+  // from elements carrying a stable id — an id is the only handle that can
+  // match an element to its rebuilt self after innerHTML is replaced, so a
+  // stateful element without one is simply not restored (the convention is
+  // documented in docs/ARCHITECTURE.md).
+  const captureView = () => {
+    const open = {};
+    for (const el of document.querySelectorAll('details[id]')) open[el.id] = el.open;
+    const scrolls = {};
+    for (const el of document.querySelectorAll('[id]')) {
+      if (el.scrollTop || el.scrollLeft) scrolls[el.id] = { t: el.scrollTop, l: el.scrollLeft };
+    }
+    return { x: window.scrollX, y: window.scrollY, open, scrolls };
+  };
+  // Restore order is load-bearing: details first (opening one changes the
+  // layout everything after lands in), then focus (focus() scrolls ancestor
+  // containers to reveal its element, which would undo a container restore
+  // that ran earlier), then container scrolls, then window scroll last.
+  // Returns whether every restore verifiably landed — false when an id is
+  // missing (a loading skeleton not yet holding the real content) or the
+  // window scroll clamped against a document still too short for it.
+  const applyView = (view, focusId, selStart, selEnd) => {
+    let landed = true;
+    for (const id of Object.keys(view.open)) {
+      const el = document.getElementById(id);
+      if (el) el.open = view.open[id]; else landed = false;
+    }
+    if (focusId) {
+      const el = document.getElementById(focusId);
+      if (el) {
+        el.focus();
+        if (selStart != null && selEnd != null) {
+          try { el.setSelectionRange(selStart, selEnd); } catch {}
+        }
+      }
+    }
+    for (const id of Object.keys(view.scrolls)) {
+      const el = document.getElementById(id);
+      if (el) { el.scrollTop = view.scrolls[id].t; el.scrollLeft = view.scrolls[id].l; } else landed = false;
+    }
+    window.scrollTo(view.x, view.y);
+    if (window.scrollX !== view.x || window.scrollY !== view.y) landed = false;
+    return landed;
+  };
+
+  // Per-route view state (design D8, task 9.4): saved when a navigation
+  // patch swaps #app-route away from a route, reapplied when one swaps back,
+  // so returning to a screen restores its scroll position and expanded
+  // sections instead of resetting to top. Keyed by the routeKey AppSurface
+  // sends on exactly those patches (the shell document stamps the first
+  // route's key on #app-route), so a patch can never restore one route's
+  // state onto another. Capped because the changeset routes are keyed per
+  // changeset id — without a bound the map would grow with every changeset
+  // visited for the life of the panel. Oldest-saved is evicted; re-saving on
+  // each leave keeps a route the reviewer actually returns to alive.
+  const ROUTE_STATES_MAX = 8;
+  const routeStates = new Map();
+  let currentRoute = document.getElementById('app-route')?.dataset.routeKey;
+  // A route entered through a loading skeleton cannot take its saved state
+  // yet: the containers are not in the DOM and the document is too short
+  // for the scroll. The snapshot is held pending and reapplied on the next
+  // patch for the same route (the content render), then dropped — a hard
+  // bound, so a patch minutes later can never yank the viewport back to an
+  // entry-time position the reviewer has since scrolled away from.
+  let pendingView;
+
   window.addEventListener('message', (ev) => {
     const data = ev.data;
     if (!data || data.type !== 'verdict:regions') return;
+    const entering = data.routeKey !== undefined && data.routeKey !== currentRoute;
+    if (entering && currentRoute !== undefined) {
+      routeStates.delete(currentRoute);
+      routeStates.set(currentRoute, captureView());
+      if (routeStates.size > ROUTE_STATES_MAX) routeStates.delete(routeStates.keys().next().value);
+    }
     // A patch replaces innerHTML wholesale, which would otherwise drop focus
     // to <body> and send the next keystroke to a screen's keyboard handler
     // as though it were a real shortcut (the other half of #38 — a full
-    // re-render used to do exactly this). Snapshot focus/selection/scroll,
-    // patch, then restore them.
+    // re-render used to do exactly this). Snapshot focus/selection and the
+    // view state above, patch, then restore them.
     //
     // Restore focus and selection ONLY — never .value: the re-rendered value
     // is the panel's own state (e.g. a regenerated summary), and restoring a
-    // stale typed value would clobber it.
+    // stale typed value would clobber it. The host holds every editable's
+    // in-progress text (task 9.3), so what the patch paints is already
+    // current and no value restore is ever needed.
     const active = document.activeElement;
     const focusId = active && active.id ? active.id : undefined;
     let selStart, selEnd;
     try { selStart = active ? active.selectionStart : undefined; selEnd = active ? active.selectionEnd : undefined; } catch {}
-    const scrollX = window.scrollX;
-    const scrollY = window.scrollY;
+    const before = entering ? undefined : captureView();
     for (const id of Object.keys(data.regions)) {
       // Not every region id exists on every screen (e.g. a page with no
       // breadcrumb) — skip rather than throw, and let the rest of the batch
@@ -412,16 +487,24 @@ export const REGIONS_SCRIPT = `
       const el = document.getElementById(id);
       if (el) el.innerHTML = data.regions[id];
     }
-    if (focusId) {
-      const restored = document.getElementById(focusId);
-      if (restored) {
-        restored.focus();
-        if (selStart != null && selEnd != null) {
-          try { restored.setSelectionRange(selStart, selEnd); } catch {}
-        }
-      }
+    if (entering) {
+      currentRoute = data.routeKey;
+      document.getElementById('app-route')?.setAttribute('data-route-key', data.routeKey);
+      // No focus restore across a route change: the departed screen's field
+      // is gone, and a coincidentally shared id would focus a stranger. A
+      // route never seen (or evicted) starts at the top, exactly as a fresh
+      // document used to.
+      const saved = routeStates.get(data.routeKey);
+      pendingView = saved && !applyView(saved) ? saved : undefined;
+      if (!saved) window.scrollTo(0, 0);
+      return;
     }
-    window.scrollTo(scrollX, scrollY);
+    if (pendingView) {
+      applyView(pendingView, focusId, selStart, selEnd);
+      pendingView = undefined;
+    } else {
+      applyView(before, focusId, selStart, selEnd);
+    }
   });
 })();
 `;
@@ -435,6 +518,87 @@ export function escapeHtml(text: string): string {
 }
 
 /**
+ * One screen's static assets, as the resident shell (design D7) needs them:
+ * the union of every route's `css` and `script` is baked into one document
+ * per panel lifetime, so both must be safe to coexist with every other
+ * screen's — `css` is scoped under `className` (see `scopeRouteCss`), and
+ * `script` must consist of `document`-level delegated listeners that match
+ * nothing while the screen's markup is absent from `#app-route`.
+ */
+export interface RouteAssets {
+  /** The ancestor class `css` is scoped under and the route content's wrapper carries. */
+  className: string;
+  css: string;
+  script: string;
+}
+
+/**
+ * Scopes a route's CSS under its ancestor class (task 8.2) with native CSS
+ * nesting: `header { … }` inside `.route-dashboard { … }` resolves as
+ * `.route-dashboard header { … }`. Without this, unioning the screens' CSS
+ * into the resident shell (D7) lets same-named selectors fight — the
+ * dashboard's and the posted screen's `.thead` disagree on column counts,
+ * their `.skel-title`s on size, tuning's and onboarding's `h1` on font size.
+ * Relaxed nesting (bare element selectors like `header`) needs Chromium 120;
+ * the extension floor is VS Code 1.96, whose runtime is well past that.
+ * Specificity only ever gains the one ancestor class, uniformly, so no
+ * route rule can start losing to the shared base CSS it used to beat.
+ */
+export function scopeRouteCss(className: string, css: string): string {
+  return `.${className} {\n${css}\n}`;
+}
+
+/**
+ * Structural markers `renderPage` places around the two per-route regions of
+ * every full-page document, so `AppSurface` can lift the route's content out
+ * of the document a screen rendered and patch it into the resident shell
+ * (D7) instead of assigning a whole document per navigation. HTML comments:
+ * they survive an innerHTML round-trip harmlessly, and content cannot forge
+ * one — every renderer escapes `<` before it could spell a comment open.
+ */
+const CRUMB_START = '<!--verdict:crumb-->';
+const CRUMB_END = '<!--/verdict:crumb-->';
+const ROUTE_START = '<!--verdict:route-->';
+const ROUTE_END = '<!--/verdict:route-->';
+
+/** The two shell regions a navigation swaps: the breadcrumb container and the route body. */
+export interface RouteRegions {
+  crumb: string;
+  route: string;
+}
+
+/**
+ * Recovers the swappable regions from a `renderPage` document. Returns
+ * undefined for a document without the markers (`renderFallbackHtml`'s
+ * script-free error pages), which callers must assign whole — those pages
+ * carry no REGIONS_SCRIPT, so a patch could never reach them anyway.
+ */
+export function extractRouteRegions(html: string): RouteRegions | undefined {
+  const crumbStart = html.indexOf(CRUMB_START);
+  const crumbEnd = html.indexOf(CRUMB_END);
+  const routeStart = html.indexOf(ROUTE_START);
+  const routeEnd = html.indexOf(ROUTE_END);
+  if (crumbStart === -1 || crumbEnd <= crumbStart || routeStart <= crumbEnd || routeEnd <= routeStart) {
+    return undefined;
+  }
+  return {
+    crumb: html.slice(crumbStart + CRUMB_START.length, crumbEnd),
+    route: html.slice(routeStart + ROUTE_START.length, routeEnd),
+  };
+}
+
+/**
+ * The ‹ back control, delegated on `document` rather than bound to the
+ * element (task 8.4): under the resident shell a navigation patches the
+ * breadcrumb container's innerHTML, which silently drops any listener bound
+ * to the old `#app-back` node — the button would go dead after the first
+ * route change. Registered on every full page, breadcrumb or not, because
+ * the shell outlives the route that first painted it: a breadcrumb patched
+ * in later must already be wired.
+ */
+const APP_BACK_SCRIPT = `document.addEventListener('click',(ev)=>{if(ev.target.closest('#app-back'))window.verdictVscode.postMessage({type:'appBack'});});`;
+
+/**
  * Codicons for the extension chrome (issue #6). A webview gets no icon font
  * for free and its CSP blocks remote ones, so the caller passes the bundled
  * stylesheet's webview URI plus the webview's own `cspSource`; both style-src
@@ -445,7 +609,15 @@ export interface CodiconAssets {
   cspSource: string;
 }
 
-/** Full webview document with the strict CSP and the design system inlined. */
+/**
+ * Full webview document with the strict CSP and the design system inlined.
+ *
+ * Every non-embedded page shares the resident shell's structure (task 8.2):
+ * the breadcrumb lives in `#app-breadcrumb` and the route's content in
+ * `#app-route`, both marker-wrapped so `AppSurface` can lift them out of
+ * this document and patch them into the already-loaded shell instead of
+ * assigning a new document per navigation (D7).
+ */
 export function renderPage(opts: {
   title: string;
   nonce: string;
@@ -453,6 +625,29 @@ export function renderPage(opts: {
   body: string;
   script?: string;
   breadcrumb?: { parent?: string; current: string };
+  /**
+   * Scopes `css` under this ancestor class and wraps `body` in a div
+   * carrying it (task 8.2), so the page's rules and markup stay well-formed
+   * for the CSS/script union the resident shell is built from. Every
+   * full-page screen passes its `RouteAssets.className` here.
+   */
+  routeClass?: string;
+  /**
+   * Pre-rendered breadcrumb container content, passed through verbatim in
+   * place of `breadcrumb` — for `appShell.ts`, which re-hosts a breadcrumb
+   * extracted from a route's own document and has no parts to rebuild it
+   * from. Wins over `breadcrumb` when both are given.
+   */
+  breadcrumbHtml?: string;
+  /**
+   * Stamped on `#app-route` as `data-route-key` so REGIONS_SCRIPT knows
+   * which route's content the document loaded with (task 9.4): the first
+   * navigation away must save that route's view state under its own key,
+   * and without the stamp the state of everything before the first
+   * route-keyed patch would be lost. Passed only by `appShell.ts`, which is
+   * the one caller that knows the `AppSurface` route id.
+   */
+  routeKey?: string;
   embedded?: boolean;
   /**
    * Opt an `embedded` page into REGIONS_SCRIPT and its `verdictReady`
@@ -468,18 +663,23 @@ export function renderPage(opts: {
   const breadcrumb = opts.breadcrumb
     ? `<nav class="app-breadcrumb" aria-label="Breadcrumb"><button class="app-back" id="app-back" type="button">‹ ${escapeHtml(opts.breadcrumb.parent ?? 'Dashboard')}</button><span class="app-crumb-separator">/</span><span class="app-crumb-current" id="app-crumb-current">${escapeHtml(opts.breadcrumb.current)}</span></nav>`
     : '';
+  const crumbContent = opts.breadcrumbHtml ?? breadcrumb;
+  const routeContent = opts.routeClass ? `<div class="${opts.routeClass}">${opts.body}</div>` : opts.body;
+  const routeKeyAttr = opts.routeKey ? ` data-route-key="${escapeHtml(opts.routeKey)}"` : '';
   const body = opts.embedded
     ? opts.body
-    : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>${renderKeysOverlay()}`;
+    : `<main class="verdict-app"><div id="app-breadcrumb">${CRUMB_START}${crumbContent}${CRUMB_END}</div><div class="app-content" id="app-route"${routeKeyAttr}>${ROUTE_START}${routeContent}${ROUTE_END}</div></main>${renderKeysOverlay()}`;
   const keysScript = opts.embedded ? '' : KEYS_SCRIPT;
   const regionsScript = opts.embedded ? (opts.regions ? REGIONS_SCRIPT : '') : REGIONS_SCRIPT;
+  const backScript = opts.embedded ? '' : APP_BACK_SCRIPT;
   // REGIONS_SCRIPT needs the vscode API to post `verdictReady`, so acquire it
   // for every full (non-embedded) page — not only when the caller supplies
   // its own script or a breadcrumb, as before #39.
   const bootstrap = opts.script || opts.breadcrumb || !opts.embedded
-    ? `window.verdictVscode=acquireVsCodeApi();${opts.breadcrumb ? `document.getElementById('app-back')?.addEventListener('click',()=>window.verdictVscode.postMessage({type:'appBack'}));` : ''}${opts.script ?? ''}${keysScript}${regionsScript}`
+    ? `window.verdictVscode=acquireVsCodeApi();${backScript}${opts.script ?? ''}${keysScript}${regionsScript}`
     : `${keysScript}${regionsScript}`;
   const script = bootstrap ? `<script nonce="${opts.nonce}">${bootstrap}</script>` : '';
+  const css = opts.routeClass ? scopeRouteCss(opts.routeClass, opts.css) : opts.css;
   const codicons = opts.codicons;
   const styleSrc = codicons ? `'nonce-${opts.nonce}' ${codicons.cspSource}` : `'nonce-${opts.nonce}'`;
   const fontSrc = codicons ? ` font-src ${codicons.cspSource};` : '';
@@ -491,7 +691,7 @@ export function renderPage(opts: {
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${styleSrc}; script-src 'nonce-${opts.nonce}';${fontSrc}">${codiconLink}
-<style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.embedded ? '' : KEYS_CSS}${opts.css}</style>
+<style nonce="${opts.nonce}">${VERDICT_TOKENS_CSS}${VERDICT_BASE_CSS}${opts.embedded ? '' : KEYS_CSS}${css}</style>
 <title>${escapeHtml(opts.title)}</title>
 </head>
 <body>

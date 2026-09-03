@@ -10,6 +10,23 @@ function icon(name: string): string {
   return `<span class="codicon codicon-${name}" aria-hidden="true"></span>`;
 }
 
+/**
+ * The triage progress segments are a continuous value, so they cannot each
+ * get a named class — quantised to the nearest 5% instead, the only width a
+ * data-driven bar can take under this webview's CSP (`style-src
+ * 'nonce-…'`), which drops the `style="width:…"` attribute these segments
+ * used to carry silently (issue #45). 5 points is under what a 4px-tall bar
+ * can show; the cost lands at the edges — a true share under 2.5% rounds
+ * down to an invisible 0%-wide segment instead of a sliver, and the three
+ * segments here are rounded independently, so their sum can drift from the
+ * true total by up to 7.5 points either way.
+ */
+const WIDTH_STEP = 5;
+function widthClass(pct: number): string {
+  return `w-${Math.max(0, Math.min(100, Math.round(pct / WIDTH_STEP) * WIDTH_STEP))}`;
+}
+const WIDTH_CSS = Array.from({ length: 100 / WIDTH_STEP + 1 }, (_, i) => `.w-${i * WIDTH_STEP} { width: ${i * WIDTH_STEP}%; }`).join('\n');
+
 export interface SidebarPod {
   id: string;
   name: string;
@@ -220,6 +237,7 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .progress-accepted { background: var(--ok); }
 .progress-rejected { background: var(--sev-blocker); }
 .progress-skipped { background: var(--fg-dim2); }
+${WIDTH_CSS}
 .review-counts { display: flex; gap: 9px; margin-top: 7px; color: var(--fg-dim); font: 10px/1 var(--font-mono); }
 .review-counts .left { margin-left: auto; color: var(--fg-hi); }
 .review-filters { display: flex; gap: 5px; padding: 9px 10px; border-bottom: 1px solid var(--line); }
@@ -482,13 +500,41 @@ function renderNavRows(state: SidebarViewState, screen: SidebarScreen): string {
 function renderReviewSection(activeReview: SidebarActiveReview): string {
   const e = escapeHtml;
   const decided = activeReview.items.length - activeReview.counts.undecided;
-  const progressWidth = (count: number) => activeReview.items.length ? (count / activeReview.items.length) * 100 : 0;
+  /**
+   * The three segments are quantised CUMULATIVELY, not one by one.
+   *
+   * Rounding each width independently to `WIDTH_STEP` lets three roundings
+   * accumulate: 2/2/1 of 7 items is 28.6/28.6/14.3, which rounds to
+   * 30/30/15 = 75 against a true 71.4. On a stacked bar that shows as a gap
+   * before the undecided remainder, or as an overrun past it. Rounding the
+   * running boundary instead makes each width the difference of two rounded
+   * values, so the segments always add up to the rounded total and no one
+   * segment is ever more than a step from its true share.
+   */
+  const total = activeReview.items.length;
+  const segmentWidths = (counts: readonly number[]): number[] => {
+    if (total === 0) return counts.map(() => 0);
+    let running = 0;
+    let placed = 0;
+    return counts.map((count) => {
+      running += count;
+      const boundary = Math.round((running / total) * 100 / WIDTH_STEP) * WIDTH_STEP;
+      const width = boundary - placed;
+      placed = boundary;
+      return width;
+    });
+  };
+  const [acceptedWidth, rejectedWidth, skippedWidth] = segmentWidths([
+    activeReview.counts.accepted,
+    activeReview.counts.rejected,
+    activeReview.counts.skipped,
+  ]);
   const reviewTree = renderReviewTree(activeReview.items);
   const filterPills = renderFilterPills(activeReview.items, activeReview.changeset ?? false);
   return `<section>
     <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(activeReview.headline)}</span><span class="review-context-meta">${e(activeReview.context)} · <span class="ok">+${activeReview.added}</span> · <span class="bad">−${activeReview.removed}</span></span></span></div>
     <div class="review-agent"><span>Agent · <span class="agent-fg">${e(activeReview.agent)}</span></span><span>${decided}/${activeReview.items.length}</span></div>
-    <div class="progress"><span class="progress-accepted" style="width:${progressWidth(activeReview.counts.accepted)}%"></span><span class="progress-rejected" style="width:${progressWidth(activeReview.counts.rejected)}%"></span><span class="progress-skipped" style="width:${progressWidth(activeReview.counts.skipped)}%"></span></div>
+    <div class="progress"><span class="progress-accepted w-${acceptedWidth}"></span><span class="progress-rejected w-${rejectedWidth}"></span><span class="progress-skipped w-${skippedWidth}"></span></div>
     <div class="review-counts"><span class="ok">${activeReview.counts.accepted} acc</span><span class="bad">${activeReview.counts.rejected} rej</span><span>${activeReview.counts.skipped} skip</span><span class="left">${activeReview.counts.undecided} left</span></div></div>
     <div class="review-filters">${filterPills}</div>
     <div class="list">${reviewTree}</div>

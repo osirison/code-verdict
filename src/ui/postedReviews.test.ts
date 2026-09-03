@@ -287,6 +287,37 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     spy.mockRestore();
   });
 
+  it('a failed reply keeps the held draft — the next repaint still offers the typed text for a retry (task 9.7)', async () => {
+    const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
+    const { PostedReviewsPanel } = await import('./postedReviews.js');
+    const deps = makeDeps(globalState);
+    await PostedReviewsPanel.show(deps);
+    await flush();
+    handlers.message?.({ type: 'verdictReady' });
+
+    const connections = await import('../app/connections.js');
+    const spy = vi.spyOn(connections, 'connectionForPod').mockResolvedValueOnce({
+      listOpenChangeRequests: () => Promise.resolve(world.crs),
+      listThreads: () => Promise.resolve(world.threads),
+      resolveThread: () => Promise.resolve(undefined),
+      replyToThread: () => Promise.reject(new Error('network down')),
+    } as never);
+
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'Still not convinced.' });
+    handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+    await flush();
+
+    // Collapse and re-expand the thread: the re-render reads the held draft,
+    // and the failed send must not have deleted it — only a send that reached
+    // the platform makes the draft stale (task 7.4b).
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    const posted = lastPosted();
+    expect(posted.regions['pr-detail']).toContain('value="Still not convinced."');
+    spy.mockRestore();
+  });
+
   it('a resolve on one thread does not disturb an unrelated thread\'s in-progress reply draft', async () => {
     world.threads = [
       reviewThread({ id: 'thread-1' }),

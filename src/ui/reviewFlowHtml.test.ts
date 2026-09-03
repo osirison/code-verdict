@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
-import type { FlowViewState, ReviewContextView } from './reviewFlowHtml';
+import type { FlowScreen, FlowViewState, ReviewContextView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, runOutputSummary } from './reviewFlowHtml';
 
 const state: FlowViewState = {
@@ -203,7 +203,10 @@ describe('the submitting screen (#42)', () => {
   it('counts comments as they post', () => {
     const html = submitting({ stage: 'comments', posted: 3, total: 12 });
     expect(html).toContain('Posting 3 of 12 inline comments…');
-    expect(html).toContain('width:25%');
+    // A class, not a style="width:…" attribute the page CSP drops silently
+    // (issue #45) — 3/12 is exactly 25%, which is also an exact 5%-step
+    // bucket, so this also confirms the quantisation leaves a round value alone.
+    expect(html).toContain('<div class="w-25"></div>');
   });
 
   it('names the summary and verdict stages, which have nothing to count', () => {
@@ -475,9 +478,9 @@ describe('the context the agent was given, on the screen where the human decides
       webUrl: 'https://gitlab.example/issues/1180',
     }],
   };
-  /** Split mode throughout: the fixture's diff mode is the one screen that still
-   *  carries a pre-existing style attribute (--item-sev), which the last case here
-   *  would trip over for a reason that has nothing to do with this box (#45). */
+  /** Split mode throughout: `reviewContextPanel` is part of the shared triage
+   *  header, rendered identically whichever mode is active — split is simply
+   *  the one this block has always used. */
   const render = (context: Partial<ReviewContextView>, over: Partial<FlowViewState> = {}): string =>
     renderReviewFlowBody(
       { ...state, mode: 'split', context: { open: true, truncated: false, entries: [{ context: reviewContext }], ...context }, ...over },
@@ -610,10 +613,9 @@ describe('the running screen shows the run is alive', () => {
     expect(running(undefined)).not.toContain('run-live');
   });
 
-  it('carries no style attribute of its own — a nonce authorises style elements only (#45)', () => {
+  it('carries no style attribute — a nonce authorises style elements only (#45, task 8.5)', () => {
     const html = running({ startedAt: 1, elapsedMs: 0, fragmentsReceived: 1, charsReceived: 1 });
-    // The pre-existing progress bar still writes one (#45 is open against it); nothing new does.
-    expect(html.match(/style="/g)?.length ?? 0).toBe(1);
+    expect(html.match(/style="/g)?.length ?? 0).toBe(0);
   });
 
   it('formats the same counters for the page as for the markup, so a push never disagrees with a render', () => {
@@ -788,14 +790,14 @@ describe('the agent and model pickers (spec: review-agents)', () => {
     expect(html).toContain('2 agent files were skipped');
   });
 
-  it('the picker markup writes no inline style attribute — the webview CSP drops them silently', () => {
+  it('writes no inline style attribute anywhere on the screen, pickers or category chips — the webview CSP drops them silently (#45, task 8.5)', () => {
     const html = run({ agentOpen: true, modelOpen: true });
     const pickers = html.slice(html.indexOf('<div class="picker-stack">'), html.indexOf('<div class="crit-grid">'));
     expect(pickers).toContain('agent-select');
-    expect(pickers).not.toMatch(/<[^>]+\sstyle="/);
-    // NOTE: the category buttons further down this screen DO carry inline
-    // `style=` and are therefore uncoloured under the CSP. That predates this
-    // change and is left alone here rather than fixed in passing.
+    expect(html).not.toMatch(/<[^>]+\sstyle="/);
+    // The fixture's one active category ('security') gets a coloured class
+    // in place of the style="…" this used to carry directly.
+    expect(html).toContain('class="cat cat-on-security"');
   });
 });
 
@@ -951,5 +953,57 @@ describe('in-progress text is committed to the host (task 9.3)', () => {
     const script = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html)?.[1];
     expect(script).toBeTruthy();
     expect(() => new Function(script!)).not.toThrow();
+  });
+});
+
+/**
+ * Task 8.5 (issue #45): the page CSP is `style-src 'nonce-…'` — a nonce
+ * authorises the `<style>` element only, so a `style="…"` attribute is
+ * dropped before layout with no error anywhere. One state per `FlowScreen`,
+ * keyed by a `Record<FlowScreen, …>` rather than a hand-picked list: adding a
+ * member to that union without adding a state here fails typecheck, so a new
+ * screen cannot silently skip this check the way the category chips and the
+ * running screen's progress bar did before this task.
+ */
+describe('no screen writes an inline style attribute (issue #45, task 8.5)', () => {
+  const SCREEN_STATES: Record<FlowScreen, FlowViewState> = {
+    agent: { ...state, screen: 'agent' },
+    running: { ...state, screen: 'running', runSteps: ['Resolving agent…', 'Items ready'], runStep: 1 },
+    triage: { ...state, screen: 'triage', mode: 'diff' },
+    clean: { ...state, screen: 'clean', items: [], selectedId: undefined, diffLines: undefined },
+    summary: {
+      ...state,
+      screen: 'summary',
+      items: state.items.map((v) => ({ ...v, verdict: 'accepted' as const })),
+      counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 },
+    },
+    submitting: { ...state, screen: 'submitting', submitProgress: { stage: 'comments', posted: 3, total: 12 } },
+    done: { ...state, screen: 'done' },
+  };
+
+  it('renders none of the seven screens with a style attribute', () => {
+    for (const screen of Object.keys(SCREEN_STATES) as FlowScreen[]) {
+      const html = renderReviewFlowBody(SCREEN_STATES[screen], 'HVE Core / PR Review');
+      expect(html, `screen: ${screen}`).not.toMatch(/<[^>]+\sstyle="/);
+    }
+  });
+
+  it('covers the variants FlowScreen alone does not reach: every triage mode, a failed or queued run, and the pre-load pages', () => {
+    for (const mode of ['split', 'queue', 'diff'] as const) {
+      const html = renderReviewFlowBody({ ...state, screen: 'triage', mode }, 'HVE Core / PR Review');
+      expect(html, `triage mode: ${mode}`).not.toMatch(/<[^>]+\sstyle="/);
+    }
+    const runError = renderReviewFlowBody(
+      { ...state, screen: 'running', runError: { message: 'boom', requestId: 'r1', partialCount: 2, code: 'E_TIMEOUT' } },
+      'HVE Core / PR Review',
+    );
+    expect(runError).not.toMatch(/<[^>]+\sstyle="/);
+    const runQueued = renderReviewFlowBody(
+      { ...state, screen: 'running', runQueued: true, runSteps: [], runStep: 0 },
+      'HVE Core / PR Review',
+    );
+    expect(runQueued).not.toMatch(/<[^>]+\sstyle="/);
+    expect(renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n')).not.toMatch(/<[^>]+\sstyle="/);
+    expect(renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n')).not.toMatch(/<[^>]+\sstyle="/);
   });
 });

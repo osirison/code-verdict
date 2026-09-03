@@ -112,15 +112,27 @@ const world = vi.hoisted(() => ({
   submitReview: undefined as ((submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => Promise<unknown>) | undefined,
   submitCalls: [] as Array<{ storedAtCall: unknown }>,
   workspaceState: undefined as (KeyValueStore & { updates: number }) | undefined,
+  /** Every platform call, so triage actions can be asserted to make none. */
+  calls: { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 },
 }));
 
 vi.mock('../app/connections', () => ({
   connectionForPod: () =>
     Promise.resolve({
-      listOpenChangeRequests: () => Promise.resolve([changeRequest()]),
-      getChangeRequestDiff: () => Promise.resolve(DIFF),
-      listWorkItems: () => Promise.resolve([]),
+      listOpenChangeRequests: () => {
+        world.calls.changeRequests += 1;
+        return Promise.resolve([changeRequest()]);
+      },
+      getChangeRequestDiff: () => {
+        world.calls.diffs += 1;
+        return Promise.resolve(DIFF);
+      },
+      listWorkItems: () => {
+        world.calls.workItems += 1;
+        return Promise.resolve([]);
+      },
       submitReview: (_ref: unknown, submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => {
+        world.calls.submits += 1;
         // Snapshot what is on disk at the moment the platform is called — the
         // flush-before-submit assertions read it back.
         world.submitCalls.push({ storedAtCall: world.workspaceState?.get(draftKeyFor(REF)) });
@@ -319,6 +331,7 @@ beforeEach(() => {
   panel.webview.postMessage.mockClear();
   world.submitReview = undefined;
   world.submitCalls = [];
+  world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
 });
 
 afterEach(() => {
@@ -591,5 +604,246 @@ describe('ask drafts are held per finding (task 9.3)', () => {
     // A repaint after the send must not resurrect the already-sent question.
     await h.post({ type: 'select', itemId: 'i1' });
     expect(panel.webview.html).not.toContain('value="why?"');
+  });
+});
+
+describe('a regenerate replaces the summary text (task 9.7)', () => {
+  it('renders the composed summary again, not the edit the reviewer had typed over it', async () => {
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'generateSummary' });
+
+    // The composed text, as the summary screen just rendered it.
+    const summaryOf = (html: string): string =>
+      /<textarea class="summary" id="summary-text">([\s\S]*?)<\/textarea>/.exec(html)?.[1] ?? '';
+    const generated = summaryOf(panel.webview.html);
+    expect(generated).not.toBe('');
+
+    await h.post({ type: 'editSummary', text: 'my own words' });
+    // A sentinel proves the regenerate really repainted — editSummary
+    // deliberately renders nothing, so without it a stale document would
+    // pass the assertions below for free.
+    panel.webview.html = 'sentinel';
+    await h.post({ type: 'regenerate' });
+
+    // The typed edit is deliberately NOT preserved: regenerate is the
+    // reviewer asking for the composed text back (the other direction of the
+    // typed-text requirement — see typedTextScript.test.ts for the page
+    // half, where REGIONS_SCRIPT must not restore the stale value either).
+    expect(panel.webview.html).not.toBe('sentinel');
+    expect(summaryOf(panel.webview.html)).toBe(generated);
+    expect(panel.webview.html).not.toContain('my own words');
+  });
+});
+
+// ---- triage is local: patches, no platform calls (spec: an action fetches ------
+// ---- only the data it could have changed / a state change redraws only the ----
+// ---- part of the screen it affects) --------------------------------------------
+
+describe('triage actions patch in place and never reach the platform', () => {
+  it('a verdict, a move and a severity-floor change each patch flow-body — zero platform calls, no document reassignment', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    // Arm the page the way REGIONS_SCRIPT does, so render() patches.
+    await h.post({ type: 'verdictReady' });
+    const htmlBefore = panel.webview.html;
+    const callsBefore = { ...world.calls };
+    panel.webview.postMessage.mockClear();
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'move', delta: 1 });
+    await h.post({ type: 'setFloor', floor: 'major' });
+
+    // Three patches, each the flow-body region and the breadcrumb.
+    const posted = panel.webview.postMessage.mock.calls
+      .map((call) => call[0] as { type: string; regions?: Record<string, string> })
+      .filter((message) => message.type === 'verdict:regions');
+    expect(posted).toHaveLength(3);
+    for (const message of posted) {
+      expect(Object.keys(message.regions ?? {}).sort()).toEqual(['app-crumb-current', 'flow-body']);
+    }
+    // The document was never reassigned, and nothing was fetched: every one
+    // of these interactions is local state.
+    expect(panel.webview.html).toBe(htmlBefore);
+    expect(world.calls).toEqual(callsBefore);
+  });
+});
+
+// ---- freshness applies to platform data, not to review results -----------------
+
+describe('a retained review does not expire (spec: freshness applies to platform data, not to review results)', () => {
+  it('opening a target whose review is far older than any freshness window shows it in full and starts no run', async () => {
+    // Ran three months ago — older than any poll interval by orders of
+    // magnitude. Freshness governs pod data; this record has no TTL.
+    const old = retainedRecord(['i1', 'i2'], '2026-06-01T08:00:00.000Z');
+    old.review.verdicts = { i1: { verdict: 'accepted', applyFix: false } };
+    const h = await harness(old);
+
+    await h.open();
+
+    // Shown in full, with its verdicts: the triage screen, opened on the
+    // one undecided finding, with the recorded verdict already counted.
+    expect(panel.webview.html).toContain('Finding i2');
+    expect(panel.webview.html).toContain('1 of 2 triaged');
+    expect(panel.webview.html).toContain('Run a new review');
+    // Queue mode lists every finding, decided ones included.
+    await h.post({ type: 'setMode', mode: 'queue' });
+    expect(panel.webview.html).toContain('Finding i1');
+    // And no new run was started to produce any of it.
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+});
+
+// ---- 10.2 — the background-review-runs invariants, re-run against the ----------
+// ---- coalesced persistence path ------------------------------------------------
+
+describe('background-review-runs invariants against the coalesced path (task 10.2)', () => {
+  it('a retained review, triaged through the coalescing writer, survives a restart in full', async () => {
+    vi.useFakeTimers();
+    const h1 = await harness(retainedRecord(['i1', 'i2']));
+    await h1.open();
+    await h1.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h1.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h1.post({ type: 'generateSummary' });
+    await h1.post({ type: 'editSummary', text: 'Summary that must survive' });
+    await h1.post({ type: 'setNote', text: 'Note that must survive' });
+    // The editor closes: dispose is the flush point.
+    handlers.dispose?.();
+    const onDisk = h1.stored();
+    expect(onDisk).toBeDefined();
+
+    // A restart: fresh module state, fresh panel, and the record read back
+    // through the same JSON round-trip a real Memento imposes — a Date or a
+    // Map smuggled into the record would not survive one.
+    vi.useRealTimers();
+    const carried = JSON.parse(JSON.stringify(onDisk)) as SessionDraft;
+    const h2 = await harness(carried);
+    await h2.open();
+
+    expect(panel.webview.html).toContain('Finding i1');
+    expect(panel.webview.html).toContain('2 of 2 triaged');
+    const reread = h2.stored();
+    expect(reread?.review.verdicts['i1']?.verdict).toBe('accepted');
+    expect(reread?.review.verdicts['i2']?.verdict).toBe('rejected');
+    expect(reread?.summaryText).toBe('Summary that must survive');
+    expect(reread?.finalNote).toBe('Note that must survive');
+    expect(reread?.ranAt).toBe(RAN_AT);
+    expect(reread?.outcome).toBe('findings');
+  });
+
+  it('a re-run that FAILS does not replace the retained review — the pending triage write still lands on it', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    expect(h.workspaceState.updates).toBe(0);
+
+    // The manager reports a failed re-run on this target. It wrote nothing
+    // (a failure never touches the retained record), so the panel's pending
+    // write belongs to the record still stored — it must NOT be dropped.
+    h.runs.settle({ key: runKeyForCr(REF), status: 'failed' });
+    await h.post({ type: 'noop' });
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.items.map((item) => item.id)).toEqual(['i1']);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('a re-run that is CANCELLED leaves the retained review and its fresh verdicts intact', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+
+    h.runs.settle({ key: runKeyForCr(REF), status: 'cancelled' });
+    await h.post({ type: 'noop' });
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+
+    // Cancellation re-enters the retained record (flushing the pending
+    // write first); the screen shows the review again, unchanged.
+    expect(panel.webview.html).toContain('Finding i1');
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('an in-flight run interrupted by a restart is reported interrupted, alongside an intact triage draft', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    // A re-run is in flight, persistently recorded — what the manager writes
+    // when it starts executing.
+    const { InFlightRunStore, sweepInterruptedRuns } = await import('../app/reviewRunManager.js');
+    const { ReviewRunStore } = await import('../app/reviewRuns.js');
+    await new InFlightRunStore(h.deps.globalState).add({
+      key: runKeyForCr(REF),
+      podId: 'pod-1',
+      refLabel: '#7',
+      repoId: REF.repoId,
+      crNumber: REF.number,
+      startedAt: '2026-09-02T09:30:00.000Z',
+    });
+    // The reviewer triages meanwhile; the window losing focus flushes the
+    // coalesced write before the editor goes down.
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    handlers.windowState?.({ focused: false });
+
+    // The restart: the sweep runs before anything paints (extension.ts).
+    const swept = await sweepInterruptedRuns(h.deps.globalState);
+
+    expect(swept).toBe(1);
+    const run = new ReviewRunStore(h.deps.globalState).byRef().get(runKeyForCr(REF));
+    expect(run?.outcome).toBe('interrupted');
+    // Named with its own start time, not the sweep's.
+    expect(run?.ranAt).toBe('2026-09-02T09:30:00.000Z');
+    // The interruption is reported alongside the retained review, never in
+    // place of it: the draft still carries the run's result and the triage.
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+});
+
+// ---- task 10.3: what a triage session costs ------------------------------------
+
+describe('a full triage session (task 10.3)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('opens, records ten verdicts and submits, without a platform call per verdict', async () => {
+    const h = await harness(retainedRecord(Array.from({ length: 10 }, (_, i) => `i${i + 1}`)));
+    await h.open();
+
+    // What opening the target costs: the change-request lookup and the diff.
+    // Everything after this is the session proper.
+    const afterOpen = { ...world.calls };
+    const writesAfterOpen = h.workspaceState.updates;
+
+    for (let i = 1; i <= 10; i += 1) {
+      await h.post({ type: 'verdict', itemId: `i${i}`, verdict: 'accepted', applyFix: false });
+    }
+
+    // Ten verdicts, zero platform calls. Before this change each render fired
+    // onSidebarState, which refetched the whole pod — three calls a verdict,
+    // thirty for this loop — and each verdict wrote the entire record.
+    expect(world.calls).toEqual(afterOpen);
+    expect(h.workspaceState.updates - writesAfterOpen).toBeLessThanOrEqual(1);
+
+    // And the decisions are all there once the window closes: coalescing
+    // collapses the writes, it does not drop any of the state they carried.
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+    const stored = h.stored();
+    for (let i = 1; i <= 10; i += 1) {
+      expect(stored?.review.verdicts[`i${i}`]?.verdict).toBe('accepted');
+    }
   });
 });
