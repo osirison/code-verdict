@@ -536,7 +536,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // to PodStore on access, but with no pod left nothing below would ever
     // read it again — and the demo and debug pods are re-created under fixed
     // ids, which must start empty, never on a deleted pod's data.
-    appStore.peek(target.id);
+    appStore.forget(target.id);
     // Keyed by pod id and naming repositories only that pod resolved: orphaned
     // the moment it goes.
     await new ManualChangesetStore(context.globalState).removePod(target.id);

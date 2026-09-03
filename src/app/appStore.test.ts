@@ -411,6 +411,56 @@ describe('coalescing stays within an intent (D3)', () => {
   });
 });
 
+describe('held data never carries a stale pod', () => {
+  it('a read inside the freshness window reflects a pod renamed since the fetch', async () => {
+    const world = makeWorld();
+    const { store, pods, clock } = await storeFor(world);
+    await store.read(pods[0]!).fetch;
+
+    // A rename, or a username filled in after the first connection. Nothing
+    // is re-fetched, and view builders read data.pod.* for both.
+    const renamed = { ...pods[0]!, name: 'Renamed', username: 'someone' };
+    clock.t += WINDOW_MS - 1;
+
+    const read = store.read(renamed);
+    expect(read.fetch).toBeUndefined();
+    expect(world.connections).toBe(1);
+    expect(read.data?.pod.name).toBe('Renamed');
+    expect(read.data?.pod.username).toBe('someone');
+  });
+
+  it('revalidate on fresh held data reflects the rename too', async () => {
+    const world = makeWorld();
+    const { store, pods, clock } = await storeFor(world);
+    await store.read(pods[0]!).fetch;
+
+    const renamed = { ...pods[0]!, name: 'Renamed' };
+    clock.t += WINDOW_MS - 1;
+    const data = await store.revalidate(renamed);
+
+    expect(world.connections).toBe(1);
+    expect(data.pod.name).toBe('Renamed');
+  });
+
+  it('overlaying the pod does not disturb what change detection compares', async () => {
+    const world = makeWorld();
+    const { store, pods, clock } = await storeFor(world);
+    await store.read(pods[0]!).fetch;
+    // Subscribed after the first fetch: that one legitimately notifies, and
+    // what is under test is everything after it.
+    const seen: number[] = [];
+    store.subscribe((data) => seen.push(data.changeRequests.length));
+
+    // A renamed pod whose platform data is unchanged must still notify
+    // nobody — the pod is configuration, not part of the snapshot compared.
+    store.read({ ...pods[0]!, name: 'Renamed' });
+    clock.t += WINDOW_MS;
+    await store.revalidate({ ...pods[0]!, name: 'Renamed' });
+
+    expect(seen).toHaveLength(0);
+  });
+});
+
 describe('entries are pod-keyed and bounded to PodStore (task 5.5)', () => {
   it('switching pods does not serve the previous pod\'s data', async () => {
     const world = makeWorld();
@@ -425,6 +475,16 @@ describe('entries are pod-keyed and bounded to PodStore (task 5.5)', () => {
     expect(store.peek('a')?.pod.id).toBe('a');
     expect(store.peek('b')?.pod.id).toBe('b');
     expect(world.connections).toBe(2);
+  });
+
+  it('forget() drops an entry on demand, for a pod id that will be reused', async () => {
+    const world = makeWorld();
+    const { store, pods } = await storeFor(world);
+    await store.read(pods[0]!).fetch;
+    expect(store.peek('a')).toBeDefined();
+
+    store.forget('a');
+    expect(store.peek('a')).toBeUndefined();
   });
 
   it('a removed pod\'s entry is dropped', async () => {

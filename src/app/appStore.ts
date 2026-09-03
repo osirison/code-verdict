@@ -115,13 +115,13 @@ export class AppStore {
     const entry = this.entryFor(pod.id);
     if (entry.data !== undefined && entry.fetchedAt !== undefined) {
       if (this.now() - entry.fetchedAt < this.freshnessMs(pod, entry.data)) {
-        return { data: entry.data };
+        return { data: this.withCurrentPod(entry.data, pod) };
       }
       // Stale: serve what is held, revalidate behind it. The reader is not
       // waiting on the fetch, so the intent carve-out below does not apply
       // and a flight of either intent is joined rather than doubled.
       const flight = entry.inFlight ?? this.startFlight(pod, entry, 'background');
-      return { data: entry.data, fetch: flight.promise };
+      return { data: this.withCurrentPod(entry.data, pod), fetch: flight.promise };
     }
     // Nothing held: the caller is waiting, so the fetch is interactive. It
     // joins only an interactive flight — joining a background one would
@@ -178,7 +178,7 @@ export class AppStore {
       && entry.fetchedAt !== undefined
       && this.now() - entry.fetchedAt < this.freshnessMs(pod, entry.data)
     ) {
-      return Promise.resolve(entry.data);
+      return Promise.resolve(this.withCurrentPod(entry.data, pod));
     }
     return this.startFlight(pod, entry, 'background').promise;
   }
@@ -197,6 +197,29 @@ export class AppStore {
    * no removal event, so the bound is enforced on access: a removed pod's
    * data must not survive to be served to a pod re-created under its id.
    */
+  /**
+   * Held data carries the `Pod` the fetch was made with, and view builders
+   * read `data.pod.*` for the name and username. `PodStore.upsert` can change
+   * those without anything being re-fetched — a rename, a username filled in
+   * after the first connection — and inside the freshness window nothing
+   * would ever correct the snapshot. So the caller's live pod is overlaid on
+   * every held-data return: the pod is configuration the reader already has,
+   * not something the platform told us. Before the store every read passed
+   * the live pod into `fetchPodData`, so this used to correct itself.
+   */
+  private withCurrentPod(data: PodData, pod: Pod): PodData {
+    return data.pod === pod ? data : { ...data, pod };
+  }
+
+  /**
+   * Drop a pod's held entry. Called when a pod is deleted, so nothing can
+   * serve its data to a pod that later reuses the id — the demo and debug
+   * pods have fixed ids and are routinely deleted and re-created.
+   */
+  forget(podId: string): void {
+    this.entries.delete(podId);
+  }
+
   private prune(): void {
     if (this.entries.size === 0) return;
     const live = new Set(this.deps.podStore.list().map((p) => p.id));
