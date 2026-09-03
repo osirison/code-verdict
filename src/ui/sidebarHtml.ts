@@ -22,9 +22,6 @@ function icon(name: string): string {
  * true total by up to 7.5 points either way.
  */
 const WIDTH_STEP = 5;
-function widthClass(pct: number): string {
-  return `w-${Math.max(0, Math.min(100, Math.round(pct / WIDTH_STEP) * WIDTH_STEP))}`;
-}
 const WIDTH_CSS = Array.from({ length: 100 / WIDTH_STEP + 1 }, (_, i) => `.w-${i * WIDTH_STEP} { width: ${i * WIDTH_STEP}%; }`).join('\n');
 
 export interface SidebarPod {

@@ -15,6 +15,7 @@ import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
 import { ReviewRunManager, sweepInterruptedRuns, type RunInput, type RunnerOptions } from './app/reviewRunManager';
 import { pruneClosedRetained } from './app/retainedReview';
+import { RunStatusGate } from './app/runStatusGate';
 import { runDemoAgent } from './app/demoAgent';
 import { runDemoChangesetAgent } from './app/combinedAgent';
 import { runLmAgent, runLmChangesetAgent } from './app/lmAgent';
@@ -107,9 +108,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /**
    * The last status seen per run, so a progress emission — four a second on a
-   * streaming run — cannot be mistaken for a state change.
+   * streaming run — cannot be mistaken for a state change (`RunStatusGate`,
+   * task 10.1: extracted so the guard below is unit-testable on its own).
    */
-  const lastRunStatus = new Map<string, string>();
+  const runStatusGate = new RunStatusGate();
 
   /**
    * Runs live here, for the window's lifetime — not on the panel that started
@@ -160,10 +162,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // would issue four platform fetches a second per streaming run — worse
       // than the burst the notifier's focus throttle exists to prevent. Only a
       // status change moves a row's pill, so only a status change refreshes.
-      const previous = lastRunStatus.get(record.key);
-      if (previous === record.status) return;
-      lastRunStatus.set(record.key, record.status);
-      if (record.status !== 'queued' && record.status !== 'running') lastRunStatus.delete(record.key);
+      if (!runStatusGate.changed(record.key, record.status)) return;
       void DashboardPanel.refreshIfOpen();
     },
     onRunRecorded: () => repaintReviewSurfaces(),

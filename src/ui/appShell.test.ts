@@ -81,6 +81,18 @@ describe('the union (task 8.3)', () => {
     const names = new Set(SHELL_ROUTES.map((route) => route.className));
     expect(names.size).toBe(SHELL_ROUTES.length);
   });
+
+  /**
+   * A tripwire for ui-responsiveness's "Every screen behaves this way"
+   * scenario (`screenRedrawCoverage.test.ts`): that test's table is not
+   * derived from `SHELL_ROUTES` at runtime (the sidebar and the shared
+   * review/changeset-review route need their own rows regardless), so this
+   * pin is what forces a maintainer to notice — a new screen joining the
+   * union without a redraw-coverage row would otherwise pass silently.
+   */
+  it('pins the route count — a new screen here needs a row in screenRedrawCoverage.test.ts', () => {
+    expect(SHELL_ROUTES.length).toBe(7);
+  });
 });
 
 describe('two routes rendered into one document (task 8.6)', () => {

@@ -299,8 +299,13 @@ describe('the changeset review screen patches in place (tasks 7.2, 7.7)', () => 
     const posted = lastPosted();
     expect(posted.type).toBe('verdict:regions');
     expect(Object.keys(posted.regions).sort()).toEqual(['app-crumb-current', 'flow-body']);
-    // The patched body carries the recorded verdict (1 of 2 decided).
+    // The patched body carries the recorded verdict (1 of 2 decided) — the
+    // next finding is selected, and the progress indicator (spec: "the
+    // finding list, the current finding and the progress indicators
+    // update") counts the same decision.
     expect(posted.regions['flow-body']).toContain('Gateway retries without jitter');
+    expect(posted.regions['flow-body']).toContain('1 of 2 triaged');
+    expect(posted.regions['flow-body']).not.toContain('0 of 2 triaged');
     // Patched, not rebuilt; and a verdict is local state — nothing fetched.
     expect(panel.state.htmlLog.length).toBe(assignmentsBefore);
     expect(world.calls).toEqual(callsBefore);

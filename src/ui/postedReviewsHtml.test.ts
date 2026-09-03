@@ -628,3 +628,29 @@ describe('a posted comment reads like the review card that produced it (#52)', (
     expect(html).toContain('&lt;img');
   });
 });
+
+describe('the reply draft is flushed before anything repaints over it', () => {
+  const html = renderPostedReviewsHtml(state([row([thread()])], { expandedThreadId: 'thread-1' }), 'n');
+
+  it('emits a page script that actually parses', () => {
+    // Neither tsc nor eslint parses the JS inside this template literal. A
+    // stray backtick in a comment closes the literal early and the whole
+    // page's script silently never runs — which is exactly what happened
+    // while this flush was being written.
+    const script = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html)?.[1];
+    expect(script).toBeTruthy();
+    expect(() => new Function(script!)).not.toThrow();
+  });
+
+  it('flushes pending drafts on click and blur, not only when the reply is sent', () => {
+    // Every local action on this screen — expanding another thread, toggling
+    // archived, selecting a review — patches #pr-detail from the panel's held
+    // drafts. Inside the debounce window that repaints the reply field from
+    // the draft as it was before the last keystrokes, and REGIONS_SCRIPT
+    // never restores a value. Cancelling only on send (which is all this had)
+    // leaves every other action losing text.
+    expect(html).toContain("document.addEventListener('click', flushReplyDrafts, true)");
+    expect(html).toContain("document.addEventListener('blur', flushReplyDrafts, true)");
+    expect(html).toContain("window.addEventListener('blur', flushReplyDrafts)");
+  });
+});

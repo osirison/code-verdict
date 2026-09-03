@@ -435,8 +435,34 @@ const SCRIPT = `
     const threadId = el.dataset.reply;
     clearTimeout(replyDraftTimers.get(threadId));
     const text = el.value;
-    replyDraftTimers.set(threadId, setTimeout(() => post({ type: 'replyDraft', threadId, text }), 300));
+    replyDraftTimers.set(threadId, setTimeout(() => {
+      replyDraftTimers.delete(threadId);
+      post({ type: 'replyDraft', threadId, text });
+    }, 300));
   });
+  // Land every pending draft before anything that can repaint this region.
+  //
+  // A debounce timer outliving the action that consumes it is how typed text
+  // gets lost, and this screen's own local actions — expanding another
+  // thread, toggling archived, selecting a different review — all patch
+  // #pr-detail from the panel's held drafts without touching the platform.
+  // Inside the 300ms window that patch re-renders the reply field from the
+  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT never
+  // restores the value, so those keystrokes are gone. Capture phase, so this
+  // runs before the delegated handlers below; blur as well, because a
+  // palette command or a click outside the webview never produces one here.
+  const flushReplyDrafts = () => {
+    for (const field of document.querySelectorAll('[data-reply]')) {
+      const threadId = field.dataset.reply;
+      if (!replyDraftTimers.has(threadId)) continue;
+      clearTimeout(replyDraftTimers.get(threadId));
+      replyDraftTimers.delete(threadId);
+      post({ type: 'replyDraft', threadId, text: field.value });
+    }
+  };
+  document.addEventListener('click', flushReplyDrafts, true);
+  document.addEventListener('blur', flushReplyDrafts, true);
+  window.addEventListener('blur', flushReplyDrafts);
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
@@ -455,6 +481,7 @@ const SCRIPT = `
     // already-sent text back in — the next unrelated patch of this region
     // would then replay it as though it were never sent.
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
+    replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
   }
   document.addEventListener('keydown', (ev) => {

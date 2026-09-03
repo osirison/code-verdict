@@ -1,6 +1,8 @@
+import { JSDOM, VirtualConsole } from 'jsdom';
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
+import { parseHunks } from '../domain/diffHunks';
 import type { FlowScreen, FlowViewState, ReviewContextView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, runOutputSummary } from './reviewFlowHtml';
 
@@ -1005,5 +1007,149 @@ describe('no screen writes an inline style attribute (issue #45, task 8.5)', () 
     expect(runQueued).not.toMatch(/<[^>]+\sstyle="/);
     expect(renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n')).not.toMatch(/<[^>]+\sstyle="/);
     expect(renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n')).not.toMatch(/<[^>]+\sstyle="/);
+  });
+});
+
+// ---- a patch preserves scroll on the real diff screen (ui-responsiveness:
+// "Scrolled partway through a long diff") -------------------------------------
+//
+// The rejected test (dashboardScript.test.ts) patched a synthetic
+// `statefulRegion()` string the test itself injected — no diff, no review
+// screen. This drives the real `renderReviewFlowHtml`/`renderReviewFlowBody`
+// in `mode: 'diff'`, in jsdom, the same way dashboardScript.test.ts drives the
+// dashboard's page script (that file's own comment explains why: jsdom has no
+// layout, so its `window.scrollTo` is unimplemented, and vitest's jsdom
+// environment never runs page scripts at all — hence a hand-built `JSDOM`
+// under the node environment, and a scroll double duplicated here rather than
+// imported from that file).
+
+interface ScrollDouble { x: number; y: number; max: number }
+
+function loadFlowPage(html: string): { dom: JSDOM; scroll: ScrollDouble } {
+  const scroll: ScrollDouble = { x: 0, y: 0, max: Number.MAX_SAFE_INTEGER };
+  const virtualConsole = new VirtualConsole();
+  const dom = new JSDOM(html, {
+    runScripts: 'dangerously',
+    virtualConsole,
+    beforeParse(window) {
+      (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+        postMessage: (): void => undefined,
+      });
+      window.scrollTo = ((x: number, y: number) => {
+        scroll.x = Math.min(x, scroll.max);
+        scroll.y = Math.min(y, scroll.max);
+      }) as typeof window.scrollTo;
+      Object.defineProperty(window, 'scrollX', { get: () => scroll.x });
+      Object.defineProperty(window, 'scrollY', { get: () => scroll.y });
+    },
+  });
+  return { dom, scroll };
+}
+
+function patchFlow(dom: JSDOM, regions: Record<string, string>): void {
+  dom.window.dispatchEvent(new dom.window.MessageEvent('message', {
+    data: { type: 'verdict:regions', regions },
+  }));
+}
+
+describe('a patch preserves scroll position on the real in-diff triage screen', () => {
+  /** A second, unrelated finding — a real diff screen only ever shows the
+   * SELECTED finding's file, so a second one is what makes the redraw below
+   * genuinely unrelated to the diff on screen rather than a no-op. */
+  const otherFinding = {
+    item: {
+      id: 'finding-2', file: 'src/auth/session.ts', line: 10, severity: 'minor' as const,
+      category: 'style' as const, confidence: 80, title: 'Unrelated finding',
+      body: 'Not the one being read.', code: 'x',
+    },
+    thread: [],
+  };
+  function diffState(overrides: Partial<FlowViewState> = {}): FlowViewState {
+    return {
+      ...state,
+      mode: 'diff',
+      items: [state.items[0]!, otherFinding],
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 2 },
+      ...overrides,
+    };
+  }
+
+  it('the diff stays at the same window scroll position after a patch caused by an unrelated finding', () => {
+    const { dom, scroll } = loadFlowPage(renderReviewFlowHtml(diffState(), 'HVE Core / PR Review', 'testnonce'));
+    const document = dom.window.document;
+    // The real renderer, not injected markup: the diff lines and the flagged
+    // widget this file's own fixture (`state.diffLines`) describes.
+    expect(document.querySelector('.diff-code')).not.toBeNull();
+    expect(document.querySelector('.diff-line')).not.toBeNull();
+
+    dom.window.scrollTo(0, 640);
+
+    // The redraw: the OTHER finding gets decided in the background. The
+    // selected finding, its diff and its body are untouched.
+    patchFlow(dom, {
+      'flow-body': renderReviewFlowBody(
+        diffState({
+          items: [diffState().items[0]!, { ...otherFinding, verdict: 'accepted' }],
+          counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 1 },
+        }),
+        'HVE Core / PR Review',
+      ),
+    });
+
+    expect(scroll.y).toBe(640);
+    // Still the real diff markup after the patch, not a blank or reset region.
+    expect(document.querySelector('.diff-code')).not.toBeNull();
+  });
+});
+
+// ---- an unchanged diff is not re-derived (ui-responsiveness) ---------------
+//
+// `parseHunks` (domain/diffHunks.ts) memoizes on the diff string and — its own
+// doc comment says so — "returns the SAME Hunk[] on a cache hit rather than a
+// copy". `diffHunks.test.ts`'s "memoization (D10)" block already proves that
+// at the pure-function level. What is missing is the render-level half the
+// audit asked for: proof that the exact derivation `reviewFlow.ts` performs
+// for the triage-diff screen (reviewFlowHtml.ts's `diffLines`: `parseHunks(
+// file.diff).flatMap(hunk => hunk.lines)`), called twice the way two renders
+// across an unrelated redraw would call it, yields the identical `HunkLine`
+// objects — not merely equal ones — so nothing downstream re-parsed anything.
+//
+// The finding's body (markdown) is the other half named in the scenario's
+// THEN. `renderMarkdown` (ui/markdown.ts) wraps the same `memoize` and its own
+// `markdown.test.ts` ("memoization (D10)") already covers it — but only via an
+// independently-constructed `memoize(vi.fn(renderMarkdownUncached))`, never
+// the real exported `renderMarkdown`'s own cache: that cache closes over
+// `renderMarkdownUncached` at module load, so a spy placed on the export
+// afterwards cannot observe it, and `renderMarkdown`'s return value is a
+// plain string — two calls with identical input are `===` by value whether or
+// not a re-parse happened, so reference identity proves nothing for it the
+// way it does for `parseHunks`'s array return. No render-level test is added
+// for the body half; this is a limit of what is externally observable, not an
+// uncovered scenario.
+describe('an unchanged diff is not re-derived across an unrelated redraw', () => {
+  it('the diffLines a render actually consumes are the identical HunkLine objects on a second render', () => {
+    const diffText = '@@ -62,3 +62,3 @@\n if (cachedToken) {\n-  return staleToken;\n+  return cachedToken;\n }\n';
+    // Exactly how reviewFlowHtml.ts's `diffLines` is derived — the same
+    // production function, called the same way a real render would.
+    const linesA = parseHunks(diffText).flatMap((hunk) => hunk.lines);
+    // A second render, for a reason unrelated to this diff (another finding
+    // decided, the tallies changed) — the diff text itself is unchanged.
+    const linesB = parseHunks(diffText).flatMap((hunk) => hunk.lines);
+
+    expect(linesA).toHaveLength(4);
+    expect(linesA.map((l) => l.text)).toEqual(['if (cachedToken) {', '  return staleToken;', '  return cachedToken;', '}']);
+    // Reference identity, not deep equality: `parseHunksUncached` builds a
+    // fresh array of fresh objects on every real parse, so the same object at
+    // the same index across two calls is only possible if the second call
+    // served the memoized Hunk rather than re-parsing.
+    for (let i = 0; i < linesA.length; i += 1) expect(linesB[i]).toBe(linesA[i]);
+
+    // What the render actually emits from each is identical too — nothing
+    // about the finding changed between the two.
+    const stateA: FlowViewState = { ...state, mode: 'diff', diffLines: linesA };
+    const stateB: FlowViewState = { ...state, mode: 'diff', diffLines: linesB, counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 } };
+    const diffMarkupOf = (html: string): string => html.slice(html.indexOf('<div class="diff-code">'));
+    expect(diffMarkupOf(renderReviewFlowBody(stateB, 'HVE Core / PR Review')))
+      .toBe(diffMarkupOf(renderReviewFlowBody(stateA, 'HVE Core / PR Review')));
   });
 });

@@ -275,3 +275,138 @@ describe('a patch between keystrokes (tasks 9.3, 9.7)', () => {
     expect((document.getElementById('reply-input') as HTMLInputElement).value).toBe('');
   });
 });
+
+// ---- an update to one thread does not disturb a DIFFERENT thread the reviewer
+// is composing in (ui-responsiveness: "A field the reviewer is composing in a
+// list that updates" and "Expanded sections") ---------------------------------
+//
+// `postedState()` above carries one thread; both scenarios below need a
+// second so "another thread on the same screen changes" is a real, separate
+// row rather than the same one patching itself.
+
+function secondThread(status: PostedThreadView['status'] = 'awaiting'): PostedThreadView {
+  return {
+    threadId: 'thread-2',
+    title: 'Gateway retries without jitter',
+    severity: 'minor',
+    file: 'src/gateway.ts',
+    line: 9,
+    status,
+    yourBody: 'This can thunder on a shared outage.',
+    replies: [],
+  };
+}
+
+function postedStateTwoThreads(opts: {
+  expandedThreadId?: string;
+  replyDrafts?: Record<string, string>;
+  /** thread-1's status — the thread that changes while thread-2 is composed in. */
+  firstThreadStatus?: PostedThreadView['status'];
+}): PostedViewState {
+  return {
+    vocabulary: GITLAB_VOCABULARY,
+    podName: 'Platform squad',
+    now: Date.parse('2026-08-22T10:00:00.000Z'),
+    waitingOnYouTotal: 2,
+    rows: [{
+      view: {
+        repoId: '9101',
+        crNumber: '2841',
+        agentLabel: 'Verdict · Demo Review',
+        submittedAt: '2026-08-20T10:00:00.000Z',
+        threads: [{ ...postedThread(), status: opts.firstThreadStatus ?? 'replied' }, secondThread()],
+        counts: { you: 2, author: 0, closed: 0 },
+      },
+      refLabel: '!2841',
+      title: 'Add per-tenant rate limiting',
+      project: 'core',
+      age: '2d',
+      archived: false,
+    }],
+    showArchived: false,
+    archivedCount: 0,
+    opinions: {},
+    replyDrafts: opts.replyDrafts ?? {},
+    expandedThreadId: opts.expandedThreadId,
+  };
+}
+
+describe('an update to one thread does not disturb another the reviewer is composing in', () => {
+  it('the composed reply stays put — value, focus and caret — while a DIFFERENT thread\'s status changes', async () => {
+    const { dom, posted } = loadShell(
+      renderPostedReviewsHtml(postedStateTwoThreads({ expandedThreadId: 'thread-2' }), 'testnonce'),
+      'posted',
+    );
+    const document = dom.window.document;
+    const typed = 'Let me check the retry budget first.';
+
+    const field = document.getElementById('reply-input') as HTMLInputElement;
+    field.focus();
+    type(dom, field, typed);
+    // As in the single-thread case above: the debounced commit is real, on
+    // the page's own timer.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(posted).toContainEqual({ type: 'replyDraft', threadId: 'thread-2', text: typed });
+
+    field.setSelectionRange(6, 6);
+    // thread-1 — collapsed, not the one being composed in — changes: new
+    // commits moved its anchor. The same region (`pr-detail`) is replaced
+    // wholesale, exactly as a real action on thread-1 (resolve, concede, a
+    // reply landing) would patch it.
+    patch(dom, {
+      'pr-detail': renderPostedReviewsRegions(postedStateTwoThreads({
+        expandedThreadId: 'thread-2',
+        replyDrafts: { [replyDraftKey('9101', '2841', 'thread-2')]: typed },
+        firstThreadStatus: 'stale',
+      }))['pr-detail']!,
+    });
+
+    // The list actually updated — thread-1's own row shows it — so this is a
+    // genuine redraw, not a no-op the field merely survived by accident.
+    expect(document.querySelector('.th-row[data-thread="thread-1"] .pill')?.textContent).toBe('thread stale');
+
+    // The composed reply survived it: still there, still focused, caret
+    // exactly where it was left.
+    const after = document.getElementById('reply-input') as HTMLInputElement;
+    expect(after.value).toBe(typed);
+    expect(document.activeElement?.id).toBe('reply-input');
+    expect(after.selectionStart).toBe(6);
+    expect(after.selectionEnd).toBe(6);
+  });
+
+  /**
+   * "Expanded sections" (ui-responsiveness): no renderer in this codebase
+   * emits a `<details id="…">` — the one real `<details>` element
+   * (dashboardHtml.ts's rate-limit disclosure) carries no id and appears only
+   * in `renderFallbackHtml`'s script-free error page, which is never patched,
+   * so REGIONS_SCRIPT's generic `details[id]` capture/restore (exercised
+   * against synthetic markup in dashboardScript.test.ts) never runs against
+   * a real one. The posted-reviews screen's own expand/collapse is this
+   * product's real analogue: `expandedThreadId` is host state, echoed into
+   * every redraw of `#pr-detail` — this proves an unrelated redraw does not
+   * collapse it.
+   */
+  it('the expanded thread stays expanded across the same unrelated update', () => {
+    const { dom } = loadShell(
+      renderPostedReviewsHtml(postedStateTwoThreads({ expandedThreadId: 'thread-2' }), 'testnonce'),
+      'posted',
+    );
+    const document = dom.window.document;
+    // thread-2 alone is expanded on first paint.
+    expect(document.querySelectorAll('.th-body')).toHaveLength(1);
+    expect(document.querySelector('.th-row[data-thread="thread-2"] .th-body')).not.toBeNull();
+
+    patch(dom, {
+      'pr-detail': renderPostedReviewsRegions(postedStateTwoThreads({
+        expandedThreadId: 'thread-2',
+        firstThreadStatus: 'stale',
+      }))['pr-detail']!,
+    });
+
+    // thread-1 changed (same fact the sibling test asserts) — a real redraw.
+    expect(document.querySelector('.th-row[data-thread="thread-1"] .pill')?.textContent).toBe('thread stale');
+    // thread-2 is still expanded — the unrelated update did not collapse it.
+    expect(document.querySelectorAll('.th-body')).toHaveLength(1);
+    expect(document.querySelector('.th-row[data-thread="thread-2"] .th-body')).not.toBeNull();
+  });
+});

@@ -9,6 +9,7 @@
  * poked directly.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AppStore } from '../app/appStore';
 import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
 import { DRAFT_WRITE_WINDOW_MS } from '../app/draftWriter';
 import {
@@ -26,6 +27,7 @@ import { clearProviders, registerProvider } from '../platform/registry';
 import type { ChangeRequestDiff, ChangeRequestRef, SubmitResult } from '../platform/types';
 import { GITHUB_VOCABULARY } from '../testing/specFixtures';
 import type { ReviewFlowDeps } from './reviewFlow';
+import { VerdictSidebarProvider, VerdictStatusBar } from './sidebar';
 
 // ---- vscode and module mocks ---------------------------------------------------
 
@@ -35,6 +37,9 @@ const handlers = vi.hoisted(() => ({
   viewState: undefined as ((event: { webviewPanel: { active: boolean; visible: boolean } }) => void) | undefined,
   windowState: undefined as ((state: { focused: boolean }) => void) | undefined,
 }));
+
+/** `VerdictStatusBar`'s segments, in creation order (verdict, agent, keys, …) — see statusBar.test.ts's own `segments()`. */
+const statusBarItems = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
 const panel = vi.hoisted(() => ({
   title: '',
@@ -61,6 +66,7 @@ const panel = vi.hoisted(() => ({
 vi.mock('vscode', () => ({
   ViewColumn: { One: 1, Beside: -2 },
   TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
+  StatusBarAlignment: { Left: 1 },
   window: {
     createWebviewPanel: () => panel,
     showInformationMessage: vi.fn(() => Promise.resolve(undefined)),
@@ -70,6 +76,26 @@ vi.mock('vscode', () => ({
       handlers.windowState = handler;
       return { dispose: vi.fn() };
     },
+    // Only the gap-3 propagation test (task 10.1) builds a real
+    // `VerdictStatusBar` — every other test here never touches this.
+    createStatusBarItem: vi.fn((_alignment: number, priority: number) => {
+      const item = {
+        priority,
+        text: '',
+        tooltip: '',
+        command: '',
+        visible: false,
+        show(): void {
+          item.visible = true;
+        },
+        hide(): void {
+          item.visible = false;
+        },
+        dispose: vi.fn(),
+      };
+      statusBarItems.push(item as unknown as Record<string, unknown>);
+      return item;
+    }),
   },
   workspace: {
     getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
@@ -80,7 +106,9 @@ vi.mock('vscode', () => ({
     clipboard: { writeText: vi.fn(() => Promise.resolve(undefined)) },
     openExternal: vi.fn(),
   },
-  Uri: { parse: () => ({}) },
+  // `joinPath` backs the sidebar's codicon asset lookup (sidebar.ts's
+  // `codicons()`), evaluated unconditionally even when nothing reads it.
+  Uri: { parse: () => ({}), joinPath: (...segments: unknown[]) => segments },
 }));
 
 // The pickers' discovery walks the filesystem and `vscode.lm`; the tests are
@@ -131,6 +159,9 @@ vi.mock('../app/connections', () => ({
         world.calls.workItems += 1;
         return Promise.resolve([]);
       },
+      // Only the gap-3 propagation test (task 10.1) builds a real `AppStore`
+      // for the sidebar to read through — `fetchPodData` calls this too.
+      listCiRuns: () => Promise.resolve([]),
       submitReview: (_ref: unknown, submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => {
         world.calls.submits += 1;
         // Snapshot what is on disk at the moment the platform is called — the
@@ -332,6 +363,7 @@ beforeEach(() => {
   world.submitReview = undefined;
   world.submitCalls = [];
   world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
+  statusBarItems.length = 0;
 });
 
 afterEach(() => {
@@ -845,5 +877,81 @@ describe('a full triage session (task 10.3)', () => {
     for (let i = 1; i <= 10; i += 1) {
       expect(stored?.review.verdicts[`i${i}`]?.verdict).toBe('accepted');
     }
+  });
+});
+
+// ---- task 10.1 gap 3: a verdict reaches every screen showing the review's progress
+
+describe("recording a verdict reaches every screen that shows the review's progress", () => {
+  it('propagates through onSidebarState to the sidebar\'s triage region and the status bar', async () => {
+    // The "no platform request" half of this scenario is covered throughout
+    // this file already (e.g. task 10.3's assertion above). What is missing
+    // is the AND clause: every screen showing the review's progress reflects
+    // the new verdict. Driven for real — a real AppStore, VerdictSidebarProvider
+    // and VerdictStatusBar, wired through onSidebarState exactly the way
+    // extension.ts wires them (sidebar.setActiveReview + statusBar.setActiveReview) —
+    // rather than asserting on a fake stand-in for either screen.
+    const sidebarPod = pod();
+    const podStoreFake = { activePod: sidebarPod, list: () => [sidebarPod] } as never;
+    const appStore = new AppStore({
+      podStore: podStoreFake,
+      secrets: {} as never,
+      reviewHistory: { list: () => [] } as never,
+      baseSeconds: () => 60,
+    });
+    const sidebarView = { html: '', postMessage: vi.fn() };
+    const sidebar = new VerdictSidebarProvider(podStoreFake, {
+      appStore,
+      extensionUri: {} as never,
+      globalState: memoryStore() as never,
+      openCr: () => undefined,
+    });
+    sidebar.resolveWebviewView({
+      webview: {
+        get html(): string {
+          return sidebarView.html;
+        },
+        set html(value: string) {
+          sidebarView.html = value;
+        },
+        postMessage: sidebarView.postMessage,
+        onDidReceiveMessage: () => ({ dispose: () => undefined }),
+        options: undefined,
+        cspSource: 'test:',
+        asWebviewUri: undefined,
+      },
+      onDidDispose: () => ({ dispose: () => undefined }),
+    } as never);
+    // The sidebar's own first pod read (unrelated to the review) lands here.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const statusBar = new VerdictStatusBar();
+    const verdictSegment = statusBarItems[0] as unknown as { text: string; tooltip: string };
+
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    h.deps.onSidebarState = (state) => {
+      sidebar.setActiveReview(state);
+      statusBar.setActiveReview(state);
+    };
+    await h.open();
+
+    // Baseline, before any triage: two undecided findings, nothing recorded.
+    expect(sidebarView.html).toContain('0 acc');
+    expect(sidebarView.html).toContain('2 left');
+    expect(verdictSegment.tooltip).toContain('0 accepted, 0 rejected, 0 skipped');
+    expect(verdictSegment.text).toContain('2 left');
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+
+    // Both screens reflect the actual new counts — not a string ("Verdict",
+    // "acc"/"left" labels) that would read the same regardless of which
+    // verdict was recorded, but the accepted/undecided numbers themselves.
+    expect(sidebarView.html).toContain('1 acc');
+    expect(sidebarView.html).toContain('1 left');
+    expect(sidebarView.html).toContain('1/2');
+    expect(verdictSegment.tooltip).toContain('1 accepted, 0 rejected, 0 skipped');
+    expect(verdictSegment.text).toContain('1 left');
+
+    statusBar.dispose();
   });
 });

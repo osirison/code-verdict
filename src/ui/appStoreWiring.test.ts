@@ -22,6 +22,8 @@ const world = vi.hoisted(() => ({
   calls: { changeRequests: 0, workItems: 0, ciRuns: 0, diffs: 0 },
   crs: [] as ChangeRequest[],
   gate: undefined as Promise<void> | undefined,
+  /** Set to make the next connection attempt fail — a revalidation gone bad. */
+  failWith: undefined as Error | undefined,
 }));
 
 /** The one `AppSurface` panel, with every full assignment logged. */
@@ -75,8 +77,13 @@ vi.mock('vscode', () => ({
 }));
 
 vi.mock('../app/connections', () => ({
-  connectionForPod: () =>
-    Promise.resolve({
+  connectionForPod: () => {
+    // The one failure injection this suite has: a rejected connection stands
+    // in for a revalidation the platform refused. Checked at connection time
+    // rather than per-list-call — simplest fake that still makes the whole
+    // fetch behind a stale read reject the way a real platform error would.
+    if (world.failWith) return Promise.reject(world.failWith);
+    return Promise.resolve({
       listOpenChangeRequests: async () => {
         world.calls.changeRequests += 1;
         if (world.gate) await world.gate;
@@ -97,7 +104,8 @@ vi.mock('../app/connections', () => ({
         if (world.gate) await world.gate;
         return { ref, headSha: 'head', files: [], anchorRefs: undefined };
       },
-    }),
+    });
+  },
 }));
 
 function changeRequest(number: string, title: string): ChangeRequest {
@@ -209,6 +217,7 @@ beforeEach(() => {
   world.calls = { changeRequests: 0, workItems: 0, ciRuns: 0, diffs: 0 };
   world.crs = [changeRequest('7', 'Add per-tenant rate limiting')];
   world.gate = undefined;
+  world.failWith = undefined;
   panel.state.htmlLog.length = 0;
   panel.state.messageHandler = undefined;
   panel.webview.postMessage.mockClear();
@@ -370,6 +379,43 @@ describe('the dashboard keeps its skeleton for a cold pod and skips it for a hel
     expect(world.calls).toEqual(before);
     expect(panel.state.htmlLog.some((html) => html.includes('class="skel'))).toBe(false);
     expect(panel.webview.html).toContain('Add per-tenant rate limiting');
+  });
+
+  it('a revalidation behind a stale reopen can fail without disturbing what is painted', async () => {
+    const s = await setup();
+    await openDashboard(s);
+    expect(panel.webview.html).toContain('Add per-tenant rate limiting');
+
+    // Navigate away and let the held data go stale, exactly like the test
+    // above — except this time the revalidation reopening starts behind the
+    // paint is going to fail.
+    const { AppSurface } = await import('./appSurface.js');
+    AppSurface.show('elsewhere', 'Elsewhere');
+    s.clock.t += 60_000;
+    world.failWith = new Error('rate limited');
+    panel.state.htmlLog.length = 0;
+
+    await openDashboard(s);
+    // The data already on screen remains shown: reopening on stale held data
+    // paints that data immediately — no loading state, and (since a repaint
+    // only ever follows a fetch that *succeeded*) no error either, no matter
+    // how the revalidation behind it turns out.
+    expect(panel.webview.html).toContain('Add per-tenant rate limiting');
+    expect(panel.state.htmlLog.every((html) => !html.includes('Could not load the pod'))).toBe(true);
+
+    // Single-flight: reading the same pod now either joins the exact
+    // background revalidation the reopened dashboard's stale read started
+    // behind its paint, or — if that flight already settled — starts an
+    // identical one, `world.failWith` still armed. Either way this is proof
+    // the failure is reported to whoever is waiting on it, not silently
+    // swallowed into a success the way a dropped rejection would be.
+    const behind = s.appStore.read(s.activePod);
+    await expect(behind.fetch).rejects.toThrow('rate limited');
+    await flush();
+
+    // What was on screen stays on screen; no error document ever replaced it.
+    expect(panel.webview.html).toContain('Add per-tenant rate limiting');
+    expect(panel.state.htmlLog.every((html) => !html.includes('Could not load the pod'))).toBe(true);
   });
 });
 
