@@ -42,10 +42,18 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain(`script-src 'nonce-nonce123'`);
     expect(html).toContain("type: 'setNotification'");
     expect(html).toContain("type: 'setQuietMode'");
-    expect(html).toContain("type: 'openSettingsJson'");
-    expect(html).toContain('let quietMode = false');
-    expect(html).toContain('quietMode = !quietMode');
-    expect(html).toContain('shareRates = !shareRates');
+    // Delegated on `document` via the shared `on(id, type)` helper (issue #39
+    // follow-up), not bound to the rendered button directly — a region patch
+    // replaces this markup, and a handler bound to the replaced node would
+    // die with it.
+    expect(html).toContain("on('open-json', 'openSettingsJson')");
+    expect(html).toContain("on('test-connection', 'testConnection')");
+    // The toggle's next value comes off its own rendered `data-checked`
+    // attribute, not a client-side variable the host can never see: the host
+    // repaints this region after every change, so the attribute is always
+    // current.
+    expect(html).toContain('data-checked="false"');
+    expect(html).toContain("el.dataset.checked !== 'true'");
   });
 });
 

@@ -1,38 +1,38 @@
 ## 1. Memoized derivations (D10)
 
-- [ ] 1.1 Add `src/app/memo.ts`: a bounded LRU memo keyed on a string, capped by entry count and total characters, following the bounds convention in `src/providers/github/http.ts:205-278` rather than inventing a new one. No `vscode` import.
-- [ ] 1.2 Memoize `parseHunks(diff)` in `src/domain/diffHunks.ts` on the diff string, and `diffStats(files)` on the concatenated per-file keys, without changing either signature.
-- [ ] 1.3 Memoize `renderMarkdown(text)` in `src/ui/markdown.ts` on its input.
-- [ ] 1.4 Tests in `src/app/memo.test.ts`: a repeated key returns the cached value without re-invoking; the entry cap evicts least-recently-used; the character cap evicts before the entry cap when entries are large; a key never seen is computed.
-- [ ] 1.5 Tests: `parseHunks` and `renderMarkdown` return values equal to the unmemoized result for every existing fixture, and a second call on the same input does not re-parse (assert via a counting spy on an injected parse step or by identity of the returned object).
+- [x] 1.1 Add `src/domain/memo.ts`: a bounded LRU memo keyed on a string, capped by entry count and total characters, following the bounds convention in `src/providers/github/http.ts:205-278` rather than inventing a new one. No `vscode` import. (Written as `src/app/` when planned; it has to live in `src/domain/` because `diffHunks.ts` needs it and nothing in `src/domain/` imports `src/app/` — 32 files import the other way. `src/ui/` reaches `src/domain/` directly, as it already does elsewhere.)
+- [x] 1.2 Memoize `parseHunks(diff)` in `src/domain/diffHunks.ts` on the diff string, and `diffStats(files)` on the concatenated per-file keys, without changing either signature.
+- [x] 1.3 Memoize `renderMarkdown(text)` in `src/ui/markdown.ts` on its input.
+- [x] 1.4 Tests in `src/domain/memo.test.ts`: a repeated key returns the cached value without re-invoking; the entry cap evicts least-recently-used; the character cap evicts before the entry cap when entries are large; a key never seen is computed.
+- [x] 1.5 Tests: `parseHunks` and `renderMarkdown` return values equal to the unmemoized result for every existing fixture, and a second call on the same input does not re-parse (assert via a counting spy on an injected parse step or by identity of the returned object).
 
 ## 2. The sidebar stops fetching on every triage action
 
-- [ ] 2.1 Split `VerdictSidebarProvider.render()` (`src/ui/sidebar.ts:148`) into a data path that fetches and a paint path that renders from already-held state. Keep `refreshSeq`/stale-guard behaviour (`:152`) on the data path only.
-- [ ] 2.2 Give `sidebarHtml.ts` region render functions and stable region container ids, matching the shape of `renderPostedReviewsRegions` (`src/ui/postedReviewsHtml.ts:329`): at minimum an active-review region, a threads region and a nav region.
-- [ ] 2.3 Make `setActiveReview`, `setPendingReview`, `setThreads`, `setActiveRoute` and `setActiveRuns` (`src/ui/sidebar.ts:71-104`) patch their own region from held state and never call the data path.
-- [ ] 2.4 Convert the sidebar's inline handlers in `src/ui/sidebarHtml.ts` to `document`-level delegated listeners matching on `closest()`, in the form used at `src/ui/reviewFlowHtml.ts:1278-1330`.
-- [ ] 2.5 Wire a region-patch path for the `WebviewView` (it is not an `AppRoute`): reuse `REGIONS_SCRIPT` and the `verdictReady` handshake, with full `webview.html` assignment as the first-paint and reload fallback.
-- [ ] 2.6 Tests in `src/ui/sidebar.test.ts` (new) or `sidebarHtml.test.ts`: recording a verdict updates the active-review region and issues **zero** platform calls against a fake connection; the change-request, work-item and CI sections are byte-identical before and after; a real pod refresh still fetches and repaints everything.
+- [x] 2.1 Split `VerdictSidebarProvider.render()` (`src/ui/sidebar.ts:148`) into a data path that fetches and a paint path that renders from already-held state. Keep `refreshSeq`/stale-guard behaviour (`:152`) on the data path only.
+- [x] 2.2 Give `sidebarHtml.ts` region render functions and stable region container ids, matching the shape of `renderPostedReviewsRegions` (`src/ui/postedReviewsHtml.ts:329`): at minimum an active-review region, a threads region and a nav region.
+- [x] 2.3 Make `setActiveReview`, `setPendingReview`, `setThreads`, `setActiveRoute` and `setActiveRuns` (`src/ui/sidebar.ts:71-104`) patch their own region from held state and never call the data path.
+- [x] 2.4 Convert the sidebar's inline handlers in `src/ui/sidebarHtml.ts` to `document`-level delegated listeners matching on `closest()`, in the form used at `src/ui/reviewFlowHtml.ts:1278-1330`.
+- [x] 2.5 Wire a region-patch path for the `WebviewView` (it is not an `AppRoute`): reuse `REGIONS_SCRIPT` and the `verdictReady` handshake, with full `webview.html` assignment as the first-paint and reload fallback.
+- [x] 2.6 Tests in `src/ui/sidebar.test.ts` (new) or `sidebarHtml.test.ts`: recording a verdict updates the active-review region and issues **zero** platform calls against a fake connection; the change-request, work-item and CI sections are byte-identical before and after; a real pod refresh still fetches and repaints everything.
 
 ## 3. Settings stops testing the connection on every toggle
 
-- [ ] 3.1 Split `SettingsPanel.render()` (`src/ui/settings.ts:55-94`) so the connection test (`:63`) and the agent-location filesystem scan (`:103-115`) run on open and on explicit re-test only, not on the message tail (`:162`).
-- [ ] 3.2 Convert the settings page's inline handlers to delegated listeners. This comes before the patch path: a patch replaces a region's `innerHTML`, so any handler still bound to a replaced node is lost and the control goes dead on the first patch.
-- [ ] 3.3 Give `settingsHtml.ts` region render functions and container ids; make each message case patch the region it affects instead of falling through to a full render.
-- [ ] 3.4 Tests in `src/ui/settingsHtml.test.ts` and a new `settings.test.ts`: toggling a setting issues zero platform calls and leaves the shown connection status unchanged; pressing the explicit re-test control does call `testConnection`; opening the panel still calls it once.
+- [x] 3.1 Split `SettingsPanel.render()` (`src/ui/settings.ts:55-94`) so the connection test (`:63`) and the agent-location filesystem scan (`:103-115`) run on open and on explicit re-test only, not on the message tail (`:162`).
+- [x] 3.2 Convert the settings page's inline handlers to delegated listeners. This comes before the patch path: a patch replaces a region's `innerHTML`, so any handler still bound to a replaced node is lost and the control goes dead on the first patch.
+- [x] 3.3 Give `settingsHtml.ts` region render functions and container ids; make each message case patch the region it affects instead of falling through to a full render.
+- [x] 3.4 Tests in `src/ui/settingsHtml.test.ts` and a new `settings.test.ts`: toggling a setting issues zero platform calls and leaves the shown connection status unchanged; pressing the explicit re-test control does call `testConnection`; opening the panel still calls it once.
 
 ## 4. Coalesced draft persistence with the generation guard (D9)
 
-- [ ] 4.1 Turn `persistDraft` (`src/ui/reviewFlow.ts:521-537`) into a coalescing writer: consecutive calls collapse into one `workspaceState.update`, with `flush()` exposed for the explicit flush points. Apply the same to `changesetReview.ts`'s draft write.
-- [ ] 4.2 Flush before submit, on `onLeave`/dispose, on `onDidChangeViewState` when the panel stops being visible (`src/ui/reviewFlow.ts:267`), and on `vscode.window.onDidChangeWindowState` losing focus.
-- [ ] 4.3 **First**, make the coalesced writer stop erasing the fields the guard reads. `persistDraft` and `changesetReview`'s draft write (`src/ui/changesetReview.ts:243-253`) put a fixed set of keys and drop every `RetainedResult` field the run manager wrote — `outcome`, `ranAt`, `agentId`, `agentLabel`, `modelId`, `submittedAt`, `candidates`, `filesRead`. Carry them forward into every put from the **raw stored record** the panel holds (`this.retained.draft`), never from the normalized `readRetained` view, whose inferred fallbacks (`src/app/retainedReview.ts:229-235`) must not be written back to storage.
-- [ ] 4.3a Test that this is a repair, not just a prerequisite: a target with a retained review still shows its "Ran …" line (`src/ui/reviewFlow.ts:1437` -> `src/ui/reviewFlowHtml.ts:788`) after a verdict is recorded. It does not today.
-- [ ] 4.3b Implement the generation guard on top of 4.3: record the `ranAt` and target of the record the panel loaded; the deferred write re-reads the key and drops itself when the stored `ranAt` differs. The `get` and the `update` are adjacent with **no `await` between them**, per `src/app/storage.ts:6-21`. Without 4.3 this guard drops every write after the panel's first one.
-- [ ] 4.4 Cancel any pending write when the panel observes a `succeeded` settle for its own target from `ReviewRunManager`.
-- [ ] 4.5 Leave every read-modify-write caller alone — `ReviewRunStore.record`, `ThreadFlags`, `PodStore`, `ManualChangesetStore` keep their synchronous `get`/`update` pairing and are not coalesced.
-- [ ] 4.6 Tests in `src/ui/reviewFlow.test.ts`: several verdicts in a row produce one write carrying the final state; each flush point writes before the panel yields; a pending write issued while a re-run settles is dropped and the new run's retained review survives (the invariant *A cached review is replaced only by a review that succeeds*); a pending write for a target whose record was replaced by a **clean** run is also dropped.
-- [ ] 4.7 Test that reading back a coalesced record never yields a mixture of two actions' state.
+- [x] 4.1 Turn `persistDraft` (`src/ui/reviewFlow.ts:521-537`) into a coalescing writer: consecutive calls collapse into one `workspaceState.update`, with `flush()` exposed for the explicit flush points. Apply the same to `changesetReview.ts`'s draft write.
+- [x] 4.2 Flush before submit, on `onLeave`/dispose, on `onDidChangeViewState` when the panel stops being visible (`src/ui/reviewFlow.ts:267`), and on `vscode.window.onDidChangeWindowState` losing focus.
+- [x] 4.3 **First**, make the coalesced writer stop erasing the fields the guard reads. `persistDraft` and `changesetReview`'s draft write (`src/ui/changesetReview.ts:243-253`) put a fixed set of keys and drop every `RetainedResult` field the run manager wrote — `outcome`, `ranAt`, `agentId`, `agentLabel`, `modelId`, `submittedAt`, `candidates`, `filesRead`. Carry them forward into every put from the **raw stored record** the panel holds (`this.retained.draft`), never from the normalized `readRetained` view, whose inferred fallbacks (`src/app/retainedReview.ts:229-235`) must not be written back to storage.
+- [x] 4.3a Test that this is a repair, not just a prerequisite: a target with a retained review still shows its "Ran …" line (`src/ui/reviewFlow.ts:1437` -> `src/ui/reviewFlowHtml.ts:788`) after a verdict is recorded. It does not today.
+- [x] 4.3b Implement the generation guard on top of 4.3: record the `ranAt` and target of the record the panel loaded; the deferred write re-reads the key and drops itself when the stored `ranAt` differs. The `get` and the `update` are adjacent with **no `await` between them**, per `src/app/storage.ts:6-21`. Without 4.3 this guard drops every write after the panel's first one.
+- [x] 4.4 Cancel any pending write when the panel observes a `succeeded` settle for its own target from `ReviewRunManager`.
+- [x] 4.5 Leave every read-modify-write caller alone — `ReviewRunStore.record`, `ThreadFlags`, `PodStore`, `ManualChangesetStore` keep their synchronous `get`/`update` pairing and are not coalesced.
+- [x] 4.6 Tests in `src/ui/reviewFlow.test.ts`: several verdicts in a row produce one write carrying the final state; each flush point writes before the panel yields; a pending write issued while a re-run settles is dropped and the new run's retained review survives (the invariant *A cached review is replaced only by a review that succeeds*); a pending write for a target whose record was replaced by a **clean** run is also dropped.
+- [x] 4.7 Test that reading back a coalesced record never yields a mixture of two actions' state.
 
 ## 5. The store (D1–D4)
 

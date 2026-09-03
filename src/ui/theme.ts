@@ -454,6 +454,15 @@ export function renderPage(opts: {
   script?: string;
   breadcrumb?: { parent?: string; current: string };
   embedded?: boolean;
+  /**
+   * Opt an `embedded` page into REGIONS_SCRIPT and its `verdictReady`
+   * handshake (issue #46 task 2.5). Every non-embedded page already gets it
+   * unconditionally below; an embedded one otherwise does not, because the
+   * only embedded caller today (the sidebar `WebviewView`) predates region
+   * patching. Gated behind its own flag rather than folded into `embedded`
+   * so a future embedded caller that has no use for it is unaffected.
+   */
+  regions?: boolean;
   codicons?: CodiconAssets;
 }): string {
   const breadcrumb = opts.breadcrumb
@@ -463,7 +472,7 @@ export function renderPage(opts: {
     ? opts.body
     : `<main class="verdict-app">${breadcrumb}<div class="app-content">${opts.body}</div></main>${renderKeysOverlay()}`;
   const keysScript = opts.embedded ? '' : KEYS_SCRIPT;
-  const regionsScript = opts.embedded ? '' : REGIONS_SCRIPT;
+  const regionsScript = opts.embedded ? (opts.regions ? REGIONS_SCRIPT : '') : REGIONS_SCRIPT;
   // REGIONS_SCRIPT needs the vscode API to post `verdictReady`, so acquire it
   // for every full (non-embedded) page — not only when the caller supplies
   // its own script or a breadcrumb, as before #39.

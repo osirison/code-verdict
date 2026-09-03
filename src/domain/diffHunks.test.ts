@@ -40,3 +40,34 @@ describe('parseHunks', () => {
     expect(hunks[0]).toMatchObject({ oldStart: 5, oldCount: 1, newStart: 5, newCount: 1 });
   });
 });
+
+describe('parseHunks and diffStats — memoization (D10)', () => {
+  it('returns the exact same array for a repeated diff, proving the second call did not re-parse', () => {
+    const first = parseHunks(DIFF);
+    const second = parseHunks(DIFF);
+    // Recomputing would allocate a new array; `toBe` is decisive here in a
+    // way `toEqual` is not.
+    expect(second).toBe(first);
+  });
+
+  it('returns the exact same stats record for a repeated file set', () => {
+    const first = diffStats([DIFF]);
+    const second = diffStats([DIFF]);
+    expect(second).toBe(first);
+  });
+
+  it('does not confuse two file splits whose bare-joined characters collide', () => {
+    // Both arrays join, unseparated, to the same 16 characters
+    // ("@@ -1 +1 @@\n+x\n") — a bare-joined key would cache one split's
+    // result under the other's key. The splits are NOT equivalent: each
+    // array element is parsed as its own diff, and splitting the header
+    // line itself breaks it, so the second split sees no header and no
+    // added line at all.
+    const wholeHeader = ['@@ -1 +1 @@\n+x\n'];
+    const splitHeader = ['@@ -1 +1 @', '@\n+x\n'];
+    expect(wholeHeader.join('')).toBe(splitHeader.join(''));
+
+    expect(diffStats(wholeHeader)).toEqual({ added: 1, removed: 0 });
+    expect(diffStats(splitHeader)).toEqual({ added: 0, removed: 0 });
+  });
+});

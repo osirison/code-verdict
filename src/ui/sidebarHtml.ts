@@ -427,18 +427,77 @@ function renderThreads(threads: SidebarThreads): string {
   </section>`;
 }
 
-export function renderSidebarHtml(state: SidebarViewState, nonce: string): string {
+/**
+ * Precedence, highest first: setup → threads → triage → pending → lists.
+ * The one place that decides which arm wins (issue #46 task 2.3) — the full
+ * page and every region patch (`renderSidebarRegions` below) call this
+ * instead of each keeping its own copy of the ternary chain, so a patch
+ * computed from a different rule than the full render is never how two
+ * regions could end up disagreeing about which one is allowed to show
+ * anything.
+ */
+export type SidebarScreen = 'setup' | 'threads' | 'triage' | 'pending' | 'lists';
+
+export function sidebarScreen(state: SidebarViewState): SidebarScreen {
+  return state.setup
+    ? 'setup'
+    : state.threads
+      ? 'threads'
+      : state.activeReview
+        ? 'triage'
+        : state.pendingReview
+          ? 'pending'
+          : 'lists';
+}
+
+/**
+ * The nav rows — filtered to just Dashboard during setup (spec §1) and
+ * carrying the active route's highlight. The first detected changeset's id
+ * rides a data attribute rather than a value the bootstrap script closes
+ * over: `#sidebar-nav` is itself a patchable region, and a script-load-time
+ * closure would go stale the moment a patch (not a full reload) changed
+ * which changeset is first.
+ */
+function renderNavRows(state: SidebarViewState, screen: SidebarScreen): string {
   const e = escapeHtml;
-  const podRows = state.pods.length > 0
-    ? state.pods.map((pod) => `<div class="pod-row-wrap ${pod.active ? 'active' : ''}">
-        <button class="pod-row ${pod.active ? 'active' : ''}" data-pod="${e(pod.id)}">
-          <span class="pod-check">${pod.active ? '✓' : ''}</span>
-          <span class="pod-name">${e(pod.name)}</span>
-          <span class="pod-meta">${e(pod.meta)}</span>
-        </button>
-        <button class="pod-delete" data-pod-delete="${e(pod.id)}" title="Delete pod" aria-label="Delete pod ${e(pod.name)}">${icon('trash')}</button>
-      </div>`).join('')
-    : '<div class="empty">No pods configured</div>';
+  return [
+    { id: 'dashboard', route: 'dashboard', icon: 'dashboard', label: 'Pod dashboard', count: `${state.mergeRequests.length}` },
+    // ⧉ is spec-named changeset content (README §15), not chrome — it stays a
+    // character while the other rows use codicons.
+    { id: 'changesets', route: 'changeset', glyph: '⧉', label: 'Changesets', count: `${(state.changesets ?? []).length} open` },
+    { id: 'posted-reviews', route: 'posted', icon: 'comment-discussion', label: 'Posted reviews', count: `${state.waitingOnYou}` },
+    { id: 'tuning', route: 'tuning', icon: 'graph', label: 'Agent tuning' },
+    { id: 'settings', route: 'settings', icon: 'gear', label: 'Settings' },
+  ]
+    // Spec §1: the later rows are hidden until setup completes — there is
+    // nothing behind them yet.
+    .filter((row) => screen !== 'setup' || row.id === 'dashboard')
+    .map((row) => `<button class="nav-row ${state.activeRoute === row.route ? 'active' : ''}" id="${row.id}"${
+      row.id === 'changesets' ? ` data-first-changeset-id="${e(state.changesets?.[0]?.id ?? '')}"` : ''
+    }><span class="nav-glyph">${'glyph' in row && row.glyph ? e(row.glyph) : icon(row.icon ?? '')}</span><span class="nav-label">${e(row.label)}</span>${row.count === undefined ? '' : `<span class="nav-count">${e(row.count)}</span>`}</button>`)
+    .join('');
+}
+
+/** Spec §5 — the triage screen: counts, progress bar, filter pills, tree. */
+function renderReviewSection(activeReview: SidebarActiveReview): string {
+  const e = escapeHtml;
+  const decided = activeReview.items.length - activeReview.counts.undecided;
+  const progressWidth = (count: number) => activeReview.items.length ? (count / activeReview.items.length) * 100 : 0;
+  const reviewTree = renderReviewTree(activeReview.items);
+  const filterPills = renderFilterPills(activeReview.items, activeReview.changeset ?? false);
+  return `<section>
+    <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(activeReview.headline)}</span><span class="review-context-meta">${e(activeReview.context)} · <span class="ok">+${activeReview.added}</span> · <span class="bad">−${activeReview.removed}</span></span></span></div>
+    <div class="review-agent"><span>Agent · <span class="agent-fg">${e(activeReview.agent)}</span></span><span>${decided}/${activeReview.items.length}</span></div>
+    <div class="progress"><span class="progress-accepted" style="width:${progressWidth(activeReview.counts.accepted)}%"></span><span class="progress-rejected" style="width:${progressWidth(activeReview.counts.rejected)}%"></span><span class="progress-skipped" style="width:${progressWidth(activeReview.counts.skipped)}%"></span></div>
+    <div class="review-counts"><span class="ok">${activeReview.counts.accepted} acc</span><span class="bad">${activeReview.counts.rejected} rej</span><span>${activeReview.counts.skipped} skip</span><span class="left">${activeReview.counts.undecided} left</span></div></div>
+    <div class="review-filters">${filterPills}</div>
+    <div class="list">${reviewTree}</div>
+  </section>`;
+}
+
+/** The default screen: open change requests and in-progress issues. */
+function renderListsSection(state: SidebarViewState): string {
+  const e = escapeHtml;
   const mergeRequestRows = state.mergeRequests.length > 0
     ? state.mergeRequests.map((mr) => `<button class="review" data-cr-repo="${e(mr.repoId)}" data-cr-number="${e(mr.number)}">
         <span class="review-dot ${mr.waiting ? 'waiting' : ''}"></span>
@@ -451,103 +510,152 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
         <span class="issue-repo">${e(issue.project)}</span>
       </button>`).join('')
     : '<div class="empty">No issues in progress</div>';
-  const activeReview = state.activeReview;
-  const decided = activeReview ? activeReview.items.length - activeReview.counts.undecided : 0;
-  const progressWidth = (count: number) => activeReview?.items.length ? (count / activeReview.items.length) * 100 : 0;
-  const reviewTree = activeReview ? renderReviewTree(activeReview.items) : '';
-  const filterPills = activeReview ? renderFilterPills(activeReview.items, activeReview.changeset ?? false) : '';
-  const reviewSection = activeReview ? `<section>
-    <div class="review-context"><div class="review-context-head"><span class="review-mark">!</span><span><span class="review-context-title">${e(activeReview.headline)}</span><span class="review-context-meta">${e(activeReview.context)} · <span class="ok">+${activeReview.added}</span> · <span class="bad">−${activeReview.removed}</span></span></span></div>
-    <div class="review-agent"><span>Agent · <span class="agent-fg">${e(activeReview.agent)}</span></span><span>${decided}/${activeReview.items.length}</span></div>
-    <div class="progress"><span class="progress-accepted" style="width:${progressWidth(activeReview.counts.accepted)}%"></span><span class="progress-rejected" style="width:${progressWidth(activeReview.counts.rejected)}%"></span><span class="progress-skipped" style="width:${progressWidth(activeReview.counts.skipped)}%"></span></div>
-    <div class="review-counts"><span class="ok">${activeReview.counts.accepted} acc</span><span class="bad">${activeReview.counts.rejected} rej</span><span>${activeReview.counts.skipped} skip</span><span class="left">${activeReview.counts.undecided} left</span></div></div>
-    <div class="review-filters">${filterPills}</div>
-    <div class="list">${reviewTree}</div>
-  </section>` : '';
+  return `<div class="divider"></div><div class="section">${e(cap(state.vocabulary.changeRequestNounPlural))}</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`;
+}
 
-  // One precedence rule, evaluated once, so the states cannot flap.
-  const screen = state.setup
-    ? 'setup'
-    : state.threads
-      ? 'threads'
-      : activeReview
-        ? 'triage'
-        : state.pendingReview
-          ? 'pending'
-          : 'lists';
+/**
+ * The `#sidebar-active-review` region (issue #46 task 2.2/2.3): triage,
+ * pending, or the default lists screen — never threads or setup, which own
+ * their own slot. Blank whenever precedence picked one of those two, so
+ * this region can never show stale content behind whichever one is
+ * actually showing.
+ */
+function renderActiveReviewRegion(state: SidebarViewState, screen: SidebarScreen): string {
+  if (screen === 'triage') return renderReviewSection(state.activeReview as SidebarActiveReview);
+  if (screen === 'pending') return renderPending(state.pendingReview as SidebarPendingReview);
+  if (screen === 'lists') return renderListsSection(state);
+  return '';
+}
 
-  const navRows = [
-    { id: 'dashboard', route: 'dashboard', icon: 'dashboard', label: 'Pod dashboard', count: `${state.mergeRequests.length}` },
-    // ⧉ is spec-named changeset content (README §15), not chrome — it stays a
-    // character while the other rows use codicons.
-    { id: 'changesets', route: 'changeset', glyph: '⧉', label: 'Changesets', count: `${(state.changesets ?? []).length} open` },
-    { id: 'posted-reviews', route: 'posted', icon: 'comment-discussion', label: 'Posted reviews', count: `${state.waitingOnYou}` },
-    { id: 'tuning', route: 'tuning', icon: 'graph', label: 'Agent tuning' },
-    { id: 'settings', route: 'settings', icon: 'gear', label: 'Settings' },
-  ]
-    // Spec §1: the later rows are hidden until setup completes — there is
-    // nothing behind them yet.
-    .filter((row) => screen !== 'setup' || row.id === 'dashboard')
-    .map((row) => `<button class="nav-row ${state.activeRoute === row.route ? 'active' : ''}" id="${row.id}"><span class="nav-glyph">${'glyph' in row && row.glyph ? e(row.glyph) : icon(row.icon ?? '')}</span><span class="nav-label">${e(row.label)}</span>${row.count === undefined ? '' : `<span class="nav-count">${e(row.count)}</span>`}</button>`)
-    .join('');
+/**
+ * The footer link/text also follows the precedence, so it has to be
+ * repatched alongside the two content regions whenever a state change could
+ * move the screen (issue #46 task 2.3) — a footer left behind would still
+ * offer "Open review tab" after the triage that put it there ended.
+ */
+function renderFooterRegion(state: SidebarViewState, screen: SidebarScreen): string {
+  const e = escapeHtml;
+  return screen === 'setup'
+    ? '<button class="foot-link" id="use-demo-pod">Skip and use a demo pod</button>'
+    : screen === 'threads'
+      ? '<button class="foot-link" id="open-posted-tab">Open posted review</button>'
+      : screen === 'triage' || screen === 'pending'
+        ? '<button class="foot-link" id="open-review-tab">Open review tab</button>'
+        : `${e(state.podName)} · ${e(state.podMeta)}`;
+}
 
-  const main =
-    screen === 'setup'
-      ? renderSetup(state.setup as SidebarSetup)
-      : screen === 'threads'
-        ? renderThreads(state.threads as SidebarThreads)
-        : screen === 'triage'
-          ? reviewSection
-          : screen === 'pending'
-            ? renderPending(state.pendingReview as SidebarPendingReview)
-            : `<div class="divider"></div><div class="section">${e(cap(state.vocabulary.changeRequestNounPlural))}</div><div class="list">${mergeRequestRows}</div><div class="divider"></div><div class="section">Issues · in progress</div><div class="list">${issueRows}</div>`;
+/**
+ * Every region a triage-adjacent state change can touch, computed together
+ * from the full current precedence so a caller never has to reason about
+ * which subset to repatch: whichever setter fired, patching this whole set
+ * from currently-held state always lands the arm precedence picked and
+ * blanks every other one (issue #46 task 2.1/2.3). Same shape as
+ * `renderPostedReviewsRegions` (postedReviewsHtml.ts:329) — one function
+ * producing every id a caller might patch, from one state snapshot.
+ *
+ * `sidebar-nav` and `sidebar-active-runs` are included too even though only
+ * `setActiveRoute`/`setActiveRuns` actually change them, so the full page
+ * render below can build every region through this single function rather
+ * than keeping a second copy of the markup.
+ */
+export function renderSidebarRegions(state: SidebarViewState): Record<string, string> {
+  const screen = sidebarScreen(state);
+  return {
+    'sidebar-nav': renderNavRows(state, screen),
+    'sidebar-active-runs': renderActiveRuns(state.activeRuns ?? []),
+    'sidebar-threads': screen === 'threads' ? renderThreads(state.threads as SidebarThreads) : '',
+    'sidebar-active-review': renderActiveReviewRegion(state, screen),
+    'sidebar-footer': renderFooterRegion(state, screen),
+  };
+}
 
-  const footer =
-    screen === 'setup'
-      ? '<button class="foot-link" id="use-demo-pod">Skip and use a demo pod</button>'
-      : screen === 'threads'
-        ? '<button class="foot-link" id="open-posted-tab">Open posted review</button>'
-        : screen === 'triage' || screen === 'pending'
-          ? '<button class="foot-link" id="open-review-tab">Open review tab</button>'
-          : `${e(state.podName)} · ${e(state.podMeta)}`;
+export function renderSidebarHtml(state: SidebarViewState, nonce: string): string {
+  const e = escapeHtml;
+  const screen = sidebarScreen(state);
+  const regions = renderSidebarRegions(state);
+  // Not a region: nothing in task 2.3 ever changes which pod is active or
+  // the pod list without going through the data path (render()), so unlike
+  // the ids above there is nothing for a patch to target here.
+  const podRows = state.pods.length > 0
+    ? state.pods.map((pod) => `<div class="pod-row-wrap ${pod.active ? 'active' : ''}">
+        <button class="pod-row ${pod.active ? 'active' : ''}" data-pod="${e(pod.id)}">
+          <span class="pod-check">${pod.active ? '✓' : ''}</span>
+          <span class="pod-name">${e(pod.name)}</span>
+          <span class="pod-meta">${e(pod.meta)}</span>
+        </button>
+        <button class="pod-delete" data-pod-delete="${e(pod.id)}" title="Delete pod" aria-label="Delete pod ${e(pod.name)}">${icon('trash')}</button>
+      </div>`).join('')
+    : '<div class="empty">No pods configured</div>';
 
   const body = `<main class="side">
     <header class="head"><span class="brand">Verdict</span><span class="head-tools"><button class="icon-btn" id="refresh" title="Refresh">${icon('refresh')}</button><span class="icon-btn">${icon('ellipsis')}</span></span></header>
-    <nav class="nav" aria-label="Verdict navigation">${navRows}</nav>
-    ${renderActiveRuns(state.activeRuns ?? [])}
+    <nav class="nav" id="sidebar-nav" aria-label="Verdict navigation">${regions['sidebar-nav']}</nav>
+    <div id="sidebar-active-runs">${regions['sidebar-active-runs']}</div>
     ${screen === 'setup' ? '' : `<div class="divider"></div><div class="section">Pods</div><div class="pod-list">${podRows}</div>`}
-    ${main}
-    <footer class="foot">${footer}</footer>
+    <div id="sidebar-threads">${regions['sidebar-threads']}</div>
+    <div id="sidebar-active-review">${regions['sidebar-active-review']}</div>
+    ${screen === 'setup' ? renderSetup(state.setup as SidebarSetup) : ''}
+    <footer class="foot" id="sidebar-footer">${regions['sidebar-footer']}</footer>
   </main>`;
 
+  // Bound on document, not on each row (issue #46 task 2.4): a region patch
+  // replaces #sidebar-nav/#sidebar-active-runs/#sidebar-threads/
+  // #sidebar-active-review/#sidebar-footer's innerHTML wholesale, which
+  // would drop a listener bound directly to an element inside them.
+  // Matching with closest() means the patched markup never needs
+  // re-binding, the same reasoning as reviewFlowHtml.ts:1267-1274.
   const script = `
     const vscode = window.verdictVscode;
     const post = (message) => vscode.postMessage(message);
-    document.getElementById('refresh')?.addEventListener('click', () => post({ type: 'refresh' }));
-    document.querySelectorAll('[data-cancel-run]').forEach((button) => {
-      button.addEventListener('click', () => post({ type: 'cancelRun', key: button.dataset.cancelRun }));
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-cancel-run]');
+      if (el) post({ type: 'cancelRun', key: el.dataset.cancelRun });
     });
-    document.getElementById('dashboard')?.addEventListener('click', () => post({ type: 'openDashboard' }));
-    document.getElementById('changesets')?.addEventListener('click', () => post({ type: 'openChangesets', firstId: ${JSON.stringify(state.changesets?.[0]?.id)} }));
-    document.getElementById('posted-reviews')?.addEventListener('click', () => post({ type: 'openPostedReviews' }));
-    document.getElementById('tuning')?.addEventListener('click', () => post({ type: 'openTuning' }));
-    document.getElementById('settings')?.addEventListener('click', () => post({ type: 'openSettings' }));
-    document.querySelectorAll('[data-pod]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectPod', podId: row.dataset.pod })));
-    document.querySelectorAll('[data-pod-delete]').forEach((button) => button.addEventListener('click', () => post({ type: 'deletePod', podId: button.dataset.podDelete })));
-    document.querySelectorAll('[data-cr-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'openCr', repoId: row.dataset.crRepo, number: row.dataset.crNumber })));
-    document.querySelectorAll('[data-issue-url]').forEach((row) => row.addEventListener('click', () => post({ type: 'openIssue', webUrl: row.dataset.issueUrl })));
-    document.querySelectorAll('[data-finding]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectFinding', itemId: row.dataset.finding })));
-    document.getElementById('open-review-tab')?.addEventListener('click', () => post({ type: 'openReviewTab' }));
-    document.getElementById('open-posted-tab')?.addEventListener('click', () => post({ type: 'openPostedReviewTab' }));
-    document.getElementById('use-demo-pod')?.addEventListener('click', () => post({ type: 'useDemoPod' }));
-    document.querySelectorAll('[data-thread]').forEach((row) => row.addEventListener('click', () => post({ type: 'selectThread', threadId: row.dataset.thread })));
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#dashboard')) post({ type: 'openDashboard' }); });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('#changesets');
+      if (el) post({ type: 'openChangesets', firstId: el.dataset.firstChangesetId || undefined });
+    });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#posted-reviews')) post({ type: 'openPostedReviews' }); });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#tuning')) post({ type: 'openTuning' }); });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#settings')) post({ type: 'openSettings' }); });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-pod]');
+      if (el) post({ type: 'selectPod', podId: el.dataset.pod });
+    });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-pod-delete]');
+      if (el) post({ type: 'deletePod', podId: el.dataset.podDelete });
+    });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-cr-repo]');
+      if (el) post({ type: 'openCr', repoId: el.dataset.crRepo, number: el.dataset.crNumber });
+    });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-issue-url]');
+      if (el) post({ type: 'openIssue', webUrl: el.dataset.issueUrl });
+    });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-finding]');
+      if (el) post({ type: 'selectFinding', itemId: el.dataset.finding });
+    });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#open-review-tab')) post({ type: 'openReviewTab' }); });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#open-posted-tab')) post({ type: 'openPostedReviewTab' }); });
+    document.addEventListener('click', (ev) => { if (ev.target.closest('#use-demo-pod')) post({ type: 'useDemoPod' }); });
+    document.addEventListener('click', (ev) => {
+      const el = ev.target.closest('[data-thread]');
+      if (el) post({ type: 'selectThread', threadId: el.dataset.thread });
+    });
     const matches = (row, filter) => {
       if (filter === 'all') return true;
       if (filter === 'cross') return row.dataset.cross === 'true';
       if (filter.startsWith('category:')) return row.dataset.category === filter.slice('category:'.length);
       return row.dataset.verdict === filter;
     };
-    document.querySelectorAll('[data-review-filter]').forEach((button) => button.addEventListener('click', () => {
+    document.addEventListener('click', (ev) => {
+      const button = ev.target.closest('[data-review-filter]');
+      if (!button) return;
       document.querySelectorAll('[data-review-filter]').forEach((candidate) => candidate.classList.remove('active'));
       button.classList.add('active');
       const filter = button.dataset.reviewFilter;
@@ -558,8 +666,8 @@ export function renderSidebarHtml(state: SidebarViewState, nonce: string): strin
       });
       // A file heading with nothing under it is noise — hide it with its items.
       document.querySelectorAll('[data-file-row]').forEach((row) => { row.hidden = !shown[row.dataset.fileRow]; });
-    }));
+    });
   `;
 
-  return renderPage({ title: 'Verdict', nonce, css: CSS, body, script, embedded: true, codicons: state.codicons });
+  return renderPage({ title: 'Verdict', nonce, css: CSS, body, script, embedded: true, regions: true, codicons: state.codicons });
 }

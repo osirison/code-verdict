@@ -21,6 +21,7 @@
  *    console error, so anything positional has to come from `MARKDOWN_CSS`.
  */
 import { escapeHtml } from './theme';
+import { memoize } from '../domain/memo';
 
 /** Marks a hard line break (two trailing spaces, or a trailing backslash). */
 const HARD_BREAK = '\u0000';
@@ -497,9 +498,32 @@ function renderBlocks(lines: string[]): string {
 /**
  * Renders agent prose to HTML. The result is safe to assign as innerHTML:
  * every character of `text` is escaped before any markup is generated.
+ *
+ * Memoized on `text` (D10): a finding's body and every reply in a thread are
+ * re-rendered on renders triggered by state that changed neither. The
+ * result is a string, so returning the same cached one back to every caller
+ * carries none of the mutation risk a shared array or object would.
+ *
+ * The non-string guard stays outside the memo, not folded into
+ * `renderMarkdownUncached`: `Memo` keys on `key.length`, and a caller that
+ * passes something other than a string — this one is called with model
+ * output, which is not guaranteed to arrive as one — would crash the cache
+ * itself rather than fail gracefully the way this function always has.
  */
 export function renderMarkdown(text: string): string {
-  if (typeof text !== 'string' || text.trim() === '') return '';
+  if (typeof text !== 'string') return '';
+  return renderMarkdownMemoized(text);
+}
+
+const renderMarkdownMemoized = memoize(renderMarkdownUncached);
+
+/**
+ * Exported only so `markdown.test.ts` can wrap it in its own spy and its own
+ * `Memo` to prove memoization independently of the shared production cache
+ * `renderMarkdown` closes over — every real call site uses `renderMarkdown`.
+ */
+export function renderMarkdownUncached(text: string): string {
+  if (text.trim() === '') return '';
   const normalised = text
     .replace(/\r\n?/g, '\n')
     // Control characters would collide with the stash and hard-break markers.

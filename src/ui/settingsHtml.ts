@@ -61,6 +61,7 @@ export function formatConnectionStatus(status: {
 
 export type SettingsMessage =
   | { type: 'rotateToken' }
+  | { type: 'testConnection' }
   | { type: 'setNotification'; key: string; mode: NotificationMode }
   | { type: 'setQuietMode'; value: boolean }
   | { type: 'setDigestCadence'; value: DigestCadence }
@@ -105,31 +106,45 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; line-height: 1.25;
 pre { margin: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--code); padding: 13px 15px; color: var(--fg); font: 12px/1.75 var(--font-mono); overflow-x: auto; }
 `;
 
-export function renderSettingsHtml(state: SettingsViewState, nonce: string): string {
+/**
+ * The connection region (issue #39 follow-up): status, masked token and the
+ * two live-check actions. `testConnection` runs only on open and when
+ * `#test-connection` is pressed here — never as a side effect of patching
+ * this region for an unrelated reason (a token rotation, say), so this
+ * markup always reflects whatever the panel last actually checked.
+ */
+function connectionRegion(state: SettingsViewState): string {
   const e = escapeHtml;
-  const notifications = state.notifications.map((setting) => `<div class="notification">
-    <div class="notification-copy"><span class="notification-name">${e(setting.label)}</span><span class="hint">${e(setting.hint)}</span></div>
-    <div class="segments">${NOTIFICATION_MODES.map((mode) => `<button class="${setting.mode === mode ? `active ${mode === 'Off' ? 'off' : ''}` : ''}" data-notification="${e(setting.key)}" data-mode="${mode}">${mode}</button>`).join('')}</div>
-  </div>`).join('');
-  const preview = JSON.stringify({
-    'codeVerdict.notifications': Object.fromEntries(state.notifications.map((setting) => [setting.key, setting.mode])),
-    'codeVerdict.notifications.quietMode': state.quietMode,
-    'codeVerdict.notifications.digestCadence': state.digestCadence,
-    'codeVerdict.shareAcceptRejectRates': state.shareRates,
-  }, null, 2);
-
-  const body = `<main class="wrap">
-    <h1>Settings</h1>
-    <section class="section"><div class="label">Connection</div><div class="connection">
+  return `<section class="section"><div class="label">Connection</div><div class="connection">
       <div class="connection-copy"><span class="instance">${e(state.instanceUrl)}</span><span class="status ${state.connected ? 'ok' : ''}">${e(state.connectionStatus)}</span></div>
-      <div class="connection-actions"><span class="masked">${state.hasToken ? '••••••••' : 'no token'}</span><button class="btn" id="rotate-token">Rotate token</button></div>
-    </div></section>
-    <section class="section"><div class="label">Notifications</div>${notifications}
-      <button class="toggle" id="quiet"><span class="box">${state.quietMode ? '☑' : '☐'}</span><span>Quiet hours</span></button>
+      <div class="connection-actions"><span class="masked">${state.hasToken ? '••••••••' : 'no token'}</span><button class="btn" id="test-connection">Test connection</button><button class="btn" id="rotate-token">Rotate token</button></div>
+    </div></section>`;
+}
+
+function notificationsRegion(state: SettingsViewState): string {
+  const notifications = state.notifications.map((setting) => `<div class="notification">
+    <div class="notification-copy"><span class="notification-name">${escapeHtml(setting.label)}</span><span class="hint">${escapeHtml(setting.hint)}</span></div>
+    <div class="segments">${NOTIFICATION_MODES.map((mode) => `<button class="${setting.mode === mode ? `active ${mode === 'Off' ? 'off' : ''}` : ''}" data-notification="${escapeHtml(setting.key)}" data-mode="${mode}">${mode}</button>`).join('')}</div>
+  </div>`).join('');
+  return `<section class="section"><div class="label">Notifications</div>${notifications}
+      <button class="toggle" id="quiet" data-checked="${state.quietMode}"><span class="box">${state.quietMode ? '☑' : '☐'}</span><span>Quiet hours</span></button>
       <span class="subnote">${state.quietMode ? 'Only blockers and direct mentions interrupt you.' : 'All events use their selected delivery mode.'}</span>
       <div class="cadence"><span class="cadence-label">Digest arrives</span>${DIGEST_CADENCES.map((cadence) => `<button class="chip compact ${state.digestCadence === cadence ? 'active' : ''}" data-cadence="${cadence}">${cadence}</button>`).join('')}</div>
-    </section>
-    <section class="section"><div class="settings-head"><span class="label">Agents</span><button class="link" id="add-location">Add a location…</button></div>
+    </section>`;
+}
+
+/**
+ * The agents region (issue #39 follow-up): the searched locations and what
+ * each yielded. `addAgentLocation`/`removeAgentLocation` are the two message
+ * cases that re-run the filesystem scan (`settings.ts`'s `agentLocationViews`)
+ * on their own — the scan is what those actions are *about*, so patching this
+ * region without it would show a location that was just added or removed as
+ * if nothing happened. That is distinct from the connection test, which never
+ * runs off the back of an unrelated message.
+ */
+function agentsRegion(state: SettingsViewState): string {
+  const e = escapeHtml;
+  return `<section class="section"><div class="settings-head"><span class="label">Agents</span><button class="link" id="add-location">Add a location…</button></div>
       <p class="subnote">Agents are <code>*.agent.md</code> files. The folders listed below are searched already; add more to search elsewhere.</p>
       ${state.agentLocations
         .map((location) => `<div class="location">
@@ -143,32 +158,102 @@ export function renderSettingsHtml(state: SettingsViewState, nonce: string): str
         </div>`)
         .join('')}
       ${state.agentLocations.length === 0 ? '<span class="subnote">No workspace folder is open, so there is nowhere to search.</span>' : ''}
-    </section>
-    <section class="section"><div class="label">Data &amp; privacy</div>
-      <p class="note">Diff hunks, file paths and your criteria go to the agent and model you selected. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
-      <button class="toggle" id="share-rates"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
+    </section>`;
+}
+
+function privacyRegion(state: SettingsViewState): string {
+  return `<section class="section"><div class="label">Data &amp; privacy</div>
+      <p class="note">Diff hunks, file paths and your criteria go to the agent and model you selected. Nothing reaches ${escapeHtml(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
+      <button class="toggle" id="share-rates" data-checked="${state.shareRates}"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
       <span class="subnote">${state.shareRates ? 'Aggregate rates are shared; finding text and rejection rationale stay local.' : 'Rates remain local to this VS Code profile.'}</span>
-    </section>
-    <section class="section"><div class="settings-head"><span class="label">settings.json</span><button class="link" id="open-json">Open in editor</button></div>
-      <pre>${e(preview)}</pre><span class="hint">Every control above writes here. The access token is not a setting — it lives in the VS Code secret store.</span>
-    </section>
+    </section>`;
+}
+
+/** Derived from notifications/quietMode/digestCadence/shareRates — every case that changes one of those patches this region alongside its own. */
+function jsonPreviewRegion(state: SettingsViewState): string {
+  const preview = JSON.stringify({
+    'codeVerdict.notifications': Object.fromEntries(state.notifications.map((setting) => [setting.key, setting.mode])),
+    'codeVerdict.notifications.quietMode': state.quietMode,
+    'codeVerdict.notifications.digestCadence': state.digestCadence,
+    'codeVerdict.shareAcceptRejectRates': state.shareRates,
+  }, null, 2);
+  return `<section class="section"><div class="settings-head"><span class="label">settings.json</span><button class="link" id="open-json">Open in editor</button></div>
+      <pre>${escapeHtml(preview)}</pre><span class="hint">Every control above writes here. The access token is not a setting — it lives in the VS Code secret store.</span>
+    </section>`;
+}
+
+export const SETTINGS_REGION_IDS = [
+  'set-connection',
+  'set-notifications',
+  'set-agents',
+  'set-privacy',
+  'set-json',
+] as const;
+
+export type SettingsRegionId = (typeof SETTINGS_REGION_IDS)[number];
+
+/** Every patchable region, from the same helpers the full page uses — one source of markup (issue #39). */
+export function renderSettingsRegions(state: SettingsViewState): Record<SettingsRegionId, string> {
+  return {
+    'set-connection': connectionRegion(state),
+    'set-notifications': notificationsRegion(state),
+    'set-agents': agentsRegion(state),
+    'set-privacy': privacyRegion(state),
+    'set-json': jsonPreviewRegion(state),
+  };
+}
+
+/**
+ * Bound once on `document`, not per element (issue #39): a region patch
+ * replaces one of the containers above wholesale, which would drop any
+ * listener bound to an element inside it. Delegation means the patched
+ * markup needs no re-binding at all — every control below matches on
+ * `closest()` instead of binding to the element the initial render produced.
+ *
+ * The quiet-hours and share-rates toggles read their current state off the
+ * button's own `data-checked` attribute rather than a module-level variable:
+ * the host repaints this region after every change, so the attribute is
+ * always current and there is nothing left for a client-side variable to
+ * cache (and no way for it to desync from a patch it did not cause).
+ */
+const SCRIPT = `
+  const vscode = window.verdictVscode;
+  const post = (m) => vscode.postMessage(m);
+  const on = (id, type, extra) => document.addEventListener('click', (ev) => {
+    if (!ev.target.closest('#' + id)) return;
+    post({ type, ...(extra ?? {}) });
+  });
+  on('test-connection', 'testConnection');
+  on('rotate-token', 'rotateToken');
+  document.addEventListener('click', (ev) => {
+    const button = ev.target.closest('[data-notification]');
+    if (button) post({ type: 'setNotification', key: button.dataset.notification, mode: button.dataset.mode });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('#quiet');
+    if (el) post({ type: 'setQuietMode', value: el.dataset.checked !== 'true' });
+  });
+  document.addEventListener('click', (ev) => {
+    const button = ev.target.closest('[data-cadence]');
+    if (button) post({ type: 'setDigestCadence', value: button.dataset.cadence });
+  });
+  document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('#share-rates');
+    if (el) post({ type: 'setShareRates', value: el.dataset.checked !== 'true' });
+  });
+  on('open-json', 'openSettingsJson');
+  on('add-location', 'addAgentLocation');
+  document.addEventListener('click', (ev) => {
+    const button = ev.target.closest('[data-remove-location]');
+    if (button) post({ type: 'removeAgentLocation', label: button.dataset.removeLocation });
+  });
+`;
+
+export function renderSettingsHtml(state: SettingsViewState, nonce: string): string {
+  const regions = renderSettingsRegions(state);
+  const body = `<main class="wrap">
+    <h1>Settings</h1>
+    ${SETTINGS_REGION_IDS.map((id) => `<div id="${id}">${regions[id]}</div>`).join('\n    ')}
   </main>`;
-  const script = `
-    const vscode = window.verdictVscode;
-    const post = (message) => vscode.postMessage(message);
-    let quietMode = ${state.quietMode};
-    let shareRates = ${state.shareRates};
-    document.getElementById('rotate-token')?.addEventListener('click', () => post({ type: 'rotateToken' }));
-    document.querySelectorAll('[data-notification]').forEach((button) => button.addEventListener('click', () => post({ type: 'setNotification', key: button.dataset.notification, mode: button.dataset.mode })));
-    document.getElementById('quiet')?.addEventListener('click', () => { quietMode = !quietMode; post({ type: 'setQuietMode', value: quietMode }); });
-    document.querySelectorAll('[data-cadence]').forEach((button) => button.addEventListener('click', () => post({ type: 'setDigestCadence', value: button.dataset.cadence })));
-    document.getElementById('share-rates')?.addEventListener('click', () => { shareRates = !shareRates; post({ type: 'setShareRates', value: shareRates }); });
-    document.getElementById('open-json')?.addEventListener('click', () => post({ type: 'openSettingsJson' }));
-    document.getElementById('add-location')?.addEventListener('click', () => post({ type: 'addAgentLocation' }));
-    document.addEventListener('click', (ev) => {
-      const button = ev.target.closest('[data-remove-location]');
-      if (button) post({ type: 'removeAgentLocation', label: button.dataset.removeLocation });
-    });
-  `;
-  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script, breadcrumb: { current: 'Settings' } });
+  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Settings' } });
 }

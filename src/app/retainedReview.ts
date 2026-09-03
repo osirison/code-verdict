@@ -134,6 +134,32 @@ export interface RetainedResult {
 }
 
 /**
+ * The result fields a panel's own draft write must carry forward, taken from
+ * the RAW stored record — never from the normalized `readRetained` view, whose
+ * inferred fallbacks (`outcome ?? 'findings'`, the agent id off the review)
+ * exist only in the reader and must not be materialized into storage, where a
+ * later reader could no longer tell a recorded fact from a guess.
+ *
+ * This exists because the panels' draft writes are whole-key puts over the
+ * same key the run manager writes: a put that lists only the triage fields
+ * erases every field above — which is how the first verdict on a target used
+ * to silently delete its "Ran …" line, and why the generation guard
+ * (`draftWriter.ts`) reads a `ranAt` that must still be there to read.
+ */
+export function carryRetainedResult(raw: RetainedResult | undefined): RetainedResult {
+  return {
+    outcome: raw?.outcome,
+    ranAt: raw?.ranAt,
+    agentId: raw?.agentId,
+    agentLabel: raw?.agentLabel,
+    modelId: raw?.modelId,
+    submittedAt: raw?.submittedAt,
+    candidates: raw?.candidates,
+    filesRead: raw?.filesRead,
+  };
+}
+
+/**
  * What both surfaces store, before either adds its ledger. A run that has just
  * finished writes exactly this — it has produced a review and nothing has been
  * posted yet — which is why the two panels and the run manager can share one
