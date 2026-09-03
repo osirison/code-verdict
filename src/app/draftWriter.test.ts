@@ -33,8 +33,14 @@ function record(summaryText: string, ranAt?: string): RetainedRecord {
   return { ...base, ranAt, summaryText };
 }
 
-function memoryStore(): KeyValueStore & { updates: number } {
-  const map = new Map<string, unknown>();
+/**
+ * Seeded, not empty: the panel only ever schedules a write against a key it
+ * loaded a record from, so a test that writes into an empty store is testing
+ * a state the product cannot reach — and would miss the flush dropping a
+ * write whose key has since been deleted.
+ */
+function memoryStore(seed: Record<string, unknown> = {}): KeyValueStore & { updates: number } {
+  const map = new Map<string, unknown>(Object.entries(seed));
   return {
     get: <T>(key: string) => map.get(key) as T | undefined,
     update(key, value) {
@@ -56,7 +62,7 @@ afterEach(() => {
 
 describe('CoalescedDraftWriter', () => {
   it('collapses consecutive schedules for one key into one update carrying the last record', async () => {
-    const store = memoryStore();
+    const store = memoryStore({ k: record('stored', undefined) });
     const writer = new CoalescedDraftWriter(store);
 
     writer.schedule('k', record('one', undefined), undefined);
@@ -71,7 +77,7 @@ describe('CoalescedDraftWriter', () => {
   });
 
   it('flush() lands the pending write synchronously enough for a same-tick read-back', () => {
-    const store = memoryStore();
+    const store = memoryStore({ k: record('stored', undefined) });
     const writer = new CoalescedDraftWriter(store);
 
     writer.schedule('k', record('now', undefined), undefined);
@@ -104,17 +110,34 @@ describe('CoalescedDraftWriter', () => {
   });
 
   it('writes when the stored ranAt still matches, including the pre-change undefined', async () => {
-    const store = memoryStore();
+    // A record written before `ranAt` existed: undefined-to-undefined matches.
+    const store = memoryStore({ k: record('stored', undefined) });
     const writer = new CoalescedDraftWriter(store);
 
-    // A legacy record never carried ranAt; undefined-to-undefined matches.
     writer.schedule('k', record('legacy', undefined), undefined);
     await writer.flush();
     expect(store.get<RetainedRecord>('k')?.summaryText).toBe('legacy');
   });
 
+  it('drops the write when the key is gone, even from a generation that compares equal', async () => {
+    // `pruneClosedRetained` deletes the record for a change request that is no
+    // longer open. A pending write must not put it back. The ranAt comparison
+    // alone cannot catch this: a legacy record carries no ranAt, so the
+    // deleted key and the loaded generation both read undefined.
+    const store = memoryStore({ k: record('stored', undefined) });
+    const writer = new CoalescedDraftWriter(store);
+
+    writer.schedule('k', record('mine', undefined), undefined);
+    await store.update('k', undefined); // the prune
+    store.updates = 0;
+    await writer.flush();
+
+    expect(store.updates).toBe(0);
+    expect(store.get<RetainedRecord>('k')).toBeUndefined();
+  });
+
   it('cancelFor drops only the pending write for that key', async () => {
-    const store = memoryStore();
+    const store = memoryStore({ a: record('stored', undefined) });
     const writer = new CoalescedDraftWriter(store);
 
     writer.schedule('a', record('a1', undefined), undefined);
@@ -132,7 +155,7 @@ describe('CoalescedDraftWriter', () => {
   });
 
   it('a schedule for a different key lands the previous key\'s pending write first', async () => {
-    const store = memoryStore();
+    const store = memoryStore({ a: record('stored', undefined), b: record('stored', undefined) });
     const writer = new CoalescedDraftWriter(store);
 
     writer.schedule('a', record('a-final', undefined), undefined);

@@ -27,9 +27,10 @@
  *
  * This module is imported from `src/domain/` (`./diffHunks`), which does not
  * import `src/app/` anywhere today — every existing import between the two
- * runs the other way, app depending on domain — so the implementation lives
- * here rather than in `src/app/memo.ts`. `src/app/memo.ts` re-exports it for
- * callers at or above the app layer.
+ * runs the other way, app depending on domain — so it lives here rather than
+ * in `src/app/`, where this change's plan first placed it. Callers above the
+ * domain layer (`src/ui/markdown.ts`) import it from here directly, as
+ * `src/ui/` already does for other domain modules.
  */
 export class Memo<V> {
   private readonly entries = new Map<string, V>();

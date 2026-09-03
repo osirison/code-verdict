@@ -43,8 +43,11 @@ interface PendingWrite {
   /**
    * `ranAt` of the record the panel had loaded when it scheduled this write —
    * the generation the write belongs to. `undefined` for a record written
-   * before `ranAt` existed, which still compares correctly: any successful
-   * re-run stamps a defined `ranAt` and the comparison fails.
+   * before `ranAt` existed. Against a *replacement* that is still correct on
+   * its own: any successful re-run stamps a defined `ranAt`, so the
+   * comparison fails and the stale write drops. Against a *deletion* it is
+   * not, which is why `flush` checks for the key's existence first — a
+   * deleted key also reads `undefined`.
    */
   expectedRanAt: string | undefined;
 }
@@ -109,7 +112,15 @@ export class CoalescedDraftWriter {
     if (!pending) return Promise.resolve();
     // The generation guard. No `await` between this `get` and the `update`.
     const stored = this.store.get<{ ranAt?: string }>(pending.key);
-    if (stored?.ranAt !== pending.expectedRanAt) return Promise.resolve();
+    // A key that is gone was deleted deliberately: `pruneClosedRetained`
+    // (`retainedReview.ts`) drops the record for a change request that is no
+    // longer open, on the pod poll that observes it. Writing here would
+    // resurrect it. The `ranAt` comparison below does NOT catch this on its
+    // own — a record written before `ranAt` existed carries none, so a
+    // deleted key and a legacy generation both read `undefined` and compare
+    // equal.
+    if (!stored) return Promise.resolve();
+    if (stored.ranAt !== pending.expectedRanAt) return Promise.resolve();
     return Promise.resolve(this.store.update(pending.key, pending.record));
   }
 

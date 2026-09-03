@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Memo, memoize } from './memo';
 
 describe('Memo', () => {
-  it('returns a key never seen by computing it', () => {
+  it('gives back a value it was given', () => {
     const cache = new Memo<number>();
     cache.set('a', 1);
     expect(cache.get('a')).toBe(1);
