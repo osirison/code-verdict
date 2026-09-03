@@ -4,7 +4,7 @@
  */
 import type { PostedReviewView, PostedThreadView } from '../app/postedReviews';
 import { formatAge } from './dashboardState';
-import { selectedPostedRow } from './postedReviewsState';
+import { replyDraftKey, selectedPostedRow } from './postedReviewsState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
 import { escapeHtml as e, renderPage } from './theme';
@@ -65,6 +65,16 @@ export interface PostedViewState {
   /** threadId → second-opinion text, appended on demand. */
   opinions: Record<string, string>;
   /**
+   * `replyDraftKey(repoId, crNumber, threadId)` → in-progress reply text
+   * (issue #46 task 9.3). The host's own copy, committed on debounced input
+   * (never `change`, which only fires on blur), so a patch from an action on
+   * one thread re-renders every OTHER thread's reply field from text that is
+   * actually current instead of leaving `value` unset and losing it. Rendered
+   * back into the field rather than restored via `REGIONS_SCRIPT`, which
+   * restores focus and selection only, never `value` (design D8).
+   */
+  replyDrafts: Record<string, string>;
+  /**
    * True while the initial fetch is still in flight (issue #39): `rows` is
    * empty and `pendingRows` — the local history cache, with no fetch
    * required — renders instead, title and counts standing in as skeletons.
@@ -80,6 +90,8 @@ export type PostedMessage =
   | { type: 'resolve'; threadId: string; resolved: boolean }
   | { type: 'concede'; threadId: string }
   | { type: 'reply'; threadId: string; text: string }
+  /** Debounced `input` on the reply field (task 9.3) — never rendered from, only stored. */
+  | { type: 'replyDraft'; threadId: string; text: string }
   | { type: 'secondOpinion'; threadId: string }
   | { type: 'rerun' }
   | { type: 'refresh' }
@@ -164,7 +176,7 @@ header .on-you { font-size: 11.5px; color: var(--sev-minor); }
 ${MARKDOWN_CSS}
 `;
 
-function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number, vocabulary: Vocabulary): string {
+function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | undefined, now: number, vocabulary: Vocabulary, draft: string): string {
   const chip = STATUS_CHIP[t.status];
   const open = t.status !== 'resolved' && t.status !== 'conceded';
   return `<div class="th-row" data-thread="${e(t.threadId)}">
@@ -198,7 +210,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
         <button class="btn btn-ok" data-resolve="${e(t.threadId)}">Resolve thread</button>
         <button class="btn" data-concede="${e(t.threadId)}">Concede — they're right</button>
         <div class="reply-row">
-          <input class="input" data-reply="${e(t.threadId)}" placeholder="Reply…">
+          <input class="input" id="reply-input" data-reply="${e(t.threadId)}" value="${e(draft)}" placeholder="Reply…">
           <button class="btn" data-reply-send="${e(t.threadId)}">Send</button>
           <span class="kbd">↩</span>
         </div>
@@ -319,7 +331,14 @@ function postedDetailRegion(state: PostedViewState): string {
     </div>
     <div class="threads">
       ${selected.view.threads
-        .map((t) => threadRow(t, state.expandedThreadId === t.threadId, state.opinions[t.threadId], state.now, state.vocabulary))
+        .map((t) => threadRow(
+          t,
+          state.expandedThreadId === t.threadId,
+          state.opinions[t.threadId],
+          state.now,
+          state.vocabulary,
+          state.replyDrafts[replyDraftKey(selected.view.repoId, selected.view.crNumber, t.threadId)] ?? '',
+        ))
         .join('')}
     </div>`;
 }
@@ -395,17 +414,42 @@ const SCRIPT = `
     ev.stopPropagation();
     post({ type: 'secondOpinion', threadId: el.dataset.opinion });
   });
+  // Commits the in-progress text into the panel's held per-thread draft (task
+  // 9.3) so a patch from acting on a DIFFERENT thread never overwrites what
+  // this one is mid-typing, and so the panel's own clearing on a successful
+  // send (below) has a real field to blank rather than guessing at one.
+  // Debounced, not committed on every keystroke — 'change' (the previous
+  // event) only fires on blur, which is what left mid-typing text nowhere
+  // but the DOM; per-thread, not one shared timer, so switching to a
+  // different thread mid-debounce cannot cancel a commit this one is still
+  // waiting on.
+  const replyDraftTimers = new Map();
+  document.addEventListener('input', (ev) => {
+    const el = ev.target.closest('[data-reply]');
+    if (!el) return;
+    const threadId = el.dataset.reply;
+    clearTimeout(replyDraftTimers.get(threadId));
+    const text = el.value;
+    replyDraftTimers.set(threadId, setTimeout(() => post({ type: 'replyDraft', threadId, text }), 300));
+  });
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
-  // The input is never cleared here: on success 'reply' round-trips into a
-  // refresh(), which patches #pr-detail with a freshly-built (and so blank)
-  // field — or, before the page has signalled ready, replaces the whole
-  // document, same result; on failure nothing re-renders and the typed text
-  // stays put for a retry, instead of vanishing with the failed send.
+  // The input is never cleared here: a successful 'reply' clears the panel's
+  // held draft for this thread (task 7.4b) before it patches #pr-detail, so
+  // the value this re-render emits is genuinely empty rather than a DOM node
+  // being blanked out from under the reviewer mid-keystroke. A failed send
+  // leaves the held draft alone and patches nothing at all, so the typed text
+  // stays exactly as it was, for a retry.
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
+    // Cancel this thread's pending debounce commit before sending: without
+    // this, a commit still in flight when the reply round-trip finishes can
+    // land AFTER the host clears the draft on success, writing the
+    // already-sent text back in — the next unrelated patch of this region
+    // would then replay it as though it were never sent.
+    clearTimeout(replyDraftTimers.get(input.dataset.reply));
     post({ type: 'reply', threadId: input.dataset.reply, text });
   }
   document.addEventListener('keydown', (ev) => {

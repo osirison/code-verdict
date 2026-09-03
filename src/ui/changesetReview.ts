@@ -14,7 +14,7 @@ import type { ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
 import { DEMO_AGENT_ID } from '../app/demoAgent';
 import { changesetContextEntries } from '../app/lmAgent';
-import { fetchPodData } from '../app/podQuery';
+import type { AppStore } from '../app/appStore';
 import type { PodStore } from '../app/pods';
 import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
 import { ReviewHistory } from '../app/reviewHistory';
@@ -49,6 +49,8 @@ import type { SidebarActiveReview } from './sidebarHtml';
 
 export interface ChangesetReviewDeps {
   podStore: PodStore;
+  /** The shared pod-data copy (task 6.2); the member diffs stay on a direct connection. */
+  appStore: AppStore;
   secrets: SecretStore;
   workspaceState: KeyValueStore;
   globalState: KeyValueStore;
@@ -195,8 +197,12 @@ export class ChangesetReviewPanel {
   private async load(): Promise<void> {
     try {
       const pod = this.pod();
+      // The pod read goes through the store (task 6.2). The connection is
+      // still built here for the member diffs below — per change request,
+      // never pod-keyed, so the store holds nothing for them.
+      const podRead = this.deps.appStore.read(pod);
+      const data = podRead.data ?? (await podRead.fetch!);
       const connection = await connectionForPod(pod, this.deps.secrets);
-      const data = await fetchPodData(connection, pod, Date.now());
       const options = changesetDetectionOptions(this.deps.globalState, pod.id);
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');

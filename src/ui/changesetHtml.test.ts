@@ -38,15 +38,26 @@ describe('changeset fidelity (spec §15)', () => {
     expect(html).toContain('Rotate signing keys on schedule');
     expect(html).toContain('Show key expiry banner');
     expect(html).toContain('Review all 4 MRs together');
-    expect(html).toContain("type:'openMember'");
-    expect(html).toContain("type:'reviewTogether'");
+    expect(html).toContain("type: 'openMember'");
+    expect(html).toContain("type: 'reviewTogether'");
   });
 
-  it('serializes the changeset id as a JavaScript string literal', () => {
+  // Handlers are delegated on `document` and matched with `closest()` (task
+  // 7.1), so they survive a region patch that replaces this container's
+  // innerHTML — a listener bound directly to a button would not. The
+  // changeset id rides a `data-changeset-id` attribute read at click time
+  // rather than a value baked into the script string, so a script that
+  // outlives the state it was built from (once this screen patches instead
+  // of reassigning the whole document) never answers with a stale id.
+  it('carries the changeset id on a data attribute, escaped for the HTML context', () => {
     const html = renderChangesetHtml({ ...state, id: "trailer:'1180" }, 'nonce123');
 
-    expect(html).toContain(`changesetId:"trailer:'1180"`);
-    expect(html).not.toContain(`changesetId:'trailer:'1180'`);
+    expect(html).toContain(`data-changeset-id="trailer:'1180"`);
+    expect(html).toContain('document.querySelector(\'[data-changeset-id]\')');
+    // The id itself never appears baked into the script as a literal — only
+    // read back from the data attribute above.
+    expect(html).not.toContain(`changesetId: "trailer:'1180"`);
+    expect(html).not.toContain(`changesetId:"trailer:'1180"`);
   });
 
   it('omits the issue chip for branch-detected changesets and shows the remove link only for manual ones', () => {
@@ -61,7 +72,7 @@ describe('changeset fidelity (spec §15)', () => {
 
     const manual = renderChangesetHtml({ ...state, linkedIssue: undefined, manual: true }, 'n');
     expect(manual).toContain('Remove changeset');
-    expect(manual).toContain("type:'removeChangeset'");
+    expect(manual).toContain("type: 'removeChangeset'");
   });
 
   it('renders cross-repo findings with both sides and their roles, wired to triage', () => {
@@ -85,7 +96,7 @@ describe('changeset fidelity (spec §15)', () => {
     expect(html).toContain('still reads the old name');
     expect(html).toContain('src/api/session.ts:41');
     expect(html).toContain('confidence 94%');
-    expect(html).toContain("type:'openFinding'");
+    expect(html).toContain("type: 'openFinding'");
     // The blockers metric now carries a real count.
     expect(html).not.toContain('<div class="metric-value ">—</div>');
     // The trap sentence names what green pipelines cannot see.

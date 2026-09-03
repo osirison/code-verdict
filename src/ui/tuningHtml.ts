@@ -46,12 +46,26 @@ function suggestionButton(suggestion: TuningViewState['suggestions'][number]): s
     : `<button class="btn btn-accent" data-suggestion="${escapeHtml(suggestion.id)}">${escapeHtml(suggestion.action)}</button>`;
 }
 
+/**
+ * Bound once on `document`, not per element (issue #39): this screen is
+ * about to move to region patching (task 7.3), which replaces a container's
+ * innerHTML wholesale and would drop any listener bound directly to a node
+ * inside it. Delegation means the patched markup never needs re-binding.
+ */
+const SCRIPT = `
+const vscode = window.verdictVscode;
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-suggestion]');
+  if (button) vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion });
+});
+`;
+
 export function renderTuningHtml(state: TuningViewState, nonce: string): string {
   const header = `<header class="head"><span class="agent">${escapeHtml(state.agentLabel)}</span><h1>${escapeHtml(state.headline)}</h1><span class="subline">${escapeHtml(state.subline)}</span></header>`;
   if (state.empty) {
     const body = `<main class="wrap">${header}
       <div class="empty">The scorecard derives from your verdicts. Accept rates by category and confidence — and the criteria suggestions they generate — appear after your first submitted review.</div></main>`;
-    return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: '', breadcrumb: { current: 'Agent tuning' } });
+    return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Agent tuning' } });
   }
   // "No evidence" and "evidence says healthy" are different claims: histories
   // predating per-finding observations must not render the all-healthy copy.
@@ -65,6 +79,5 @@ export function renderTuningHtml(state: TuningViewState, nonce: string): string 
     <section class="section"><div class="label">Accept rate by category</div>${rows(state.categories)}</section>
     <section class="section"><div class="label">Accept rate by agent confidence</div>${rows(state.confidence)}</section>
     <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section></main>`;
-  const script = `const vscode = window.verdictVscode; document.querySelectorAll('[data-suggestion]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion })));`;
-  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script, breadcrumb: { current: 'Agent tuning' } });
+  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Agent tuning' } });
 }

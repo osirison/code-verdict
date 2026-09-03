@@ -1,9 +1,10 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import type { AppStore } from '../app/appStore';
 import { detectChangesets } from '../app/changesets';
-import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
-import { fetchPodData, repoIdsOf } from '../app/podQuery';
+import { repoIdsOf } from '../app/podQuery';
+import type { PodData } from '../app/podQuery';
 import { changesetDetectionOptions } from './changesetOptions';
 import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
 import {
@@ -63,7 +64,8 @@ function isVerdictReadyMessage(message: unknown): boolean {
 }
 
 export interface VerdictSidebarDeps {
-  secrets: vscode.SecretStorage;
+  /** The shared pod-data copy every surface reads (task 6.2). */
+  appStore: AppStore;
   extensionUri: vscode.Uri;
   /** Manual changesets + detection settings feed the Changesets nav row. */
   globalState: vscode.Memento;
@@ -103,7 +105,16 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly podStore: PodStore,
     private readonly deps: VerdictSidebarDeps,
-  ) {}
+  ) {
+    // Pod data now reaches the sidebar through the store (task 6.4): a poll
+    // or another screen's fetch that changed the active pod's data repaints
+    // the lists without this view fetching anything of its own. Never
+    // unsubscribed — the provider lives as long as the extension host, so
+    // there is no dispose path for a dangling listener to outlive.
+    deps.appStore.subscribe((data) => {
+      if (this.view && data.pod.id === this.podStore.activePod?.id) this.applyPodData(data);
+    });
+  }
 
   refresh(): void {
     void this.render();
@@ -247,6 +258,29 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
     void view.webview.postMessage({ type: 'verdict:regions', regions });
   }
 
+  /**
+   * Derives the data-path state from a pod snapshot and repaints in full.
+   * A full paint, not a patch, because the pod header and the CR/work-item
+   * lists deliberately live outside the patchable regions (see
+   * renderSidebarHtml) — only the data path ever changes them, and this is
+   * the data path's landing point, for both a render() read and a store
+   * notification.
+   */
+  private applyPodData(data: PodData): void {
+    const view = this.view;
+    const pod = this.podStore.activePod;
+    if (!view || !pod) return;
+    // The nav row's "N open" rides the fetch that just happened — the
+    // changesets are re-derived, never re-fetched.
+    const changesets = detectChangesets(
+      pod,
+      data.changeRequests,
+      data.workItems,
+      changesetDetectionOptions(this.deps.globalState, pod.id),
+    ).map((changeset) => ({ id: changeset.id, name: changeset.name }));
+    this.paint(view, { ...toSidebarViewState(data, this.podStore.list()), changesets });
+  }
+
   private async render(): Promise<void> {
     const view = this.view;
     if (!view) return;
@@ -260,17 +294,14 @@ export class VerdictSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const data = await fetchPodData(await connectionForPod(pod, this.deps.secrets), pod, Date.now());
+      // The store serves this read (task 6.2): held data paints at once — a
+      // refresh inside the freshness window repaints from the held copy and
+      // issues nothing — and a stale entry revalidates behind the paint,
+      // the constructor's subscription repainting if it changed anything.
+      const read = this.deps.appStore.read(pod);
+      const data = read.data ?? (await read.fetch!);
       if (seq !== this.refreshSeq || this.view !== view) return;
-      // The nav row's "N open" rides the fetch that just happened — the
-      // changesets are re-derived, never re-fetched.
-      const changesets = detectChangesets(
-        pod,
-        data.changeRequests,
-        data.workItems,
-        changesetDetectionOptions(this.deps.globalState, pod.id),
-      ).map((changeset) => ({ id: changeset.id, name: changeset.name }));
-      this.paint(view, { ...toSidebarViewState(data, this.podStore.list()), changesets });
+      this.applyPodData(data);
     } catch {
       if (seq !== this.refreshSeq || this.view !== view) return;
       // Looked up without throwing: this is the error path, and a pod naming

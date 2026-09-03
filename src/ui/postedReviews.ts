@@ -18,8 +18,13 @@ import type { PostedMessage, PostedRow, PostedViewState } from './postedReviewsH
 import { renderPostedReviewsHtml, renderPostedReviewsRegions } from './postedReviewsHtml';
 import {
   buildPostedRows,
+  concedeThreadView,
   countArchived,
   countWaitingOnYou,
+  patchThreadInRows,
+  replyDraftKey,
+  replyThreadView,
+  resolveThreadView,
   selectedPostedRow,
   visiblePostedRows,
 } from './postedReviewsState';
@@ -80,6 +85,16 @@ export class PostedReviewsPanel {
   private selectedRef?: { repoId: string; number: string };
   private expandedThreadId?: string;
   private opinions: Record<string, string> = {};
+  /**
+   * `replyDraftKey(...)` → in-progress reply text (issue #46 task 9.3): the
+   * only copy of a half-typed reply once patching (task 7.4) replaces
+   * `refresh()`'s full rebuild — without it, patching one thread's status
+   * would re-render every reply field, including ones the reviewer is
+   * mid-typing, from nothing. Pruned in `refresh()` against the threads a
+   * real fetch actually returns, never here: a local patch neither adds nor
+   * removes a thread, so it has no basis for deciding one has disappeared.
+   */
+  private replyDrafts: Record<string, string> = {};
 
   private constructor(
     private readonly route: AppRoute,
@@ -171,7 +186,14 @@ export class PostedReviewsPanel {
               m.threadId,
             );
           }
-          await this.refresh();
+          // Patch this one thread instead of refetching the whole history
+          // (task 7.4) — the action already succeeded on the platform, and
+          // nothing else on screen depends on data this thread's own status
+          // and counts do not feed into.
+          this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
+            resolveThreadView(t, m.resolved, pod.username ?? 'you'),
+          );
+          this.render();
           return;
         }
         case 'concede': {
@@ -188,7 +210,8 @@ export class PostedReviewsPanel {
             crKey(view.repoId, view.crNumber),
             m.threadId,
           );
-          await this.refresh();
+          this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, concedeThreadView);
+          this.render();
           return;
         }
         case 'reply': {
@@ -199,9 +222,26 @@ export class PostedReviewsPanel {
             m.threadId,
             m.text,
           );
-          await this.refresh();
+          // A send that reached the platform is what makes the held draft
+          // stale (task 7.4b) — clear it explicitly, before the patch below
+          // reads it, or the field this re-render emits would show text that
+          // was already sent as though it never went anywhere.
+          delete this.replyDrafts[replyDraftKey(view.repoId, view.crNumber, m.threadId)];
+          this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
+            replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
+          );
+          this.render();
           return;
         }
+        case 'replyDraft':
+          // Render-only, and deliberately so (D8): a per-keystroke (debounced)
+          // message must never trigger a re-render of the region holding the
+          // field it came from, or every commit would fight the caret it is
+          // supposed to protect. Matches `editSummary`/`setNote`
+          // (src/ui/reviewFlow.ts) returning here instead of falling through
+          // to a tail render.
+          if (view) this.replyDrafts[replyDraftKey(view.repoId, view.crNumber, m.threadId)] = m.text;
+          return;
         case 'secondOpinion': {
           const thread = view?.threads.find((t) => t.threadId === m.threadId);
           if (thread) {
@@ -260,6 +300,7 @@ export class PostedReviewsPanel {
             showArchived: this.showArchived,
             archivedCount: 0,
             opinions: {},
+            replyDrafts: {},
             loading: true,
             pendingRows: history.map((entry) => ({
               refLabel: vocabulary.formatCrRef(entry.crNumber),
@@ -306,6 +347,18 @@ export class PostedReviewsPanel {
       if (!canRender()) return;
       this.pod = pod;
       this.rows = rows;
+      // Drop drafts for threads a real fetch no longer returns (task 9.3) —
+      // only a real fetch knows the current thread set; a local patch
+      // (resolve/concede/reply) never adds or removes one, so it has no basis
+      // for deciding a thread is gone. Without this, a draft for a thread that
+      // disappears from the data — its change request left history, or the
+      // platform discussion itself vanished — would sit in memory forever.
+      const liveDraftKeys = new Set(
+        rows.flatMap((r) => r.view.threads.map((t) => replyDraftKey(r.view.repoId, r.view.crNumber, t.threadId))),
+      );
+      for (const key of Object.keys(this.replyDrafts)) {
+        if (!liveDraftKeys.has(key)) delete this.replyDrafts[key];
+      }
       if (this.focusRef) {
         const wanted = this.focusRef;
         const match = rows.find(
@@ -414,6 +467,7 @@ export class PostedReviewsPanel {
       selectedRef: this.selectedRef,
       expandedThreadId: this.expandedThreadId,
       opinions: this.opinions,
+      replyDrafts: this.replyDrafts,
     };
     // Patch the two regions in place rather than replacing the whole
     // document (#39) — a plain selection (selectReview/toggleThread/
