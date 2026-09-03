@@ -92,7 +92,7 @@
 
 ## 10. Model Protocol And Harness Engine
 
-- [ ] 10.1 Define and parse the bounded model protocol for plan creation/revision, plan-item transitions, public rationale, tool requests, candidate submissions, checkpoint suggestions, and completion requests.
+- [x] 10.1 Define and parse the bounded model protocol for plan creation/revision, plan-item transitions, public rationale, tool requests, candidate submissions, checkpoint suggestions, and completion requests.
 - [ ] 10.2 Replace raw final-response parsing in the review path with phase-specific typed turns and bounded protocol repair; keep follow-up questions outside the review harness unless separately specified.
 - [ ] 10.3 Implement `HarnessAttempt` phase transitions for bootstrap/inventory, planning, risk classification, logical-unit investigation, checkpoint, synthesis, verification/contradiction/deduplication, host validation, and persistence.
 - [ ] 10.4 Reuse the selected model and persona across planning, investigation, synthesis, and verification by default, preserving phase-specific contracts and budgets without requiring another model.
