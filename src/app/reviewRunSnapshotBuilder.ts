@@ -30,6 +30,7 @@ import type { AgentDescriptor, ModelDescriptor } from './agents';
 import { canonicalStringify, sha256Hex } from './contentDigest';
 import type { Attachment, ReviewContext } from './reviewContext';
 import { HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
+import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
 import type { Criteria } from '../domain/types';
 import { effortPrompt, type EffortLevel } from '../domain/effort';
 import type { AttemptNumber, LineageId, RunId } from '../domain/harnessLifecycle';
@@ -43,8 +44,8 @@ import type {
 import type { ChangeRequestRef } from '../platform/types';
 import type { ProviderCapabilities } from '../platform/provider';
 
-/** Versions the shape of the (not-yet-built, section 9) host tool catalog this snapshot pins. */
-export const HARNESS_TOOL_CONTRACT_VERSION = '1';
+/** Re-exported so existing importers of this module keep working; the catalog itself now lives in `../domain/harnessTools.ts` (task 9.1). */
+export { HARNESS_TOOL_CONTRACT_VERSION };
 
 /** Content-addressed: identical capability declarations always sign identically, any real difference never does. */
 export function providerCapabilitySignature(capabilities: ProviderCapabilities): string {

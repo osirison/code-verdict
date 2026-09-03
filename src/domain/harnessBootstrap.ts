@@ -35,6 +35,7 @@
 import type { InvestigationCursor, NormalizedDetail } from '../platform/types';
 import type { Criteria } from './criteria';
 import type { EffortLevel } from './effort';
+import { HOST_TOOL_DEFINITIONS } from './harnessTools';
 
 export type BootstrapSectionKind = 'changeRequestDetails' | 'issueDetails';
 
@@ -122,19 +123,17 @@ export interface BootstrapToolSchema {
   readonly description: string;
 }
 
-/** Verbatim from design.md D6's fixed tool catalog table — not implemented (dispatch is section 9), only described for bootstrap accounting. */
-export const HOST_TOOL_CATALOG: readonly BootstrapToolSchema[] = [
-  { name: 'listChangedFiles', requiredScope: 'member, base/head, cursor', description: 'Complete changed-file inventory and metadata.' },
-  { name: 'readDiff', requiredScope: 'member, path, base/head, bounded range or cursor', description: 'Exact changed evidence and inline anchors.' },
-  { name: 'readFile', requiredScope: 'member, explicit base or head SHA, path, bounded line range', description: 'Revision-pinned supporting source.' },
-  { name: 'searchRepository', requiredScope: 'member, explicit base or head SHA, query, path scope, cursor', description: 'Bounded unchanged or changed source discovery.' },
-  { name: 'searchDiff', requiredScope: 'member, base/head, query, path scope, cursor', description: 'Bounded discovery inside changed content.' },
-  { name: 'resolvePolicy', requiredScope: 'member, changed path', description: 'Applicable root-to-leaf base-revision AGENTS.md chain.' },
-  { name: 'getChangeRequestDetails', requiredScope: 'member, section, cursor', description: 'Reopen normalized target details.' },
-  { name: 'getIssueDetails', requiredScope: 'member, issue identity, section, cursor', description: 'Reopen normalized linked-issue details.' },
-  { name: 'submitCandidateFinding', requiredScope: 'candidate plus source citations', description: 'Incremental schema and evidence validation.' },
-  { name: 'requestCompletion', requiredScope: 'claimed coverage and unresolved-work summary', description: 'Advisory request evaluated by the host gate.' },
-];
+/**
+ * Derived from the section-9 host tool catalog (`harnessTools.ts`'s
+ * `HOST_TOOL_DEFINITIONS`), which is now the single source of truth for the
+ * ten D6 tools; this projects down to the three fields bootstrap accounting
+ * needs (`name`, `requiredScope`, `description`), in the same D6 table order.
+ */
+export const HOST_TOOL_CATALOG: readonly BootstrapToolSchema[] = HOST_TOOL_DEFINITIONS.map((definition) => ({
+  name: definition.name,
+  requiredScope: definition.requiredScope,
+  description: definition.description,
+}));
 
 /** Root `AGENTS.md` presence, digest, and composed text — see the file header for why this is authoritative, not untrusted. */
 export interface BootstrapPolicySource {

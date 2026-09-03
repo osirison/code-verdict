@@ -81,14 +81,14 @@
 
 ## 9. Host Tool Dispatcher And Retry Policy
 
-- [ ] 9.1 Create the versioned host tool catalog for manifest, diff, base/head file ranges, repository search, diff search, policy resolution, issue details, change-request details, candidate submission, and completion requests.
-- [ ] 9.2 Validate every tool request for allowed tool, phase, target/member, normalized path, immutable revision, cursor provenance, bounds, provider capability, budget, and cancellation before dispatch.
-- [ ] 9.3 Implement common bounded result envelopes with source identifiers, digests, real units, continuation, and explicit complete, paginated, truncated, unavailable, binary, too-large, and not-found states.
-- [ ] 9.4 Connect provider-backed handlers to the neutral `Connection` operations and host-backed candidate/completion handlers without importing concrete providers.
-- [ ] 9.5 Implement bounded transient retries using provider guidance first and exponential jittered backoff otherwise; never retry a non-idempotent side effect implicitly.
-- [ ] 9.6 Move long retry delays to waiting with checkpoint and slot release, then through resuming with original queue fairness and one-active-run-per-target ownership preserved.
-- [ ] 9.7 Propagate cancellation to active model and provider work, stop new reservations synchronously, ignore late results, and emit cancelling/cancelled activity before releasing retained state.
-- [ ] 9.8 Test path traversal, forged cursor, unauthorized member, stale revision, unavailable capability, page bounds, retry exhaustion, `Retry-After`, cancellation during dispatch/backoff, and late completion.
+- [x] 9.1 Create the versioned host tool catalog for manifest, diff, base/head file ranges, repository search, diff search, policy resolution, issue details, change-request details, candidate submission, and completion requests.
+- [x] 9.2 Validate every tool request for allowed tool, phase, target/member, normalized path, immutable revision, cursor provenance, bounds, provider capability, budget, and cancellation before dispatch.
+- [x] 9.3 Implement common bounded result envelopes with source identifiers, digests, real units, continuation, and explicit complete, paginated, truncated, unavailable, binary, too-large, and not-found states.
+- [x] 9.4 Connect provider-backed handlers to the neutral `Connection` operations and host-backed candidate/completion handlers without importing concrete providers.
+- [x] 9.5 Implement bounded transient retries using provider guidance first and exponential jittered backoff otherwise; never retry a non-idempotent side effect implicitly.
+- [ ] 9.6 Move long retry delays to waiting with checkpoint and slot release, then through resuming with original queue fairness and one-active-run-per-target ownership preserved. (Policy-level classification, typed `wait` outcome, and `onCheckpointDue`/`onEnterWaiting`/`onResuming` hooks are implemented and tested in `harnessRetry.ts`/`harnessRetry.test.ts`. Left unticked: real slot release, FIFO queue fairness, and one-active-run-per-target ownership are `ReviewRunManager` mechanics owned by task 12.1, out of this pass's scope per the coordination note with `add-app-state-and-incremental-rendering`.)
+- [x] 9.7 Propagate cancellation to active model and provider work, stop new reservations synchronously, ignore late results, and emit cancelling/cancelled activity before releasing retained state.
+- [x] 9.8 Test path traversal, forged cursor, unauthorized member, stale revision, unavailable capability, page bounds, retry exhaustion, `Retry-After`, cancellation during dispatch/backoff, and late completion.
 
 ## 10. Model Protocol And Harness Engine
 

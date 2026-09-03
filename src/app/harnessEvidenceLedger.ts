@@ -255,11 +255,25 @@ export function normalizeEvidenceRange(startLine: unknown, endLine?: unknown): E
   return { startLine, endLine };
 }
 
+/**
+ * A literal `%2e`/`%2f`/`%5c` (case-insensitive) anywhere refuses the path
+ * outright rather than decoding and re-checking it (task 9.8 "encoded" path
+ * traversal): this module never resolves a path against a real filesystem
+ * or URL, so a legitimate repository path has no reason to carry a
+ * percent-encoded dot or separator, and fail-closed here costs nothing a
+ * real path would ever need. A leading `/` is deliberately *not* refused --
+ * it is stripped and the remainder treated as repository-relative, the same
+ * normalization `modelVisiblePath.ts` uses for multi-root workspace labels
+ * (`harnessEvidenceLedger.test.ts` pins `'/src/a.ts' -> 'src/a.ts'`).
+ */
+const ENCODED_TRAVERSAL_OR_SEPARATOR = /%(?:2e|2f|5c)/i;
+
 /** Representation-only normalization plus a refusal of anything that could escape a repository root. */
 export function normalizeEvidencePath(path: unknown): string | undefined {
   if (typeof path !== 'string') return undefined;
   const normalized = normalizeModelVisiblePath(path).replace(/^\//, '');
   if (normalized === '' || normalized.includes('\u0000')) return undefined;
+  if (ENCODED_TRAVERSAL_OR_SEPARATOR.test(normalized)) return undefined;
   if (normalized.split('/').some((segment) => segment === '..')) return undefined;
   return normalized;
 }
