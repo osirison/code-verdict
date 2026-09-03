@@ -204,6 +204,15 @@ export class ReviewFlowPanel {
   private agentWatches: vscode.Disposable[] = [];
   private review?: Review;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
+  /**
+   * itemId → in-progress ask text (task 9.3): the panel's own copy of what is
+   * being typed into #ask, committed on debounced input. The panel used to
+   * hold nothing for it, so a flow-body patch re-rendered the field empty and
+   * the half-typed question was gone — REGIONS_SCRIPT restores focus and
+   * selection only, never `value` (D8). Memory-only: unlike the summary and
+   * the note, an unasked question is not part of the persisted draft.
+   */
+  private askDrafts: Record<string, string> = {};
   private mode: 'split' | 'queue' | 'diff' = 'split';
   private selectedId?: string;
   /**
@@ -352,6 +361,7 @@ export class ReviewFlowPanel {
     this.review = undefined;
     this.retained = undefined;
     this.threads = {};
+    this.askDrafts = {};
     this.selectedId = undefined;
     this.summaryText = '';
     this.finalNote = '';
@@ -739,11 +749,20 @@ export class ReviewFlowPanel {
       // clean screen's buckets are drawn from.
       this.retained = undefined;
       this.review = undefined;
+      this.askDrafts = {};
       return false;
     }
     const draft = retained.draft;
     this.retained = retained;
     this.review = retained.outcome === 'clean' ? undefined : draft.review;
+    // Ask drafts are keyed by finding id, and entering a review is the only
+    // way the finding set changes (task 9.3): drop drafts for findings this
+    // review no longer has, or a replaced run's draft would sit in memory
+    // forever — or surface under an unrelated finding that reused the id.
+    const liveItems = new Set((this.review?.items ?? []).map((item) => item.id));
+    for (const id of Object.keys(this.askDrafts)) {
+      if (!liveItems.has(id)) delete this.askDrafts[id];
+    }
     this.threads = draft.threads;
     this.summaryText = draft.summaryText;
     this.finalNote = draft.finalNote;
@@ -845,9 +864,17 @@ export class ReviewFlowPanel {
         break;
       }
       case 'setInstructions':
+        // Per-keystroke, from debounced input (task 9.3): update the
+        // in-memory criteria only and return — rendering here would repaint
+        // the region holding the field being typed in, and a podStore.upsert
+        // would be one uncoalesced read-modify-write per character, which
+        // task 4.5 forbids. The single upsert lands on blur, below.
+        pod.criteria.extraInstructions = m.text;
+        return;
+      case 'commitInstructions':
         pod.criteria.extraInstructions = m.text;
         await this.deps.podStore.upsert(pod);
-        break;
+        return;
       case 'run':
         void this.run();
         return;
@@ -942,6 +969,13 @@ export class ReviewFlowPanel {
         await this.ask(item, m.preset, m.text);
         return;
       }
+      case 'askDraft':
+        // Held only while its finding is on the review (task 9.3): a commit
+        // racing a run replacement is dropped rather than stored, so no draft
+        // leaks for a finding that is gone. Stored and nothing more — a
+        // render here would fight the caret in the very field this protects.
+        if (this.review?.items.some((i) => i.id === m.itemId)) this.askDrafts[m.itemId] = m.text;
+        return;
       case 'openInEditor': {
         // Land on the flagged line, not just the file — and only when this
         // workspace really holds the reviewed code.
@@ -1096,6 +1130,11 @@ export class ReviewFlowPanel {
   private async ask(item: ReviewItem, preset: AskPreset, text?: string): Promise<void> {
     const question = preset === 'freeform' ? (text ?? '').trim() : PRESET_QUESTION[preset];
     if (question === '') return;
+    // The question is sent and the page cleared its field — the held draft is
+    // stale from here on, whatever the agent answers (task 9.3). Left in
+    // place, the next flow-body patch would render the already-asked question
+    // back into #ask. Presets never consume the field, so theirs stays.
+    if (preset === 'freeform') delete this.askDrafts[item.id];
     const label = preset === 'freeform' ? 'agent · reply' : `agent · ${preset}`;
     const list = (this.threads[item.id] ??= []);
 
@@ -1433,6 +1472,7 @@ export class ReviewFlowPanel {
       verdict: this.review?.verdicts[item.id]?.verdict,
       applyFix: this.review?.verdicts[item.id]?.applyFix,
       thread: this.threads[item.id] ?? [],
+      askDraft: this.askDrafts[item.id],
       lineMoved: this.staleItemIds.has(item.id),
     }));
     const counts = this.review

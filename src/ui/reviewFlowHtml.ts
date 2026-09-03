@@ -68,6 +68,13 @@ export interface TriageItemView {
    * Only sides that resolve to a real added-line anchor appear here.
    */
   crossTargets?: Array<{ repoId: string; number: string; location: string; active: boolean }>;
+  /**
+   * The finding's in-progress ask text, held by the panel (task 9.3): a
+   * flow-body patch re-renders #ask, and the panel used to hold no copy of
+   * its text at all, so the half-typed question was wiped — REGIONS_SCRIPT
+   * restores focus and selection, never `value` (design D8).
+   */
+  askDraft?: string;
 }
 
 /**
@@ -199,6 +206,13 @@ export type FlowMessage =
   | { type: 'setConfidence'; value: number }
   | { type: 'toggleCategory'; category: Category }
   | { type: 'setInstructions'; text: string }
+  /**
+   * Blur on #extra (task 9.3). `setInstructions` above is the per-keystroke
+   * (debounced input) commit and updates the in-memory criteria only; this is
+   * the one `podStore.upsert` the whole edit costs — per keystroke it would be
+   * one uncoalesced read-modify-write per character (task 4.5).
+   */
+  | { type: 'commitInstructions'; text: string }
   | { type: 'run' }
   | { type: 'cancel' }
   | { type: 'usePartial' }
@@ -211,6 +225,13 @@ export type FlowMessage =
   | { type: 'move'; delta: 1 | -1 }
   | { type: 'jumpSeverity'; severity: Severity }
   | { type: 'ask'; itemId: string; preset: 'explain' | 'fix' | 'similar' | 'why' | 'freeform'; text?: string }
+  /**
+   * Debounced input on #ask (task 9.3) — the panel's per-finding copy of the
+   * question being typed, rendered back into the field on the next patch. The
+   * handler stores it and never renders: a per-keystroke commit re-rendering
+   * the region holding the field would fight the caret it exists to protect.
+   */
+  | { type: 'askDraft'; itemId: string; text: string }
   | { type: 'openInEditor'; file: string; line: number }
   | { type: 'reanchor' }
   | { type: 'rerun' }
@@ -976,7 +997,7 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
       .join('')}</div>
     <div class="ask-row">
       <span class="prompt">▸</span>
-      <input class="input" id="ask" placeholder="Ask the agent about this finding…">
+      <input class="input" id="ask" placeholder="Ask the agent about this finding…" value="${e(view.askDraft ?? '')}">
       <span class="kbd">⌘↩</span>
     </div>`;
 }
@@ -1281,6 +1302,59 @@ const on = (id, type, extra) => document.addEventListener('click', (ev) => {
   post({ type, ...(extra ?? {}) });
 });
 
+// ---- in-progress text commits (task 9.3 / design D8) -----------------------
+// Every editable's text is committed to the host on debounced input, never on
+// 'change': 'change' fires on blur, so mid-typing text existed only in the
+// DOM, and a flow-body patch re-rendered the last blurred value over it. The
+// host handlers for these messages store the text and never re-render, so a
+// commit cannot fight the caret in the field it came from.
+const pendingCommits = new Map();
+const queueCommit = (key, fire) => {
+  clearTimeout(pendingCommits.get(key)?.t);
+  pendingCommits.set(key, { fire, t: setTimeout(() => { pendingCommits.delete(key); fire(); }, 300) });
+};
+const dropCommit = (key) => {
+  clearTimeout(pendingCommits.get(key)?.t);
+  pendingCommits.delete(key);
+};
+// Capture phase, so this runs before every delegated (bubble) handler below:
+// an action that consumes a field (submit reads the summary, copy-md reads
+// the note, run reads the instructions) or repaints the region (a verdict, a
+// regenerate) must land AFTER the text it acts on has been committed — a
+// debounce timer outliving the action that consumes it is how stale text
+// resurrects (the posted-reviews reply path hit exactly this).
+const flushCommits = () => {
+  for (const [key, commit] of [...pendingCommits]) {
+    clearTimeout(commit.t);
+    pendingCommits.delete(key);
+    commit.fire();
+  }
+};
+document.addEventListener('click', flushCommits, true);
+// Not every consumer of this text arrives as a click in the page. The palette
+// reaches submit directly (codeVerdict.submitReview), and a keyboard verdict
+// never touches the mouse — both would otherwise act on text up to the
+// debounce window out of date, and submit posts that text to the platform.
+// Losing focus is the one signal common to all of them: opening the palette,
+// tabbing away and clicking outside the webview all blur the focused field.
+document.addEventListener('blur', flushCommits, true);
+window.addEventListener('blur', flushCommits);
+document.addEventListener('input', (ev) => {
+  const id = ev.target.id;
+  const text = ev.target.value;
+  if (id === 'summary-text') queueCommit(id, () => post({ type: 'editSummary', text }));
+  else if (id === 'final-note') queueCommit(id, () => post({ type: 'setNote', text }));
+  else if (id === 'extra') queueCommit(id, () => post({ type: 'setInstructions', text }));
+  else if (id === 'ask') {
+    // Keyed per finding, and the finding is resolved NOW, not when the timer
+    // fires: the selection can move in between, and this draft belongs to the
+    // finding that was on screen while it was typed — one shared timer would
+    // let a switch mid-debounce cancel or misfile the other finding's commit.
+    const item = itemId();
+    if (item) queueCommit('ask:' + item, () => post({ type: 'askDraft', itemId: item, text }));
+  }
+});
+
 on('agent-toggle', 'toggleAgentOpen');
 document.addEventListener('click', (ev) => {
   const el = ev.target.closest('.agent-option');
@@ -1299,7 +1373,11 @@ document.addEventListener('input', (ev) => {
   if (el) el.textContent = ev.target.value + '%';
 });
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-cat]'); if (b) post({ type: 'toggleCategory', category: b.dataset.cat }); });
-document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'setInstructions', text: ev.target.value }); });
+// Blur is where the one podStore write lands (task 9.3): the per-keystroke
+// setInstructions above updates the host's in-memory criteria only, because
+// podStore.upsert is a read-modify-write and one per character is exactly
+// what task 4.5 forbids.
+document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'commitInstructions', text: ev.target.value }); });
 on('run', 'run'); on('cancel', 'cancel'); on('cancel-run', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
@@ -1381,7 +1459,18 @@ window.addEventListener('message', (ev) => {
 });
 document.addEventListener('keydown', (ev) => {
   if (ev.target.id !== 'ask') return;
-  if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { const id = itemId(); if (id && ev.target.value.trim()) { post({ type: 'ask', itemId: id, preset: 'freeform', text: ev.target.value }); ev.target.value = ''; } }
+  if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+    const id = itemId();
+    if (id && ev.target.value.trim()) {
+      // Drop the pending draft commit before sending (task 9.3): a commit
+      // firing after the host clears this finding's draft on send would write
+      // the already-sent question back, and the next patch would replay it
+      // into the field as though it were never asked.
+      dropCommit('ask:' + id);
+      post({ type: 'ask', itemId: id, preset: 'freeform', text: ev.target.value });
+      ev.target.value = '';
+    }
+  }
 });
 document.addEventListener('click', (ev) => {
   const el = ev.target.closest('#open-editor');
@@ -1391,9 +1480,10 @@ document.addEventListener('click', (ev) => {
 });
 on('gen-summary', 'generateSummary');
 
-document.addEventListener('change', (ev) => { if (ev.target.id === 'summary-text') post({ type: 'editSummary', text: ev.target.value }); });
+// #summary-text and #final-note commit through the debounced input listener
+// above (task 9.3) — 'change' fires on blur, which left mid-typing text
+// nowhere but the DOM for a flow-body patch to paint over.
 on('regenerate', 'regenerate');
-document.addEventListener('change', (ev) => { if (ev.target.id === 'final-note') post({ type: 'setNote', text: ev.target.value }); });
 document.addEventListener('click', (ev) => {
   const c = ev.target.closest('[data-note]');
   if (!c) return;

@@ -10,7 +10,13 @@ import { defaultProviderId, getProvider } from '../platform/registry';
 import { acquireSessionFor, sessionAvailableFor } from '../app/connections';
 import { cap } from './vocab';
 import type { Repository } from '../platform/types';
-import { renderOnboardingHtml, type OnboardingMessage, type OnboardingSourceView } from './onboardingHtml';
+import {
+  renderOnboardingBody,
+  renderOnboardingHtml,
+  type OnboardingMessage,
+  type OnboardingSourceView,
+  type OnboardingViewState,
+} from './onboardingHtml';
 import type { SidebarSetup } from './sidebarHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { COMMANDS } from '../commands';
@@ -86,10 +92,13 @@ export class OnboardingPanel {
       this.deps.onSetupState?.(undefined);
       if (OnboardingPanel.current === this) OnboardingPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // repaint from the wizard state already held (step, connection, sources)
+    // rather than losing it: render()'s own postRegions call falls back to
+    // setHtml on its own once `ready` is reset, so no separate path needed.
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as OnboardingMessage));
   }
-
-  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private render(): void {
     if (this.disposed) return;
@@ -98,7 +107,7 @@ export class OnboardingPanel {
       0,
     );
     const provider = getProvider(this.providerId);
-    this.panel.webview.html = renderOnboardingHtml({
+    const state: OnboardingViewState = {
       vocabulary: provider.vocabulary,
       host: provider.host,
       sessionAvailable: sessionAvailableFor(this.providerId, this.instanceUrl),
@@ -109,7 +118,13 @@ export class OnboardingPanel {
       podName: this.podName,
       sources: this.sources,
       selectedProjects,
-    }, crypto.randomBytes(16).toString('hex'));
+    };
+    // Patch the region in place rather than replacing the whole document
+    // (task 7.3) — falling back to setHtml only when the page has not yet
+    // signalled ready is exactly today's always-full-render behaviour.
+    if (!this.route.postRegions({ 'onb-body': renderOnboardingBody(state) })) {
+      this.route.setHtml(renderOnboardingHtml(state, crypto.randomBytes(16).toString('hex')));
+    }
     // Spec §1: the sidebar checklist mirrors these steps with live meta.
     this.deps.onSetupState?.({
       steps: [

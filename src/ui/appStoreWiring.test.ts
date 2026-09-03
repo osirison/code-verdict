@@ -94,6 +94,7 @@ vi.mock('../app/connections', () => ({
       },
       getChangeRequestDiff: async (ref: { repoId: string; number: string }) => {
         world.calls.diffs += 1;
+        if (world.gate) await world.gate;
         return { ref, headSha: 'head', files: [], anchorRefs: undefined };
       },
     }),
@@ -375,8 +376,11 @@ describe('the dashboard keeps its skeleton for a cold pod and skips it for a hel
 describe('the changeset screen reads the pod through the store (task 6.2)', () => {
   const CHANGESET_ID = 'manual:test1';
 
-  async function openChangeset(s: Awaited<ReturnType<typeof setup>>) {
-    const { ChangesetPanel } = await import('./changeset.js');
+  /** Built synchronously (no dynamic import) so a caller timing a paint
+   * against `ChangesetPanel.show()` itself — not this whole async helper —
+   * can import once, then call `.show()` unawaited without the import's own
+   * microtask gap swallowing the synchronous part of `load()`. */
+  function changesetDeps(s: Awaited<ReturnType<typeof setup>>) {
     const globalState = memoryKv({
       'codeVerdict.manualChangesets': {
         'pod-1': [
@@ -391,19 +395,21 @@ describe('the changeset screen reads the pod through the store (task 6.2)', () =
         ],
       },
     });
-    await ChangesetPanel.show(
-      {
-        podStore: s.podStore,
-        appStore: s.appStore,
-        secrets: {} as never,
-        globalState,
-        workspaceState: memoryKv(),
-        openCr: () => undefined,
-        openReview: () => undefined,
-        openDashboard: () => undefined,
-      },
-      CHANGESET_ID,
-    );
+    return {
+      podStore: s.podStore,
+      appStore: s.appStore,
+      secrets: {} as never,
+      globalState,
+      workspaceState: memoryKv(),
+      openCr: () => undefined,
+      openReview: () => undefined,
+      openDashboard: () => undefined,
+    };
+  }
+
+  async function openChangeset(s: Awaited<ReturnType<typeof setup>>) {
+    const { ChangesetPanel } = await import('./changeset.js');
+    await ChangesetPanel.show(changesetDeps(s), CHANGESET_ID);
     return ChangesetPanel;
   }
 
@@ -441,5 +447,112 @@ describe('the changeset screen reads the pod through the store (task 6.2)', () =
 
     expect(world.calls.changeRequests).toBe(2);
     expect(panel.webview.html).toContain('Enforce the limit at the edge proxy');
+  });
+
+  describe('the loading first paint (task 7.6)', () => {
+    it('a cold open shows the pod name and the raw changeset id, upgraded to the real name once data lands', async () => {
+      const s = await setup();
+      // Imported and awaited BEFORE the gate and the `.show()` call below —
+      // a dynamic import is itself an async gap, and awaiting `openChangeset`
+      // as a whole would swallow the synchronous part of `load()` this
+      // assertion is timed against (the dashboard's equivalent test at
+      // ":341" does the same).
+      const { ChangesetPanel } = await import('./changeset.js');
+      const held = gate();
+      world.gate = held.promise;
+
+      const shown = ChangesetPanel.show(changesetDeps(s), CHANGESET_ID);
+      // Synchronous, before the first await — nothing has been held for this
+      // pod yet, so the label falls back to the id `load()` was called with.
+      expect(panel.webview.html).toContain('Platform squad');
+      expect(panel.webview.html).toContain(CHANGESET_ID);
+      expect(panel.webview.html).not.toContain('Tenant limits');
+      expect(panel.webview.html).toContain('class="skel');
+
+      held.open();
+      // `await shown` alone is not enough here: the store's own subscription
+      // (constructor above) fires a SECOND, untracked `load()` the moment
+      // this first-ever fetch installs and notifies (D4) — synchronously,
+      // from inside the flight's own continuation, before `shown`'s awaited
+      // call ever resumes past its `seq !== this.loadSeq` guard. On the
+      // dashboard the analogous second call finishes in that same
+      // synchronous turn (nothing left to await once data is held), so
+      // `shown` alone suffices there; here it does not, because this screen
+      // owes an EXTRA real await afterwards — the member diffs on a direct
+      // connection — so the second call's actual render still needs a few
+      // more microtask turns after `shown` settles.
+      await shown;
+      await flush();
+      expect(panel.webview.html).toContain('Tenant limits');
+    });
+
+    it('reopening with held pod data upgrades the label to the real changeset name before the member diffs resolve', async () => {
+      const s = await setup();
+      const { ChangesetPanel } = await import('./changeset.js');
+      await ChangesetPanel.show(changesetDeps(s), CHANGESET_ID);
+      const { AppSurface } = await import('./appSurface.js');
+      AppSurface.show('elsewhere', 'Elsewhere');
+      panel.state.htmlLog.length = 0;
+      // Gate only the diffs this time — the pod read is served from the
+      // store's held copy (fresh: `clock.t` has not advanced), so nothing
+      // blocks the label upgrade itself, only the rest of the page.
+      const held = gate();
+      world.gate = held.promise;
+
+      const shown = ChangesetPanel.show(changesetDeps(s), CHANGESET_ID);
+      expect(panel.webview.html).toContain('Tenant limits');
+      expect(panel.webview.html).toContain('class="skel');
+
+      held.open();
+      await shown;
+    });
+  });
+
+  describe('the region patch (task 7.3)', () => {
+    /** Arms the route the way REGIONS_SCRIPT does on a real page load. */
+    function armReady(): void {
+      panel.state.messageHandler?.({ type: 'verdictReady' });
+    }
+
+    it('a repaint after the page is ready patches cs-body instead of reassigning the document', async () => {
+      const s = await setup();
+      await openChangeset(s);
+      armReady();
+      panel.webview.postMessage.mockClear();
+      panel.state.htmlLog.length = 0;
+      s.clock.t += 60_000;
+      world.crs = [
+        changeRequest('7', 'Add per-tenant rate limiting'),
+        changeRequest('8', 'Enforce the limit at the edge proxy'),
+      ];
+
+      await s.appStore.revalidate(s.activePod);
+      await flush();
+
+      expect(panel.state.htmlLog).toEqual([]);
+      expect(panel.webview.postMessage).toHaveBeenCalledTimes(1);
+      const posted = panel.webview.postMessage.mock.calls[0]?.[0] as { type: string; regions: Record<string, string> };
+      expect(posted.type).toBe('verdict:regions');
+      expect(Object.keys(posted.regions)).toEqual(['cs-body']);
+      expect(posted.regions['cs-body']).toContain('Enforce the limit at the edge proxy');
+    });
+
+    it('a reload re-arms readiness to false and the next repaint falls back to a full setHtml', async () => {
+      const s = await setup();
+      await openChangeset(s);
+      armReady();
+      // A second `verdictReady` while already ready is what a webview reload
+      // looks like (AppRoute.onReload's doc comment) — it resets `ready` and
+      // fires the reload handlers, which for this screen is `load()` again.
+      armReady();
+      panel.webview.postMessage.mockClear();
+      panel.state.htmlLog.length = 0;
+
+      await flush();
+
+      expect(panel.webview.postMessage).not.toHaveBeenCalled();
+      expect(panel.state.htmlLog.length).toBeGreaterThan(0);
+      expect(panel.webview.html).toContain('Tenant limits');
+    });
   });
 });

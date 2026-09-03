@@ -138,7 +138,19 @@ document.addEventListener('click', (ev) => {
 });
 `;
 
-export function renderOnboardingHtml(state: OnboardingViewState, nonce: string): string {
+/**
+ * The data-dependent part of the page (issue #39 task 7.3): the step nav,
+ * the current step's content and the footer, all wrapped by the full page in
+ * the same `id="onb-body"` container — one source of markup, no duplication.
+ * A step change swaps which `content` branch renders, but never which
+ * container holds it: `onb-body` wraps the step nav too, so the patch always
+ * covers the element that decides which step is showing, not just its
+ * innards. `#back`/`#next` read `data-current-step` off themselves at click
+ * time (task 7.1) rather than closing over `state.step`, so the script never
+ * goes stale across a step change even though it is bound once for the
+ * page's whole lifetime.
+ */
+export function renderOnboardingBody(state: OnboardingViewState): string {
   const e = escapeHtml;
   const v = state.vocabulary;
   const h = state.host;
@@ -153,6 +165,10 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
     : state.step === 2
       ? `<section class="content"><h1>Name your pod</h1><p class="lede">A pod is a named set of ${e(v.platformName)} ${e(v.repoNounPlural)} you review together.</p><input class="input name" id="pod-name" value="${e(state.podName)}" placeholder="Platform squad"><div class="suggestions">${['Platform squad', 'Payments', 'My work'].map((name) => `<button class="chip" data-name="${name}">${name}</button>`).join('')}</div></section>`
       : `<section class="content"><h1>Add ${e(v.repoNounPlural)} to ${e(state.podName)}</h1><p class="lede">${e(h.sourceInputHint)} Choose which ${e(v.repoNounPlural)} the pod watches.</p><div class="source-input"><input class="input" id="source" placeholder="${e(h.sourceInputPlaceholder)}"><button class="btn btn-accent" id="add">Add</button></div><span class="status">${e(h.sourceInputHint)}</span><div class="samples">${h.sourceSamples.map((sample) => `<button class="chip" data-sample="${e(sample.value)}">${e(sample.label)}</button>`).join('')}</div><div class="sources">${sourceCards}</div></section>`;
-  const body = `<main class="wrap"><div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" data-current-step="${state.step}" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next" data-current-step="${state.step}">${state.step === 3 ? `Create pod · ${state.selectedProjects} ${e(v.repoNounPlural)}` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer></main>`;
-  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: `Connect ${v.platformName}` } });
+  return `<div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" data-current-step="${state.step}" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next" data-current-step="${state.step}">${state.step === 3 ? `Create pod · ${state.selectedProjects} ${e(v.repoNounPlural)}` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer>`;
+}
+
+export function renderOnboardingHtml(state: OnboardingViewState, nonce: string): string {
+  const body = `<main class="wrap"><div id="onb-body">${renderOnboardingBody(state)}</div></main>`;
+  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: `Connect ${state.vocabulary.platformName}` } });
 }

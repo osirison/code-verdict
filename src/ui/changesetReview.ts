@@ -42,8 +42,9 @@ import { agentRunConcurrency, agentRunTimeouts } from './agentRunOptions';
 import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
-import { renderReviewFlowHtml } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { livenessView } from './runLiveness';
+import { escapeHtml } from './theme';
 import { AppSurface, type AppRoute } from './appSurface';
 import type { SidebarActiveReview } from './sidebarHtml';
 
@@ -100,6 +101,9 @@ export class ChangesetReviewPanel {
 
   private disposed = false;
   private pendingSelectId?: string;
+  /** First load() on this instance paints the loading skeleton (task 7.6);
+   * see load(). */
+  private painted = false;
   private focusWatch?: vscode.Disposable;
   private changeset!: DetectedChangeset;
   private members: ChangesetAgentMember[] = [];
@@ -120,6 +124,13 @@ export class ChangesetReviewPanel {
   private review?: Review;
   private selectedId?: string;
   private threads: Record<string, Array<{ label: string; text: string }>> = {};
+  /**
+   * itemId → in-progress ask text (task 9.3) — same mechanism as
+   * `ReviewFlowPanel.askDrafts`, and this screen needs it for the same
+   * reason: task 7.2 makes it patch the flow-body region holding #ask.
+   * Memory-only, never part of the persisted draft.
+   */
+  private askDrafts: Record<string, string> = {};
   /** This panel's view of the run, mirrored from the manager (see `ReviewFlowPanel`). */
   private runRecord?: RunRecord;
   private runWatch?: vscode.Disposable;
@@ -175,6 +186,14 @@ export class ChangesetReviewPanel {
     this.windowFocusWatch = vscode.window.onDidChangeWindowState((state) => {
       if (!state.focused) this.draftWriter.flushQuietly();
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. This panel's state is already in
+    // memory, so a plain re-render (falling back to setHtml since readiness
+    // was just reset) is enough — no need to load() from the network. Before
+    // load() has set `changeset`, render() declines and the stored loading
+    // page (task 7.6) is the right thing to leave on screen.
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
   }
 
@@ -197,13 +216,33 @@ export class ChangesetReviewPanel {
   private async load(): Promise<void> {
     try {
       const pod = this.pod();
+      const options = changesetDetectionOptions(this.deps.globalState, pod.id);
+      // First paint on route entry (task 7.6), before the store read below —
+      // the pod name and the changeset id are always known synchronously,
+      // upgraded to the real changeset name when the store already holds
+      // this pod's data: detectChangesets runs over that via `peek`, which —
+      // unlike `read` — never starts a fetch of its own. Even with held pod
+      // data this screen still owes a network round for the member diffs, so
+      // the paint is guarded only by `painted`, not by what is held — the
+      // same reasoning as changeset.ts's load().
+      if (!this.painted) {
+        const held = this.deps.appStore.peek(pod.id);
+        const knownName = held
+          ? detectChangesets(pod, held.changeRequests, held.workItems, options)
+              .find((candidate) => candidate.id === this.changesetId)?.name
+          : undefined;
+        this.route.setHtml(renderReviewFlowLoadingHtml(
+          { refLabel: knownName ?? this.changesetId, projectPath: pod.name },
+          crypto.randomBytes(16).toString('hex'),
+        ));
+      }
+      this.painted = true;
       // The pod read goes through the store (task 6.2). The connection is
       // still built here for the member diffs below — per change request,
       // never pod-keyed, so the store holds nothing for them.
       const podRead = this.deps.appStore.read(pod);
       const data = podRead.data ?? (await podRead.fetch!);
       const connection = await connectionForPod(pod, this.deps.secrets);
-      const options = changesetDetectionOptions(this.deps.globalState, pod.id);
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');
       this.changeset = changeset;
@@ -395,11 +434,19 @@ export class ChangesetReviewPanel {
     if (!retained) {
       this.retained = undefined;
       this.review = undefined;
+      this.askDrafts = {};
       return false;
     }
     const draft = retained.draft;
     this.retained = retained;
     this.review = retained.outcome === 'clean' ? undefined : draft.review;
+    // Drop ask drafts for findings this review no longer has (task 9.3) — a
+    // replaced run's draft must not sit in memory forever, or surface under
+    // an unrelated finding that reused the id (see `ReviewFlowPanel`).
+    const liveItems = new Set((this.review?.items ?? []).map((item) => item.id));
+    for (const id of Object.keys(this.askDrafts)) {
+      if (!liveItems.has(id)) delete this.askDrafts[id];
+    }
     this.threads = draft.threads;
     this.summaryText = draft.summaryText;
     this.finalNote = draft.finalNote;
@@ -447,7 +494,12 @@ export class ChangesetReviewPanel {
         await this.deps.podStore.upsert(pod);
         break;
       }
-      case 'setInstructions': pod.criteria.extraInstructions = message.text; await this.deps.podStore.upsert(pod); break;
+      // Per-keystroke, from debounced input (task 9.3): in-memory only, and
+      // return — the tail render would repaint the region holding the field
+      // being typed in, and a podStore.upsert here would be one uncoalesced
+      // read-modify-write per character (task 4.5). The upsert lands on blur.
+      case 'setInstructions': pod.criteria.extraInstructions = message.text; return;
+      case 'commitInstructions': pod.criteria.extraInstructions = message.text; await this.deps.podStore.upsert(pod); return;
       case 'run': void this.run(); return;
       // Two meanings on one message — see `ReviewFlowPanel`. A live run is
       // stopped; a failed one is dismissed back to the pickers, which is what
@@ -498,9 +550,20 @@ export class ChangesetReviewPanel {
         break;
       }
       case 'jumpSeverity': this.selectedId = this.review?.items.find((item) => item.severity === message.severity)?.id ?? this.selectedId; break;
+      case 'askDraft':
+        // Same rules as `ReviewFlowPanel` (task 9.3): held only while its
+        // finding is on the review, stored and nothing more — a render here
+        // would fight the caret in the very field this protects.
+        if (this.review?.items.some((candidate) => candidate.id === message.itemId)) {
+          this.askDrafts[message.itemId] = message.text;
+        }
+        return;
       case 'ask': {
         const item = this.review?.items.find((candidate) => candidate.id === message.itemId);
         if (!item) return;
+        // The question was sent and the page cleared its field (task 9.3) —
+        // a held draft would be painted back into #ask by the tail render.
+        if (message.preset === 'freeform') delete this.askDrafts[item.id];
         const list = (this.threads[item.id] ??= []);
         const label = message.preset === 'freeform' ? 'agent · reply' : `agent · ${message.preset}`;
         if (message.preset === 'freeform' || !list.some((entry) => entry.label === label)) {
@@ -743,6 +806,7 @@ export class ChangesetReviewPanel {
       verdict: this.review?.verdicts[item.id]?.verdict,
       applyFix: this.review?.verdicts[item.id]?.applyFix,
       thread: this.threads[item.id] ?? [],
+      askDraft: this.askDrafts[item.id],
       projectLabel: pod.repos?.find((repository) => repository.id === item.repoId)?.name ?? item.repoId,
       refLabel: item.crNumber ? `!${item.crNumber}` : undefined,
       crossTargets: this.crossTargets(item),
@@ -838,7 +902,18 @@ export class ChangesetReviewPanel {
     };
     const abbrev = `${this.members.length} ${vocabulary.changeRequestAbbrev}s`;
     this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${abbrev}` : `Verdict: Review · ${abbrev}`;
-    this.panel.webview.html = renderReviewFlowHtml(state, this.agentLabel(), crypto.randomBytes(16).toString('hex'));
+    // Patch the region in place rather than replacing the whole document
+    // (task 7.2) — every state change on this screen funnels through render(),
+    // so this is what stops a verdict or a screen transition from rebuilding
+    // the entire page. Falling back to setHtml only when the page has not yet
+    // signalled ready is exactly the previous always-full-render behaviour.
+    const agentLabel = this.agentLabel();
+    if (!this.route.postRegions({
+      'flow-body': renderReviewFlowBody(state, agentLabel),
+      'app-crumb-current': escapeHtml(reviewFlowCrumb(state)),
+    })) {
+      this.route.setHtml(renderReviewFlowHtml(state, agentLabel, crypto.randomBytes(16).toString('hex')));
+    }
     this.deps.onSidebarState?.(this.review ? {
       // Spec §15: the chrome names the changeset — `⧉ <name>` over
       // "N MRs · N repos" with the summed diff stat.
