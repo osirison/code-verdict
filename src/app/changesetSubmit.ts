@@ -1,17 +1,21 @@
 import type { Connection } from '../platform/provider';
 import type { AnchorRefs, ChangeRequestRef, ReviewSubmission } from '../platform/types';
-import type { Review } from '../domain/types';
-import { composeCommentDrafts } from './submit';
+import type { AnchorCandidate } from '../domain/anchor';
+import type { Review, ReviewItem } from '../domain/types';
+import { composeCommentDrafts, composeSummaryBody } from './submit';
 
 export interface ChangesetSubmitMember {
   ref: ChangeRequestRef;
   anchorRefs: AnchorRefs;
+  candidatesFor: (file: string) => readonly AnchorCandidate[] | undefined;
   projectLabel?: string;
+  workspaceRootLabel?: string;
 }
 
 export interface ChangesetMemberPlan {
   ref: ChangeRequestRef;
   submission: ReviewSubmission;
+  withheld: ReviewItem[];
 }
 
 export interface ChangesetSubmitState {
@@ -49,7 +53,15 @@ export function buildChangesetSubmitPlans(
   return members.map((member) => {
     const memberItems = review.items.filter((item) => item.repoId === member.ref.repoId && item.crNumber === member.ref.number);
     const memberReview: Review = { ...review, items: memberItems };
-    const comments = composeCommentDrafts(memberReview, agentLabel, you, member.anchorRefs).map((comment) => {
+    const composition = composeCommentDrafts(
+      memberReview,
+      agentLabel,
+      you,
+      member.anchorRefs,
+      member.candidatesFor,
+      member.workspaceRootLabel,
+    );
+    const comments = composition.drafts.map((comment) => {
       const item = memberItems.find((candidate) => candidate.id === comment.key);
       if (!item?.cross || !item.spans?.length) return comment;
       const spans = item.spans.map((span) => `- ${labels.get(span.repoId) ?? span.repoId} · ${span.location} · ${span.role}`).join('\n');
@@ -57,7 +69,13 @@ export function buildChangesetSubmitPlans(
     });
     return {
       ref: member.ref,
-      submission: { comments, summary, requestChanges, asSingleThread },
+      submission: {
+        comments,
+        summary: composeSummaryBody(summary, '', undefined, composition.withheld),
+        requestChanges,
+        asSingleThread,
+      },
+      withheld: composition.withheld,
     };
   });
 }

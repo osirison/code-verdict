@@ -16,6 +16,7 @@ describe('parseAgentReviewResponse', () => {
 
     const blocker = response.items[0];
     expect(blocker?.id).toBe('itm_01H9Z4');
+    expect(blocker?.anchored).toBe(true);
     expect(blocker?.severity).toBe('blocker');
     expect(blocker?.category).toBe('security');
     expect(blocker?.confidence).toBe(96);
@@ -53,6 +54,80 @@ describe('parseAgentReviewResponse', () => {
     });
     expect(response.items).toHaveLength(1);
     expect(rejected.map((r) => r.index)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('derives anchoring from supplied file paths and rejects files outside the supplied evidence', () => {
+    const item = (file: string, anchored?: boolean) => ({
+      file,
+      line: 999,
+      severity: 'major',
+      category: 'tests',
+      confidence: 80,
+      title: file,
+      anchored,
+    });
+    const { response, rejected } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [item('src/diff.ts', false), item('docs/evidence.md', true), item('description', true)],
+    }, {
+      diffPaths: ['src/diff.ts'],
+      attachmentManifest: [{ path: 'docs/evidence.md', ranges: [{ startLine: 900, endLine: 1_000 }] }],
+    });
+
+    expect(response.items.map(({ file, anchored }) => ({ file, anchored }))).toEqual([
+      { file: 'src/diff.ts', anchored: true },
+      { file: 'docs/evidence.md', anchored: false },
+    ]);
+    expect(rejected).toEqual([
+      { index: 2, reason: 'file was not supplied as diff or attachment: description' },
+    ]);
+  });
+
+  it('requires attachment findings to name an actual manifested path and visible positive integer line', () => {
+    const item = (file: string, line: number) => ({
+      file,
+      line,
+      severity: 'major',
+      category: 'tests',
+      confidence: 80,
+      title: `${file}:${line}`,
+    });
+    const { response, rejected } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [
+        item('root/docs/evidence.md', 10),
+        item('root/docs/evidence.md', 12),
+        item('attachment:docs', 10),
+        item('root/docs/imitated.md', 10),
+        item('root/docs/evidence.md', 0),
+        item('root/docs/evidence.md', -1),
+        item('root/docs/evidence.md', 10.5),
+      ],
+    }, {
+      diffPaths: [],
+      attachmentManifest: [{ path: 'root/docs/evidence.md', ranges: [{ startLine: 10, endLine: 11 }] }],
+    });
+
+    expect(response.items.map((entry) => `${entry.file}:${entry.line}`)).toEqual(['root/docs/evidence.md:10']);
+    expect(rejected).toHaveLength(6);
+    expect(rejected[0]?.reason).toContain('outside model-visible attachment evidence');
+    expect(rejected.slice(1, 3).every((entry) => entry.reason.includes('not supplied'))).toBe(true);
+    expect(rejected.slice(3).every((entry) => entry.reason.includes('invalid line'))).toBe(true);
+  });
+
+  it('keeps a positive changed-file line anchored even when it drifted outside added lines', () => {
+    const { response, rejected } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [{
+        file: 'root/src/diff.ts', line: 9_999, severity: 'major', category: 'tests', confidence: 80,
+      }],
+    }, { diffPaths: ['root/src/diff.ts'], attachmentManifest: [] });
+
+    expect(rejected).toEqual([]);
+    expect(response.items[0]).toMatchObject({ file: 'root/src/diff.ts', line: 9_999, anchored: true });
   });
 
   it('drops candidate buckets with unknown reasons and non-finite stats', () => {

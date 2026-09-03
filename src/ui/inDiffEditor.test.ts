@@ -9,7 +9,7 @@ const FILE_TEXT = [
 ].join('\n');
 
 const state = vi.hoisted(() => ({
-  workspaceFolders: [{ uri: { path: '/repo' } }] as unknown[],
+  workspaceFolders: [{ name: 'repo', uri: { path: '/repo' } }] as unknown[],
   files: new Map<string, string>(),
   /** Paths whose open is held open until the test releases them. */
   gate: new Map<string, Promise<void>>(),
@@ -88,13 +88,14 @@ const ITEM: ReviewItem = {
   category: 'concurrency',
   confidence: 96,
   file: 'src/auth/token.ts',
+  anchored: true,
   line: 3,
   code: '  return cache.get(key);',
 };
 
 describe('InDiffEditor', () => {
   beforeEach(() => {
-    state.workspaceFolders = [{ uri: { path: '/repo' } }];
+    state.workspaceFolders = [{ name: 'repo', uri: { path: '/repo' } }];
     state.files = new Map([['/repo/src/auth/token.ts', FILE_TEXT]]);
     state.gate = new Map();
     editor.setDecorations.mockClear();
@@ -140,6 +141,22 @@ describe('InDiffEditor', () => {
       { line: 4, text: '  return cache.get(key);' },
     ]);
     inDiff.dispose();
+  });
+
+  it('opens the qualified root when two roots contain the same relative path', async () => {
+    state.workspaceFolders = [
+      { name: 'service-a', uri: { path: '/workspace/service-a' } },
+      { name: 'service-b', uri: { path: '/workspace/service-b' } },
+    ];
+    state.files = new Map([
+      ['/workspace/service-a/src/auth/token.ts', FILE_TEXT],
+      ['/workspace/service-b/src/auth/token.ts', FILE_TEXT.replace('cache.get(key)', 'other.get(key)')],
+    ]);
+    const { locateInWorkspace } = await import('./inDiffEditor.js');
+
+    const located = await locateInWorkspace({ ...ITEM, file: 'service-a/src/auth/token.ts' });
+
+    expect(located?.document.uri.path).toBe('/workspace/service-a/src/auth/token.ts');
   });
 
   it('stays silent when the reviewed file is not in this workspace', async () => {

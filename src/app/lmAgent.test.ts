@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { BUILTIN_AGENT_DESCRIPTOR, type AgentDescriptor } from './agents';
 import type { ChangeRequest, ChangeRequestDiff, WorkItem } from '../platform/types';
-import { buildReviewContext, CONTEXT_SECTION_BUDGET, CONTEXT_TRUNCATION_MARKER } from './reviewContext';
+import { buildReviewContext, CONTEXT_SECTION_BUDGET, CONTEXT_TRUNCATION_MARKER, type Attachment } from './reviewContext';
 import type { AgentTraceSink } from './agentTrace';
 import type { ChangesetAgentMember } from './combinedAgent';
+import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 
 /**
  * Minimal fake of the two vscode.lm pieces `lmAgent.ts` touches:
@@ -562,6 +563,96 @@ describe('runLmAgent / runLmChangesetAgent forward options to runPrompt', () => 
     expect(sink.lines.some((l) => l.includes('prompt ('))).toBe(true);
   });
 
+  it('runLmAgent derives anchoring from its supplied diff and attachment paths', async () => {
+    const { runLmAgent } = await import('./lmAgent.js');
+    const item = (id: string, file: string, anchored: boolean, line = 999) => ({
+      id, file, anchored, line, severity: 'major', category: 'tests', confidence: 90,
+      title: id, body: `${id} body`, code: `${id}();`,
+    });
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [{
+        delayMs: 10,
+        text: JSON.stringify({
+          schemaVersion: '1', agentId: 'a', agentLabel: 'b', headSha: 'h1',
+          items: [item('diff', 'a.ts', false), item('attachment', 'schema.ts', true, 1), item('invented', 'other.ts', true)],
+        }),
+      }]),
+    );
+    const attachment: Attachment = {
+      id: 'schema', kind: 'file', label: 'schema.ts', path: 'schema.ts', content: 'schema', truncated: false,
+      evidence: [{ path: 'schema.ts', range: { startLine: 1, endLine: 1 }, contentStart: 0, contentEnd: 6 }],
+    };
+    const promise = runLmAgent(BUILTIN_AGENT_DESCRIPTOR, 'lm:acme/turbo', diff, DEFAULT_CRITERIA, undefined, {
+      trace: fakeSink(), attachments: [attachment],
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const response = await promise;
+    expect(response.items.map(({ id, anchored }) => ({ id, anchored }))).toEqual([
+      { id: 'diff', anchored: true },
+      { id: 'attachment', anchored: false },
+    ]);
+  });
+
+  it('uses one root-qualified changed-file identity in the prompt and parsed finding', async () => {
+    const { runLmAgent } = await import('./lmAgent.js');
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [{
+        delayMs: 10,
+        text: JSON.stringify({
+          schemaVersion: '1', agentId: 'a', agentLabel: 'b', headSha: 'h1',
+          items: [{
+            id: 'rooted', file: 'repo/a.ts', line: 999, severity: 'major', category: 'tests', confidence: 90,
+          }],
+        }),
+      }]),
+    );
+    const promise = runLmAgent(BUILTIN_AGENT_DESCRIPTOR, 'lm:acme/turbo', diff, DEFAULT_CRITERIA, undefined, {
+      trace: fakeSink(), workspaceRootLabel: 'repo',
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const response = await promise;
+    const [messages] = sendRequest.mock.calls[0] as [Array<{ content: string }>];
+    expect(messages[0]?.content).toContain('--- repo/a.ts\n@@ -1 +1 @@');
+    expect(response.items[0]).toMatchObject({ file: 'repo/a.ts', anchored: true });
+  });
+
+  it('drops an unreadable attachment and reports it before assembling the run prompt', async () => {
+    const { runLmAgent } = await import('./lmAgent.js');
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [{ delayMs: 10, text: '{"schemaVersion":"1","agentId":"a","agentLabel":"b","headSha":"h1","items":[]}' }]),
+    );
+    const attachment: Attachment = {
+      id: 'schema', kind: 'file', label: 'schema.ts', path: 'schema.ts', content: 'STALE_ATTACHMENT', truncated: false,
+    };
+    const warnings = vi.fn();
+    const promise = runLmAgent(BUILTIN_AGENT_DESCRIPTOR, 'lm:acme/turbo', diff, DEFAULT_CRITERIA, undefined, {
+      trace: fakeSink(),
+      attachments: [attachment],
+      attachmentRevalidator: async () => ({
+        attachments: [],
+        warnings: [{
+          code: 'attachment-unreadable',
+          attachmentId: 'schema',
+          label: 'schema.ts',
+          path: 'schema.ts',
+          reason: 'ENOENT',
+        }],
+      }),
+      onAttachmentWarnings: warnings,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await promise;
+
+    expect(warnings).toHaveBeenCalledWith([expect.objectContaining({
+      code: 'attachment-unreadable', path: 'schema.ts', reason: 'ENOENT',
+    })]);
+    const [messages] = sendRequest.mock.calls[0] as [Array<{ content: string }>];
+    expect(messages[0]?.content).not.toContain('STALE_ATTACHMENT');
+    expect(messages[0]?.content).toContain('--- a.ts\n@@ -1 +1 @@\n-old\n+new');
+  });
+
   it('runFollowUpPrompt shares streamText, so the configured windows apply to a follow-up too', async () => {
     const { runFollowUpPrompt, AgentRunError } = await import('./lmAgent.js');
     sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
@@ -595,6 +686,49 @@ describe('runLmAgent / runLmChangesetAgent forward options to runPrompt', () => 
     await promise;
     expect(progress).toHaveBeenCalled();
     expect(sink.lines.some((l) => l.includes('prompt ('))).toBe(true);
+  });
+
+  it('labels a changeset attachment and resolves its finding to that member', async () => {
+    const { runLmChangesetAgent } = await import('./lmAgent.js');
+    const attachment: Attachment = {
+      id: 'schema', kind: 'file', label: 'schema.ts', path: 'config/schema.ts', content: 'unsafe: true', truncated: false,
+      evidence: [{ path: 'config/schema.ts', range: { startLine: 1, endLine: 1 }, contentStart: 0, contentEnd: 12 }],
+    };
+    const members: ChangesetAgentMember[] = [{
+      ref: { repoId: 'repo1', number: '42' },
+      projectPath: 'org/repo1',
+      diff,
+      attachments: [attachment],
+    }];
+    sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+      fragmentStream(token, [{
+        delayMs: 10,
+        text: JSON.stringify({
+          schemaVersion: '1', agentId: 'a', agentLabel: 'b', headSha: 'repo1!42:h1',
+          items: [{
+            id: 'attachment', projectId: 'repo1', mrIid: '42', file: 'config/schema.ts', line: 1,
+            severity: 'major', category: 'security', confidence: 90, title: 'Unsafe', body: 'Unsafe.', code: 'unsafe: true',
+          }],
+        }),
+      }]),
+    );
+
+    const promise = runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink() },
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    const response = await promise;
+    const [messages] = sendRequest.mock.calls[0] as [Array<{ content: string }>];
+
+    expect(messages[0]?.content).toContain('id="projectId=repo1 mrIid=42 attachment=schema"');
+    expect(messages[0]?.content).toContain('filePath="projectId=repo1 mrIid=42 project=org/repo1 file=config/schema.ts"');
+    expect(response.items[0]).toMatchObject({
+      repoId: 'repo1', crNumber: '42', file: 'config/schema.ts', anchored: false,
+    });
   });
 });
 
@@ -654,7 +788,244 @@ describe('the prompt carries what the change is for', () => {
     return messages[0]?.content ?? '';
   }
 
-  it('sends the title, the description and the linked work item, and keeps the diffs-only rule', async () => {
+  async function capturePrompt(run: () => Promise<unknown>): Promise<string> {
+    sendRequest.mockClear();
+    const promise = run();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await promise;
+    return sentPrompt();
+  }
+
+  const attachment: Attachment = {
+    id: 'schema',
+    kind: 'file',
+    label: 'schema.ts',
+    path: 'src/schema.ts',
+    content: '--- valid YAML front matter\nkey: value',
+    truncated: false,
+  };
+
+  it('represents every non-diff contextual source in the rendered context area', async () => {
+    const { assembleReviewPrompt } = await import('./lmAgent.js');
+    const { renderReviewFlowBody } = await import('../ui/reviewFlowHtml.js');
+    const context = buildReviewContext(changeRequest, [workItem]);
+    const criteria = { ...DEFAULT_CRITERIA, extraInstructions: 'Focus on rollover.' };
+    const prompt = assembleReviewPrompt(BUILTIN_AGENT_DESCRIPTOR, diff, criteria, context, {
+      attachments: [attachment],
+    });
+    const html = renderReviewFlowBody({
+      vocabulary: GITLAB_VOCABULARY,
+      screen: 'agent',
+      header: {
+        refLabel: '!42', projectPath: 'org/repo1', branch: 'feat/rotate', fileCount: 1,
+        added: 1, removed: 1, title: changeRequest.title,
+      },
+      agents: [BUILTIN_AGENT_DESCRIPTOR],
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      agentOpen: false,
+      models: [{ id: 'lm:acme/turbo', label: 'Turbo', description: 'acme · turbo', vendor: 'acme', family: 'turbo' }],
+      modelId: 'lm:acme/turbo',
+      modelOpen: false,
+      effort: 'none',
+      effortOpen: false,
+      effortComparisonDisclosure: false,
+      selectionNotices: [],
+      attachmentWarnings: [],
+      skippedAgents: [],
+      criteria,
+      attachments: [attachment],
+      autoContextItems: [
+        { id: 'auto:title', kind: 'title', label: `Title · ${context.title}`, enabled: true },
+        { id: 'auto:description', kind: 'description', label: 'Change request description', enabled: true },
+        { id: 'auto:linked:0:1180', kind: 'linkedItem', label: '#1180 · Key rotation, end to end', enabled: true },
+      ],
+      unresolvedContextReferences: [],
+      runSteps: [],
+      runStep: 0,
+      mode: 'split',
+      items: [],
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 0 },
+      candidates: [],
+      filesRead: 1,
+      summaryText: '',
+      finalNote: '',
+      postThread: true,
+      requestChanges: true,
+      supportsRequestChanges: true,
+      username: 'kai',
+      doneSentence: '',
+      crWebUrl: changeRequest.webUrl,
+    }, BUILTIN_AGENT_DESCRIPTOR.label);
+
+    const contextualSources = [
+      { sent: `Title: ${context.title}`, represented: 'data-auto-context="auto:title"' },
+      { sent: 'Description:\nPart-of: #1180', represented: 'data-auto-context="auto:description"' },
+      { sent: 'Linked work item #1180', represented: 'data-auto-context="auto:linked:0:1180"' },
+      { sent: '<attachment id="schema"', represented: 'data-context-item="schema"' },
+    ];
+    for (const source of contextualSources) {
+      expect(prompt).toContain(source.sent);
+      expect(html).toContain(source.represented);
+    }
+  });
+
+  it('keeps prompts byte-identical when attachments are empty and effort is none', async () => {
+    const { runLmAgent, runLmChangesetAgent } = await import('./lmAgent.js');
+    const singleBefore = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      undefined,
+      { trace: fakeSink() },
+    ));
+    const singleAfter = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      undefined,
+      { trace: fakeSink(), attachments: [], effort: 'none' },
+    ));
+    expect(singleAfter).toBe(singleBefore);
+
+    const members: ChangesetAgentMember[] = [{
+      ref: { repoId: 'repo1', number: '42' },
+      projectPath: 'org/repo1',
+      diff,
+    }];
+    const changesetBefore = await capturePrompt(() => runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink() },
+    ));
+    const changesetAfter = await capturePrompt(() => runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink(), attachments: [], effort: 'none' },
+    ));
+    expect(changesetAfter).toBe(changesetBefore);
+  });
+
+  it.each([
+    ['minimal', 'answer directly; do not deliberate'],
+    ['low', 'brief check before answering'],
+    ['medium', 'reason through the diff before reporting'],
+    ['high', 'reason carefully; consider alternatives before reporting'],
+    ['xhigh', 'exhaustive reasoning; enumerate and discard alternatives'],
+    ['max', 'no reasoning budget; take as long as needed'],
+  ] as const)('adds the exact %s effort contribution without changing the contract or diff', async (effort, contribution) => {
+    const { runLmAgent } = await import('./lmAgent.js');
+    const prompt = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      undefined,
+      { trace: fakeSink(), effort },
+    ));
+
+    expect(prompt).toContain(`Review effort instruction: ${contribution}.`);
+    expect(prompt).toContain('Respond with a single JSON object matching this contract:');
+    expect(prompt).toContain('--- a.ts\n@@ -1 +1 @@\n-old\n+SENTINEL_ADDED_LINE');
+    expect(sendRequest.mock.calls[0]?.[1]).toEqual({});
+  });
+
+  it('applies the selected effort to changeset and follow-up prompts', async () => {
+    const { runFollowUpPrompt, runLmChangesetAgent } = await import('./lmAgent.js');
+    const members: ChangesetAgentMember[] = [{
+      ref: { repoId: 'repo1', number: '42' },
+      projectPath: 'org/repo1',
+      diff,
+    }];
+    const changesetPrompt = await capturePrompt(() => runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink(), effort: 'high' },
+    ));
+    expect(changesetPrompt).toContain('Review effort instruction: reason carefully; consider alternatives before reporting.');
+
+    const followUpPrompt = await capturePrompt(() => runFollowUpPrompt(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      'Why is this risky?',
+      { trace: fakeSink(), effort: 'low' },
+    ));
+    expect(followUpPrompt).toContain('Review effort instruction: brief check before answering.');
+    expect(followUpPrompt).toContain('Why is this risky?');
+  });
+
+  it('places attachments between intent and diffs in single and changeset prompts', async () => {
+    const { runLmAgent, runLmChangesetAgent } = await import('./lmAgent.js');
+    const context = buildReviewContext(changeRequest, [workItem]);
+    const single = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      context,
+      { trace: fakeSink(), attachments: [attachment], effort: 'none' },
+    ));
+    const singleAttachments = single.indexOf('<attachments>\n<attachment ');
+    expect(single.indexOf('--- END OF CONTEXT')).toBeLessThan(singleAttachments);
+    expect(singleAttachments).toBeLessThan(single.indexOf('--- a.ts'));
+    expect(single).toContain('--- valid YAML front matter');
+
+    const members: ChangesetAgentMember[] = [{
+      ref: { repoId: 'repo1', number: '42' },
+      projectPath: 'org/repo1',
+      diff,
+      context,
+      attachments: [attachment],
+    }];
+    const changeset = await capturePrompt(() => runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink(), effort: 'none' },
+    ));
+    const changesetAttachments = changeset.indexOf('<attachments>\n<attachment ');
+    expect(changeset.indexOf('--- END OF CONTEXT')).toBeLessThan(changesetAttachments);
+    expect(changesetAttachments).toBeLessThan(changeset.indexOf('--- projectId=repo1'));
+  });
+
+  it('truthfully scopes the built-in agent to attachments and diffs only when attachments are sent', async () => {
+    const { runLmAgent, runLmChangesetAgent } = await import('./lmAgent.js');
+    const single = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      undefined,
+      { trace: fakeSink(), attachments: [attachment] },
+    ));
+    expect(single.startsWith('You are a code review agent. Review ONLY the attachments and diffs below.')).toBe(true);
+
+    const members: ChangesetAgentMember[] = [{
+      ref: { repoId: 'repo1', number: '42' },
+      projectPath: 'org/repo1',
+      diff,
+      attachments: [attachment],
+    }];
+    const changeset = await capturePrompt(() => runLmChangesetAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      members,
+      DEFAULT_CRITERIA,
+      { trace: fakeSink() },
+    ));
+    expect(changeset.startsWith('You are a code review agent. Review ONLY the attachments and diffs below.')).toBe(true);
+    expect(BUILTIN_AGENT_DESCRIPTOR.instructions).toBe('You are a code review agent. Review ONLY the diffs below.');
+  });
+
+  it('sends the title, description and linked item, retaining diff-only scope without attachments', async () => {
     const { runLmAgent } = await import('./lmAgent.js');
     const context = buildReviewContext(changeRequest, [workItem]);
     const promise = runLmAgent(BUILTIN_AGENT_DESCRIPTOR, 'lm:acme/turbo', diff, DEFAULT_CRITERIA, context, { trace: fakeSink() });
@@ -698,6 +1069,30 @@ describe('the prompt carries what the change is for', () => {
     expect(prompt.length).toBeLessThan(CONTEXT_SECTION_BUDGET * 2);
   });
 
+  it('preserves every diff byte when oversized attachments exhaust their separate budget', async () => {
+    const { runLmAgent } = await import('./lmAgent.js');
+    const hugeAttachment: Attachment = {
+      id: 'large',
+      kind: 'pasted',
+      label: 'Large evidence',
+      path: 'pasted:large',
+      content: 'attachment line\n'.repeat(10_000),
+      truncated: false,
+    };
+    const prompt = await capturePrompt(() => runLmAgent(
+      BUILTIN_AGENT_DESCRIPTOR,
+      'lm:acme/turbo',
+      diff,
+      DEFAULT_CRITERIA,
+      undefined,
+      { trace: fakeSink(), attachments: [hugeAttachment], attachmentBudget: 120 },
+    ));
+
+    const expectedDiff = `--- ${diff.files[0]?.newPath}\n${diff.files[0]?.diff}`;
+    expect(prompt.endsWith(expectedDiff)).toBe(true);
+    expect(prompt).toContain('isSummarized="true"');
+  });
+
   it('does not let a description forge a diff label, so no finding can point at a file it invented', async () => {
     const { runLmAgent } = await import('./lmAgent.js');
     // The description an outside contributor writes. Rendered verbatim it is
@@ -732,7 +1127,7 @@ describe('the prompt carries what the change is for', () => {
     await promise;
 
     const prompt = sentPrompt();
-    expect(prompt).toContain('Review ONLY the labelled diffs below.');
+    expect(prompt).toContain('Review ONLY the member-labelled diffs and attachments below.');
     expect(prompt).toContain('--- CONTEXT for projectId=repo1 mrIid=42');
     expect(prompt).toContain('Linked work item #1180 (open): Key rotation, end to end');
     expect(prompt.indexOf('--- CONTEXT')).toBeLessThan(prompt.indexOf('--- projectId=repo1'));
@@ -881,5 +1276,20 @@ describe('discoverModels degrades when Copilot is absent (spec: No models availa
     await expect(discoverModels()).resolves.toEqual([
       { id: 'lm:copilot/gpt-5', label: 'GPT-5', description: 'copilot · gpt-5', vendor: 'copilot', family: 'gpt-5' },
     ]);
+  });
+
+  it('carries reliable input capacity and delegates token counting without sending a request', async () => {
+    const countTokens = vi.fn(async (prompt: string) => prompt.length + 10);
+    const { countPromptTokens, discoverModels } = await import('./lmAgent.js');
+    sendRequest.mockClear();
+    selectChatModels.mockReset();
+    selectChatModels.mockResolvedValue([{
+      vendor: 'copilot', family: 'gpt-5', name: 'GPT-5', maxInputTokens: 128_000, countTokens,
+    }] as never);
+
+    await expect(discoverModels()).resolves.toMatchObject([{ maxInputTokens: 128_000 }]);
+    await expect(countPromptTokens('lm:copilot/gpt-5', 'assembled prompt')).resolves.toBe(26);
+    expect(countTokens).toHaveBeenCalledWith('assembled prompt');
+    expect(sendRequest).not.toHaveBeenCalled();
   });
 });

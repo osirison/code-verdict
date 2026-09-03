@@ -5,6 +5,7 @@
  * parser maps the spec's `projectId`/`mrIid` field names onto these.
  */
 import type { Criteria as CriteriaShape } from './criteria';
+import type { EffortLevel } from './effort';
 
 export type Severity = 'nit' | 'minor' | 'major' | 'blocker';
 
@@ -63,6 +64,8 @@ export interface Pod {
   agentId: string;
   /** The selected Copilot model. Absent on a pod saved before the split, and on a demo pod. */
   modelId?: string;
+  /** Prompt-level review effort, isolated by model id. Invalid stored entries are ignored on read. */
+  effortByModel?: Record<string, EffortLevel>;
   /** Repository snapshot (id/path/name) taken when sources were resolved. */
   repos?: Array<{ id: string; path: string; name: string }>;
   /** Signed-in username at connection time — drives "waiting on you". */
@@ -72,6 +75,8 @@ export interface Pod {
 export interface ReviewItem {
   id: string;
   file: string;
+  /** Host-derived from diff-file membership. Omitted stored values predate attachments and read as true. */
+  anchored: boolean;
   /** Anchor as reported by the agent. */
   line: number;
   endLine?: number;
@@ -96,6 +101,10 @@ export interface ReviewItem {
   answers?: Partial<Record<'explain' | 'fix' | 'similar' | 'why', string>>;
 }
 
+export function isReviewItemAnchored(item: ReviewItem): boolean {
+  return item.anchored !== false;
+}
+
 export type Verdict = 'accepted' | 'rejected' | 'skipped';
 
 export interface VerdictRecord {
@@ -110,6 +119,8 @@ export interface Review {
   agentId: string;
   /** The model that produced it. Absent on a review stored before the split, and on a demo review. */
   modelId?: string;
+  /** Prompt-level effort that produced it. Absent stored values predate the control and read as `none`. */
+  effort?: EffortLevel;
   criteria: Criteria;
   /** What the agent read — compare against the CR head to detect staleness. */
   headSha: string;

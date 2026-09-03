@@ -11,6 +11,15 @@ const state: SettingsViewState = {
   quietMode: false,
   digestCadence: 'End of day',
   shareRates: false,
+  context: {
+    sectionBudget: 4_000,
+    totalBudget: 12_000,
+    maxLinkedItems: 5,
+    includeTitle: true,
+    includeDescription: true,
+    includeLinkedItems: true,
+    usageEnabled: true,
+  },
   agentLocations: [{ label: '.github/agents', configured: false, status: 'ok', agentCount: 2 }],
   notifications: [
     { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', mode: 'Interrupt' },
@@ -29,12 +38,14 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('Settings');
     expect(html).toContain('Connection');
     expect(html).toContain('Notifications');
+    expect(html).toContain('Context');
     expect(html).toContain('Data &amp; privacy');
     expect(html).toContain('settings.json');
     expect(html).toContain('Agent finished a review');
     expect(html).toContain('A posted thread went stale');
     expect(html).toContain('Rotate token');
     expect(html).toContain('••••••••');
+    expect(html).toContain('The selected agent and model receive diff hunks, file paths, your review criteria, selected attachment contents and paths, and, when enabled, the merge request title, description, and linked issues.');
   });
 
   it('wires controls through typed CSP-safe messages', () => {
@@ -46,6 +57,20 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('let quietMode = false');
     expect(html).toContain('quietMode = !quietMode');
     expect(html).toContain('shareRates = !shareRates');
+  });
+
+  it('renders every context setting and wires validated typed messages', () => {
+    const html = renderSettingsHtml(state, 'nonce123');
+    expect(html).toContain('data-context-budget="sectionBudget" type="number" min="1" step="1" value="4000"');
+    expect(html).toContain('data-context-budget="totalBudget" type="number" min="1" step="1" value="12000"');
+    expect(html).toContain('data-context-budget="maxLinkedItems" type="number" min="1" step="1" value="5"');
+    expect(html).toContain('data-context-toggle="includeTitle" data-enabled="true"');
+    expect(html).toContain('data-context-toggle="includeDescription" data-enabled="true"');
+    expect(html).toContain('data-context-toggle="includeLinkedItems" data-enabled="true"');
+    expect(html).toContain('data-context-toggle="usageEnabled" data-enabled="true"');
+    expect(html).toContain("type: 'setContextBudget'");
+    expect(html).toContain("type: 'setContextToggle'");
+    expect(html).toContain('Number.isInteger(value) && value > 0');
   });
 });
 

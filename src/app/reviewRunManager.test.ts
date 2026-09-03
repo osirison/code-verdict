@@ -16,6 +16,7 @@ import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { ChangeRequestDiff } from '../platform/types';
 import type { KeyValueStore } from './storage';
+import { DEFAULT_CONTEXT_BUDGETS } from './reviewContext';
 
 function memoryStore(): KeyValueStore & { snapshot(): Map<string, unknown> } {
   const map = new Map<string, unknown>();
@@ -54,6 +55,7 @@ function response(itemCount: number, headSha = 'head-1'): AgentReviewResponse {
     items: Array.from({ length: itemCount }, (_, index) => ({
       id: `i${index}`,
       file: 'src/a.ts',
+      anchored: true,
       line: 1,
       severity: 'major' as const,
       category: 'security' as const,
@@ -75,7 +77,9 @@ function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
     agent: BUILTIN_AGENT_DESCRIPTOR,
     agentLabel: 'Default review',
     modelId: 'lm:acme/turbo',
+    effort: 'none',
     timeouts: TIMEOUTS,
+    contextBudgets: DEFAULT_CONTEXT_BUDGETS,
     steps: ['Sending…', 'Indexing…', 'Cross-referencing…', 'Scoring…', 'Items ready'],
     demo: false,
     ...over,
@@ -88,16 +92,19 @@ function controllableRunners() {
   const started: string[] = [];
   const cancelled: string[] = [];
   const progressOf = new Map<string, RunnerOptions['onProgress']>();
+  const warningsOf = new Map<string, RunnerOptions['onAttachmentWarnings']>();
   return {
     started,
     cancelled,
     pending,
     progressOf,
+    warningsOf,
     runners: {
       lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse> {
         const key = input.refLabel;
         started.push(key);
         progressOf.set(key, options.onProgress);
+        warningsOf.set(key, options.onAttachmentWarnings);
         return new Promise<AgentReviewResponse>((resolve, reject) => {
           pending.set(key, { resolve, reject });
           options.cancellation.onCancellationRequested(() => {
@@ -436,6 +443,32 @@ describe('attribution is fixed at trigger', () => {
 });
 
 describe('progress and transitions', () => {
+  it('exposes attachment warnings during the run and retains them after completion', async () => {
+    const { pending, warningsOf, runners } = controllableRunners();
+    const { runs, workspaceState } = manager({ runners });
+    const record = runs.trigger(crInput('2841'), 3);
+
+    warningsOf.get('!2841')?.([{
+      code: 'attachment-unreadable',
+      attachmentId: 'schema',
+      label: 'schema.ts',
+      path: 'src/schema.ts',
+      reason: 'ENOENT',
+    }]);
+
+    expect(runs.get(record.key)?.attachmentWarnings).toEqual([
+      expect.objectContaining({ code: 'attachment-unreadable', path: 'src/schema.ts' }),
+    ]);
+
+    pending.get('!2841')!.resolve(response(1));
+    await vi.waitFor(() => {
+      const retained = readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'));
+      expect(retained?.attachmentWarnings).toEqual([
+        expect.objectContaining({ code: 'attachment-unreadable', path: 'src/schema.ts' }),
+      ]);
+    });
+  });
+
   it('emits a finish at once even when it lands inside the progress throttle', async () => {
     const { pending, progressOf, runners } = controllableRunners();
     let now = 1_000;
@@ -551,6 +584,20 @@ describe('changeset runs', () => {
     // Prefixed keys: a changeset id can never be read as a `repoId!number`.
     expect(started).toHaveLength(2);
     expect(runs.active()).toHaveLength(2);
+  });
+});
+
+describe('stored effort attribution', () => {
+  it('records the immutable run effort on the review', async () => {
+    const { runs, workspaceState } = manager({
+      runners: { lm: async () => response(1), demo: () => ({ response: response(0), steps: [] }) },
+    });
+
+    runs.trigger(crInput('2841', { effort: 'xhigh' }), 3);
+
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeDefined());
+    expect((workspaceState.get('codeVerdict.draft.repo-1!2841') as { review: { effort: string } }).review.effort)
+      .toBe('xhigh');
   });
 });
 

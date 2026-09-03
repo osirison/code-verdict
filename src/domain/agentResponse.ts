@@ -7,6 +7,8 @@
 import type { Category, ReviewItem, Severity } from './types';
 import { ALL_CATEGORIES } from './types';
 import { SEVERITY_ORDER } from './criteria';
+import { normalizeModelVisiblePath } from '../app/modelVisiblePath';
+import type { EvidenceManifest } from '../app/reviewContext';
 
 export interface CandidateBucket {
   severity: Severity;
@@ -39,6 +41,11 @@ export interface RejectedItem {
   reason: string;
 }
 
+export interface AgentResponsePaths {
+  diffPaths: readonly string[];
+  attachmentManifest?: EvidenceManifest;
+}
+
 export class AgentResponseError extends Error {
   constructor(message: string) {
     super(message);
@@ -56,7 +63,15 @@ const CANDIDATE_REASONS = new Set<string>(['belowSeverityFloor', 'belowConfidenc
 
 function itemRejection(raw: Record<string, unknown>): string | null {
   if (typeof raw.file !== 'string' || raw.file === '') return 'missing file';
-  if (typeof raw.line !== 'number' || !Number.isFinite(raw.line)) return 'missing line';
+  if (typeof raw.line !== 'number' || !Number.isInteger(raw.line) || raw.line < 1) {
+    return `invalid line: ${String(raw.line)}`;
+  }
+  if (
+    raw.endLine !== undefined
+    && (typeof raw.endLine !== 'number' || !Number.isInteger(raw.endLine) || raw.endLine < raw.line)
+  ) {
+    return `invalid endLine: ${String(raw.endLine)}`;
+  }
   if (typeof raw.severity !== 'string' || !SEVERITIES.has(raw.severity)) {
     return `invalid severity: ${String(raw.severity)}`;
   }
@@ -76,7 +91,20 @@ function itemRejection(raw: Record<string, unknown>): string | null {
   return null;
 }
 
-function toItem(raw: Record<string, unknown>, index: number): ReviewItem {
+export function manifestContainsLocation(
+  manifest: EvidenceManifest | undefined,
+  path: string,
+  line: number,
+): boolean {
+  if (!Number.isInteger(line) || line < 1) return false;
+  const normalized = normalizeModelVisiblePath(path);
+  return manifest?.some((entry) => (
+    normalizeModelVisiblePath(entry.path) === normalized
+    && entry.ranges.some((range) => line >= range.startLine && line <= range.endLine)
+  )) ?? false;
+}
+
+function toItem(raw: Record<string, unknown>, index: number, anchored: boolean): ReviewItem {
   const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
   const suggestion = isRecord(raw.suggestion)
     ? { old: str(raw.suggestion.old) ?? '', new: str(raw.suggestion.new) ?? '' }
@@ -99,6 +127,7 @@ function toItem(raw: Record<string, unknown>, index: number): ReviewItem {
   return {
     id: str(raw.id) ?? `itm_generated_${index}`,
     file: raw.file as string,
+    anchored,
     line: raw.line as number,
     endLine: typeof raw.endLine === 'number' ? raw.endLine : undefined,
     severity: raw.severity as Severity,
@@ -118,7 +147,7 @@ function toItem(raw: Record<string, unknown>, index: number): ReviewItem {
   };
 }
 
-export function parseAgentReviewResponse(rawInput: unknown): {
+export function parseAgentReviewResponse(rawInput: unknown, paths?: AgentResponsePaths): {
   response: AgentReviewResponse;
   rejected: RejectedItem[];
 } {
@@ -135,6 +164,9 @@ export function parseAgentReviewResponse(rawInput: unknown): {
 
   const items: ReviewItem[] = [];
   const rejected: RejectedItem[] = [];
+  const diffPaths = paths
+    ? new Set(paths.diffPaths.map((path) => normalizeModelVisiblePath(path)))
+    : undefined;
   raw.items.forEach((entry, index) => {
     if (!isRecord(entry)) {
       rejected.push({ index, reason: 'item is not an object' });
@@ -145,7 +177,21 @@ export function parseAgentReviewResponse(rawInput: unknown): {
       rejected.push({ index, reason: rejection });
       return;
     }
-    items.push(toItem(entry, index));
+    const file = normalizeModelVisiblePath(entry.file as string);
+    const anchored = diffPaths?.has(file) ?? true;
+    const line = entry.line as number;
+    if (diffPaths && !anchored && !manifestContainsLocation(paths?.attachmentManifest, file, line)) {
+      const manifested = paths?.attachmentManifest?.some((manifestEntry) => (
+        normalizeModelVisiblePath(manifestEntry.path) === file
+      ));
+      rejected.push({ index, reason: `file was not supplied as diff or attachment: ${file}` });
+      if (manifested) rejected[rejected.length - 1] = {
+        index,
+        reason: `line was outside model-visible attachment evidence: ${file}:${line}`,
+      };
+      return;
+    }
+    items.push(toItem({ ...entry, file }, index, anchored));
   });
 
   const candidates: CandidateBucket[] = Array.isArray(raw.candidates)

@@ -75,6 +75,8 @@ extra instructions
 
 Borrowing the panel's `<attachments>` / `<attachment>` element shape gives an unambiguous, machine-checkable boundary that prose cannot imitate, which matters more here than in the panel because this product's whole safety story is that intent cannot masquerade as evidence.
 
+Rendering the attachments zone also produces a host-owned evidence manifest (D9) from the exact post-budget content. The manifest is kept outside author-controlled content and drives finding validation; wrapper ids and labels are presentation metadata, not evidence paths.
+
 ### D2 — The fence wording changes, and so does the footer promise
 
 `CONTEXT_END_FENCE` currently ends "the diffs are the only material a finding may cite." With reviewable attachments that is false. It becomes a statement that the context above is not citable and that the attachments and diffs below are — the *intent/evidence* boundary is preserved; only the *attachments-are-intent* claim is dropped.
@@ -87,15 +89,21 @@ The run footer's "never the whole repo" becomes a live count: "N changed files +
 
 `quoteDiffLabels` rewrites `^-{3,}` so a description cannot forge a `--- path` label. An attached file is far likelier than a description to legitimately contain `---` (Markdown, YAML front matter, diffs-in-tests), so escaping every one would corrupt the evidence the reviewer attached.
 
-Instead the boundary moves off the `---` convention for the new zone: attachments are delimited by the `<attachments>` element, and each carries a generated `id`. A file whose content contains the literal `</attachments>` has that one sequence escaped — a far narrower and rarer intervention than rewriting every `---` run. `quoteDiffLabels` continues to apply unchanged to auto-derived context, where the text is prose and the escape costs nothing.
+Instead the boundary moves off the `---` convention for the new zone: attachments are delimited by host-generated `<attachments>` and `<attachment>` elements, and each carries a generated `id`. Before any non-host text enters the prompt, a narrow scanner recognises every wrapper-like opening or closing tag whose name is singular `attachment` or plural `attachments`, case-insensitively, with whitespace, attributes, and self-closing syntax permitted. It encodes only that match's leading `<` as `&lt;` and leaves every remaining character intact. Decoding that one entity reconstructs the source text, while variants such as `<ATTACHMENTS>`, `</ Attachments >`, `<attachment data-kind="source">`, and `</ATTACHMENT   >` cannot become structure.
 
-Findings are validated after parse: an item whose `file` matches neither a diff path nor an attachment path is dropped before triage, which is what makes the "finding cites the auto-derived context" scenario enforceable rather than merely instructed.
+Host-generated tags are not passed through this content escape. Their attribute values are XML-escaped by the host so a path, id, root label, or summary flag cannot terminate an attribute or add markup. Attachment Markdown horizontal rules and YAML `---` delimiters remain byte-for-byte unchanged. `quoteDiffLabels` continues to apply unchanged to auto-derived context, where the text is prose and can otherwise imitate a diff label.
+
+*Alternative rejected:* matching only the exact lowercase `</attachments>` sequence. It leaves opening tags, singular tags, and harmless syntactic variants able to imitate host structure.
 
 ### D4 — Out-of-diff findings route to the summary
 
 `ReviewCommentDraft` needs a `DiffAnchor` and no unanchored path exists. Rather than inventing one (a new provider method, implemented twice, with two more contract tests), an accepted finding whose file is not in the diff is appended to the summary body under its own heading, naming file and line.
 
-`ReviewItem` gains `anchored: boolean` — set at parse time by testing whether the finding's **file** is among the diff's paths, not asserted by the agent. **File, not file-and-line.** A finding on a diff file whose line has drifted off an added line is exactly what `src/domain/anchor.ts` exists to repair (exact / moved / lost); testing the line here would mark it unanchored and silently reroute to the summary a finding that today posts inline after re-anchoring. Line placement stays entirely with the existing anchor matcher, untouched by this change. `composeCommentDrafts` filters to `anchored` items; `composeSummaryBody` gains the rest. Triage marks unanchored findings, and the "apply fix" affordance is withheld for them because a suggestion block has no line to attach to.
+Finding validation precedes anchor classification. A finding may proceed only when its host-normalised path is a changed-file path or a D9 manifest path; attachment citations additionally require a positive integer line inside a model-visible manifest range. Wrapper pseudo-paths never pass this gate.
+
+`ReviewItem` gains `anchored: boolean` — set after validation by testing whether the finding's **workspace-root-qualified file** is among the diff's paths, not asserted by the agent. **File, not file-and-line.** A finding on a diff file whose line has drifted off an added line is exactly what `src/domain/anchor.ts` exists to repair (exact / moved / lost); testing the line here would mark it unanchored and silently reroute to the summary a finding that today posts inline after re-anchoring. Line placement stays entirely with the existing anchor matcher, untouched by this classification. A manifest-valid finding whose file is not changed is attachment-only and unanchored regardless of its line. `composeCommentDrafts` filters to `anchored` items; `composeSummaryBody` gains the rest. Triage marks unanchored findings, and the "apply fix" affordance is withheld for them because a suggestion block has no line to attach to.
+
+Provider-bound draft composition repeats the anchor match against the current diff's added-line candidates. An exact match keeps the reported line; a moved match uses the resolved line; a lost match, empty candidate set, missing changed file, or empty code emits no inline draft. The accepted finding is instead named in the summary as withheld because it no longer has a current inline anchor. This submission check does not redefine or mutate `ReviewItem.anchored`; it proves only that the provider position is valid at the point of submission. Changeset members supply candidates from their own current diff so identical paths in separate repositories cannot cross-resolve.
 
 *Alternative rejected:* posting them as inline comments anchored to the diff's first line. It puts a comment about `schema.sql` on an unrelated line of `auth.ts`, which is worse than a summary entry.
 
@@ -129,7 +137,7 @@ The control carries a line stating the level is applied as review instructions. 
 
 Stored as `Record<modelId, EffortLevel>` on the pod. Restoring filters against the seven known values and falls back to the default — the panel's own "filtered against the model's current schema" behaviour, which matters for the same reason: a stored value that no longer means anything must not surface as a broken control.
 
-The control is hidden, not disabled, when the selected agent is the demo agent or no model is available — the panel's `display:none` treatment. Hiding does not clear the stored value.
+The control is hidden, not disabled, when the selected agent is the demo agent or no model is available — the panel's `display:none` treatment. Hiding does not clear the stored value. The demo agent's lack of model effort does not exempt it from the context contract; D11 gives it deterministic attachment inspection.
 
 ### D8 — Copy the gestures, not the chrome
 
@@ -138,6 +146,41 @@ Adopted verbatim because the reviewer already knows them: the label "Add Context
 Deliberately not adopted: the ">" chevron and "·" separator (they do not exist in the product — only in its docs); the `ordinal` registry (this product has a fixed list, not contributed kinds); the Session Info panel (its cost and category breakdown have no analogue here) — the indicator's tooltip carries "{used} / {total} tokens" instead.
 
 Per the CSP note in Context, chips and the indicator use classes only. The usage pie is an inline SVG with class-based fills, not a `style` attribute.
+
+### D9 — A post-budget manifest is the source of attachment evidence provenance
+
+Attachment rendering returns both prompt text and an immutable manifest. Each manifest entry contains a host-generated workspace-root identity, an actual model-visible file path, and one or more inclusive positive-integer line ranges. Entries describe the exact content that survived budgeting:
+
+- A file contributes the visible source-line range after truncation.
+- A selection contributes only its selected source-line range.
+- A folder contributes one entry per child whose content is actually sent; the folder wrapper contributes none.
+- A symbol contributes the source file and range represented to the agent.
+- Problems contribute the source file and range represented for each included diagnostic.
+- Pasted text contributes no file provenance and cannot make a file location valid by imitating a path or manifest record.
+
+The parser normalises a reported identity through the same root-qualified path service, requires an integer line greater than zero, and tests membership in a visible range. The manifest object is never parsed back out of prompt text, so attachment content cannot expand it. A wrapper id, folder label, changeset member label, or other pseudo-path is insufficient without an actual file entry.
+
+*Alternative rejected:* accepting any path found in an attachment wrapper. Folder and problems wrappers can represent several files, and truncation can remove lines the wrapper originally covered.
+
+### D10 — Path identity includes a unique workspace-root qualification
+
+The host assigns each workspace folder a stable root label for the run, disambiguating duplicate display names when necessary. The canonical evidence identity is the tuple `(rootLabel, workspaceRelativePath)`, rendered in a single unambiguous form everywhere a reviewer or agent sees it. Context chips, prompt file paths, diff paths, attachment deduplication, manifest entries, finding normalisation, triage labels, and summary output all use that identity.
+
+Changeset member identity remains an additional outer qualification rather than a replacement for workspace-root identity. This keeps two members or two workspace roots with the same relative path distinct through parse and submission.
+
+*Alternative rejected:* qualifying only duplicate basenames in the chip label. That fixes display ambiguity but leaves prompt validation, deduplication, and stored findings able to collapse separate files.
+
+### D11 — Context behavior is shared by foreground, background, demo, and changeset runs
+
+Dropped or unreadable attachment warnings are values on the retained run result, not transient notifications. Foreground navigation shows them before triage. Background completion stores the same values and surfaces them when the reviewer opens the completed review, before triage begins.
+
+The demo agent receives the same post-budget attachment records and manifest as a model-backed agent. It runs its deterministic finding detector over every model-visible attachment line and emits root-qualified file and line locations through the same manifest-validation and D4 routing path. The UI therefore never advertises an attachment to an agent that ignores it.
+
+On a changeset surface, Run carries the instructions value currently in the webview rather than a value cached when HTML was rendered. The extension host resolves supported `#` references from that latest value, returns unresolved-reference reporting without deleting typed text, and updates the context representation for the run. The `Ctrl+/` command resolves the active panel identity at invocation time and routes Add Context to that changeset panel, preventing stale-panel dispatch.
+
+### D12 — Generated webview scripts have a compilation gate
+
+HTML regression tests extract every generated webview script and compile it with a JavaScript parser or runtime constructor without executing DOM behavior. Fixtures cover single change-request and changeset surfaces with auto-context items, attachment text and paths requiring escaping, resolved and unresolved references, retained warnings, and multi-root labels. Behavioral webview tests remain separate; this gate catches malformed interpolation and generated syntax before runtime.
 
 ## Risks / Trade-offs
 
