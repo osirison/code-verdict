@@ -1242,3 +1242,73 @@ describe('a retained review, and the way back to it', () => {
     expect(html).not.toMatch(/<[^>]+\sstyle="/);
   });
 });
+
+/**
+ * The host holds every editable's in-progress text (task 9.3, design D8):
+ * committed on debounced input — 'change' fires on blur, which left
+ * mid-typing text nowhere but the DOM for a flow-body patch to paint over —
+ * and rendered back into the field, because REGIONS_SCRIPT restores focus
+ * and selection only, never `value`.
+ */
+describe('in-progress text is committed to the host (task 9.3)', () => {
+  const html = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n');
+
+  it('commits the summary, note and instructions on debounced input, never on change', () => {
+    expect(html).toContain("post({ type: 'editSummary', text })");
+    expect(html).toContain("post({ type: 'setNote', text })");
+    expect(html).toContain("post({ type: 'setInstructions', text })");
+    expect(html).not.toContain("post({ type: 'editSummary', text: ev.target.value })");
+    expect(html).not.toContain("post({ type: 'setNote', text: ev.target.value })");
+    expect(html).not.toContain("post({ type: 'setInstructions', text: ev.target.value })");
+  });
+
+  it('keeps the one podStore write on blur, as commitInstructions', () => {
+    // The per-keystroke setInstructions updates in-memory criteria only —
+    // podStore.upsert is a read-modify-write, and one per character is what
+    // task 4.5 forbids.
+    expect(html).toContain("post({ type: 'commitInstructions', text: ev.target.value })");
+  });
+
+  it('flushes pending commits before any click reaches an action handler', () => {
+    // Capture phase, so a submit, copy-md or verdict acts on the text as
+    // typed — a debounce timer outliving the action that consumes it is how
+    // stale text resurrects.
+    expect(html).toContain('pendingCommits');
+    expect(html).toContain('}, true);');
+  });
+
+  it('renders the per-finding ask draft back into the field, escaped', () => {
+    const base = state.items[0]!;
+    const withDraft = renderReviewFlowBody(
+      { ...state, mode: 'split', items: [{ ...base, askDraft: 'why is "x" safe?' }] } as FlowViewState,
+      'HVE Core / PR Review',
+    );
+    expect(withDraft).toContain('id="ask"');
+    expect(withDraft).toContain('value="why is &quot;x&quot; safe?"');
+  });
+
+  it('cancels the pending draft commit when the question is sent', () => {
+    // A commit firing after the host clears the draft on send would write the
+    // already-sent question back for the next patch to replay.
+    expect(html).toContain("dropCommit('ask:' + id)");
+  });
+
+  it('flushes pending commits on blur, not only on a click in the page', () => {
+    // The palette reaches submit directly (codeVerdict.submitReview) without
+    // any click landing in the webview, so a click-only flush would let it
+    // post a summary up to the debounce window out of date — to the platform.
+    // Blur is the one signal every such path shares.
+    expect(html).toContain("document.addEventListener('click', flushCommits, true)");
+    expect(html).toContain("document.addEventListener('blur', flushCommits, true)");
+    expect(html).toContain("window.addEventListener('blur', flushCommits)");
+  });
+
+  it('emits a page script that actually parses', () => {
+    // tsc and eslint never parse the JS inside these template literals, so a
+    // syntax error here reaches the webview and disables the whole page
+    // silently. Compile the emitted script body rather than trusting review.
+    const script = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html)?.[1];
+    expect(script).toBeTruthy();
+    expect(() => new Function(script!)).not.toThrow();
+  });
+});

@@ -60,7 +60,9 @@ describe('sidebar fidelity (prototype navigation)', () => {
     expect(html).toContain('<button class="pod-delete" data-pod-delete="platform"');
     expect(html).toContain('<button class="pod-delete" data-pod-delete="payments"');
     expect(html).toContain('aria-label="Delete pod Platform squad"');
-    expect(html).toContain("document.querySelectorAll('[data-pod-delete]')");
+    // Delegated on document (issue #46 task 2.4), not bound per element —
+    // a patch that replaces the pod list's innerHTML must not detach it.
+    expect(html).toContain("ev.target.closest('[data-pod-delete]')");
     expect(html).toContain("type: 'deletePod'");
     // The selecting rows keep their own hook: [data-pod] must not match the
     // delete buttons, or every delete would also switch pods.
@@ -81,7 +83,9 @@ describe('sidebar fidelity (prototype navigation)', () => {
       '<button class="issue" data-issue-repo="9105" data-issue-number="1180" data-issue-url="https://gitlab.example/hve/platform/notifications/-/issues/1180">',
     );
     expect(html).not.toContain('<div class="issue">');
-    expect(html).toContain("document.querySelectorAll('[data-issue-url]')");
+    // Delegated on document (issue #46 task 2.4) so a region patch to the
+    // lists screen never leaves an issue row's click handler unbound.
+    expect(html).toContain("ev.target.closest('[data-issue-url]')");
   });
 
   it('replaces the general lists with live review progress, filters, and findings', () => {
@@ -374,7 +378,12 @@ describe('changeset scope in the sidebar (spec §15)', () => {
     expect(html).toContain('id="changesets"');
     expect(html).toContain('1 open');
     expect(html).toContain('⧉');
-    expect(html).toContain("type: 'openChangesets', firstId: \"trailer:1180\"");
+    // The id rides a data attribute, read by a delegated handler, rather
+    // than a value closed over at script-load time (issue #46 task 2.4) —
+    // #sidebar-nav is itself a patchable region.
+    expect(html).toContain('data-first-changeset-id="trailer:1180"');
+    expect(html).toContain("type: 'openChangesets'");
+    expect(html).toContain('firstId: el.dataset.firstChangesetId');
   });
 
   it('replaces the Security pill with Cross-repo in changeset scope', () => {

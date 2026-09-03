@@ -12,9 +12,10 @@
  * as spec §16 prescribes for all data fetching.
  */
 import * as vscode from 'vscode';
+import type { AppStore } from '../app/appStore';
 import { connectionForPod } from '../app/connections';
 import { NotificationCenter, STALE_SNAPSHOT_MS, type PendingNotification } from '../app/notificationCenter';
-import { fetchPodData, repoIdsOf } from '../app/podQuery';
+import { repoIdsOf } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { DEFAULT_POLL_INTERVAL_SECONDS, pollIntervalMs } from '../app/pollSchedule';
 import type { ReviewHistory } from '../app/reviewHistory';
@@ -106,6 +107,12 @@ export function readNotificationPrefs(): NotificationPrefs {
 
 export interface NotifierDeps {
   podStore: PodStore;
+  /**
+   * The poll's pod fetch goes through here (task 6.3/D5): the store owns
+   * caching and single-flight, the notifier keeps owning the schedule. The
+   * thread fan-out below still uses `secrets` for its own connection.
+   */
+  appStore: AppStore;
   secrets: SecretStore;
   reviewHistory: ReviewHistory;
   /** Repaint the status bar's 🔔 segment. */
@@ -323,11 +330,14 @@ export class VerdictNotifier implements vscode.Disposable {
     this.lastPollAt = Date.now();
     let nextIn = this.intervalMs();
     try {
-      // Declared background so the provider can keep a reserve back from it:
-      // this poll runs on a schedule nobody asked for, and must not be what
-      // spends the last requests before the user opens a review.
-      const connection = await connectionForPod(pod, this.deps.secrets, { intent: 'background' });
-      const data = await fetchPodData(connection, pod, Date.now());
+      // The store runs the pod fetch now (task 6.3/D5): a tick that lands
+      // inside the freshness window — a focus poll just after a screen
+      // fetched — is served from the held copy and costs nothing, which is
+      // the continuation of the focus throttle #50 added. The fetch the
+      // store does start declares `background` (task 6.3a) so the provider
+      // keeps its interactive reserve, and a rejection surfaces here
+      // unchanged, so the rate-limit stand-down below still sees the error.
+      const data = await this.deps.appStore.revalidate(pod);
       // Reply polling is per submitted review (handoff §16), scoped to CRs
       // still open — merged and closed ones leave the live set, which also
       // bounds the fan-out as history accumulates.
@@ -336,20 +346,29 @@ export class VerdictNotifier implements vscode.Disposable {
         .list()
         .filter((review) => review.podId === pod.id && openRefs.has(`${review.repoId}!${review.crNumber}`));
       this.submittedReviews = submitted.length;
-      const threads: ReviewThread[] = (
-        await Promise.all(
-          submitted.map(async (review) => {
-            const key = `${pod.id}/${review.repoId}!${review.crNumber}`;
-            try {
-              const fetched = await connection.listThreads({ repoId: review.repoId, number: review.crNumber });
-              this.threadCache.set(key, fetched);
-              return fetched;
-            } catch {
-              return this.threadCache.get(key) ?? [];
-            }
-          }),
-        )
-      ).flat();
+      // Threads are per change request, not pod-keyed, so the store never
+      // holds them: this fan-out stays here, on a connection the notifier
+      // builds itself — still declared background, because these requests
+      // too run on a schedule nobody asked for and must not be what spends
+      // the last of the budget before the user opens a review.
+      let threads: ReviewThread[] = [];
+      if (submitted.length > 0) {
+        const connection = await connectionForPod(pod, this.deps.secrets, { intent: 'background' });
+        threads = (
+          await Promise.all(
+            submitted.map(async (review) => {
+              const key = `${pod.id}/${review.repoId}!${review.crNumber}`;
+              try {
+                const fetched = await connection.listThreads({ repoId: review.repoId, number: review.crNumber });
+                this.threadCache.set(key, fetched);
+                return fetched;
+              } catch {
+                return this.threadCache.get(key) ?? [];
+              }
+            }),
+          )
+        ).flat();
+      }
       if (this.disposed) return;
       const vocabulary = getProvider(pod.providerId).vocabulary;
       this.center.observe(

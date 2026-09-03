@@ -10,6 +10,7 @@ import { ScmError } from '../platform/errors';
 import type { ScmProvider } from '../platform/provider';
 import { clearProviders, registerProvider } from '../platform/registry';
 import { GITHUB_VOCABULARY } from '../testing/specFixtures';
+import { AppStore } from '../app/appStore';
 import type { PodStore } from '../app/pods';
 import type { ReviewHistory } from '../app/reviewHistory';
 import type { SecretStore } from '../app/storage';
@@ -116,14 +117,29 @@ let dispose: (() => void) | undefined;
 async function notifierFor(repoCount = 1) {
   const { VerdictNotifier } = await import('./notifier.js');
   const onPollPaused = vi.fn();
-  const podStore = { activePod: pod(repoCount) };
-  const notifier = new VerdictNotifier({
+  // The store bounds its entries to `list()` on every access (task 5.5).
+  const podStore: { activePod: Pod; list: () => Pod[] } = {
+    activePod: pod(repoCount),
+    list: () => [podStore.activePod],
+  };
+  const reviewHistory = {
+    list: () => [],
+    submittedRefs: () => new Set<string>(),
+  } as unknown as ReviewHistory;
+  // A real store over the same mocked connection module (task 6.3): what the
+  // poll spends at the platform is now what the store spends, so `world`
+  // keeps counting the whole path, intent included.
+  const appStore = new AppStore({
     podStore: podStore as unknown as PodStore,
     secrets: {} as unknown as SecretStore,
-    reviewHistory: {
-      list: () => [],
-      submittedRefs: () => new Set<string>(),
-    } as unknown as ReviewHistory,
+    reviewHistory,
+    baseSeconds: () => 60,
+  });
+  const notifier = new VerdictNotifier({
+    podStore: podStore as unknown as PodStore,
+    appStore,
+    secrets: {} as unknown as SecretStore,
+    reviewHistory,
     onBadgeCount: () => undefined,
     onPollPaused,
     openReview: () => undefined,
@@ -158,7 +174,10 @@ describe('the poll that stands down', () => {
     notifier.start();
     await vi.advanceTimersByTimeAsync(0);
     // This poll runs on a schedule nobody asked for. It must not be what
-    // spends the last requests before the user opens a review.
+    // spends the last requests before the user opens a review. The intent
+    // now rides the store's revalidation (task 6.3a) — this asserts the
+    // whole path, notifier → store → connection, still declares it;
+    // appStore.test.ts pins the store's half against its own fake factory.
     expect(world.intents).toEqual(['background']);
   });
 
@@ -327,8 +346,82 @@ describe('the cadence has to stay inside the window the engine still diffs', () 
     expect(world.infos.join(' ')).toContain('Review requested');
   });
 
-  it('a small pod keeps the 15s focus gap it always had', async () => {
+  /**
+   * The deliberate behaviour change of task 6.3, continuing what #50 started:
+   * a focus poll that lands while the held data is younger than the pod's own
+   * interval is served from the store and issues nothing. The 15s throttle
+   * still gates how often the poll *runs* (pinned below with a cold store);
+   * the freshness window now gates what a permitted poll *spends*.
+   */
+  it('a focus poll inside the freshness window issues no platform fetch', async () => {
     const { notifier } = await notifierFor(1);
+    notifier.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.polls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    world.focus?.({ focused: true });
+    await vi.advanceTimersByTimeAsync(0);
+    // The poll ran — the throttle allowed it — but the store served the
+    // 15-second-old data instead of paying for it again.
+    expect(world.polls).toBe(1);
+
+    // The tick the focus poll re-armed lands one interval later, at 75s,
+    // where the data is 75s old — past the window, so it fetches.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(world.polls).toBe(2);
+  });
+
+  /**
+   * The freshness window and the scheduled interval are the same number, so
+   * the comparison has to be strict (`now - fetchedAt < window`): served on
+   * `<=`, the scheduled tick would find "fresh" data at every boundary and
+   * the notifier would never fetch again.
+   */
+  it('the scheduled tick at exactly the interval boundary still fetches', async () => {
+    const { notifier } = await notifierFor(1);
+    notifier.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.polls).toBe(1);
+
+    // The tick fires at exactly pollIntervalMs after the fetch that stamped
+    // the entry — age === window, which must count as stale.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(world.polls).toBe(2);
+  });
+
+  /**
+   * The engine diffs snapshot content against the previous snapshot, not
+   * object identity, so a poll the store served from the held copy derives
+   * nothing — same content — and must not disturb the baseline: the next
+   * tick that carries a real change still surfaces exactly that change.
+   */
+  it('a poll served from held data derives no events and leaves the baseline intact', async () => {
+    const { notifier } = await notifierFor(1);
+    world.crs = [changeRequest([])];
+    notifier.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.polls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    world.focus?.({ focused: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.polls).toBe(1);
+    expect(world.infos).toEqual([]);
+
+    // One rescheduled tick later the pod owner was added as a reviewer.
+    world.crs = [changeRequest(['me'])];
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(world.polls).toBe(2);
+    expect(world.infos.join(' ')).toContain('Review requested');
+  });
+
+  it('a small pod keeps the 15s focus gap when there is anything to fetch', async () => {
+    const { notifier } = await notifierFor(1);
+    // Nothing gets held: every permitted poll reaches the platform, which is
+    // what makes the 15s gap itself observable now that a healthy window
+    // makes a permitted focus poll free.
+    world.failWith = new Error('offline');
     notifier.start();
     await vi.advanceTimersByTimeAsync(0);
     expect(world.polls).toBe(1);
@@ -343,9 +436,12 @@ describe('the cadence has to stay inside the window the engine still diffs', () 
    * The focus path is the one the scheduled cadence does not bound. A flat 15s
    * gap against a 240s interval is 16 polls where the allowance budgeted one:
    * an hour of Alt-Tab on this pod issued ~19,000 requests against 1,200.
+   * The store holds nothing here (the fetches fail), so each permitted poll
+   * still reaches the platform and the gap stays observable.
    */
   it('scales the focus gap with the pod, so a focus flurry cannot outrun the allowance', async () => {
     const { notifier } = await notifierFor(20);
+    world.failWith = new Error('offline');
     notifier.start();
     await vi.advanceTimersByTimeAsync(0);
     expect(world.polls).toBe(1);

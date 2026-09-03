@@ -1,24 +1,26 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import type { AppStore } from '../app/appStore';
 import { detectChangesets } from '../app/changesets';
 import { collectCrossFindings } from '../app/changesetFindings';
 import { connectionForPod } from '../app/connections';
 import { ManualChangesetStore } from '../app/manualChangesets';
 import { deriveMergeOrder } from '../app/mergeOrder';
-import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import { getProvider } from '../platform/registry';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { diffStats } from '../domain/diffHunks';
 import type { Review } from '../domain/types';
-import type { ChangesetMessage } from './changesetHtml';
-import { renderChangesetHtml } from './changesetHtml';
+import type { ChangesetMessage, ChangesetViewState } from './changesetHtml';
+import { renderChangesetBody, renderChangesetHtml, renderChangesetLoadingHtml } from './changesetHtml';
 import { changesetDetectionOptions } from './changesetOptions';
 import { AppSurface, type AppRoute } from './appSurface';
 
 export interface ChangesetPanelDeps {
   podStore: PodStore;
+  /** The shared pod-data copy (task 6.2); the member diffs stay on a direct connection. */
+  appStore: AppStore;
   secrets: SecretStore;
   globalState: KeyValueStore;
   /** The combined-review triage draft lives here (`codeVerdict.changesetDraft.<id>`). */
@@ -53,16 +55,36 @@ export class ChangesetPanel {
 
   private disposed = false;
   private loadSeq = 0;
+  /** First load() on this instance paints the loading skeleton (task 7.6);
+   * see load(). */
+  private painted = false;
+  /** The store subscription below — dropped with the route, or a dead
+   * screen would keep repainting the panel over whatever replaced it. */
+  private readonly storeWatch: { dispose(): void };
 
   private constructor(
     private readonly route: AppRoute,
     private readonly deps: ChangesetPanelDeps,
     private readonly changesetId: string,
   ) {
+    // Pod data now reaches this screen through the store (task 6.4): a poll
+    // that moved a member's CI state or the detected grouping repaints it.
+    // load() reads the store back, so the repaint costs the member diffs only.
+    this.storeWatch = deps.appStore.subscribe((data) => {
+      if (!this.disposed && data.pod.id === this.deps.podStore.activePod?.id) void this.load();
+    });
     route.onLeave(() => {
       this.disposed = true;
+      this.storeWatch.dispose();
       if (ChangesetPanel.current === this) ChangesetPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // e.g. "Developer: Reload Webviews" recreates the webview from the
+    // stored (possibly stale) html. `ready` was just reset, so load()'s own
+    // postRegions call falls back to setHtml on its own — no separate path
+    // needed here, and no need to re-fetch since the member diffs are
+    // already held.
+    route.onReload(() => void this.load());
     route.onMessage((message) => void this.onMessage(message as ChangesetMessage));
   }
 
@@ -71,13 +93,44 @@ export class ChangesetPanel {
     try {
       const pod = this.deps.podStore.activePod;
       if (!pod) return this.deps.openDashboard();
-      const connection = await connectionForPod(pod, this.deps.secrets);
-      const data = await fetchPodData(connection, pod, Date.now());
-      if (this.disposed || seq !== this.loadSeq) return;
       const options = changesetDetectionOptions(this.deps.globalState, pod.id);
+      // First paint on navigation (task 7.6), before the store read below —
+      // the pod name and the changeset id are always known synchronously.
+      // Upgraded to the real changeset name when the store already holds
+      // this pod's data: detectChangesets runs over that synchronously via
+      // `peek`, which — unlike `read` — never starts a fetch of its own.
+      //
+      // Painted unconditionally on first entry, not only when nothing is
+      // held (contrast dashboard.ts's `!this.painted && !read.data`): even
+      // with held pod data this screen still owes a network round for the
+      // per-member diffs below, and that round is exactly what the "upgrade
+      // to the real name" case exists to cover — a guard that skipped
+      // painting whenever data was held would make that case unreachable.
+      if (!this.painted) {
+        const held = this.deps.appStore.peek(pod.id);
+        const knownName = held
+          ? detectChangesets(pod, held.changeRequests, held.workItems, options)
+              .find((candidate) => candidate.id === this.changesetId)?.name
+          : undefined;
+        this.route.setHtml(renderChangesetLoadingHtml(
+          pod.name,
+          knownName ?? this.changesetId,
+          this.changesetId,
+          crypto.randomBytes(16).toString('hex'),
+        ));
+      }
+      this.painted = true;
+      // The pod read goes through the store (task 6.2). The member diffs
+      // below stay on a direct connection: they are per change request,
+      // never pod-keyed, and the store holds pod data only.
+      const read = this.deps.appStore.read(pod);
+      const data = read.data ?? (await read.fetch!);
+      if (this.disposed || seq !== this.loadSeq) return;
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options)
         .find((candidate) => candidate.id === this.changesetId);
       if (!changeset) return this.deps.openDashboard();
+      const connection = await connectionForPod(pod, this.deps.secrets);
+      if (this.disposed || seq !== this.loadSeq) return;
       const diffs = await Promise.all(changeset.members.map((member) => connection.getChangeRequestDiff(member.ref)));
       if (this.disposed || seq !== this.loadSeq) return;
       const stats = diffStats(diffs.flatMap((diff) => diff.files.map((file) => file.diff)));
@@ -93,7 +146,7 @@ export class ChangesetPanel {
         pod.repos?.find((repository) => repository.id === repoId)?.name ?? repoId;
       const order = deriveMergeOrder(changeset.members, findings ?? []);
       this.route.panel.title = `Verdict: Changeset · ${changeset.name}`;
-      this.route.panel.webview.html = renderChangesetHtml({
+      const state: ChangesetViewState = {
         vocabulary: getProvider(pod.providerId).vocabulary,
         id: changeset.id,
         name: changeset.name,
@@ -126,7 +179,13 @@ export class ChangesetPanel {
           reviewed: submitted.has(`${member.ref.repoId}!${member.ref.number}`),
           reason,
         })),
-      }, crypto.randomBytes(16).toString('hex'));
+      };
+      // Patch the region in place rather than replacing the whole document
+      // (task 7.3) — falling back to setHtml only when the page has not yet
+      // signalled ready is exactly today's always-full-render behaviour.
+      if (!this.route.postRegions({ 'cs-body': renderChangesetBody(state) })) {
+        this.route.setHtml(renderChangesetHtml(state, crypto.randomBytes(16).toString('hex')));
+      }
     } catch (error) {
       if (this.disposed || seq !== this.loadSeq) return;
       void vscode.window.showErrorMessage(`Verdict: ${error instanceof Error ? error.message : String(error)}`);

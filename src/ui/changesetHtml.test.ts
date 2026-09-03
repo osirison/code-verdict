@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
-import { renderChangesetHtml, type ChangesetViewState } from './changesetHtml';
+import {
+  renderChangesetHtml,
+  renderChangesetLoadingHtml,
+  type ChangesetViewState,
+} from './changesetHtml';
 
 const state: ChangesetViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -38,15 +42,26 @@ describe('changeset fidelity (spec §15)', () => {
     expect(html).toContain('Rotate signing keys on schedule');
     expect(html).toContain('Show key expiry banner');
     expect(html).toContain('Review all 4 MRs together');
-    expect(html).toContain("type:'openMember'");
-    expect(html).toContain("type:'reviewTogether'");
+    expect(html).toContain("type: 'openMember'");
+    expect(html).toContain("type: 'reviewTogether'");
   });
 
-  it('serializes the changeset id as a JavaScript string literal', () => {
+  // Handlers are delegated on `document` and matched with `closest()` (task
+  // 7.1), so they survive a region patch that replaces this container's
+  // innerHTML — a listener bound directly to a button would not. The
+  // changeset id rides a `data-changeset-id` attribute read at click time
+  // rather than a value baked into the script string, so a script that
+  // outlives the state it was built from (once this screen patches instead
+  // of reassigning the whole document) never answers with a stale id.
+  it('carries the changeset id on a data attribute, escaped for the HTML context', () => {
     const html = renderChangesetHtml({ ...state, id: "trailer:'1180" }, 'nonce123');
 
-    expect(html).toContain(`changesetId:"trailer:'1180"`);
-    expect(html).not.toContain(`changesetId:'trailer:'1180'`);
+    expect(html).toContain(`data-changeset-id="trailer:'1180"`);
+    expect(html).toContain('document.querySelector(\'[data-changeset-id]\')');
+    // The id itself never appears baked into the script as a literal — only
+    // read back from the data attribute above.
+    expect(html).not.toContain(`changesetId: "trailer:'1180"`);
+    expect(html).not.toContain(`changesetId:"trailer:'1180"`);
   });
 
   it('omits the issue chip for branch-detected changesets and shows the remove link only for manual ones', () => {
@@ -61,7 +76,7 @@ describe('changeset fidelity (spec §15)', () => {
 
     const manual = renderChangesetHtml({ ...state, linkedIssue: undefined, manual: true }, 'n');
     expect(manual).toContain('Remove changeset');
-    expect(manual).toContain("type:'removeChangeset'");
+    expect(manual).toContain("type: 'removeChangeset'");
   });
 
   it('renders cross-repo findings with both sides and their roles, wired to triage', () => {
@@ -85,7 +100,7 @@ describe('changeset fidelity (spec §15)', () => {
     expect(html).toContain('still reads the old name');
     expect(html).toContain('src/api/session.ts:41');
     expect(html).toContain('confidence 94%');
-    expect(html).toContain("type:'openFinding'");
+    expect(html).toContain("type: 'openFinding'");
     // The blockers metric now carries a real count.
     expect(html).not.toContain('<div class="metric-value ">—</div>');
     // The trap sentence names what green pipelines cannot see.
@@ -120,5 +135,43 @@ describe('changeset fidelity (spec §15)', () => {
     }, 'n');
 
     expect(html).not.toContain('class="reason"');
+  });
+});
+
+describe('the loading document is a full citizen, not a placeholder', () => {
+  // It ships the same SCRIPT and arms the same region handshake, so once the
+  // page is ready the completing load() patches only #cs-body and whatever
+  // the skeleton put on the <main> is what the screen keeps for its whole
+  // life. An attribute the handlers read at click time therefore has to be on
+  // BOTH documents or neither.
+  it('carries data-changeset-id, so actions still resolve after the first patch', () => {
+    const loading = renderChangesetLoadingHtml('Platform', 'trailer:#1180', "trailer:'1180", 'n');
+    // escapeHtml covers " but not ', which is safe inside a double-quoted
+    // attribute — this is the same shape the full document emits.
+    expect(loading).toContain(`data-changeset-id="trailer:'1180"`);
+  });
+
+  it('puts the id in the same place the full document does', () => {
+    // The regression was the two documents disagreeing about the shell. If
+    // this ever diverges again, the click handlers read undefined.
+    const id = 'trailer:#1180';
+    const loading = renderChangesetLoadingHtml('Platform', id, id, 'n');
+    const full = renderChangesetHtml({
+      id,
+      name: 'Rate limiting',
+      vocabulary: GITLAB_VOCABULARY,
+      members: [],
+      added: 0,
+      removed: 0,
+      pipelinesPassing: 0,
+      reviewed: 0,
+      detectionDetail: 'trailer',
+      findings: [],
+      agentRan: false,
+    } as unknown as ChangesetViewState, 'n');
+
+    const shellOf = (html: string): string | undefined =>
+      /<main class="wrap"[^>]*>/.exec(html)?.[0];
+    expect(shellOf(loading)).toBe(shellOf(full));
   });
 });

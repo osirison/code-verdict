@@ -91,6 +91,21 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; }
 .footer-note { margin-left: auto; color: var(--fg-dimmer); font-size: 11px; }
 .remove-link { border: 0; background: none; padding: 0; color: var(--fg-dimmer); font-size: 11px; cursor: pointer; }
 .remove-link:hover { color: var(--sev-blocker); text-decoration: underline; }
+
+/* Loading-skeleton bars for this screen's first paint (issue #39 task 7.6),
+   named for the real element each stands in for and sized by a class here —
+   never a style attribute, which this page's CSP silently drops (issue #45).
+   Prefixed cs- (not dashboardHtml.ts's bare .skel-title etc.) so a future
+   CSS union (task 8.1) cannot pair this screen's sizing with another's
+   same-named class. */
+.skel-cs-title { width: 220px; height: 15px; }
+.skel-cs-meta { width: 60%; height: 10px; }
+.skel-cs-metric { width: 46px; height: 15px; }
+.skel-cs-label { width: 70px; height: 10.5px; }
+.skel-cs-note { width: 70%; height: 11.5px; }
+.skel-cs-line { width: 80%; height: 12px; }
+.skel-cs-step { width: 12px; height: 12px; border-radius: 50%; }
+.skel-cs-state { width: 60px; height: 10.5px; }
 `;
 
 /**
@@ -135,13 +150,117 @@ function renderFindings(state: ChangesetViewState): string {
   return `<div class="findings">${state.findings.map((finding) => `<button class="finding-card" data-finding="${e(finding.id)}"><div class="finding-head"><span class="sev sev-${finding.severity}">${finding.severity}</span><span class="finding-title">${e(finding.title)}</span>${finding.confidence === undefined ? '' : `<span class="finding-confidence">confidence ${finding.confidence}%</span>`}</div>${finding.sides.map((side) => `<div class="finding-side"><span class="side-repo">${e(side.project)}</span><span><span class="side-location">${e(side.location)}</span><span class="side-role">${e(side.role)}</span></span></div>`).join('')}</button>`).join('')}</div>`;
 }
 
-export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
+/**
+ * Bound once on `document`, not per element (issue #39): this screen is
+ * about to move to region patching (task 7.3), which replaces a container's
+ * innerHTML wholesale and would drop any listener bound directly to a node
+ * inside it. Delegation means the patched markup never needs re-binding, the
+ * same reasoning as reviewFlowHtml.ts:1267-1274.
+ *
+ * `changesetId` is read from `[data-changeset-id]` at click time rather than
+ * closed over at script-build time: the trap phase 1 hit (sidebarHtml.ts's
+ * `data-first-changeset-id`) is a value baked into the script string when it
+ * was still safe to assume the script never outlives the state it was built
+ * from. Once this screen patches instead of reassigning the whole document,
+ * the script survives across state changes it was not built from — a baked
+ * id would keep answering with whichever changeset was current when the
+ * page first painted.
+ */
+const SCRIPT = `
+const vscode = window.verdictVscode;
+const post = (m) => vscode.postMessage(m);
+const on = (id, type, extra) => document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#' + id)) return;
+  post({ type, ...(extra ?? {}) });
+});
+const changesetId = () => document.querySelector('[data-changeset-id]')?.dataset.changesetId;
+document.addEventListener('click', (ev) => {
+  const row = ev.target.closest('[data-repo]');
+  if (row) post({ type: 'openMember', repoId: row.dataset.repo, number: row.dataset.number });
+});
+document.addEventListener('click', (ev) => {
+  const card = ev.target.closest('[data-finding]');
+  if (card) post({ type: 'openFinding', changesetId: changesetId(), itemId: card.dataset.finding });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#review-together')) post({ type: 'reviewTogether', changesetId: changesetId() });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#remove-changeset')) post({ type: 'removeChangeset', changesetId: changesetId() });
+});
+on('back', 'back');
+`;
+
+/**
+ * The data-dependent part of the page (issue #39 task 7.3): everything a
+ * repaint can change, wrapped by both the full page and the loading page in
+ * the same `id="cs-body"` container so a patch can replace either with the
+ * other — one source of markup, no duplication. `data-changeset-id` stays
+ * OUTSIDE this function, on the `<main>` shell in `renderChangesetHtml` below
+ * — it must survive a patch unchanged, since the delegated script (task 7.1)
+ * re-reads it from the DOM on every click rather than closing over it.
+ */
+export function renderChangesetBody(state: ChangesetViewState): string {
   const v = state.vocabulary;
   const allPipelines = state.pipelinesPassing === state.members.length;
   const allReviewed = state.reviewed === state.members.length;
   const members = state.members.map((member, index) => `<button class="member" data-repo="${e(member.repoId)}" data-number="${e(member.number)}"><span class="step">${index + 1}</span><span><span class="member-title">${e(member.refLabel)} · ${e(member.title)}</span><span class="member-meta">${e(member.project)}</span>${member.reason ? `<span class="reason">${e(member.reason)}</span>` : ''}</span><span class="state"><span class="${member.reviewed ? 'ok' : 'warn'}">${member.reviewed ? 'reviewed' : 'not reviewed'}</span><br><span class="${member.ciStatus === 'success' ? 'ok' : member.ciStatus === 'failed' ? 'bad' : 'dimmer'}">${e(v.ciNoun)} ${e(member.ciStatus ?? 'none')}</span></span></button>`).join('');
-  const body = `<main class="wrap"><header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer></main>`;
-  const changesetId = JSON.stringify(state.id);
-  const script = `const vscode=window.verdictVscode;const post=(message)=>vscode.postMessage(message);document.querySelectorAll('[data-repo]').forEach((row)=>row.addEventListener('click',()=>post({type:'openMember',repoId:row.dataset.repo,number:row.dataset.number})));document.querySelectorAll('[data-finding]').forEach((card)=>card.addEventListener('click',()=>post({type:'openFinding',changesetId:${changesetId},itemId:card.dataset.finding})));document.getElementById('review-together')?.addEventListener('click',()=>post({type:'reviewTogether',changesetId:${changesetId}}));document.getElementById('remove-changeset')?.addEventListener('click',()=>post({type:'removeChangeset',changesetId:${changesetId}}));document.getElementById('back')?.addEventListener('click',()=>post({type:'back'}));`;
-  return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script, breadcrumb: { current: state.name } });
+  return `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer>`;
+}
+
+/**
+ * The page shell both documents share.
+ *
+ * `data-changeset-id` sits on the `<main>`, deliberately OUTSIDE `#cs-body`:
+ * the delegated handlers read it at click time (see SCRIPT), and a region
+ * patch replaces the container's innerHTML, never the container itself, so an
+ * id kept inside would be fine but an id kept in a script closure would go
+ * stale. That only holds while EVERY document that can be the loaded page
+ * carries it. The loading skeleton is such a document — it ships the same
+ * SCRIPT and arms the same region handshake — and it once omitted the
+ * attribute, so a cold open patched `#cs-body` and left a `<main>` that never
+ * gained it, making openFinding, reviewTogether and removeChangeset all post
+ * `changesetId: undefined` for the life of the screen. Hence one shell, used
+ * by both, rather than two places to keep in step.
+ */
+function shell(changesetId: string, inner: string): string {
+  return `<main class="wrap" data-changeset-id="${e(changesetId)}"><div id="cs-body">${inner}</div></main>`;
+}
+
+export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
+  const body = shell(state.id, renderChangesetBody(state));
+  return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: state.name } });
+}
+
+/**
+ * First paint on navigation (issue #39 task 7.6), before `load()`'s member
+ * diff fetch: the active pod's name and the changeset id are known
+ * synchronously (the id is the route parameter itself), so the header shows
+ * real text instead of leaving the previous screen frozen for the whole
+ * fetch. `changesetLabel` is upgraded to the changeset's real name by the
+ * caller when the store (task 6.2) already holds this pod's platform data —
+ * `detectChangesets` runs over that synchronously — and falls back to the
+ * raw id on a cold open, where nothing is held yet. Everything past the
+ * header — added/removed, findings, merge order — needs the per-member diff
+ * fetch `load()` always makes, held data or not, so it is a skeleton
+ * regardless of which label this call got. Wrapped in the same `id="cs-body"`
+ * container the data patch replaces, and carries the same `SCRIPT` as the
+ * full page: this is the only document a cold open ever runs the script
+ * from, and the later data patch only ever patches into it.
+ */
+export function renderChangesetLoadingHtml(
+  podName: string,
+  changesetLabel: string,
+  changesetId: string,
+  nonce: string,
+): string {
+  const metrics = Array.from({ length: 3 })
+    .map(() => `<div class="metric"><div class="metric-value"><span class="skel skel-cs-metric"></span></div><div class="metric-label"><span class="skel skel-cs-label"></span></div></div>`)
+    .join('');
+  const memberRows = Array.from({ length: 3 })
+    .map(() => `<div class="member"><span class="step"><span class="skel skel-cs-step"></span></span><span><span class="member-title"><span class="skel skel-cs-title"></span></span><span class="member-meta"><span class="skel skel-cs-meta"></span></span></span><span class="state"><span class="skel skel-cs-state"></span></span></div>`)
+    .join('');
+  const bodyInner = `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(changesetLabel)}</h1></div><div class="subline">${e(podName)}</div></header><section class="readiness">${metrics}<div class="readiness-note"><span class="skel skel-cs-note"></span></div></section><section><div class="section-label">Findings that only exist between these repos</div><div class="empty-findings"><span class="skel skel-cs-line"></span></div></section><section><div class="section-label">Merge order</div><div class="order">${memberRows}</div></section><footer class="footer"><button class="btn" id="back">Back to dashboard</button></footer>`;
+  const body = shell(changesetId, bodyInner);
+  return renderPage({ title: `Verdict: Changeset · ${changesetLabel}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: changesetLabel } });
 }

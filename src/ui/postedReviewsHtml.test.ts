@@ -67,6 +67,7 @@ function state(rows: PostedRow[], overrides: Partial<PostedViewState> = {}): Pos
     showArchived: false,
     archivedCount: 0,
     opinions: {},
+    replyDrafts: {},
     ...overrides,
   };
 }
@@ -141,6 +142,66 @@ describe('reply affordance (#33 — Enter did nothing, no send button)', () => {
     expect(html).not.toContain('data-reply=');
     expect(html).not.toContain('data-reply-send=');
     expect(html).toContain('data-reopen="thread-1"');
+  });
+});
+
+describe('the reply field survives a patch (issue #46 tasks 7.4a, 9.3)', () => {
+  it('gives the reply input a stable id — REGIONS_SCRIPT restores focus by id and had nothing to restore to before this', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread()])], { expandedThreadId: 'thread-1' }),
+      'nonce123',
+    );
+    expect(html).toContain('id="reply-input"');
+    expect(html).toContain('data-reply="thread-1"');
+  });
+
+  it('renders the panel-held draft back into the field, keyed per thread within the review', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread()])], {
+        expandedThreadId: 'thread-1',
+        replyDrafts: { '9101!2841:thread-1': 'Still not convinced this is safe under load.' },
+      }),
+      'nonce123',
+    );
+    expect(html).toContain('value="Still not convinced this is safe under load."');
+  });
+
+  it('leaves the field blank when no draft is held for this thread — a stale key for a different thread must not leak in', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread()])], {
+        expandedThreadId: 'thread-1',
+        replyDrafts: { '9101!2841:some-other-thread': 'Not this thread.' },
+      }),
+      'nonce123',
+    );
+    expect(html).toContain('id="reply-input" data-reply="thread-1" value=""');
+  });
+
+  it('posts a debounced replyDraft message on input, never on every keystroke synchronously and never from the send path', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread()])], { expandedThreadId: 'thread-1' }),
+      'nonce123',
+    );
+    expect(html).toContain("post({ type: 'replyDraft', threadId, text })");
+    expect(html).toContain("document.addEventListener('input'");
+    // Per-thread timers, not one shared timer — switching to another
+    // thread's field mid-debounce must not cancel a commit this thread's
+    // timer is still waiting on (watch point: a patch must not destroy a
+    // draft for a thread other than the one being acted on).
+    expect(html).toContain('replyDraftTimers.get(threadId)');
+    expect(html).toContain('replyDraftTimers.set(threadId,');
+  });
+
+  it('cancels this thread\'s pending debounce commit before sending, so a slow timer cannot resurrect already-sent text', () => {
+    const html = renderPostedReviewsHtml(
+      state([row([thread()])], { expandedThreadId: 'thread-1' }),
+      'nonce123',
+    );
+    const submitReply = html.slice(html.indexOf('function submitReply'), html.indexOf('function submitReply') + html.slice(html.indexOf('function submitReply')).indexOf('}\n'));
+    expect(submitReply).toContain('clearTimeout(replyDraftTimers.get(input.dataset.reply))');
+    // Ordered before the post — cancelling after would already be too late
+    // if the round trip resolves before this tick ends.
+    expect(submitReply.indexOf('clearTimeout')).toBeLessThan(submitReply.indexOf("post({ type: 'reply'"));
   });
 });
 

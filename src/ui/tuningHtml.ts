@@ -46,12 +46,36 @@ function suggestionButton(suggestion: TuningViewState['suggestions'][number]): s
     : `<button class="btn btn-accent" data-suggestion="${escapeHtml(suggestion.id)}">${escapeHtml(suggestion.action)}</button>`;
 }
 
-export function renderTuningHtml(state: TuningViewState, nonce: string): string {
+/**
+ * Bound once on `document`, not per element (issue #39): this screen is
+ * about to move to region patching (task 7.3), which replaces a container's
+ * innerHTML wholesale and would drop any listener bound directly to a node
+ * inside it. Delegation means the patched markup never needs re-binding.
+ */
+const SCRIPT = `
+const vscode = window.verdictVscode;
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-suggestion]');
+  if (button) vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion });
+});
+`;
+
+/**
+ * The data-dependent part of the page (issue #39 task 7.3), covering both
+ * the empty-scorecard and normal branches — wrapped by the full page in the
+ * same `id="tune-body"` container in EITHER case, so a patch aimed at it
+ * always finds something to replace. Before this, the empty branch and the
+ * populated one were different top-level markup with no shared container id;
+ * a patch built from one state landing while the page showed the other
+ * would target an id that only exists in the state it was NOT built from,
+ * and `REGIONS_SCRIPT` skips a missing id rather than throwing — so it would
+ * silently do nothing instead of switching branches.
+ */
+export function renderTuningBody(state: TuningViewState): string {
   const header = `<header class="head"><span class="agent">${escapeHtml(state.agentLabel)}</span><h1>${escapeHtml(state.headline)}</h1><span class="subline">${escapeHtml(state.subline)}</span></header>`;
   if (state.empty) {
-    const body = `<main class="wrap">${header}
-      <div class="empty">The scorecard derives from your verdicts. Accept rates by category and confidence — and the criteria suggestions they generate — appear after your first submitted review.</div></main>`;
-    return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: '', breadcrumb: { current: 'Agent tuning' } });
+    return `${header}
+      <div class="empty">The scorecard derives from your verdicts. Accept rates by category and confidence — and the criteria suggestions they generate — appear after your first submitted review.</div>`;
   }
   // "No evidence" and "evidence says healthy" are different claims: histories
   // predating per-finding observations must not render the all-healthy copy.
@@ -61,10 +85,13 @@ export function renderTuningHtml(state: TuningViewState, nonce: string): string 
   const suggestions = state.suggestions.length > 0
     ? state.suggestions.map((suggestion) => `<div class="suggestion"><div class="suggestion-copy"><span class="suggestion-title">${escapeHtml(suggestion.title)}</span><span class="suggestion-body">${escapeHtml(suggestion.body)}</span></div>${suggestionButton(suggestion)}</div>`).join('')
     : `<div class="empty">${noSuggestions}</div>`;
-  const body = `<main class="wrap">${header}
+  return `${header}
     <section class="section"><div class="label">Accept rate by category</div>${rows(state.categories)}</section>
     <section class="section"><div class="label">Accept rate by agent confidence</div>${rows(state.confidence)}</section>
-    <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section></main>`;
-  const script = `const vscode = window.verdictVscode; document.querySelectorAll('[data-suggestion]').forEach((button) => button.addEventListener('click', () => vscode.postMessage({ type: 'applySuggestion', suggestionId: button.dataset.suggestion })));`;
-  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script, breadcrumb: { current: 'Agent tuning' } });
+    <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section>`;
+}
+
+export function renderTuningHtml(state: TuningViewState, nonce: string): string {
+  const body = `<main class="wrap"><div id="tune-body">${renderTuningBody(state)}</div></main>`;
+  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Agent tuning' } });
 }

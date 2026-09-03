@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Review } from '../domain/types';
 import {
+  carryRetainedResult,
   clearChangesetSubmitLedger,
   clearSubmitLedger,
   mergeRetainedDraft,
@@ -154,6 +155,10 @@ describe('merging UI edits into retained results', () => {
     filesRead: 7,
     attachmentWarnings: [warning],
   };
+
+  it('carries every run metadata field into a coalesced whole-record write', () => {
+    expect(carryRetainedResult(metadata)).toEqual(metadata);
+  });
 
   it('keeps all run metadata through verdict, summary, note, and follow-up edits then reopen', () => {
     let stored: SessionDraft = { ...retainedFromRun({

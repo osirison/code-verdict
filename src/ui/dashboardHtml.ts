@@ -550,6 +550,13 @@ const SCRIPT = `
   // when the whole document (and this script) reloaded each time. Without
   // it a stale filter would silently keep applying to rows a chip click
   // never touched, while the freshly-rendered chips show "All" active.
+  //
+  // Not a duplicate of REGIONS_SCRIPT (theme.ts) and not covered by it
+  // (task 7.5): that listener only patches the named regions' innerHTML and
+  // restores focus/selection/scroll — it has no notion of scopeSel/repoSel,
+  // which are private to this page's own script. Deleting this block as
+  // redundant with REGIONS_SCRIPT would leave a stale filter silently
+  // applied to freshly-patched rows it never touched.
   window.addEventListener('message', (ev) => {
     const data = ev.data;
     if (data && data.type === 'verdict:regions' && data.regions && 'db-body' in data.regions) {

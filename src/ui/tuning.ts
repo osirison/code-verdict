@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import type { KeyValueStore } from '../app/storage';
-import { renderTuningHtml, type TuningMessage } from './tuningHtml';
+import { renderTuningBody, renderTuningHtml, type TuningMessage } from './tuningHtml';
 import { deriveTuningState, type TuningSuggestion } from './tuningState';
 import { AppSurface, type AppRoute } from './appSurface';
 import { COMMANDS } from '../commands';
@@ -52,10 +52,15 @@ export class TuningPanel {
       this.disposed = true;
       if (TuningPanel.current === this) TuningPanel.current = undefined;
     });
+    // The document reloaded underneath this route (issue #39 follow-up) —
+    // repaint from the criteria/history already held rather than treating it
+    // as a fresh navigation (which would also be harmless here, since this
+    // screen has no fetch to skip — but render()'s own postRegions call
+    // falls back to setHtml on its own once `ready` is reset, so no separate
+    // path is needed).
+    route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as TuningMessage));
   }
-
-  private get panel(): vscode.WebviewPanel { return this.route.panel; }
 
   private state() {
     const pod = this.deps.podStore.activePod;
@@ -94,7 +99,12 @@ export class TuningPanel {
     const state = this.state();
     if (!state) return;
     const view = { ...state.view, suggestions: this.mergeSuggestions(state.view.suggestions) };
-    this.panel.webview.html = renderTuningHtml(view, crypto.randomBytes(16).toString('hex'));
+    // Patch the region in place rather than replacing the whole document
+    // (task 7.3) — falling back to setHtml only when the page has not yet
+    // signalled ready is exactly today's always-full-render behaviour.
+    if (!this.route.postRegions({ 'tune-body': renderTuningBody(view) })) {
+      this.route.setHtml(renderTuningHtml(view, crypto.randomBytes(16).toString('hex')));
+    }
   }
 
   private async onMessage(message: TuningMessage): Promise<void> {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PodStore } from '../app/pods';
 import type { SubmittedReview } from '../app/reviewHistory';
 import type { KeyValueStore } from '../app/storage';
@@ -9,6 +9,7 @@ import { renderTuningHtml } from './tuningHtml';
 
 const handlers = vi.hoisted(() => ({
   message: undefined as ((message: unknown) => void) | undefined,
+  dispose: undefined as (() => void) | undefined,
 }));
 
 const panel = vi.hoisted(() => ({
@@ -16,12 +17,16 @@ const panel = vi.hoisted(() => ({
   reveal: vi.fn(),
   webview: {
     html: '',
+    postMessage: vi.fn(),
     onDidReceiveMessage: vi.fn((handler: (message: unknown) => void) => {
       handlers.message = handler;
       return { dispose: vi.fn() };
     }),
   },
-  onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+  onDidDispose: vi.fn((handler: () => void) => {
+    handlers.dispose = handler;
+    return { dispose: vi.fn() };
+  }),
 }));
 
 vi.mock('vscode', () => ({
@@ -29,6 +34,12 @@ vi.mock('vscode', () => ({
   window: { createWebviewPanel: vi.fn(() => panel) },
   commands: { executeCommand: vi.fn() },
 }));
+
+type RegionsMessage = { type: 'verdict:regions'; regions: Record<string, string> };
+
+function lastPosted(): RegionsMessage {
+  return panel.webview.postMessage.mock.calls.at(-1)?.[0] as RegionsMessage;
+}
 
 const history: SubmittedReview[] = [{
   repoId: '9101', crNumber: '2841', podId: 'pod', agentId: 'demo', agentLabel: 'HVE Core · PR Review',
@@ -200,6 +211,15 @@ describe('agent tuning fidelity (spec §10)', () => {
 describe('TuningPanel apply flow', () => {
   beforeEach(() => {
     panel.webview.html = '';
+    panel.webview.postMessage.mockClear();
+  });
+
+  afterEach(() => {
+    // Dispose the surface so the next test builds a fresh panel and route —
+    // `AppSurface`'s and `TuningPanel`'s statics otherwise survive test
+    // boundaries in the same module instance (settings.test.ts's pattern).
+    handlers.dispose?.();
+    handlers.message = undefined;
   });
 
   function makeDeps(pods: Pod[], activeId: string, reviews: SubmittedReview[]) {
@@ -266,5 +286,51 @@ describe('TuningPanel apply flow', () => {
     TuningPanel.show(deps);
     expect(panel.webview.html).not.toContain('✓ applied');
     expect(panel.webview.html).toContain('No reviews yet');
+  });
+
+  it('once the page is ready, applying a suggestion patches tune-body instead of reassigning the document', async () => {
+    const podA = makePod('pod');
+    const recent = [{ ...history[0]!, submittedAt: new Date(Date.now() - 86_400_000).toISOString() }];
+    const { deps } = makeDeps([podA], 'pod', recent);
+    const { TuningPanel } = await import('./tuning.js');
+
+    TuningPanel.show(deps);
+    // Arm the route the way REGIONS_SCRIPT does on a real page load — the
+    // shape every migrated screen's tests use (settings.test.ts).
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+    panel.webview.html = '';
+
+    handlers.message?.({ type: 'applySuggestion', suggestionId: 'confidence:80' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(panel.webview.html).toBe('');
+    expect(panel.webview.postMessage).toHaveBeenCalledOnce();
+    const posted = lastPosted();
+    expect(posted.type).toBe('verdict:regions');
+    expect(Object.keys(posted.regions)).toEqual(['tune-body']);
+    expect(posted.regions['tune-body']).toContain('✓ applied');
+  });
+
+  it('a reload resets readiness and the next repaint falls back to a full setHtml', async () => {
+    const podA = makePod('pod');
+    const recent = [{ ...history[0]!, submittedAt: new Date(Date.now() - 86_400_000).toISOString() }];
+    const { deps } = makeDeps([podA], 'pod', recent);
+    const { TuningPanel } = await import('./tuning.js');
+
+    TuningPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+    panel.webview.html = '';
+
+    // A second `verdictReady` while already ready is what a webview reload
+    // looks like (AppRoute.onReload's doc comment) — it resets `ready` and
+    // fires tuning.ts's `onReload`, which repaints from the criteria/history
+    // already held. render()'s own postRegions call falls back to setHtml on
+    // its own since `ready` was just reset — no separate path needed.
+    handlers.message?.({ type: 'verdictReady' });
+
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.webview.html).toContain('Set 80% floor');
   });
 });
