@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
-import { renderChangesetHtml, type ChangesetViewState } from './changesetHtml';
+import {
+  renderChangesetHtml,
+  renderChangesetLoadingHtml,
+  type ChangesetViewState,
+} from './changesetHtml';
 
 const state: ChangesetViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -131,5 +135,43 @@ describe('changeset fidelity (spec §15)', () => {
     }, 'n');
 
     expect(html).not.toContain('class="reason"');
+  });
+});
+
+describe('the loading document is a full citizen, not a placeholder', () => {
+  // It ships the same SCRIPT and arms the same region handshake, so once the
+  // page is ready the completing load() patches only #cs-body and whatever
+  // the skeleton put on the <main> is what the screen keeps for its whole
+  // life. An attribute the handlers read at click time therefore has to be on
+  // BOTH documents or neither.
+  it('carries data-changeset-id, so actions still resolve after the first patch', () => {
+    const loading = renderChangesetLoadingHtml('Platform', 'trailer:#1180', "trailer:'1180", 'n');
+    // escapeHtml covers " but not ', which is safe inside a double-quoted
+    // attribute — this is the same shape the full document emits.
+    expect(loading).toContain(`data-changeset-id="trailer:'1180"`);
+  });
+
+  it('puts the id in the same place the full document does', () => {
+    // The regression was the two documents disagreeing about the shell. If
+    // this ever diverges again, the click handlers read undefined.
+    const id = 'trailer:#1180';
+    const loading = renderChangesetLoadingHtml('Platform', id, id, 'n');
+    const full = renderChangesetHtml({
+      id,
+      name: 'Rate limiting',
+      vocabulary: GITLAB_VOCABULARY,
+      members: [],
+      added: 0,
+      removed: 0,
+      pipelinesPassing: 0,
+      reviewed: 0,
+      detectionDetail: 'trailer',
+      findings: [],
+      agentRan: false,
+    } as unknown as ChangesetViewState, 'n');
+
+    const shellOf = (html: string): string | undefined =>
+      /<main class="wrap"[^>]*>/.exec(html)?.[0];
+    expect(shellOf(loading)).toBe(shellOf(full));
   });
 });

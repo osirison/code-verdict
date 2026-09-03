@@ -70,6 +70,7 @@
 
 ## 8. The resident shell (D7)
 
+- [x] 7.6a Every document that can be the loaded page must carry the attributes the delegated handlers read. Found in review of 7.6: the changeset loading skeleton ships the same script and arms the same region handshake, but omitted `data-changeset-id` from its `<main>`. Because the completing `load()` patches only `#cs-body`, a cold open left a `<main>` that never gained it, and openFinding/reviewTogether/removeChangeset posted `changesetId: undefined` for the life of the screen. Both documents now come from one `shell()`, so they cannot diverge; a test compares the two shells directly.
 - [ ] 8.1 Audit every screen's CSS for unprefixed selectors that would collide once unioned. Record what changed.
 - [ ] 8.2 Scope each route's CSS under a route ancestor class, and add `#app-route` as the swappable body container in `renderPage` (`src/ui/theme.ts:449-490`).
 - [ ] 8.3 Build the shell document once per panel lifetime: the union of every route's CSS and bootstrap script, assigned via `setHtml` on first paint and on `onReload` (`src/ui/appSurface.ts:9-21`). No new "force full" signal.

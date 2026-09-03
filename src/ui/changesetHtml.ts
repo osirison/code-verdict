@@ -208,8 +208,27 @@ export function renderChangesetBody(state: ChangesetViewState): string {
   return `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer>`;
 }
 
+/**
+ * The page shell both documents share.
+ *
+ * `data-changeset-id` sits on the `<main>`, deliberately OUTSIDE `#cs-body`:
+ * the delegated handlers read it at click time (see SCRIPT), and a region
+ * patch replaces the container's innerHTML, never the container itself, so an
+ * id kept inside would be fine but an id kept in a script closure would go
+ * stale. That only holds while EVERY document that can be the loaded page
+ * carries it. The loading skeleton is such a document — it ships the same
+ * SCRIPT and arms the same region handshake — and it once omitted the
+ * attribute, so a cold open patched `#cs-body` and left a `<main>` that never
+ * gained it, making openFinding, reviewTogether and removeChangeset all post
+ * `changesetId: undefined` for the life of the screen. Hence one shell, used
+ * by both, rather than two places to keep in step.
+ */
+function shell(changesetId: string, inner: string): string {
+  return `<main class="wrap" data-changeset-id="${e(changesetId)}"><div id="cs-body">${inner}</div></main>`;
+}
+
 export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
-  const body = `<main class="wrap" data-changeset-id="${e(state.id)}"><div id="cs-body">${renderChangesetBody(state)}</div></main>`;
+  const body = shell(state.id, renderChangesetBody(state));
   return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: state.name } });
 }
 
@@ -229,7 +248,12 @@ export function renderChangesetHtml(state: ChangesetViewState, nonce: string): s
  * full page: this is the only document a cold open ever runs the script
  * from, and the later data patch only ever patches into it.
  */
-export function renderChangesetLoadingHtml(podName: string, changesetLabel: string, nonce: string): string {
+export function renderChangesetLoadingHtml(
+  podName: string,
+  changesetLabel: string,
+  changesetId: string,
+  nonce: string,
+): string {
   const metrics = Array.from({ length: 3 })
     .map(() => `<div class="metric"><div class="metric-value"><span class="skel skel-cs-metric"></span></div><div class="metric-label"><span class="skel skel-cs-label"></span></div></div>`)
     .join('');
@@ -237,6 +261,6 @@ export function renderChangesetLoadingHtml(podName: string, changesetLabel: stri
     .map(() => `<div class="member"><span class="step"><span class="skel skel-cs-step"></span></span><span><span class="member-title"><span class="skel skel-cs-title"></span></span><span class="member-meta"><span class="skel skel-cs-meta"></span></span></span><span class="state"><span class="skel skel-cs-state"></span></span></div>`)
     .join('');
   const bodyInner = `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(changesetLabel)}</h1></div><div class="subline">${e(podName)}</div></header><section class="readiness">${metrics}<div class="readiness-note"><span class="skel skel-cs-note"></span></div></section><section><div class="section-label">Findings that only exist between these repos</div><div class="empty-findings"><span class="skel skel-cs-line"></span></div></section><section><div class="section-label">Merge order</div><div class="order">${memberRows}</div></section><footer class="footer"><button class="btn" id="back">Back to dashboard</button></footer>`;
-  const body = `<main class="wrap"><div id="cs-body">${bodyInner}</div></main>`;
+  const body = shell(changesetId, bodyInner);
   return renderPage({ title: `Verdict: Changeset · ${changesetLabel}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: changesetLabel } });
 }

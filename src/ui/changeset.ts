@@ -115,6 +115,7 @@ export class ChangesetPanel {
         this.route.setHtml(renderChangesetLoadingHtml(
           pod.name,
           knownName ?? this.changesetId,
+          this.changesetId,
           crypto.randomBytes(16).toString('hex'),
         ));
       }
