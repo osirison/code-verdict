@@ -8,6 +8,21 @@ import { SEVERITY_ORDER } from '../domain/criteria';
 import type { Severity, Verdict } from '../domain/types';
 import type { FlowMessage } from './reviewFlowHtml';
 
+export interface ReviewCommandTarget {
+  isActive(): boolean;
+  handle(command: string, arg?: unknown): boolean;
+}
+
+/** Resolve the active review at invocation time so a retained controller cannot receive the command. */
+export function routeToActiveReviewCommand(
+  command: string,
+  arg: unknown,
+  targets: readonly ReviewCommandTarget[],
+): boolean {
+  const active = targets.find((target) => target.isActive());
+  return active?.handle(command, arg) ?? false;
+}
+
 export function flowCommandMessage(
   command: string,
   arg: unknown,
@@ -48,6 +63,7 @@ export function flowCommandMessage(
     'codeVerdict.generateSummary': { type: 'generateSummary' },
     'codeVerdict.submitReview': { type: 'submit' },
     'codeVerdict.runReview': { type: 'run' },
+    [INTERNAL_COMMANDS.addContext]: { type: 'addContext' },
   };
   return simple[command];
 }

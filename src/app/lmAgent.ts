@@ -1,22 +1,49 @@
 /**
  * Copilot agent integration via `vscode.lm` (spec §5): discovery lists the
- * user's chat models next to the demo agent; a run sends the changed-file
- * diffs, criteria and extra instructions — never the whole repo — and
+ * user's chat models next to the demo agent; a run sends criteria, extra
+ * instructions, explicitly attached evidence and changed-file diffs, then
  * expects the agentReviewResponse contract back.
  */
 import * as vscode from 'vscode';
-import type { AgentReviewResponse } from '../domain/agentResponse';
+import type { AgentResponsePaths, AgentReviewResponse } from '../domain/agentResponse';
 import { AgentResponseError, parseAgentReviewResponse } from '../domain/agentResponse';
 import type { Criteria } from '../domain/types';
+import { effortPrompt, type EffortLevel } from '../domain/effort';
 import type { ChangeRequestDiff } from '../platform/types';
-import type { AgentDescriptor, ModelDescriptor } from './agents';
+import { BUILTIN_AGENT_ID, type AgentDescriptor, type ModelDescriptor } from './agents';
+import { modelVisiblePath } from './modelVisiblePath';
 import { AgentTrace, type AgentProgressCallback, type AgentTimeoutReason, type AgentTraceSink } from './agentTrace';
 import { changesetHeadSha, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
-import { renderReviewContextPrompt, type ReviewContext, type ReviewContextEntry } from './reviewContext';
+import {
+  revalidateAttachments,
+  type AttachmentWarning,
+  type RevalidatedAttachments,
+} from './attachments';
+import {
+  ATTACHMENT_TOTAL_BUDGET,
+  attachmentEvidenceManifest,
+  DEFAULT_CONTEXT_BUDGETS,
+  renderAttachmentsForModel,
+  renderAttachmentsPrompt,
+  renderReviewContextPrompt,
+  type Attachment,
+  type ContextBudgets,
+  type EvidenceManifest,
+  type ReviewContext,
+  type ReviewContextEntry,
+} from './reviewContext';
 
 export type { AgentProgressCallback, AgentRunProgress, AgentTraceSink } from './agentTrace';
 
 const LM_PREFIX = 'lm:';
+
+const BUILTIN_ATTACHMENT_INSTRUCTIONS = 'You are a code review agent. Review ONLY the attachments and diffs below.';
+
+function promptAgentInstructions(agent: AgentDescriptor, hasAttachments: boolean): string {
+  return agent.id === BUILTIN_AGENT_ID && hasAttachments
+    ? BUILTIN_ATTACHMENT_INSTRUCTIONS
+    : agent.instructions;
+}
 
 // Issue #36 opened this: a flat total-duration timeout cancels a review that
 // is still actively streaming. The fix then added an inactivity window but
@@ -83,6 +110,30 @@ export interface RunAgentOptions {
    * still keep the next one out.
    */
   cancellation?: AgentCancellationToken;
+  /** Explicit reviewable evidence. Empty or omitted contributes no prompt bytes. */
+  attachments?: readonly Attachment[];
+  /** Normalized in the UI layer; omitted callers retain the shipped defaults. */
+  contextBudgets?: ContextBudgets;
+  /** Fixed attachment pool override for focused tests. */
+  attachmentBudget?: number;
+  /** Run-start validation seam; production uses `vscode.workspace.fs`. */
+  attachmentRevalidator?: (attachments: readonly Attachment[]) => Promise<RevalidatedAttachments>;
+  /** Structured drops are available to the run manager before findings reach triage. */
+  onAttachmentWarnings?: (warnings: readonly AttachmentWarning[]) => void;
+  /** Prompt-level review instruction. `none` contributes no prompt bytes. */
+  effort?: EffortLevel;
+  /** Host-assigned qualification for changed-file paths in a multi-root workspace. */
+  workspaceRootLabel?: string;
+}
+
+export interface AssembleReviewPromptOptions {
+  attachments?: readonly Attachment[];
+  contextBudgets?: ContextBudgets;
+  attachmentBudget?: number;
+  /** Exact rendered zone reused by execution so its manifest cannot drift from this prompt. */
+  attachmentPrompt?: string;
+  effort?: EffortLevel;
+  workspaceRootLabel?: string;
 }
 
 /**
@@ -94,6 +145,29 @@ export interface RunAgentOptions {
 export interface AgentCancellationToken {
   readonly isCancellationRequested: boolean;
   onCancellationRequested(listener: () => void): { dispose(): void };
+}
+
+async function attachmentsForRun(options?: RunAgentOptions): Promise<Attachment[]> {
+  const attachments = options?.attachments ?? [];
+  if (attachments.length === 0) return [];
+  const result = await (options?.attachmentRevalidator ?? revalidateAttachments)(attachments);
+  if (result.warnings.length > 0) options?.onAttachmentWarnings?.(result.warnings);
+  return result.attachments;
+}
+
+async function changesetMembersForRun(
+  members: readonly ChangesetAgentMember[],
+  options?: RunAgentOptions,
+): Promise<ChangesetAgentMember[]> {
+  const results = await Promise.all(members.map(async (member) => {
+    const attachments = member.attachments ?? [];
+    if (attachments.length === 0) return { member, warnings: [] as AttachmentWarning[] };
+    const result = await (options?.attachmentRevalidator ?? revalidateAttachments)(attachments);
+    return { member: { ...member, attachments: result.attachments }, warnings: result.warnings };
+  }));
+  const warnings = results.flatMap((result) => result.warnings);
+  if (warnings.length > 0) options?.onAttachmentWarnings?.(warnings);
+  return results.map((result) => result.member);
 }
 
 /**
@@ -112,11 +186,20 @@ export async function discoverModels(): Promise<ModelDescriptor[]> {
       description: `${m.vendor} · ${m.family}`,
       vendor: m.vendor,
       family: m.family,
+      maxInputTokens: m.maxInputTokens > 0 ? m.maxInputTokens : undefined,
     }));
   } catch {
     // No Copilot in this session (e.g. emulator-only debugging).
     return [];
   }
+}
+
+/** Count an already assembled prompt without issuing a chat request. */
+export async function countPromptTokens(modelId: string, prompt: string): Promise<number | undefined> {
+  const [vendor, family] = modelId.slice(LM_PREFIX.length).split('/');
+  const models = await vscode.lm.selectChatModels({ vendor, family });
+  const model = models[0];
+  return model ? model.countTokens(prompt) : undefined;
 }
 
 export class AgentRunError extends Error {
@@ -142,9 +225,9 @@ export class AgentRunError extends Error {
 
 /**
  * `context` carries what the change is for (title, description, linked work
- * items). It sits between the criteria and the diffs so intent is read before
- * evidence, and `renderReviewContextPrompt` is what states that it is intent
- * rather than more surface to review.
+ * items). It sits before attached evidence and diffs so intent is read before
+ * evidence, and `renderReviewContextPrompt` states that it is intent rather
+ * than more surface to review.
  */
 export async function runLmAgent(
   agent: AgentDescriptor,
@@ -154,20 +237,50 @@ export async function runLmAgent(
   context?: ReviewContext,
   options?: RunAgentOptions,
 ): Promise<AgentReviewResponse> {
-  const prompt = [
+  const attachments = await attachmentsForRun(options);
+  const renderedAttachments = renderAttachmentsForModel(
+    attachments,
+    options?.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
+  );
+  const prompt = assembleReviewPrompt(agent, diff, criteria, context, {
+    attachments,
+    contextBudgets: options?.contextBudgets,
+    attachmentBudget: options?.attachmentBudget,
+    attachmentPrompt: renderedAttachments.prompt,
+    effort: options?.effort,
+    workspaceRootLabel: options?.workspaceRootLabel,
+  });
+  return runPrompt(modelId, prompt, options, {
+    diffPaths: diff.files.map((file) => modelVisiblePath(file.newPath, options?.workspaceRootLabel)),
+    attachmentManifest: renderedAttachments.manifest,
+  });
+}
+
+/** The exact single-review prompt, shared by execution and the pre-run usage indicator. */
+export function assembleReviewPrompt(
+  agent: AgentDescriptor,
+  diff: ChangeRequestDiff,
+  criteria: Criteria,
+  context?: ReviewContext,
+  options: AssembleReviewPromptOptions = {},
+): string {
+  const attachmentPrompt = options.attachmentPrompt
+    ?? renderAttachmentsPrompt(options.attachments ?? [], options.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET);
+  return [
     // Element zero is the ONLY agent-controlled part of this array. Everything
     // after it is built here, from these inputs, exactly as it was before
     // agents were selectable — which is what makes it impossible for an agent
     // body to displace the contract, drop the criteria, or change the diffs.
     // The built-in agent's instructions are the literal that used to sit here.
-    agent.instructions,
+    promptAgentInstructions(agent, attachmentPrompt !== ''),
     `Respond with a single JSON object matching this contract: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": "${diff.headSha}", "items": [{ "id", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "suggestion"?: {"old","new"} }], "candidates": [] }`,
     `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
     criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
-    renderReviewContextPrompt(context ? [{ context }] : []),
-    ...diff.files.map((f) => `--- ${f.newPath}\n${f.diff}`),
+    effortPrompt(options.effort),
+    renderReviewContextPrompt(context ? [{ context }] : [], options.contextBudgets ?? DEFAULT_CONTEXT_BUDGETS),
+    attachmentPrompt,
+    ...diff.files.map((f) => `--- ${modelVisiblePath(f.newPath, options.workspaceRootLabel)}\n${f.diff}`),
   ].filter((part) => part !== '').join('\n\n');
-  return runPrompt(modelId, prompt, options);
 }
 
 /**
@@ -184,6 +297,97 @@ export function changesetContextEntries(members: readonly ChangesetAgentMember[]
     : []));
 }
 
+/** Member-labelled attachment zone, using the same wire identifiers as each changeset diff. */
+export function renderChangesetAttachmentsPrompt(
+  members: readonly ChangesetAgentMember[],
+  totalBudget = ATTACHMENT_TOTAL_BUDGET,
+): string {
+  const labelled = members.flatMap((member) => (member.attachments ?? []).map((attachment) => ({
+    ...attachment,
+    id: `projectId=${member.ref.repoId} mrIid=${member.ref.number} attachment=${attachment.id}`,
+    // vocab-ok: the agent prompt's wire format — the member path label parallels the diff label below
+    path: `projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${attachment.path}`,
+  })));
+  return renderAttachmentsPrompt(labelled, totalBudget);
+}
+
+interface RenderedChangesetAttachments {
+  prompt: string;
+  manifest: EvidenceManifest;
+  memberManifests: ReadonlyMap<string, EvidenceManifest>;
+}
+
+function changesetMemberKey(member: Pick<ChangesetAgentMember, 'ref'>): string {
+  return `${member.ref.repoId}!${member.ref.number}`;
+}
+
+function renderChangesetAttachmentsForModel(
+  members: readonly ChangesetAgentMember[],
+  totalBudget: number,
+): RenderedChangesetAttachments {
+  const ownerById = new Map<string, string>();
+  const labelled = members.flatMap((member) => (member.attachments ?? []).map((attachment) => {
+    const id = `projectId=${member.ref.repoId} mrIid=${member.ref.number} attachment=${attachment.id}`;
+    ownerById.set(id, changesetMemberKey(member));
+    return {
+      ...attachment,
+      id,
+      // vocab-ok: the agent prompt's provider-neutral member wire format
+      path: `projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${attachment.path}`,
+    };
+  }));
+  const rendered = renderAttachmentsForModel(labelled, totalBudget);
+  const byMember = new Map<string, Attachment[]>();
+  for (const attachment of rendered.attachments) {
+    const owner = ownerById.get(attachment.id);
+    if (!owner) continue;
+    const entries = byMember.get(owner) ?? [];
+    entries.push(attachment);
+    byMember.set(owner, entries);
+  }
+  return {
+    prompt: rendered.prompt,
+    manifest: rendered.manifest,
+    memberManifests: new Map([...byMember].map(([key, attachments]) => [key, attachmentEvidenceManifest(attachments)])),
+  };
+}
+
+export interface AssembleChangesetReviewPromptOptions {
+  contextBudgets?: ContextBudgets;
+  attachmentBudget?: number;
+  effort?: EffortLevel;
+  attachmentPrompt?: string;
+}
+
+export function assembleChangesetReviewPrompt(
+  agent: AgentDescriptor,
+  members: readonly ChangesetAgentMember[],
+  criteria: Criteria,
+  options: AssembleChangesetReviewPromptOptions = {},
+): string {
+  const headSha = changesetHeadSha(members);
+  const contract = '{ "id", "projectId", "mrIid", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "cross"?: true, "spans"?: [{"projectId","location","role"}], "suggestion"?: {"old","new"} }';
+  const attachmentPrompt = options.attachmentPrompt
+    ?? renderChangesetAttachmentsPrompt(members, options.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET);
+  return [
+    promptAgentInstructions(agent, attachmentPrompt !== ''),
+    'Review this changeset as one distributed unit. Review ONLY the member-labelled diffs and attachments below.',
+    'Find both normal per-repository issues and failures that exist only between repositories. A cross-repository item must set cross=true and name both sides in spans[].',
+    `Respond with one JSON object: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": ${JSON.stringify(headSha)}, "items": [${contract}], "candidates": [] }`,
+    'Every item must use the exact projectId and mrIid labels supplied below. Its file and line must identify an added line in that member diff or a line in that member attachment.',
+    `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
+    criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
+    effortPrompt(options.effort),
+    renderReviewContextPrompt(changesetContextEntries(members), options.contextBudgets ?? DEFAULT_CONTEXT_BUDGETS),
+    attachmentPrompt,
+    ...members.flatMap((member) => member.diff.files.map((file) => [
+      // vocab-ok: the agent prompt's wire format — the provider-neutral response parser reads this member label
+      `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${modelVisiblePath(file.newPath, member.workspaceRootLabel)}`,
+      file.diff,
+    ].join('\n'))),
+  ].filter((part) => part !== '').join('\n\n');
+}
+
 export async function runLmChangesetAgent(
   agent: AgentDescriptor,
   modelId: string,
@@ -191,30 +395,25 @@ export async function runLmChangesetAgent(
   criteria: Criteria,
   options?: RunAgentOptions,
 ): Promise<AgentReviewResponse> {
-  const headSha = changesetHeadSha(members);
-  const contract = '{ "id", "projectId", "mrIid", "file", "line", "severity": "nit|minor|major|blocker", "category": "security|concurrency|errorHandling|performance|craftsmanship|apiContract|tests|docs|style", "confidence": 0-100, "title", "body", "code", "cross"?: true, "spans"?: [{"projectId","location","role"}], "suggestion"?: {"old","new"} }';
-  const prompt = [
-    // Same rule as `runLmAgent`: the agent goes first and owns nothing after
-    // it. The changeset framing below is system-owned — it describes the
-    // labelling contract the response parser enforces, not a persona — so it
-    // stays whichever agent is selected. Its old "You are a code review
-    // agent." opener has moved into the agent, which is what now supplies it.
-    agent.instructions,
-    'Review this changeset as one distributed unit. Review ONLY the labelled diffs below.',
-    'Find both normal per-repository issues and failures that exist only between repositories. A cross-repository item must set cross=true and name both sides in spans[].',
-    `Respond with one JSON object: { "schemaVersion": "1", "agentId": string, "agentLabel": string, "headSha": ${JSON.stringify(headSha)}, "items": [${contract}], "candidates": [] }`,
-    'Every item must use the exact projectId and mrIid labels supplied below. The file and line must identify an added line in that member diff.',
-    `Criteria: severity floor ${criteria.severityFloor}, min confidence ${criteria.minConfidence}, categories ${criteria.categories.join(', ')}.`,
-    criteria.extraInstructions ? `Extra instructions: ${criteria.extraInstructions}` : '',
-    // One block per member that has context, all of them before any diff.
-    renderReviewContextPrompt(changesetContextEntries(members)),
-    ...members.flatMap((member) => member.diff.files.map((file) => [
-      // vocab-ok: the agent prompt's wire format — the response parser reads these exact field names back
-      `--- projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${file.newPath}`,
-      file.diff,
-    ].join('\n'))),
-  ].filter((part) => part !== '').join('\n\n');
-  return validateChangesetResponse(await runPrompt(modelId, prompt, options), members);
+  const runMembers = await changesetMembersForRun(members, options);
+  const renderedAttachments = renderChangesetAttachmentsForModel(
+    runMembers,
+    options?.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
+  );
+  const validationMembers = runMembers.map((member) => ({
+    ...member,
+    evidenceManifest: renderedAttachments.memberManifests.get(changesetMemberKey(member)) ?? Object.freeze([]),
+  }));
+  const prompt = assembleChangesetReviewPrompt(agent, runMembers, criteria, {
+    ...options,
+    attachmentPrompt: renderedAttachments.prompt,
+  });
+  return validateChangesetResponse(await runPrompt(modelId, prompt, options, {
+    diffPaths: runMembers.flatMap((member) => member.diff.files.map((file) => (
+      modelVisiblePath(file.newPath, member.workspaceRootLabel)
+    ))),
+    attachmentManifest: renderedAttachments.manifest,
+  }), validationMembers);
 }
 
 /**
@@ -231,7 +430,9 @@ export async function runFollowUpPrompt(
   // The agent's instructions lead here too, so the answer keeps the persona
   // that produced the finding being asked about. An agent with no
   // instructions contributes nothing and the prompt is what it always was.
-  const withPersona = [agent.instructions, prompt].filter((part) => part !== '').join('\n\n');
+  const withPersona = [agent.instructions, effortPrompt(options?.effort), prompt]
+    .filter((part) => part !== '')
+    .join('\n\n');
   return streamText(modelId, withPersona, options, (text, trace) => {
     trace.rawText(text, true);
     trace.success(0);
@@ -239,7 +440,12 @@ export async function runFollowUpPrompt(
   });
 }
 
-export async function runPrompt(modelId: string, prompt: string, options?: RunAgentOptions): Promise<AgentReviewResponse> {
+export async function runPrompt(
+  modelId: string,
+  prompt: string,
+  options?: RunAgentOptions,
+  responsePaths?: AgentResponsePaths,
+): Promise<AgentReviewResponse> {
   return streamText(modelId, prompt, options, (text, trace) => {
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
@@ -249,7 +455,7 @@ export async function runPrompt(modelId: string, prompt: string, options?: RunAg
     }
     let parsed: AgentReviewResponse;
     try {
-      parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1))).response;
+      parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1)), responsePaths).response;
     } catch (parseError) {
       trace.rawText(text, false, parseError instanceof Error ? parseError.message : String(parseError));
       throw parseError;

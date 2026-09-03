@@ -16,6 +16,29 @@ A review needs two choices, and they are separate things:
 Both are picked on the Run AI Review screen. The extension ships a default agent, so a workspace
 that defines none reviews exactly as it always did.
 
+### Context and thinking effort
+
+An attachment is a file, folder, editor selection, symbol, Problems snapshot, or pasted text that
+you explicitly add to one review run. The context area shows attachments alongside the
+automatically derived change request title, description, and linked work items, and lets you remove
+or restore each item before running the review.
+
+The evidence boundary is strict. Automatically derived change request text is intent that helps the
+agent interpret the change, but a finding cannot cite it. Attachments and changed-file diffs are
+reviewable evidence. An accepted finding against an attached file outside the diff is included in
+the review summary with its file and line instead of being posted as an inline comment.
+
+Thinking Effort adds review instructions to the prompt. It does not change the provider's native
+reasoning setting or expose a model reasoning trace. The selected level is remembered per model.
+
+Auto-derived context defaults to 4,000 characters per section, 12,000 characters total, and five
+linked work items. Configure those limits with `codeVerdict.context.sectionBudget`,
+`codeVerdict.context.totalBudget`, and `codeVerdict.context.maxLinkedItems`. New reviews include the
+title, description, and linked work items by default; use `codeVerdict.context.includeTitle`,
+`codeVerdict.context.includeDescription`, and `codeVerdict.context.includeLinkedItems` to change
+those starting choices. `codeVerdict.contextUsage.enabled` controls the usage indicator and defaults
+to `true`; context and attachment budgets continue to apply when it is off.
+
 ### Writing an agent
 
 An agent is a `*.agent.md` file. Every workspace folder's `.github/agents` directory is searched
@@ -38,10 +61,11 @@ a non-empty body. Nesting and multi-line values are not supported; a `tools:` li
 another tool is ignored rather than rejected. A file that cannot be parsed is skipped and reported
 on the run screen — it never stops the screen from opening.
 
-**An agent supplies prompt text and nothing else.** The JSON response contract, the review criteria
-and the diffs are always appended by Code Verdict, after the agent's instructions. An agent file
-cannot change the response shape, drop the criteria, or alter which diffs are sent — a body that
-tries is simply text the model reads before the contract it must still satisfy.
+**An agent supplies prompt text and nothing else.** The JSON response contract, the review criteria,
+selected context, attachments, and diffs are assembled by Code Verdict after the agent's
+instructions. An agent file cannot change the response shape, drop the criteria, or alter which
+attachments or diffs are sent. A body that tries is text the model reads before the contract it
+must still satisfy.
 
 **Status: under construction.** The build is tracked in
 [issues](https://github.com/osirison/code-verdict/issues) across three milestones

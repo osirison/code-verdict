@@ -3,6 +3,7 @@
  * staleness, auto-advance. UI layers call these; they never own the rules.
  */
 import type { AgentReviewResponse } from './agentResponse';
+import { normalizeEffortLevel, type EffortLevel } from './effort';
 import type { Criteria, Review, ReviewItem, Severity, Verdict } from './types';
 
 export function createReview(input: {
@@ -11,6 +12,7 @@ export function createReview(input: {
   agentId: string;
   /** The model that ran it. Absent for the demo agent, which calls none. */
   modelId?: string;
+  effort?: EffortLevel;
   criteria: Criteria;
   response: AgentReviewResponse;
 }): Review {
@@ -19,6 +21,7 @@ export function createReview(input: {
     crNumber: input.crNumber,
     agentId: input.agentId,
     modelId: input.modelId,
+    effort: normalizeEffortLevel(input.effort),
     criteria: input.criteria,
     headSha: input.response.headSha,
     items: input.response.items,

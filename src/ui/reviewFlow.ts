@@ -14,15 +14,32 @@ import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
-import { AgentRunError, discoverModels, runFollowUpPrompt } from '../app/lmAgent';
+import { AgentRunError, assembleReviewPrompt, countPromptTokens, discoverModels, runFollowUpPrompt } from '../app/lmAgent';
 import type { AgentSelectionState } from './agentRefresh';
 import type { PodStore } from '../app/pods';
 import {
   buildReviewContext,
+  budgetAttachments,
   reviewContextTruncatedForPrompt,
   type ReviewContext,
   type ReviewContextEntry,
+  type ContextBudgets,
+  type Attachment,
 } from '../app/reviewContext';
+import {
+  attachmentKey,
+  deduplicateAttachments,
+  resolveAttachment,
+  type FileAttachmentTarget,
+  type SymbolAttachmentTarget,
+} from '../app/attachments';
+import {
+  ContextReferenceResolutionCoordinator,
+  parseContextReferences,
+  prepareContextReferencesForRun,
+  resolveContextReferences,
+  type ContextReferenceCache,
+} from '../app/contextReferences';
 import { ReviewHistory } from '../app/reviewHistory';
 import {
   carryRetainedResult,
@@ -38,7 +55,14 @@ import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunMana
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
-import { diffStats, parseHunks } from '../domain/diffHunks';
+import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import {
+  effortForModel,
+  effortLabel,
+  isEffortLevel,
+  normalizeEffortsByModel,
+  setEffortForModel,
+} from '../domain/effort';
 import { composeSummary } from '../domain/summary';
 import type { AgentVoice } from '../domain/summary';
 import {
@@ -50,22 +74,38 @@ import {
   setVerdict,
   verdictCounts,
 } from '../domain/reviewState';
-import type { Category, Review, ReviewItem, Severity } from '../domain/types';
+import { isReviewItemAnchored, type Category, type Review, type ReviewItem, type Severity } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef, WorkItem } from '../platform/types';
 import { flowCommandMessage } from './flowCommands';
-import type { FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
+import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
 import { agentRunConcurrency, agentRunTimeouts } from './agentRunOptions';
+import {
+  contextSourceEnabledByDefault,
+  readContextBudgets,
+  readContextSourceDefaults,
+  readContextUsageEnabled,
+} from './contextOptions';
+import { ContextUsageCounter } from './contextUsage';
+import {
+  attachmentFileTarget,
+  attachmentRange,
+  findReferenceFile,
+  modelVisibleWorkspaceRoots,
+  pickContextAttachment,
+} from './contextAttachmentPicker';
 import { livenessView } from './runLiveness';
 import { changesetTrailer } from './changesetOptions';
 import { escapeHtml } from './theme';
 import { renderMarkdown } from './markdown';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
+import { findingFollowUpPrompt, followUpQuestion, type AskPreset } from './findingFollowUp';
+import { modelVisibleRootLabelForProject, providerRelativePath } from '../app/modelVisiblePath';
 
 /**
  * How often triage asks whether the branch moved under it (handoff §6 —
@@ -73,43 +113,6 @@ import type { SidebarActiveReview, SidebarPendingReview } from './sidebarHtml';
  * enough that a push lands in the banner while the reviewer is still reading.
  */
 const HEAD_POLL_MS = 45_000;
-
-type AskPreset = 'explain' | 'fix' | 'similar' | 'why' | 'freeform';
-
-/**
- * What each chip actually asks. These used to read a pre-baked `answers` map
- * that no agent is required to supply, so they almost always answered "the
- * agent has nothing further on this" (#37).
- */
-const PRESET_QUESTION: Record<Exclude<AskPreset, 'freeform'>, string> = {
-  explain: 'Explain the concrete risk this finding describes. What goes wrong, and under what conditions?',
-  fix: 'Show the smallest change that removes this problem. Give the code, and say what it changes.',
-  similar: 'Where else in this diff does the same problem appear? Quote each occurrence, or say none.',
-  why: 'Why was this flagged at this severity and confidence? Say what would make it more or less serious.',
-};
-
-/**
- * A follow-up asks about ONE finding, so it carries that finding and the hunk
- * it sits in — never the whole diff, which is the review run's job and a much
- * larger request.
- */
-function followUpPrompt(item: ReviewItem, question: string, hunk: string | undefined): string {
-  return [
-    'You are answering a reviewer\'s follow-up question about a single code review finding.',
-    'Answer in plain prose, at most two short paragraphs. No JSON, no preamble.',
-    '',
-    `Finding: ${item.title}`,
-    `Severity: ${item.severity} · confidence ${item.confidence}`,
-    `Location: ${item.file}:${item.line}`,
-    `Detail: ${item.body}`,
-    item.code ? `Flagged code:\n${item.code}` : '',
-    hunk ? `Surrounding diff:\n${hunk}` : '',
-    '',
-    `Question: ${question}`,
-  ]
-    .filter((line) => line !== '')
-    .join('\n');
-}
 
 export interface ReviewFlowDeps {
   podStore: PodStore;
@@ -162,8 +165,13 @@ export class ReviewFlowPanel {
 
   static handleCommand(command: string, arg?: unknown): boolean {
     const panel = ReviewFlowPanel.current;
-    if (!panel || panel.disposed) return false;
+    if (!panel || panel.disposed || !ReviewFlowPanel.isCommandTargetActive()) return false;
     return panel.dispatchCommand(command, arg);
+  }
+
+  static isCommandTargetActive(): boolean {
+    const panel = ReviewFlowPanel.current;
+    return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
   }
 
   static selectItem(itemId: string): void {
@@ -190,14 +198,29 @@ export class ReviewFlowPanel {
    * than deriving its own — so the reviewer sees exactly what the model saw.
    */
   private reviewContext?: ReviewContext;
+  private manualAttachments: Attachment[] = [];
+  private referenceAttachments: Attachment[] = [];
+  private referenceAttachmentCache: ContextReferenceCache = new Map();
+  private removedAttachmentKeys = new Set<string>();
+  private unresolvedContextReferences: string[] = [];
+  private autoContextEnabled = new Map<string, boolean>();
+  private readonly autoContextDefaults = readContextSourceDefaults();
+  private readonly referenceResolution = new ContextReferenceResolutionCoordinator();
+  private contextUsage?: ContextUsageView;
+  private contextUsageEnabled = readContextUsageEnabled();
+  private readonly contextUsageCounter = new ContextUsageCounter();
+  private contextUsageWatch?: vscode.Disposable;
+  private reviewFocusActive = false;
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
+  private readonly contextBudgets: ContextBudgets = readContextBudgets();
   private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
   private agentId: string = BUILTIN_AGENT_DESCRIPTOR.id;
   private agentOpen = false;
   private models: ModelDescriptor[] = [];
   private modelId?: string;
   private modelOpen = false;
+  private effortOpen = false;
   private selectionNotices: string[] = [];
   private skippedAgents: SkippedDefinition[] = [];
   /** File-system, model-list and settings watchers; all three feed `refreshAgents`. */
@@ -272,6 +295,9 @@ export class ReviewFlowPanel {
       this.inDiff.dispose();
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
+      this.contextUsageWatch?.dispose();
+      this.contextUsageWatch = undefined;
+      this.contextUsageCounter.cancel();
       this.windowFocusWatch?.dispose();
       this.windowFocusWatch = undefined;
       this.deps.onSidebarState?.();
@@ -303,13 +329,25 @@ export class ReviewFlowPanel {
     // was just reset) is enough — no need to reload() from the network.
     route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
+    this.contextUsageWatch = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('codeVerdict.contextUsage.enabled')) return;
+      this.contextUsageEnabled = readContextUsageEnabled();
+      this.scheduleContextUsage();
+      this.render();
+    });
   }
 
   private setReviewFocus(active: boolean): void {
+    this.reviewFocusActive = active && !this.disposed;
     void vscode.commands.executeCommand(
       'setContext',
       'verdict.reviewFocus',
-      active && !this.disposed,
+      this.reviewFocusActive,
+    );
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewContextFocus',
+      this.reviewFocusActive && this.cr !== undefined && this.screen === 'agent',
     );
   }
 
@@ -331,6 +369,172 @@ export class ReviewFlowPanel {
 
   private draftKey(): string {
     return draftKeyFor(this.ref);
+  }
+
+  private autoContextItems(): AutoContextItemView[] {
+    const context = this.reviewContext;
+    if (!context) return [];
+    const items: AutoContextItemView[] = [{
+      id: 'auto:title',
+      kind: 'title',
+      label: `Title · ${context.title}`,
+      enabled: this.autoContextEnabled.get('auto:title')
+        ?? contextSourceEnabledByDefault('title', this.autoContextDefaults),
+    }];
+    if (context.description) {
+      items.push({
+        id: 'auto:description',
+        kind: 'description',
+        label: 'Change request description',
+        enabled: this.autoContextEnabled.get('auto:description')
+          ?? contextSourceEnabledByDefault('description', this.autoContextDefaults),
+      });
+    }
+    context.linkedItems.forEach((item, index) => {
+      const id = `auto:linked:${index}:${item.number}`;
+      items.push({
+        id,
+        kind: 'linkedItem',
+        label: `#${item.number}${item.title ? ` · ${item.title}` : ''}`,
+        detail: item.resolved ? item.state : 'reference only',
+        enabled: this.autoContextEnabled.get(id)
+          ?? contextSourceEnabledByDefault('linkedItem', this.autoContextDefaults),
+      });
+    });
+    return items;
+  }
+
+  private promptReviewContext(): ReviewContext | undefined {
+    const context = this.reviewContext;
+    if (!context) return undefined;
+    const includeTitle = this.autoContextEnabled.get('auto:title')
+      ?? contextSourceEnabledByDefault('title', this.autoContextDefaults);
+    const includeDescription = context.description
+      ? this.autoContextEnabled.get('auto:description')
+        ?? contextSourceEnabledByDefault('description', this.autoContextDefaults)
+      : true;
+    const linkedItems = context.linkedItems.filter((item, index) =>
+      this.autoContextEnabled.get(`auto:linked:${index}:${item.number}`)
+        ?? contextSourceEnabledByDefault('linkedItem', this.autoContextDefaults),
+    );
+    if (!includeTitle && (!context.description || !includeDescription) && linkedItems.length === 0) {
+      return undefined;
+    }
+    return { ...context, includeTitle, includeDescription, linkedItems };
+  }
+
+  private attachments(): Attachment[] {
+    return deduplicateAttachments([...this.manualAttachments, ...this.referenceAttachments])
+      .filter((attachment) => !this.removedAttachmentKeys.has(attachmentKey(attachment)));
+  }
+
+  private addManualAttachment(attachment: Attachment): void {
+    this.removedAttachmentKeys.delete(attachmentKey(attachment));
+    this.manualAttachments = deduplicateAttachments([...this.manualAttachments, attachment]);
+  }
+
+  private selectionRange(selection: vscode.Selection): { startLine: number; endLine: number } {
+    return attachmentRange(selection);
+  }
+
+  private fileTarget(uri: vscode.Uri): FileAttachmentTarget {
+    return attachmentFileTarget(uri);
+  }
+
+  private workspaceRootLabel(): string | undefined {
+    const repository = this.pod().repos?.find((candidate) => candidate.id === this.ref.repoId);
+    return modelVisibleRootLabelForProject(
+      [repository?.path, repository?.name],
+      modelVisibleWorkspaceRoots(),
+    );
+  }
+
+  private providerFilePath(path: string): string {
+    return providerRelativePath(path, this.workspaceRootLabel());
+  }
+
+  private async addContext(): Promise<void> {
+    const attachment = await pickContextAttachment();
+    if (!attachment || this.disposed) return;
+    this.addManualAttachment(attachment);
+    this.scheduleContextUsage();
+    this.render();
+  }
+
+  private async findReferenceSymbol(name: string): Promise<SymbolAttachmentTarget | undefined> {
+    const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+      'vscode.executeWorkspaceSymbolProvider',
+      name,
+    ) ?? [];
+    const exact = symbols.filter((symbol) => symbol.name === name);
+    if (exact.length !== 1) return undefined;
+    const symbol = exact[0] as vscode.SymbolInformation;
+    return {
+      ...this.fileTarget(symbol.location.uri),
+      name: symbol.name,
+      range: this.selectionRange(new vscode.Selection(symbol.location.range.start, symbol.location.range.end)),
+    };
+  }
+
+  private resolveInstructionReferences(
+    text: string,
+    targetIsCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    return this.referenceResolution.resolve(text, async (isCurrent) => {
+      if (!targetIsCurrent()) return;
+      const currentReferences = new Set(parseContextReferences(text).map((reference) => reference.raw));
+      for (const reference of this.referenceAttachmentCache.keys()) {
+        if (!currentReferences.has(reference)) this.referenceAttachmentCache.delete(reference);
+      }
+      const result = await resolveContextReferences(text, {
+        findFile: findReferenceFile,
+        findSymbol: (name) => this.findReferenceSymbol(name),
+        resolveAttachment: (kind, target) => resolveAttachment(kind, target),
+      }, this.referenceAttachmentCache);
+      if (this.disposed || !targetIsCurrent() || !isCurrent()) return;
+      this.referenceAttachments = result.attachments;
+      this.unresolvedContextReferences = result.unresolved;
+    });
+  }
+
+  private scheduleContextUsage(): void {
+    const model = this.selectedModel();
+    if (
+      !this.contextUsageEnabled
+      || this.screen !== 'agent'
+      || this.selectedAgent().source === 'demo'
+      || !model
+      || !model.maxInputTokens
+      || !this.diff
+    ) {
+      this.contextUsageCounter.cancel();
+      this.contextUsage = undefined;
+      return;
+    }
+    const prompt = assembleReviewPrompt(
+      this.selectedAgent(),
+      this.diff,
+      this.pod().criteria,
+      this.promptReviewContext(),
+      {
+        attachments: this.attachments(),
+        contextBudgets: this.contextBudgets,
+        effort: this.selectedEffort(),
+      },
+    );
+    const promptHash = crypto.createHash('sha256').update(prompt).digest('hex');
+    const cacheKey = `${model.id}\0${promptHash}`;
+    this.contextUsage = undefined;
+    this.contextUsageCounter.schedule({
+      cacheKey,
+      prompt,
+      totalTokens: model.maxInputTokens,
+      countTokens: (assembled) => countPromptTokens(model.id, assembled),
+    }, (usage) => {
+      if (this.disposed) return;
+      this.contextUsage = usage;
+      this.render();
+    });
   }
 
   private loadSeq = 0;
@@ -357,6 +561,15 @@ export class ReviewFlowPanel {
     // header is a wrong answer, and feeding it to this ref's agent run is a
     // worse one.
     this.reviewContext = undefined;
+    this.manualAttachments = [];
+    this.referenceAttachments = [];
+    this.referenceAttachmentCache = new Map();
+    this.removedAttachmentKeys = new Set();
+    this.unresolvedContextReferences = [];
+    this.autoContextEnabled = new Map();
+    this.referenceResolution.invalidate();
+    this.contextUsage = undefined;
+    this.contextUsageCounter.cancel();
     this.contextOpen = false;
     this.review = undefined;
     this.retained = undefined;
@@ -433,6 +646,8 @@ export class ReviewFlowPanel {
       // whose file is gone, or a model that is no longer offered, falls back
       // here and says so on the screen rather than failing at run time.
       this.applySelection(await selectionPromise);
+      await this.resolveInstructionReferences(pod.criteria.extraInstructions);
+      if (this.disposed || loadToken !== this.loadSeq) return;
       this.armAgentWatches();
 
       // What this change request opens on, in order of precedence. A run
@@ -451,6 +666,7 @@ export class ReviewFlowPanel {
       } else if (!hadRetained) {
         this.screen = 'agent';
       }
+      this.scheduleContextUsage();
       this.render();
       void this.resolveChangesetMembership(loadToken);
     } catch (e) {
@@ -487,14 +703,11 @@ export class ReviewFlowPanel {
 
   // ---- staleness (handoff §6) --------------------------------------------------
 
-  /** The lines a finding can legitimately sit on: everything the new diff shows. */
+  /** The lines a finding can legitimately sit on: current additions only. */
   private anchorCandidates(diff: ChangeRequestDiff, file: string): AnchorCandidate[] | undefined {
-    const changed = diff.files.find((f) => f.newPath === file);
+    const changed = diff.files.find((f) => f.newPath === this.providerFilePath(file));
     if (!changed) return undefined;
-    return parseHunks(changed.diff)
-      .flatMap((hunk) => hunk.lines)
-      .filter((line) => line.newLine !== undefined)
-      .map((line) => ({ line: line.newLine as number, text: line.text }));
+    return addedLines(changed.diff);
   }
 
   private markMoved(diff: ChangeRequestDiff): Set<string> {
@@ -602,22 +815,81 @@ export class ReviewFlowPanel {
    */
   private async run(): Promise<void> {
     if (!this.diff) return;
+    const loadToken = this.loadSeq;
+    const ref = this.ref;
+    const targetIsCurrent = (): boolean => (
+      !this.disposed && loadToken === this.loadSeq && ref === this.ref
+    );
     const pod = this.pod();
-    pod.agentId = this.agentId;
-    pod.modelId = this.modelId;
-    await this.deps.podStore.upsert(pod);
-    if (this.disposed) return;
+    const diff = this.diff;
+    const reviewContext = this.promptReviewContext();
+    const attachments = this.attachments();
+    const workspaceRootLabel = this.workspaceRootLabel();
+    const agentId = this.agentId;
+    const agent = this.selectedAgent();
+    const agentLabel = agent.label || agentId;
+    const modelId = this.modelId;
+    const model = this.selectedModel();
+    const criteria = { ...pod.criteria, categories: [...pod.criteria.categories] };
+    const effort = this.selectedEffort();
+    const contextBudgets = { ...this.contextBudgets };
+    const demo = agentId === DEMO_AGENT_DESCRIPTOR.id;
+    const lmStats = diffStats(diff.files.map((file) => file.diff));
+    const input: RunInput = {
+      target: {
+        kind: 'cr',
+        ref,
+        diff,
+        reviewContext,
+        attachments,
+        workspaceRootLabel,
+      },
+      refLabel: this.refLabel(),
+      podId: pod.id,
+      criteria,
+      agent,
+      agentLabel,
+      modelId: demo ? undefined : modelId,
+      effort,
+      timeouts: agentRunTimeouts(),
+      contextBudgets,
+      steps: [
+        `Sending ${agent.label} to ${model?.label ?? 'the model'}…`,
+        `Indexing ${diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
+        'Cross-referencing module history…',
+        `Scoring findings against ${getProvider(pod.providerId).vocabulary.repoNoun} criteria…`,
+        'Items ready',
+      ],
+      demo,
+    };
+    const concurrency = agentRunConcurrency();
 
-    const demo = this.agentId === DEMO_AGENT_DESCRIPTOR.id;
+    pod.agentId = agentId;
+    pod.modelId = modelId;
+    pod.effortByModel = normalizeEffortsByModel(pod.effortByModel);
+    try {
+      await this.deps.podStore.upsert(pod);
+    } catch (error) {
+      if (!targetIsCurrent()) return;
+      throw error;
+    }
+    if (!targetIsCurrent()) return;
+
     if (!demo) {
       // A model-backed agent with no model must not reach the transport: an
       // empty id there selects an arbitrary model rather than failing, because
       // `selectChatModels({vendor: undefined, family: undefined})` matches
       // everything.
-      const stillThere = await discoverModels();
-      if (this.disposed) return;
-      if (this.modelId === undefined || !stillThere.some((model) => model.id === this.modelId)) {
-        this.selectionNotices = [`The model "${this.modelId ?? 'none selected'}" is no longer available.`];
+      let stillThere: ModelDescriptor[];
+      try {
+        stillThere = await discoverModels();
+      } catch (error) {
+        if (!targetIsCurrent()) return;
+        throw error;
+      }
+      if (!targetIsCurrent()) return;
+      if (modelId === undefined || !stillThere.some((candidate) => candidate.id === modelId)) {
+        this.selectionNotices = [`The model "${modelId ?? 'none selected'}" is no longer available.`];
         this.models = stillThere;
         this.screen = 'agent';
         this.render();
@@ -625,28 +897,9 @@ export class ReviewFlowPanel {
       }
     }
 
-    const lmStats = diffStats(this.diff.files.map((file) => file.diff));
-    const input: RunInput = {
-      target: { kind: 'cr', ref: this.ref, diff: this.diff, reviewContext: this.reviewContext },
-      refLabel: this.refLabel(),
-      podId: pod.id,
-      criteria: pod.criteria,
-      agent: this.selectedAgent(),
-      agentLabel: this.agentLabel(),
-      modelId: demo ? undefined : this.modelId,
-      timeouts: agentRunTimeouts(),
-      steps: [
-        `Sending ${this.selectedAgent().label} to ${this.selectedModel()?.label ?? 'the model'}…`,
-        `Indexing ${this.diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
-        'Cross-referencing module history…',
-        `Scoring findings against ${getProvider(pod.providerId).vocabulary.repoNoun} criteria…`,
-        'Items ready',
-      ],
-      demo,
-    };
-
+    if (!targetIsCurrent()) return;
     this.newRunFromResult = false;
-    this.attachRun(this.deps.runs.trigger(input, agentRunConcurrency()));
+    this.attachRun(this.deps.runs.trigger(input, concurrency));
     this.screen = 'running';
     this.render();
   }
@@ -822,10 +1075,24 @@ export class ReviewFlowPanel {
         break;
       case 'toggleModelOpen':
         this.modelOpen = !this.modelOpen;
+        this.effortOpen = false;
         break;
       case 'selectModel':
         this.modelId = m.modelId;
         this.modelOpen = false;
+        this.effortOpen = false;
+        break;
+      case 'toggleEffortOpen':
+        if (this.selectedAgent().source !== 'demo' && this.selectedModel()) {
+          this.effortOpen = !this.effortOpen;
+          this.modelOpen = false;
+        }
+        break;
+      case 'selectEffort':
+        if (!this.modelId || !isEffortLevel(m.effort)) break;
+        pod.effortByModel = setEffortForModel(pod.effortByModel, this.modelId, m.effort);
+        await this.deps.podStore.upsert(pod);
+        this.effortOpen = false;
         break;
       case 'dismissNotices':
         this.selectionNotices = [];
@@ -865,19 +1132,54 @@ export class ReviewFlowPanel {
       }
       case 'setInstructions':
         // Per-keystroke, from debounced input (task 9.3): update the
-        // in-memory criteria only and return — rendering here would repaint
-        // the region holding the field being typed in, and a podStore.upsert
-        // would be one uncoalesced read-modify-write per character, which
-        // task 4.5 forbids. The single upsert lands on blur, below.
+        // in-memory criteria and resolved references only. A podStore.upsert
+        // here would be one uncoalesced read-modify-write per character;
+        // persistence lands once on blur, below.
         pod.criteria.extraInstructions = m.text;
+        await this.resolveInstructionReferences(m.text);
+        this.scheduleContextUsage();
+        this.render();
         return;
       case 'commitInstructions':
         pod.criteria.extraInstructions = m.text;
         await this.deps.podStore.upsert(pod);
+        await this.resolveInstructionReferences(m.text);
+        break;
+      case 'addContext':
+        await this.addContext();
         return;
-      case 'run':
+      case 'removeContextItem': {
+        const attachment = this.attachments().find((item) => item.id === m.itemId);
+        if (attachment) this.removedAttachmentKeys.add(attachmentKey(attachment));
+        break;
+      }
+      case 'toggleAutoContextItem': {
+        const item = this.autoContextItems().find((candidate) => candidate.id === m.itemId);
+        if (item) {
+          this.autoContextEnabled.set(m.itemId, !item.enabled);
+        }
+        break;
+      }
+      case 'run': {
+        const loadToken = this.loadSeq;
+        const target = this.ref;
+        const targetIsCurrent = (): boolean => (
+          !this.disposed && loadToken === this.loadSeq && target === this.ref
+        );
+        await prepareContextReferencesForRun(
+          m.instructions ?? pod.criteria.extraInstructions,
+          pod.criteria.extraInstructions,
+          async (instructions) => {
+            if (!targetIsCurrent()) return;
+            pod.criteria.extraInstructions = instructions;
+            await this.deps.podStore.upsert(pod);
+          },
+          (instructions) => this.resolveInstructionReferences(instructions, targetIsCurrent),
+        );
+        if (!targetIsCurrent()) return;
         void this.run();
         return;
+      }
       case 'cancel':
         // Two meanings on one message, because the failure screen's "Switch
         // agent" reuses it. A live run is stopped — really stopped, request and
@@ -916,6 +1218,10 @@ export class ReviewFlowPanel {
         // failed re-run cost the reviewer nothing.
         this.newRunFromResult = this.retained !== undefined;
         this.preselectFromRetained();
+        this.autoContextEnabled = new Map();
+        this.manualAttachments = [];
+        this.removedAttachmentKeys = new Set();
+        await this.resolveInstructionReferences(pod.criteria.extraInstructions);
         this.screen = 'agent';
         break;
       case 'backToResult':
@@ -935,7 +1241,7 @@ export class ReviewFlowPanel {
       case 'verdict': {
         if (!this.review) return;
         const item = this.review.items.find((i) => i.id === m.itemId);
-        const applyFix = m.applyFix && Boolean(item?.suggestion);
+        const applyFix = m.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item));
         this.review = setVerdict(this.review, m.itemId, m.verdict, applyFix);
         const auto = vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true);
         if (auto) {
@@ -1016,7 +1322,12 @@ export class ReviewFlowPanel {
             if (resolved.state === 'lost') lost += 1;
             if (resolved.state !== 'moved') return item;
             moved += 1;
-            return { ...item, line: resolved.line };
+            const delta = resolved.line - item.line;
+            return {
+              ...item,
+              line: resolved.line,
+              endLine: item.endLine === undefined ? undefined : item.endLine + delta,
+            };
           });
           this.review = { ...this.review, items, headSha: diff.headSha };
           const sentence = [
@@ -1063,7 +1374,12 @@ export class ReviewFlowPanel {
         void this.submit();
         return;
       case 'copyMarkdown':
-        await vscode.env.clipboard.writeText(composeSummaryBody(this.summaryText, this.finalNote));
+        await vscode.env.clipboard.writeText(composeSummaryBody(
+          this.summaryText,
+          this.finalNote,
+          this.review,
+          this.commentDraftComposition()?.withheld,
+        ));
         void vscode.window.showInformationMessage('Verdict: summary copied as markdown.');
         return;
       case 'reconnect':
@@ -1107,6 +1423,7 @@ export class ReviewFlowPanel {
         // Cross findings exist only in changeset scope — nothing to do here.
         return;
     }
+    this.scheduleContextUsage();
     this.render();
   }
 
@@ -1128,7 +1445,7 @@ export class ReviewFlowPanel {
    * and sends the next keystroke to the triage handler as a verdict (#38).
    */
   private async ask(item: ReviewItem, preset: AskPreset, text?: string): Promise<void> {
-    const question = preset === 'freeform' ? (text ?? '').trim() : PRESET_QUESTION[preset];
+    const question = followUpQuestion(preset, text);
     if (question === '') return;
     // The question is sent and the page cleared its field — the held draft is
     // stale from here on, whatever the agent answers (task 9.3). Left in
@@ -1157,12 +1474,13 @@ export class ReviewFlowPanel {
     this.appendAnswer(item.id, list, label, 'Thinking…');
     const entry = list[list.length - 1] as { label: string; text: string };
     try {
-      const hunk = this.diff?.files.find((f) => f.newPath === item.file)?.diff;
+      const hunk = this.diff?.files.find((f) => f.newPath === this.providerFilePath(item.file))?.diff;
       // Shares `streamText`, so it gets the same configured windows: a model
       // slow enough to need a longer one on the review is the same model
       // answering the follow-up.
-      entry.text = await runFollowUpPrompt(this.selectedAgent(), this.modelId, followUpPrompt(item, question, hunk), {
+      entry.text = await runFollowUpPrompt(this.selectedAgent(), this.modelId, findingFollowUpPrompt(item, question, hunk), {
         timeouts: agentRunTimeouts(),
+        effort: this.selectedEffort(),
       });
     } catch (e) {
       const error = e instanceof AgentRunError ? e.message : toScmError(e).message;
@@ -1200,6 +1518,21 @@ export class ReviewFlowPanel {
     return composeSummary(this.review, this.agentLabel(), voice);
   }
 
+  private commentDraftComposition() {
+    const review = this.review;
+    const diff = this.diff;
+    if (!review || !diff) return undefined;
+    const pod = this.pod();
+    return composeCommentDrafts(
+      review,
+      this.agentLabel(),
+      pod.username ?? 'you',
+      diff.anchorRefs,
+      (file) => this.anchorCandidates(diff, file),
+      this.workspaceRootLabel(),
+    );
+  }
+
   // ---- submit ---------------------------------------------------------------------
 
   private threadsAccum: Record<string, string> = {};
@@ -1218,6 +1551,8 @@ export class ReviewFlowPanel {
     // check above and started a concurrent submit with the same drafts,
     // posting every comment twice (#42).
     if (this.submitting) return;
+    const composition = this.commentDraftComposition();
+    if (!composition) return;
     this.submitting = true;
     this.submitProgress = undefined;
     // Flush point (D9): the persisted state must reflect every decision made
@@ -1228,8 +1563,7 @@ export class ReviewFlowPanel {
     this.render();
     const pod = this.pod();
     const provider = getProvider(pod.providerId);
-    const you = pod.username ?? 'you';
-    const drafts = composeCommentDrafts(this.review, this.agentLabel(), you, this.diff.anchorRefs);
+    const { drafts, withheld } = composition;
     try {
       const connection = await this.connection();
       const result = await performSubmit(
@@ -1237,7 +1571,7 @@ export class ReviewFlowPanel {
         this.ref,
         {
           drafts,
-          summary: composeSummaryBody(this.summaryText, this.finalNote),
+          summary: composeSummaryBody(this.summaryText, this.finalNote, this.review, withheld),
           // The author's own request-for-changes is refused the same way their
           // approval is, and `requestChanges` defaults to true — so the summary
           // screen's disabled checkbox is the notice, this is the enforcement.
@@ -1416,6 +1750,7 @@ export class ReviewFlowPanel {
     const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
     if (this.disposed) return;
     this.applySelection(next);
+    this.scheduleContextUsage();
     // Only the selection screen shows the pickers; re-rendering mid-triage
     // would rebuild the screen under the reviewer for no visible gain.
     if (this.screen === 'agent') this.render();
@@ -1441,6 +1776,10 @@ export class ReviewFlowPanel {
 
   private selectedModel(): ModelDescriptor | undefined {
     return this.models.find((m) => m.id === this.modelId);
+  }
+
+  private selectedEffort() {
+    return effortForModel(this.pod().effortByModel, this.modelId);
   }
 
   /**
@@ -1478,6 +1817,7 @@ export class ReviewFlowPanel {
     const counts = this.review
       ? verdictCounts(this.review)
       : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
+    const withheldInlineItemIds = this.commentDraftComposition()?.withheld.map((item) => item.id) ?? [];
     const history = new ReviewHistory(this.deps.globalState).list().filter((r) => r.podId === pod.id);
     const produced = history.reduce(
       (n, r) => n + r.counts.accepted + r.counts.rejected + r.counts.skipped,
@@ -1513,10 +1853,18 @@ export class ReviewFlowPanel {
       models: this.models,
       modelId: this.modelId,
       modelOpen: this.modelOpen,
+      effort: this.selectedEffort(),
+      effortOpen: this.effortOpen,
+      effortComparisonDisclosure: (this.retained?.draft.review.items.length ?? 0) > 0 && this.screen === 'agent',
       reviewModelLabel: this.reviewModelLabel(),
+      reviewEffortLabel: this.review ? effortLabel(this.review.effort) : undefined,
       selectionNotices: this.selectionNotices,
       skippedAgents: this.skippedAgents,
       criteria: pod.criteria,
+      attachments: budgetAttachments(this.attachments()),
+      autoContextItems: this.autoContextItems(),
+      contextUsage: this.contextUsage,
+      unresolvedContextReferences: this.unresolvedContextReferences,
       runSteps: this.runRecord?.steps ?? [],
       runStep: this.runRecord?.step ?? 0,
       runLive: livenessView(this.runRecord),
@@ -1528,21 +1876,23 @@ export class ReviewFlowPanel {
       // flight: neither of them has replaced it yet.
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
-        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.agentLabel(), modelLabel: this.reviewModelLabel() }
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.agentLabel(), modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
         : undefined,
       mode: this.mode,
       items,
       selectedId: this.selectedId,
       diffLines: this.mode === 'diff'
         ? this.diff?.files
-          .filter((file) => file.newPath === items.find((view) => view.item.id === this.selectedId)?.item.file)
+          .filter((file) => file.newPath === this.providerFilePath(
+            items.find((view) => view.item.id === this.selectedId)?.item.file ?? '',
+          ))
           .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines))
         : undefined,
       counts,
       context: contextEntries.length > 0
         ? {
             open: this.contextOpen,
-            truncated: reviewContextTruncatedForPrompt(contextEntries),
+            truncated: reviewContextTruncatedForPrompt(contextEntries, this.contextBudgets),
             entries: contextEntries,
           }
         : undefined,
@@ -1562,7 +1912,9 @@ export class ReviewFlowPanel {
       // the clean screen, which has to survive being re-opened.
       candidates: this.retained?.candidates ?? [],
       filesRead: this.retained?.filesRead ?? this.diff?.files.length ?? 0,
+      attachmentWarnings: this.retained?.attachmentWarnings ?? [],
       summaryText: this.summaryText,
+      withheldInlineItemIds,
       finalNote: this.finalNote,
       postThread: this.postThread,
       requestChanges: this.requestChanges,
@@ -1578,6 +1930,11 @@ export class ReviewFlowPanel {
         : this.screen === 'done'
           ? `Verdict: Posted · ${state.header.refLabel}`
           : `Verdict: Review · ${state.header.refLabel}`;
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewContextFocus',
+      this.reviewFocusActive && this.cr !== undefined && this.screen === 'agent',
+    );
     // Patch the region in place rather than replacing the whole document
     // (#39) — render() runs on every screen transition (triage, summary,
     // submitting, ...), so this is what stops each of those from rebuilding

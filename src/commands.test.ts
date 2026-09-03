@@ -9,6 +9,7 @@ import {
   MAX_POLL_INTERVAL_SECONDS,
   MIN_POLL_INTERVAL_SECONDS,
 } from './app/pollSchedule';
+import { DEFAULT_CONTEXT_BUDGETS } from './app/reviewContext';
 
 interface PackageJson {
   description: string;
@@ -21,7 +22,15 @@ interface PackageJson {
     configuration: {
       properties: Record<
         string,
-        { enum?: string[]; default?: unknown; description?: string; minimum?: number; maximum?: number }
+        {
+          type?: string;
+          enum?: string[];
+          default?: unknown;
+          description?: string;
+          minimum?: number;
+          maximum?: number;
+          scope?: string;
+        }
       >;
     };
   };
@@ -59,7 +68,7 @@ describe('package.json contributions', () => {
 
   it('scopes every keybinding under verdict.reviewFocus', () => {
     for (const kb of pkg.contributes.keybindings) {
-      expect(kb.when).toBe('verdict.reviewFocus');
+      expect(kb.when).toMatch(/^verdict\.reviewFocus(?: && |$)/);
     }
   });
 
@@ -72,6 +81,7 @@ describe('package.json contributions', () => {
         '3:minor',
         '4:nit',
         'a',
+        'ctrl+/',
         'ctrl+enter',
         'j',
         'k',
@@ -87,6 +97,12 @@ describe('package.json contributions', () => {
     expect(bound.get('shift+a')).toBe(INTERNAL_COMMANDS.acceptCommentOnly);
     expect(bound.get('u')).toBe(INTERNAL_COMMANDS.undoVerdict);
     expect(bound.get('shift+/')).toBe(INTERNAL_COMMANDS.keyboardHelp);
+    expect(bound.get('ctrl+/')).toBe(INTERNAL_COMMANDS.addContext);
+  });
+
+  it('scopes add context to the active single-review context area', () => {
+    const binding = pkg.contributes.keybindings.find((keybinding) => keybinding.command === INTERNAL_COMMANDS.addContext);
+    expect(binding?.when).toBe('verdict.reviewFocus && verdict.reviewContextFocus');
   });
 
   it('binds keys and menus only to contributed or internal command ids', () => {
@@ -166,6 +182,37 @@ describe('notification settings contributions', () => {
     expect(
       Object.keys(properties).filter((key) => key.startsWith('codeVerdict.notifications.events.')),
     ).not.toContain('codeVerdict.notifications.pollIntervalSeconds');
+  });
+});
+
+describe('context settings contributions', () => {
+  const properties = pkg.contributes.configuration.properties;
+
+  it('contributes validated budget settings with the runtime defaults', () => {
+    const budgets = {
+      sectionBudget: properties['codeVerdict.context.sectionBudget'],
+      totalBudget: properties['codeVerdict.context.totalBudget'],
+      maxLinkedItems: properties['codeVerdict.context.maxLinkedItems'],
+    };
+    expect(Object.fromEntries(Object.entries(budgets).map(([key, setting]) => [key, setting?.default])))
+      .toEqual(DEFAULT_CONTEXT_BUDGETS);
+    for (const setting of Object.values(budgets)) {
+      expect(setting?.type).toBe('integer');
+      expect(setting?.minimum).toBe(1);
+      expect(setting?.scope).toBe('window');
+    }
+  });
+
+  it('includes each auto-derived source and the usage indicator by default', () => {
+    for (const key of [
+      'codeVerdict.context.includeTitle',
+      'codeVerdict.context.includeDescription',
+      'codeVerdict.context.includeLinkedItems',
+      'codeVerdict.contextUsage.enabled',
+    ]) {
+      expect(properties[key]?.default, key).toBe(true);
+      expect(properties[key]?.scope, key).toBe('window');
+    }
   });
 });
 

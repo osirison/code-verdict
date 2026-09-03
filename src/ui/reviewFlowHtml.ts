@@ -4,8 +4,11 @@
  * → Clean bill → Summary (with the submit-failure banner) → Submitted.
  */
 import type { CandidateBucket } from '../domain/agentResponse';
-import type { Category, Criteria, ReviewItem, Severity, Verdict } from '../domain/types';
+import { DEFAULT_EFFORT_LEVEL, EFFORT_LEVELS, type EffortLevel } from '../domain/effort';
+import { isReviewItemAnchored, type Category, type Criteria, type ReviewItem, type Severity, type Verdict } from '../domain/types';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
+import type { AttachmentWarning } from '../app/attachments';
+import type { Attachment } from '../app/reviewContext';
 import type { HunkLine } from '../domain/diffHunks';
 import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { Vocabulary } from './vocab';
@@ -113,6 +116,19 @@ export interface ChangesetReviewScope {
   repoLabels?: Record<string, string>;
 }
 
+export interface AutoContextItemView {
+  id: string;
+  kind: 'title' | 'description' | 'linkedItem';
+  label: string;
+  detail?: string;
+  enabled: boolean;
+}
+
+export interface ContextUsageView {
+  usedTokens: number;
+  totalTokens: number;
+}
+
 export interface FlowViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
@@ -128,11 +144,23 @@ export interface FlowViewState {
   /** Unset when no model is available, and whenever the demo agent is selected. */
   modelId?: string;
   modelOpen: boolean;
+  effort: EffortLevel;
+  effortOpen: boolean;
+  /** A retained finding set makes a differently instructed re-run non-comparable. */
+  effortComparisonDisclosure: boolean;
   /** What reconciliation silently changed — a stale agent or model. Rendered on the screen, not as a toast. */
   selectionNotices: string[];
   /** Agent files that could not be parsed. Reported as a count with the detail behind it. */
   skippedAgents: Array<{ path: string; reason: string }>;
   criteria: Criteria;
+  /** Explicit and typed-reference attachments that will be sent with this run. */
+  attachments: readonly Attachment[];
+  /** One independently enabled item per auto-derived source value. */
+  autoContextItems: readonly AutoContextItemView[];
+  /** Absent when disabled, unavailable, unknown, or the selected agent uses no model. */
+  contextUsage?: ContextUsageView;
+  /** Typed references that currently name no unique workspace target. */
+  unresolvedContextReferences: readonly string[];
   /** "56% accepted in this pod" — undefined hides the tuning link. */
   acceptRate?: number;
   /**
@@ -159,7 +187,9 @@ export interface FlowViewState {
    */
   retainedAvailable?: boolean;
   /** When the shown review ran, and what produced it. Absent while none is retained. */
-  retainedMeta?: { ranAt?: string; agentLabel?: string; modelLabel?: string };
+  retainedMeta?: { ranAt?: string; agentLabel?: string; modelLabel?: string; effortLabel?: string };
+  /** Context omitted after its run-start filesystem revalidation failed. */
+  attachmentWarnings: readonly AttachmentWarning[];
   // triage
   mode: 'split' | 'queue' | 'diff';
   items: TriageItemView[];
@@ -173,6 +203,7 @@ export interface FlowViewState {
    * review stored before models were separate, and for a demo review.
    */
   reviewModelLabel?: string;
+  reviewEffortLabel?: string;
   /** Absent until the change request's own fetch returns — the box renders nothing at all rather than a shell. */
   context?: ReviewContextView;
   stale?: { newHead: string; affected: number; affectedAccepted?: number };
@@ -184,6 +215,8 @@ export interface FlowViewState {
   filesRead: number;
   // summary
   summaryText: string;
+  /** Accepted changed-file findings that cannot be proven on a current added line. */
+  withheldInlineItemIds?: readonly string[];
   finalNote: string;
   postThread: boolean;
   requestChanges: boolean;
@@ -200,6 +233,8 @@ export type FlowMessage =
   | { type: 'selectAgent'; agentId: string }
   | { type: 'toggleModelOpen' }
   | { type: 'selectModel'; modelId: string }
+  | { type: 'toggleEffortOpen' }
+  | { type: 'selectEffort'; effort: EffortLevel }
   | { type: 'dismissNotices' }
   | { type: 'showSkippedAgents' }
   | { type: 'setFloor'; floor: Severity }
@@ -213,7 +248,10 @@ export type FlowMessage =
    * one uncoalesced read-modify-write per character (task 4.5).
    */
   | { type: 'commitInstructions'; text: string }
-  | { type: 'run' }
+  | { type: 'addContext' }
+  | { type: 'removeContextItem'; itemId: string }
+  | { type: 'toggleAutoContextItem'; itemId: string }
+  | { type: 'run'; instructions?: string }
   | { type: 'cancel' }
   | { type: 'usePartial' }
   | { type: 'retryRun' }
@@ -319,6 +357,19 @@ h1 { font-size: 19px; font-weight: 600; color: var(--fg-max); }
 .agent-origin { font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-dimmer); margin-left: auto; }
 .agent-row.inert { cursor: default; opacity: .6; }
 .agent-row.inert:hover { border-color: var(--line2); }
+.model-picker-split { display: flex; align-items: stretch; }
+.model-picker-split .model-picker-name { flex: 1; min-width: 0; border-radius: 5px 0 0 5px; }
+.model-picker-config { flex: none; min-width: 86px; border: 1px solid var(--line2); border-left: 0; border-radius: 0 5px 5px 0; background: var(--bg2); color: var(--fg-hi); padding: 9px 11px; cursor: pointer; font: 600 11.5px/1 var(--font-ui); }
+.model-picker-config:hover { border-color: var(--accent); background: var(--hover); }
+.model-picker-config-hidden { display: none; }
+.model-picker-split.effort-hidden .model-picker-name { border-radius: 5px; }
+.effort-menu { left: auto; width: min(460px, 100%); }
+.effort-option { width: 100%; border: 0; background: none; color: var(--fg); font-family: var(--font-ui); text-align: left; }
+.effort-option-check { width: 14px; flex: none; color: var(--agent); }
+.effort-option-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.effort-option-title { display: flex; align-items: center; gap: 7px; }
+.effort-default { border: 1px solid var(--line2); border-radius: 3px; padding: 1px 5px; color: var(--fg-dimmer); font: 9px/1.2 var(--font-mono); }
+.effort-disclosure { border-top: 1px solid var(--line2); padding: 8px 12px; color: var(--fg-dim); font-size: 10.5px; line-height: 1.45; }
 .picker-stack { display: flex; flex-direction: column; gap: 10px; }
 .picker-label { font-size: 11px; color: var(--fg-dim); margin-bottom: 5px; }
 .notice { display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--line2); border-left: 2px solid var(--agent); border-radius: 4px; background: var(--bg2); padding: 8px 11px; font-size: 11.5px; color: var(--fg-dim); }
@@ -334,6 +385,27 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .cats { display: flex; flex-wrap: wrap; gap: 8px; }
 .cat { font-size: 11px; padding: 6px 11px; border-radius: 14px; border: 1px solid var(--line2); color: var(--fg-dimmer); background: none; cursor: pointer; font-family: var(--font-ui); }
 textarea.extra { width: 100%; min-height: 74px; font-family: var(--font-mono); font-size: 12px; line-height: 1.7; background: var(--bg2); color: var(--fg); border: 1px solid var(--line2); border-radius: 5px; padding: 10px 12px; resize: vertical; outline: none; }
+.context-area { display: flex; flex-direction: column; gap: 9px; }
+.context-toolbar { display: flex; align-items: center; gap: 10px; }
+.context-add { display: inline-flex; align-items: center; gap: 6px; }
+.context-items { display: flex; flex-wrap: wrap; gap: 7px; }
+.context-chip { min-width: 0; max-width: 100%; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line2); border-radius: 5px; background: var(--bg2); color: var(--fg); padding: 4px 6px 4px 8px; font: 11px/1.35 var(--font-ui); }
+.context-chip:hover, .context-chip:focus { border-color: var(--accent); outline: none; }
+.context-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.context-chip-origin { color: var(--fg-dimmer); font-family: var(--font-mono); font-size: 9.5px; }
+.context-chip-disabled { border-style: dashed; color: var(--fg-dimmer); background: none; }
+.context-chip-cut { color: var(--sev-major); font-family: var(--font-mono); font-size: 9.5px; }
+.context-remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; flex: none; border: none; border-radius: 3px; background: none; color: var(--fg-dimmer); cursor: pointer; }
+.context-remove:hover, .context-remove:focus { color: var(--fg-hi); background: var(--hover); outline: none; }
+.context-empty, .context-reference-status { color: var(--fg-dimmer); font-size: 11px; line-height: 1.5; }
+.context-reference-status { color: var(--sev-major); }
+.context-usage { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--fg-dim); font: 10.5px/1 var(--font-mono); }
+.context-usage svg { width: 20px; height: 20px; flex: none; }
+.context-usage-track { fill: var(--line2); }
+.context-usage-fill { fill: var(--ok); }
+.context-usage-warning .context-usage-fill { fill: var(--sev-major); }
+.context-usage-error .context-usage-fill { fill: var(--sev-blocker); }
+.context-usage-copy { color: var(--sev-major); font-family: var(--font-ui); font-size: 10.5px; }
 .footer-row { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--line); padding-top: 18px; }
 .footer-hint { margin-left: auto; font-size: 11px; color: var(--fg-dimmer); }
 
@@ -551,32 +623,44 @@ function agentPicker(s: FlowViewState, agent: AgentDescriptor | undefined): stri
  * an empty model list states why rather than offering an empty menu.
  */
 function modelPicker(s: FlowViewState, agent: AgentDescriptor | undefined): string {
+  const effort = EFFORT_LEVELS.find((level) => level.id === s.effort)
+    ?? EFFORT_LEVELS.find((level) => level.id === DEFAULT_EFFORT_LEVEL)!;
+  const effortSegment = (hidden: boolean): string => `<button class="model-picker-config${hidden ? ' model-picker-config-hidden' : ''}" id="effort-toggle" type="button" title="Configure Model" aria-label="Configure Model, Thinking Effort: ${e(effort.label)}" aria-haspopup="menu" aria-expanded="${!hidden && s.effortOpen}">${e(effort.label)}</button>`;
   if (agent?.source === 'demo') {
     return `<div class="agent-select">
       <div class="picker-label">Model</div>
-      <button class="agent-row inert" id="model-inert" disabled>
-        <span class="agent-name">Not used by this agent</span>
-        <span class="agent-origin">the demo agent generates findings from the diff</span>
-      </button>
+      <div class="model-picker-split effort-hidden">
+        <button class="agent-row model-picker-name inert" id="model-inert" disabled>
+          <span class="agent-name">Not used by this agent</span>
+          <span class="agent-origin">the demo agent generates findings from the diff</span>
+        </button>
+        ${effortSegment(true)}
+      </div>
     </div>`;
   }
   if (s.models.length === 0) {
     return `<div class="agent-select">
       <div class="picker-label">Model</div>
-      <button class="agent-row inert" id="model-inert" disabled>
-        <span class="agent-name">No model available</span>
-        <span class="agent-origin">sign in to Copilot, or pick the demo agent</span>
-      </button>
+      <div class="model-picker-split effort-hidden">
+        <button class="agent-row model-picker-name inert" id="model-inert" disabled>
+          <span class="agent-name">No model available</span>
+          <span class="agent-origin">sign in to Copilot, or pick the demo agent</span>
+        </button>
+        ${effortSegment(true)}
+      </div>
     </div>`;
   }
   const model = s.models.find((m) => m.id === s.modelId) ?? s.models[0];
   return `<div class="agent-select">
       <div class="picker-label">Model</div>
-      <button class="agent-row" id="model-toggle">
-        <span class="agent-name">${e(model?.label ?? 'Select a model')}</span>
-        <span class="agent-badge">copilot</span>
-        <span class="agent-caret">${s.modelOpen ? '▲' : '▼'}</span>
-      </button>
+      <div class="model-picker-split">
+        <button class="agent-row model-picker-name" id="model-toggle">
+          <span class="agent-name">${e(model?.label ?? 'Select a model')}</span>
+          <span class="agent-badge">copilot</span>
+          <span class="agent-caret">${s.modelOpen ? '▲' : '▼'}</span>
+        </button>
+        ${effortSegment(false)}
+      </div>
       ${
         s.modelOpen
           ? `<div class="agent-menu">
@@ -593,7 +677,76 @@ function modelPicker(s: FlowViewState, agent: AgentDescriptor | undefined): stri
       </div>`
           : ''
       }
+      ${
+        s.effortOpen
+          ? `<div class="agent-menu effort-menu" role="menu" aria-label="Thinking Effort">
+        <div class="agent-menu-head">Thinking Effort</div>
+        ${EFFORT_LEVELS.map((level) => `<button class="agent-option effort-option ${level.id === s.effort ? 'active' : ''}" type="button" role="menuitemradio" aria-checked="${level.id === s.effort}" data-effort="${level.id}" title="${e(level.description)}">
+          <span class="effort-option-check" aria-hidden="true">${level.id === s.effort ? '✓' : ''}</span>
+          <span class="effort-option-copy">
+            <span class="effort-option-title"><span class="agent-name">${e(level.label)}</span>${level.id === DEFAULT_EFFORT_LEVEL ? '<span class="effort-default">Default</span>' : ''}</span>
+            <span class="desc">${e(level.description)}</span>
+          </span>
+        </button>`).join('')}
+        <div class="effort-disclosure">Applied as review instructions in the prompt, not as the model's own reasoning configuration.</div>
+        ${s.effortComparisonDisclosure ? '<div class="effort-disclosure">Changing the level now makes the next run not comparable with the findings already in hand.</div>' : ''}
+      </div>`
+          : ''
+      }
     </div>`;
+}
+
+function usagePiePath(percentage: number): string {
+  const value = Math.max(0, Math.min(100, percentage));
+  if (value <= 0) return '';
+  if (value >= 100) return '<circle class="context-usage-fill" cx="10" cy="10" r="9"></circle>';
+  const angle = (value / 100) * Math.PI * 2;
+  const x = 10 + 9 * Math.sin(angle);
+  const y = 10 - 9 * Math.cos(angle);
+  return `<path class="context-usage-fill" d="M 10 10 L 10 1 A 9 9 0 ${value > 50 ? 1 : 0} 1 ${x.toFixed(3)} ${y.toFixed(3)} Z"></path>`;
+}
+
+function contextUsageIndicator(usage: ContextUsageView | undefined): string {
+  if (!usage || usage.totalTokens <= 0) return '';
+  const percentage = Math.max(0, Math.round((usage.usedTokens / usage.totalTokens) * 100));
+  const level = percentage >= 90 ? 'error' : percentage >= 75 ? 'warning' : 'normal';
+  return `<div class="context-usage context-usage-${level}" role="img" aria-label="Context window usage: ${percentage}%" title="${usage.usedTokens} / ${usage.totalTokens} tokens">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-usage-track" cx="10" cy="10" r="9"></circle>${usagePiePath(percentage)}</svg>
+    <span>${percentage}%</span>
+    ${percentage >= 75 ? '<span class="context-usage-copy">Quality may decline as limit nears.</span>' : ''}
+  </div>`;
+}
+
+function contextArea(s: FlowViewState): string {
+  const automatic = s.autoContextItems.map((item) => `<button class="context-chip context-auto${item.enabled ? '' : ' context-chip-disabled'}" type="button" role="button" tabindex="0" data-auto-context="${e(item.id)}" aria-pressed="${item.enabled}" title="${item.enabled ? 'Remove from this run' : 'Include in this run'}">
+    <span class="context-chip-label">${e(item.label)}</span>
+    ${item.detail ? `<span class="context-chip-origin">${e(item.detail)}</span>` : ''}
+    <span class="context-chip-origin">Automatically derived</span>
+  </button>`).join('');
+  const attachments = s.attachments.map((attachment) => `<div class="context-chip context-attachment" role="button" tabindex="0" data-context-item="${e(attachment.id)}" title="${e(attachment.label)}">
+    <span class="context-chip-label">${e(attachment.label)}</span>
+    ${attachment.truncated ? '<span class="context-chip-cut">Part sent</span>' : ''}
+    <button class="context-remove" type="button" data-remove-context="${e(attachment.id)}" title="Remove from context" aria-label="Remove from context"><span class="codicon codicon-close" aria-hidden="true"></span></button>
+  </div>`).join('');
+  const empty = automatic || attachments
+    ? ''
+    : '<div class="context-empty">No context will be sent beyond the changed-file diffs.</div>';
+  const unresolved = s.unresolvedContextReferences.length > 0
+    ? `<div class="context-reference-status" role="status">${s.unresolvedContextReferences.map((reference) => `${e(reference)} did not resolve.`).join(' ')}</div>`
+    : '';
+  const selectedAgent = s.agents.find((agent) => agent.id === s.agentId);
+  const selectedModel = s.models.find((model) => model.id === s.modelId);
+  const usage = selectedAgent?.source !== 'demo' && selectedModel?.maxInputTokens
+    ? s.contextUsage
+    : undefined;
+  return `<div class="context-area" aria-label="Review context">
+    <div class="context-toolbar">
+      <button class="btn context-add" id="add-context" type="button"><span class="codicon codicon-add" aria-hidden="true"></span><span>Add Context…</span></button>
+      ${contextUsageIndicator(usage)}
+    </div>
+    <div class="context-items">${automatic}${attachments}${empty}</div>
+    ${unresolved}
+  </div>`;
 }
 
 /** Only reached when `s.agents` is somehow empty; keeps `agentOrigin` total. */
@@ -638,6 +791,7 @@ function renderRunReview(s: FlowViewState): string {
       ${agentPicker(s, agent)}
       ${modelPicker(s, agent)}
     </div>
+    ${s.effortComparisonDisclosure ? '<div class="notice"><span>Changing the effort level now makes the next run not comparable with the findings already in hand.</span></div>' : ''}
     <div class="crit-grid">
       <div>
         <div class="crit-label">Report at or above</div>
@@ -670,13 +824,14 @@ function renderRunReview(s: FlowViewState): string {
       <div class="crit-label">Extra instructions</div>
       <textarea class="extra" id="extra" placeholder="Terse. No praise. Cite the rule or CVE class.">${e(s.criteria.extraInstructions)}</textarea>
     </div>
+    ${contextArea(s)}
     <div class="footer-row">
       <button class="btn btn-brand" id="run"${runBlocked ? ' disabled' : ''}>Run review</button>
       <button class="btn" id="cancel">Cancel</button>
       <span class="footer-hint">${
         runBlocked
           ? e(`${agent?.label ?? 'This agent'} needs a Copilot model, and none is available.`)
-          : `${s.header.fileCount} files, +${s.header.added} −${s.header.removed} go to the agent — never the whole repo.`
+          : `${s.header.fileCount} changed files + ${s.attachments.length} attachments go to the agent.`
       }</span>
     </div>
   </div>`;
@@ -809,6 +964,7 @@ function retainedMetaLine(s: FlowViewState): string {
     meta.ranAt ? `Ran ${e(formatRanAt(meta.ranAt))}` : '',
     meta.agentLabel ? e(meta.agentLabel) : '',
     meta.modelLabel ? e(meta.modelLabel) : '',
+    meta.effortLabel ? `effort ${e(meta.effortLabel)}` : '',
   ].filter((part) => part !== '');
   return parts.length > 0 ? `<p class="dim">${parts.join(' · ')}</p>` : '';
 }
@@ -817,6 +973,15 @@ function formatRanAt(iso: string): string {
   const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return iso;
   return at.toLocaleString();
+}
+
+function attachmentWarningNotice(s: FlowViewState): string {
+  if (s.attachmentWarnings.length === 0) return '';
+  const failures = [...new Map(s.attachmentWarnings.map((warning) => [
+    `${warning.label}\0${warning.reason}`,
+    `${warning.label} (${warning.reason})`,
+  ])).values()];
+  return `<div class="notice attachment-warning"><span>Some attached context could not be read at run start and was excluded: ${failures.map(e).join(', ')}.</span></div>`;
 }
 
 // ---- §5 Triage ---------------------------------------------------------------
@@ -830,10 +995,10 @@ function triageHeader(s: FlowViewState): string {
   const scope = s.changeset
     ? `<div class="changeset-scope"><span class="glyph">⧉</span><span><strong>Reviewing ${e(s.changeset.name)} · ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s</strong> · findings are labelled with the repo they land in</span><a href="#" id="review-single">Review this ${e(s.vocabulary.changeRequestAbbrev)} alone</a></div>`
     : '';
-  return `${scope}<div class="tri-head">
+  return `${scope}${attachmentWarningNotice(s)}<div class="tri-head">
     <div>
       <div class="tri-title">${e(s.header.title)}</div>
-      <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}</div>
+      <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}${s.reviewEffortLabel ? ` · effort ${e(s.reviewEffortLabel)}` : ''}</div>
     </div>
     <div class="tallies">${tallies}</div>
     <div class="seg mode" id="mode">
@@ -952,6 +1117,18 @@ function movedChip(view?: TriageItemView): string {
   return view?.lineMoved ? '<span class="pill pill-warn">⚠ line moved</span>' : '';
 }
 
+function canApplyFix(view: TriageItemView | undefined): boolean {
+  return Boolean(view?.item.suggestion) && Boolean(view && isReviewItemAnchored(view.item));
+}
+
+function summaryOnlyNotice(view: TriageItemView): string {
+  if (isReviewItemAnchored(view.item)) return '';
+  const suggestionReason = view.item.suggestion
+    ? ' There is no diff line for a suggestion block to attach to, so accepting cannot apply the fix.'
+    : '';
+  return `<div class="ctx-note">This finding is outside the diff. If accepted, it will be included in the summary rather than posted inline.${suggestionReason}</div>`;
+}
+
 function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabulary, repoLabels?: Record<string, string>, modelLabel?: string): string {
   const item = view.item;
   const owner = view.projectLabel && view.refLabel ? `<span class="agent-fg">${e(view.projectLabel)} · ${e(view.refLabel)}</span> · ` : '';
@@ -967,11 +1144,14 @@ function itemDetail(view: TriageItemView, agentLabel: string, vocabulary: Vocabu
     : '';
   return `
     <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${movedChip(view)}</div>
+      <div>${sevChip(item.severity)}${item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${!isReviewItemAnchored(item) ? '<span class="pill pill-agent">summary only</span>' : ''}${movedChip(view)}</div>
     <div class="detail-title">${e(item.title)}</div>
     <div class="detail-meta">${owner}${e(item.file)}:${item.line} · ${e(ALL_CATEGORY_LABELS[item.category].toLowerCase())} · confidence ${item.confidence}% · <span class="agent-fg">${e(agentLabel)}</span> · ${e(modelLabel ?? 'model unknown')}</div>
     ${cross}
     <div class="prose md">${renderMarkdown(item.body)}</div>
+    ${summaryOnlyNotice(view)}
     <div class="code-card">
+        <div class="sugg-head">${isReviewItemAnchored(item) ? `Suggested change · posts as a ${e(vocabulary.platformName)} suggestion` : 'Suggested fix · summary-only finding'}</div>
       <div class="code-head"><span>${e(item.file)}:${item.line}</span><a href="#" id="open-editor" data-file="${e(item.file)}" data-line="${item.line}">Open in editor</a></div>
       <div class="code-body">${e(item.code)}</div>
     </div>
@@ -1011,7 +1191,7 @@ function renderTriageSplit(s: FlowViewState, agentLabel: string): string {
     ${selected ? itemDetail(selected, agentLabel, s.vocabulary, s.changeset?.repoLabels, s.reviewModelLabel) : '<p class="prose">No review items.</p>'}
   </div>
   <div class="action-bar">
-    <button class="btn btn-ok" id="accept">Accept<span class="key">A</span></button>
+    <button class="btn btn-ok" id="accept" data-apply-fix="${canApplyFix(selected)}">Accept<span class="key">A</span></button>
     <button class="btn btn-danger" id="reject">Reject<span class="key">R</span></button>
     <button class="btn" id="skip">Skip<span class="key">S</span></button>
     <span class="bar-count">${decided} of ${s.items.length} triaged</span>
@@ -1045,11 +1225,12 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
     <div class="qcard">
       ${
         selected
-          ? `<div class="qrow">${sevChip(selected.item.severity)}${selected.item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${catPill(selected.item.category)}${movedChip(selected)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
+          ? `<div class="qrow">${sevChip(selected.item.severity)}${selected.item.cross ? '<span class="pill pill-agent">⧉ cross-repo</span>' : ''}${!isReviewItemAnchored(selected.item) ? '<span class="pill pill-agent">summary only</span>' : ''}${catPill(selected.item.category)}${movedChip(selected)}<span class="dim">confidence ${selected.item.confidence}%</span></div>
         <div class="qtitle">${e(selected.item.title)}</div>
         <div class="detail-meta">${selected.projectLabel && selected.refLabel ? `<span class="agent-fg">${e(selected.projectLabel)} · ${e(selected.refLabel)}</span> · ` : ''}${e(selected.item.file)}:${selected.item.line}</div>
         <div class="code-card"><div class="code-body">${e(selected.item.code)}</div></div>
         <div class="prose md">${renderMarkdown(selected.item.body)}</div>
+        ${summaryOnlyNotice(selected)}
         <div class="presets">
           <button class="chip preset" data-preset="explain">Explain the risk</button>
           <button class="chip preset" data-preset="fix">Show me a fix</button>
@@ -1067,7 +1248,7 @@ function renderTriageQueue(s: FlowViewState, _agentLabel: string): string {
     <div class="deck-actions">
       <button class="btn btn-danger grow" id="reject">← Reject</button>
       <button class="btn" id="skip">↓ Skip</button>
-      <button class="btn btn-ok grow" id="accept">Accept →</button>
+      <button class="btn btn-ok grow" id="accept" data-apply-fix="${canApplyFix(selected)}">Accept →</button>
     </div>
     <div class="deck-foot">
       <span>${decided} of ${s.items.length} triaged</span>
@@ -1083,15 +1264,16 @@ function renderTriageDiff(s: FlowViewState): string {
   const item = selected.item;
   const severityColor = item.severity === 'nit' ? 'var(--fg-dim)' : `var(--sev-${item.severity})`;
   const suggestion = item.suggestion
-    ? `<div class="code-card"><div class="sugg-head">Suggested change · posts as a ${e(s.vocabulary.platformName)} suggestion</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
+    ? `<div class="code-card"><div class="sugg-head">${isReviewItemAnchored(item) ? `Suggested change · posts as a ${e(s.vocabulary.platformName)} suggestion` : 'Suggested fix · summary-only finding'}</div><div class="sugg-del">- ${e(item.suggestion.old)}</div><div class="sugg-add">+ ${e(item.suggestion.new)}</div></div>`
     : '';
   const thread = selected.thread.map((entry) => `<div class="thread-entry"><div class="thread-label">${e(entry.label)}</div><div class="thread-text md">${renderMarkdown(entry.text)}</div></div>`).join('');
   const widget = `<div class="peek-widget" data-item="${e(item.id)}" data-repo-id="${e(item.repoId ?? '')}" data-cr-number="${e(item.crNumber ?? '')}" style="--item-sev:${severityColor}">
     <div class="peek-head">${sevChip(item.severity)}${movedChip(selected)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
-    <div class="peek-body"><div class="prose md">${renderMarkdown(item.body)}</div>${suggestion}${thread}
+    <div class="peek-head">${sevChip(item.severity)}${!isReviewItemAnchored(item) ? '<span class="pill pill-agent">summary only</span>' : ''}${movedChip(selected)}<span class="peek-title">${e(item.title)}</span><span class="peek-count">${item.confidence}% · ${itemIndex + 1} of ${s.items.length}</span></div>
+    <div class="peek-body"><div class="prose md">${renderMarkdown(item.body)}</div>${summaryOnlyNotice(selected)}${suggestion}${thread}
       <div class="peek-actions">
-        <button class="btn btn-ok" id="accept">${item.suggestion ? 'Accept &amp; apply' : 'Accept'}</button>
-        ${item.suggestion ? '<button class="btn" id="accept-comment">Accept, comment only</button>' : ''}
+        <button class="btn btn-ok" id="accept" data-apply-fix="${canApplyFix(selected)}">${canApplyFix(selected) ? 'Accept &amp; apply' : 'Accept'}</button>
+        ${canApplyFix(selected) ? '<button class="btn" id="accept-comment">Accept, comment only</button>' : ''}
         <button class="btn btn-danger" id="reject">Reject</button><button class="btn" id="skip">Skip</button>
         <a href="#" class="ask-link preset" data-preset="explain">Ask agent <span class="kbd">⌘↩</span></a>
       </div>
@@ -1146,6 +1328,7 @@ function renderClean(s: FlowViewState): string {
             why: `${c.category} is off in this pod's criteria`,
           };
   return `<div class="clean-col">
+    ${attachmentWarningNotice(s)}
     <div class="ok-circle">✓</div>
     <h1>No findings above your criteria</h1>
     <p class="lede">${s.filesRead} files read, ${totalFiltered} candidate observations scored — none cleared the ${s.criteria.severityFloor} floor at ${s.criteria.minConfidence}% confidence.</p>
@@ -1177,12 +1360,20 @@ function renderClean(s: FlowViewState): string {
 
 function renderSummary(s: FlowViewState): string {
   const accepted = s.items.filter((v) => v.verdict === 'accepted');
+  const withheldInlineItemIds = new Set(s.withheldInlineItemIds ?? []);
+  const inlineAccepted = accepted.filter((view) => (
+    isReviewItemAnchored(view.item) && !withheldInlineItemIds.has(view.item.id)
+  ));
+  const summaryAccepted = accepted.filter((view) => !isReviewItemAnchored(view.item));
+  const withheldInline = accepted.filter((view) => withheldInlineItemIds.has(view.item.id));
   const rejected = s.items.filter((v) => v.verdict === 'rejected');
   return `<div class="wrap wrap-wide">
     ${subline(s.header)}
     <div>
       <h1>${s.changeset ? `Submit review across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestNounPlural)}` : `Submit review to ${e(s.vocabulary.platformName)}`}</h1>
       <p class="lede">${s.items.length} findings triaged — ${s.counts.accepted} accepted, ${s.counts.rejected} rejected, ${s.counts.skipped} skipped.</p>
+      <p class="lede">${summaryAccepted.length} accepted ${summaryAccepted.length === 1 ? 'finding will' : 'findings will'} go to the summary rather than inline.</p>
+      ${withheldInline.length === 0 ? '' : `<p class="lede">${withheldInline.length} accepted ${withheldInline.length === 1 ? 'finding no longer has' : 'findings no longer have'} matching code on a current added line; ${withheldInline.length === 1 ? 'it will be' : 'they will be'} withheld from inline submission and included in the summary.</p>`}
     </div>
     <div class="tally-blocks">
       <div class="tally tally-acc"><b>${s.counts.accepted}</b>accepted</div>
@@ -1195,11 +1386,13 @@ function renderSummary(s: FlowViewState): string {
     </div>
     ${s.changeset ? `<div class="cs-note">⧉ Posted to all ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestNounPlural)} in this changeset, each comment landing in the repo it belongs to, cross-linked to ${e(s.changeset.linkedIssue ?? s.changeset.name)}.</div>` : ''}
     <div class="card">
-      <div class="sum-card-head"><span>Line comments to post (${s.counts.accepted})</span></div>
+      <div class="sum-card-head"><span>Line comments to post (${inlineAccepted.length})</span></div>
       ${
-        accepted.length === 0
-          ? `<div class="empty-comments">Accepted items become inline comments here — nothing is accepted yet.</div>`
-          : accepted
+        inlineAccepted.length === 0
+          ? `<div class="empty-comments">${accepted.length === 0
+              ? 'Accepted items become inline comments here — nothing is accepted yet.'
+              : 'No accepted finding has a current added-line anchor for inline submission.'}</div>`
+          : inlineAccepted
               .map(
                 (v) => `<div class="comment-row">
           <span>☑</span>
@@ -1247,7 +1440,7 @@ function renderSummary(s: FlowViewState): string {
       s.submitError
         ? `<div class="submit-fail">
         <div class="fail-title">${e(s.vocabulary.platformName)} rejected the request · ${e(s.submitError)}</div>
-        <div class="lede">Nothing is lost — the summary, the ${s.counts.accepted} line comments and your final note are still here.</div>
+        <div class="lede">Nothing is lost — the summary, the ${inlineAccepted.length} line comments and your final note are still here.</div>
         <div class="actions-row">
           <button class="btn btn-accent" id="reconnect">Reconnect ${e(s.vocabulary.platformName)}</button>
           <button class="btn" id="retry-submit">Retry submit</button>
@@ -1363,6 +1556,11 @@ document.addEventListener('click', (ev) => {
   else if (el.dataset.agent) post({ type: 'selectAgent', agentId: el.dataset.agent });
 });
 on('model-toggle', 'toggleModelOpen');
+on('effort-toggle', 'toggleEffortOpen');
+document.addEventListener('click', (ev) => {
+  const option = ev.target.closest('[data-effort]');
+  if (option) post({ type: 'selectEffort', effort: option.dataset.effort });
+});
 on('dismiss-notices', 'dismissNotices');
 on('show-skipped', 'showSkippedAgents');
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-floor]'); if (b) post({ type: 'setFloor', floor: b.dataset.floor }); });
@@ -1373,12 +1571,37 @@ document.addEventListener('input', (ev) => {
   if (el) el.textContent = ev.target.value + '%';
 });
 document.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-cat]'); if (b) post({ type: 'toggleCategory', category: b.dataset.cat }); });
-// Blur is where the one podStore write lands (task 9.3): the per-keystroke
-// setInstructions above updates the host's in-memory criteria only, because
-// podStore.upsert is a read-modify-write and one per character is exactly
-// what task 4.5 forbids.
+// Blur is where the one podStore write lands (task 9.3): the debounced
+// setInstructions commit above updates the host's in-memory criteria only.
 document.addEventListener('change', (ev) => { if (ev.target.id === 'extra') post({ type: 'commitInstructions', text: ev.target.value }); });
-on('run', 'run'); on('cancel', 'cancel'); on('cancel-run', 'cancel');
+on('add-context', 'addContext');
+document.addEventListener('click', (ev) => {
+  const remove = ev.target.closest('[data-remove-context]');
+  if (remove) post({ type: 'removeContextItem', itemId: remove.dataset.removeContext });
+});
+document.addEventListener('click', (ev) => {
+  const item = ev.target.closest('[data-auto-context]');
+  if (item) post({ type: 'toggleAutoContextItem', itemId: item.dataset.autoContext });
+});
+document.addEventListener('auxclick', (ev) => {
+  const item = ev.target.closest('.context-attachment[data-context-item]');
+  if (item && ev.button === 1) { ev.preventDefault(); post({ type: 'removeContextItem', itemId: item.dataset.contextItem }); }
+});
+document.addEventListener('keydown', (ev) => {
+  const attachment = ev.target.closest('.context-attachment[data-context-item]');
+  if (attachment && (ev.key === 'Backspace' || ev.key === 'Delete')) {
+    ev.preventDefault();
+    post({ type: 'removeContextItem', itemId: attachment.dataset.contextItem });
+    return;
+  }
+});
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#run')) return;
+  ev.preventDefault();
+  const instructions = document.getElementById('extra')?.value;
+  post({ type: 'run', instructions });
+});
+on('cancel', 'cancel'); on('cancel-run', 'cancel');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
 on('new-run', 'newRun'); on('back-to-result', 'backToResult');
@@ -1387,7 +1610,8 @@ on('reanchor', 'reanchor'); on('rerun', 'rerun'); on('ctx-toggle', 'toggleReview
 
 const itemId = () => document.querySelector('[data-item]')?.dataset.item;
 const verdict = (v, applyFix) => { const id = itemId(); if (id) post({ type: 'verdict', itemId: id, verdict: v, applyFix }); };
-document.addEventListener('click', (ev) => { if (ev.target.closest('#accept')) verdict('accepted', true); });
+const acceptCanApplyFix = () => document.querySelector('#accept')?.dataset.applyFix === 'true';
+document.addEventListener('click', (ev) => { if (ev.target.closest('#accept')) verdict('accepted', acceptCanApplyFix()); });
 document.addEventListener('click', (ev) => {
   if (!ev.target.closest('#accept-comment')) return;
   const id = itemId();
@@ -1523,7 +1747,7 @@ document.addEventListener('click', (ev) => {
 document.addEventListener('keydown', (ev) => {
   if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // never hijack Cmd/Ctrl chords
-  const map = { a: () => verdict('accepted', !ev.shiftKey ? true : false), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); } };
+  const map = { a: () => verdict('accepted', !ev.shiftKey && acceptCanApplyFix()), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); } };
   const jump = { '1': 'blocker', '2': 'major', '3': 'minor', '4': 'nit' };
   const key = ev.key.toLowerCase();
   if (map[key]) { ev.preventDefault(); map[key](); }

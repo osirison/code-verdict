@@ -16,6 +16,16 @@ export interface NotificationSettingView {
   mode: NotificationMode;
 }
 
+export interface ContextSettingsView {
+  sectionBudget: number;
+  totalBudget: number;
+  maxLinkedItems: number;
+  includeTitle: boolean;
+  includeDescription: boolean;
+  includeLinkedItems: boolean;
+  usageEnabled: boolean;
+}
+
 export interface SettingsViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
@@ -26,6 +36,7 @@ export interface SettingsViewState {
   quietMode: boolean;
   digestCadence: DigestCadence;
   shareRates: boolean;
+  context: ContextSettingsView;
   notifications: NotificationSettingView[];
   /** Where `*.agent.md` definitions are searched, and what each one yielded. */
   agentLocations: AgentLocationView[];
@@ -66,6 +77,16 @@ export type SettingsMessage =
   | { type: 'setQuietMode'; value: boolean }
   | { type: 'setDigestCadence'; value: DigestCadence }
   | { type: 'setShareRates'; value: boolean }
+  | {
+    type: 'setContextBudget';
+    key: 'sectionBudget' | 'totalBudget' | 'maxLinkedItems';
+    value: number;
+  }
+  | {
+    type: 'setContextToggle';
+    key: 'includeTitle' | 'includeDescription' | 'includeLinkedItems' | 'usageEnabled';
+    value: boolean;
+  }
   | { type: 'addAgentLocation' }
   | { type: 'removeAgentLocation'; label: string }
   | { type: 'openSettingsJson' };
@@ -103,6 +124,12 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; line-height: 1.25;
 .location-status { color: var(--fg-dimmer); font-size: 11px; margin-left: auto; flex: none; }
 .location-status.bad { color: var(--warn, var(--fg-dim)); }
 .link { border: none; background: none; color: var(--link); cursor: pointer; padding: 0; font: 11px/1 var(--font-ui); }
+.context-setting { display: flex; align-items: center; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--row); }
+.context-setting .notification-copy { flex: 1; }
+.number-input { width: 112px; flex: none; padding: 7px 9px; text-align: right; }
+.context-toggles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px 18px; padding-top: 4px; }
+.context-toggle { align-items: flex-start; }
+.context-toggle-copy { display: flex; flex-direction: column; gap: 3px; }
 pre { margin: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--code); padding: 13px 15px; color: var(--fg); font: 12px/1.75 var(--font-mono); overflow-x: auto; }
 `;
 
@@ -161,9 +188,34 @@ function agentsRegion(state: SettingsViewState): string {
     </section>`;
 }
 
+function contextRegion(state: SettingsViewState): string {
+  return `<section class="section"><div class="label">Context</div>
+      <p class="subnote">Set the limits and starting sources for new reviews. Auto-derived context is intent; attachments and diffs are reviewable evidence.</p>
+      <div class="context-setting">
+        <label class="notification-copy" for="context-section-budget"><span class="notification-name">Per-section budget</span><span class="hint">Maximum characters from one auto-derived section.</span></label>
+        <input class="input number-input" id="context-section-budget" data-context-budget="sectionBudget" type="number" min="1" step="1" value="${state.context.sectionBudget}">
+      </div>
+      <div class="context-setting">
+        <label class="notification-copy" for="context-total-budget"><span class="notification-name">Total budget</span><span class="hint">Maximum characters across auto-derived context; attachments and diffs are separate.</span></label>
+        <input class="input number-input" id="context-total-budget" data-context-budget="totalBudget" type="number" min="1" step="1" value="${state.context.totalBudget}">
+      </div>
+      <div class="context-setting">
+        <label class="notification-copy" for="context-max-linked-items"><span class="notification-name">Linked item limit</span><span class="hint">Maximum linked work items included in the prompt.</span></label>
+        <input class="input number-input" id="context-max-linked-items" data-context-budget="maxLinkedItems" type="number" min="1" step="1" value="${state.context.maxLinkedItems}">
+      </div>
+      <div class="context-toggles">
+        <button class="toggle context-toggle" data-context-toggle="includeTitle" data-enabled="${state.context.includeTitle}"><span class="box">${state.context.includeTitle ? '☑' : '☐'}</span><span class="context-toggle-copy"><span class="notification-name">Include title</span><span class="hint">Start new reviews with the change request title.</span></span></button>
+        <button class="toggle context-toggle" data-context-toggle="includeDescription" data-enabled="${state.context.includeDescription}"><span class="box">${state.context.includeDescription ? '☑' : '☐'}</span><span class="context-toggle-copy"><span class="notification-name">Include description</span><span class="hint">Start new reviews with the change request description.</span></span></button>
+        <button class="toggle context-toggle" data-context-toggle="includeLinkedItems" data-enabled="${state.context.includeLinkedItems}"><span class="box">${state.context.includeLinkedItems ? '☑' : '☐'}</span><span class="context-toggle-copy"><span class="notification-name">Include linked work items</span><span class="hint">Start new reviews with linked work items.</span></span></button>
+        <button class="toggle context-toggle" data-context-toggle="usageEnabled" data-enabled="${state.context.usageEnabled}"><span class="box">${state.context.usageEnabled ? '☑' : '☐'}</span><span class="context-toggle-copy"><span class="notification-name">Show context usage</span><span class="hint">Estimate use of the selected model's input capacity.</span></span></button>
+      </div>
+    </section>`;
+}
+
 function privacyRegion(state: SettingsViewState): string {
+  const e = escapeHtml;
   return `<section class="section"><div class="label">Data &amp; privacy</div>
-      <p class="note">Diff hunks, file paths and your criteria go to the agent and model you selected. Nothing reaches ${escapeHtml(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
+      <p class="note">The selected agent and model receive diff hunks, file paths, your review criteria, selected attachment contents and paths, and, when enabled, the ${e(state.vocabulary.changeRequestNoun)} title, description, and linked ${e(state.vocabulary.workItemNounPlural)}. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
       <button class="toggle" id="share-rates" data-checked="${state.shareRates}"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
       <span class="subnote">${state.shareRates ? 'Aggregate rates are shared; finding text and rejection rationale stay local.' : 'Rates remain local to this VS Code profile.'}</span>
     </section>`;
@@ -175,6 +227,13 @@ function jsonPreviewRegion(state: SettingsViewState): string {
     'codeVerdict.notifications': Object.fromEntries(state.notifications.map((setting) => [setting.key, setting.mode])),
     'codeVerdict.notifications.quietMode': state.quietMode,
     'codeVerdict.notifications.digestCadence': state.digestCadence,
+    'codeVerdict.context.sectionBudget': state.context.sectionBudget,
+    'codeVerdict.context.totalBudget': state.context.totalBudget,
+    'codeVerdict.context.maxLinkedItems': state.context.maxLinkedItems,
+    'codeVerdict.context.includeTitle': state.context.includeTitle,
+    'codeVerdict.context.includeDescription': state.context.includeDescription,
+    'codeVerdict.context.includeLinkedItems': state.context.includeLinkedItems,
+    'codeVerdict.contextUsage.enabled': state.context.usageEnabled,
     'codeVerdict.shareAcceptRejectRates': state.shareRates,
   }, null, 2);
   return `<section class="section"><div class="settings-head"><span class="label">settings.json</span><button class="link" id="open-json">Open in editor</button></div>
@@ -186,6 +245,7 @@ export const SETTINGS_REGION_IDS = [
   'set-connection',
   'set-notifications',
   'set-agents',
+  'set-context',
   'set-privacy',
   'set-json',
 ] as const;
@@ -198,6 +258,7 @@ export function renderSettingsRegions(state: SettingsViewState): Record<Settings
     'set-connection': connectionRegion(state),
     'set-notifications': notificationsRegion(state),
     'set-agents': agentsRegion(state),
+    'set-context': contextRegion(state),
     'set-privacy': privacyRegion(state),
     'set-json': jsonPreviewRegion(state),
   };
@@ -236,6 +297,16 @@ const SCRIPT = `
   document.addEventListener('click', (ev) => {
     const button = ev.target.closest('[data-cadence]');
     if (button) post({ type: 'setDigestCadence', value: button.dataset.cadence });
+  });
+  document.addEventListener('change', (ev) => {
+    const input = ev.target.closest('[data-context-budget]');
+    if (!input) return;
+    const value = Number(input.value);
+    if (Number.isInteger(value) && value > 0) post({ type: 'setContextBudget', key: input.dataset.contextBudget, value });
+  });
+  document.addEventListener('click', (ev) => {
+    const button = ev.target.closest('[data-context-toggle]');
+    if (button) post({ type: 'setContextToggle', key: button.dataset.contextToggle, value: button.dataset.enabled !== 'true' });
   });
   document.addEventListener('click', (ev) => {
     const el = ev.target.closest('#share-rates');

@@ -202,6 +202,51 @@
           "default": true,
           "description": "After a verdict, advance to the next undecided item."
         },
+        "codeVerdict.context.sectionBudget": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4000,
+          "scope": "window",
+          "description": "Maximum characters sent from any single auto-derived context section. Missing or unusable values fall back to 4,000 characters."
+        },
+        "codeVerdict.context.totalBudget": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 12000,
+          "scope": "window",
+          "description": "Maximum total characters sent as auto-derived context. Attachments and diffs use separate limits. Missing or unusable values fall back to 12,000 characters."
+        },
+        "codeVerdict.context.maxLinkedItems": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "scope": "window",
+          "description": "Maximum linked work items sent as auto-derived context. Missing or unusable values fall back to 5 items."
+        },
+        "codeVerdict.context.includeTitle": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Include the change request title in auto-derived context for new reviews by default. It can still be removed for a single run."
+        },
+        "codeVerdict.context.includeDescription": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Include the change request description in auto-derived context for new reviews by default. It can still be removed for a single run."
+        },
+        "codeVerdict.context.includeLinkedItems": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Include linked work items in auto-derived context for new reviews by default. Individual items can still be removed or restored for a single run."
+        },
+        "codeVerdict.contextUsage.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Show the selected model's estimated context-window usage before a review. Context and attachment budgets still apply when this indicator is hidden."
+        },
         "codeVerdict.agentVoice": {
           "type": "string",
           "enum": [
@@ -412,6 +457,12 @@
         "command": "codeVerdict.internal.keyboardHelp",
         "key": "shift+/",
         "when": "verdict.reviewFocus"
+      },
+      {
+        "command": "codeVerdict.internal.addContext",
+        "key": "ctrl+/",
+        "mac": "cmd+/",
+        "when": "verdict.reviewFocus && verdict.reviewContextFocus"
       },
       {
         "command": "codeVerdict.askAgent",

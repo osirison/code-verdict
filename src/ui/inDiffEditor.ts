@@ -11,6 +11,11 @@
  * silence is the common, correct outcome.
  */
 import * as vscode from 'vscode';
+import {
+  modelVisibleRootLabelForUri,
+  providerRelativePath,
+  type ModelVisibleWorkspaceRoot,
+} from '../app/modelVisiblePath';
 import { documentCandidates, resolveAnchor } from '../domain/anchor';
 import type { ReviewItem, Verdict } from '../domain/types';
 
@@ -42,8 +47,12 @@ const VERDICT_LABEL: Record<Verdict, string> = {
 export async function locateInWorkspace(
   anchor: { file: string; line: number; code: string },
 ): Promise<{ document: vscode.TextDocument; line: number } | undefined> {
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    const uri = vscode.Uri.joinPath(folder.uri, ...anchor.file.split('/'));
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const roots: ModelVisibleWorkspaceRoot[] = folders.map((folder) => ({ name: folder.name, path: folder.uri.path }));
+  for (const folder of folders) {
+    const rootLabel = modelVisibleRootLabelForUri(folder.uri.path, roots);
+    const relativePath = providerRelativePath(anchor.file, rootLabel);
+    const uri = vscode.Uri.joinPath(folder.uri, ...relativePath.split('/'));
     let document: vscode.TextDocument;
     try {
       document = await vscode.workspace.openTextDocument(uri);

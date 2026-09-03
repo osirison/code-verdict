@@ -11,6 +11,7 @@ const SPANS = [
 const crossItem: ReviewItem = {
   id: 'cross_1',
   file: 'src/api/session.ts',
+  anchored: true,
   line: 41,
   severity: 'blocker',
   category: 'apiContract',

@@ -50,6 +50,8 @@ export interface ModelDescriptor {
   description: string;
   vendor: string;
   family: string;
+  /** Undefined or non-positive when the provider does not expose a reliable input capacity. */
+  maxInputTokens?: number;
 }
 
 /**

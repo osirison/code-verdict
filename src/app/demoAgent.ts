@@ -9,10 +9,18 @@
  * are discovered alongside it.
  */
 import type { ChangeRequestDiff } from '../platform/types';
-import type { AgentReviewResponse, CandidateBucket } from '../domain/agentResponse';
+import { manifestContainsLocation, parseAgentReviewResponse, type AgentReviewResponse, type CandidateBucket } from '../domain/agentResponse';
 import type { Category, Criteria, ReviewItem, Severity } from '../domain/types';
 import { filterReason } from '../domain/criteria';
 import { addedLines, diffStats } from '../domain/diffHunks';
+import { modelVisiblePath } from './modelVisiblePath';
+import {
+  ATTACHMENT_TOTAL_BUDGET,
+  neutralizeAttachmentWrapperTags,
+  renderAttachmentsForModel,
+  type Attachment,
+  type RenderedAttachments,
+} from './reviewContext';
 
 export const DEMO_AGENT_ID = 'verdict.demo-agent';
 export const DEMO_AGENT_LABEL = 'Verdict · Demo Review';
@@ -118,16 +126,96 @@ export interface DemoAgentResult {
   steps: string[];
 }
 
-export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoAgentResult {
+export interface DemoAgentOptions {
+  workspaceRootLabel?: string;
+  attachments?: readonly Attachment[];
+  attachmentBudget?: number;
+  /** Exact records prepared by a changeset-wide budget allocation. */
+  renderedAttachments?: RenderedAttachments;
+}
+
+interface AttachmentLine {
+  path: string;
+  line: number;
+  text: string;
+}
+
+function detectedAttachmentLines(rendered: RenderedAttachments): AttachmentLine[] {
+  const detected = new Map<string, AttachmentLine>();
+  for (const attachment of rendered.attachments) {
+    const visibleLength = Math.min(
+      attachment.content.length,
+      attachment.visibleContentLength ?? attachment.content.length,
+    );
+    for (const source of attachment.evidence ?? []) {
+      const visibleEnd = Math.min(source.contentEnd, visibleLength);
+      if (visibleEnd <= source.contentStart) continue;
+      const content = neutralizeAttachmentWrapperTags(
+        attachment.content.slice(source.contentStart, visibleEnd),
+      );
+      const lines = source.wholeRange
+        ? [{ path: source.path, line: source.range.startLine, text: content.trim() }]
+        : content.split(/\r?\n/).map((text, index) => ({
+            path: source.path,
+            line: source.range.startLine + index,
+            text: text.trim(),
+          }));
+      const visibleLines = lines.filter((line) => (
+        line.text !== '' && manifestContainsLocation(rendered.manifest, line.path, line.line)
+      ));
+      if (visibleLines.length === 0) continue;
+      const representative = visibleLines.reduce((best, line) => (
+        hash(`${line.path}:${line.line}:${line.text}`) < hash(`${best.path}:${best.line}:${best.text}`)
+          ? line
+          : best
+      ));
+      detected.set(`${representative.path}:${representative.line}:${representative.text}`, representative);
+    }
+  }
+  return [...detected.values()];
+}
+
+export function runDemoAgent(
+  diff: ChangeRequestDiff,
+  criteria: Criteria,
+  options: DemoAgentOptions = {},
+): DemoAgentResult {
   const items: ReviewItem[] = [];
   const rejectedBuckets = new Map<string, CandidateBucket>();
   let sequence = 0;
+  const renderedAttachments = options.renderedAttachments ?? renderAttachmentsForModel(
+    options.attachments ?? [],
+    options.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
+  );
+
+  const recordItem = (item: ReviewItem): void => {
+    const reason = filterReason(item, criteria);
+    if (reason === null) {
+      items.push(item);
+      return;
+    }
+    const key = `${reason}:${item.severity}:${item.category}`;
+    const bucket = rejectedBuckets.get(key);
+    if (bucket) {
+      bucket.count += 1;
+      bucket.confidence = Math.max(bucket.confidence, item.confidence);
+      return;
+    }
+    rejectedBuckets.set(key, {
+      severity: item.severity,
+      category: item.category,
+      confidence: item.confidence,
+      reason,
+      count: 1,
+    });
+  };
 
   for (const file of diff.files) {
+    const filePath = modelVisiblePath(file.newPath, options.workspaceRootLabel);
     const anchors = addedLines(file.diff);
     if (anchors.length === 0) continue;
     // Deterministic per file: which anchors get findings, and which template.
-    const seed = hash(`${diff.headSha}:${file.newPath}`);
+    const seed = hash(`${diff.headSha}:${filePath}`);
     const take = Math.min(anchors.length, 1 + (seed % 2));
     const used = new Set<number>();
     for (let i = 0; i < take; i++) {
@@ -144,8 +232,9 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
       const confidence = 58 + ((seed >>> (4 + i)) % 40);
       const snippet = anchor.text.trim();
       const item: ReviewItem = {
-        id: `dem_${hash(`${file.newPath}:${anchor.line}`).toString(16)}_${sequence++}`,
-        file: file.newPath,
+        id: `dem_${hash(`${filePath}:${anchor.line}`).toString(16)}_${sequence++}`,
+        file: filePath,
+        anchored: true,
         line: anchor.line,
         severity: template.severity,
         category: template.category,
@@ -159,30 +248,30 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
             : undefined,
         answers: { ...template.answers },
       };
-      const reason = filterReason(item, criteria);
-      if (reason === null) {
-        items.push(item);
-      } else {
-        const key = `${reason}:${item.severity}:${item.category}`;
-        const bucket = rejectedBuckets.get(key);
-        if (bucket) {
-          bucket.count += 1;
-          // The clean screen reads this as "highest scored N%".
-          bucket.confidence = Math.max(bucket.confidence, item.confidence);
-        } else
-          rejectedBuckets.set(key, {
-            severity: item.severity,
-            category: item.category,
-            confidence: item.confidence,
-            reason,
-            count: 1,
-          });
-      }
+      recordItem(item);
     }
   }
 
+  for (const line of detectedAttachmentLines(renderedAttachments)) {
+    const seed = hash(`${line.path}:${line.line}:${line.text}`);
+    const template = TEMPLATES[seed % TEMPLATES.length] as Template;
+    recordItem({
+      id: `dem_attachment_${seed.toString(16)}_${sequence++}`,
+      file: line.path,
+      anchored: false,
+      line: line.line,
+      severity: template.severity,
+      category: template.category,
+      confidence: 80 + (seed % 18),
+      title: template.title(line.text),
+      body: template.body,
+      code: line.text,
+      answers: { ...template.answers },
+    });
+  }
+
   const stats = diffStats(diff.files.map((f) => f.diff));
-  const response: AgentReviewResponse = {
+  const response = parseAgentReviewResponse({
     schemaVersion: '1',
     agentId: DEMO_AGENT_ID,
     agentLabel: DEMO_AGENT_LABEL,
@@ -195,7 +284,10 @@ export function runDemoAgent(diff: ChangeRequestDiff, criteria: Criteria): DemoA
     },
     items,
     candidates: [...rejectedBuckets.values()],
-  };
+  }, {
+    diffPaths: diff.files.map((file) => modelVisiblePath(file.newPath, options.workspaceRootLabel)),
+    attachmentManifest: renderedAttachments.manifest,
+  }).response;
   return {
     response,
     steps: [

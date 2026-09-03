@@ -22,8 +22,10 @@
 import { crKey } from './postedReviews';
 import type { KeyValueStore } from './storage';
 import type { ChangesetSubmitState } from './changesetSubmit';
+import type { AttachmentWarning } from './attachments';
 import type { CandidateBucket } from '../domain/agentResponse';
-import type { Review } from '../domain/types';
+import { normalizeEffortLevel } from '../domain/effort';
+import { isReviewItemAnchored, type Review } from '../domain/types';
 
 /**
  * Where a single change request's record lives. Exported rather than left as a
@@ -131,6 +133,8 @@ export interface RetainedResult {
   candidates?: CandidateBucket[];
   /** The run's own file count, for the same reason: it is on the response, not the review. */
   filesRead?: number;
+  /** Filesystem-backed context omitted when its run-start revalidation failed. */
+  attachmentWarnings?: readonly AttachmentWarning[];
 }
 
 /**
@@ -156,6 +160,7 @@ export function carryRetainedResult(raw: RetainedResult | undefined): RetainedRe
     submittedAt: raw?.submittedAt,
     candidates: raw?.candidates,
     filesRead: raw?.filesRead,
+    attachmentWarnings: raw?.attachmentWarnings,
   };
 }
 
@@ -191,6 +196,14 @@ export interface ChangesetDraft extends RetainedRecord {
   submitState?: ChangesetSubmitState;
 }
 
+/** Merge UI-owned edits into the latest retained result without dropping run metadata. */
+export function mergeRetainedDraft<D extends RetainedRecord>(
+  current: D | undefined,
+  edited: D,
+): D {
+  return { ...current, ...edited };
+}
+
 /**
  * Build the record a finished run leaves behind. One writer for both surfaces
  * and for the run manager, so a clean run and a run with findings cannot drift
@@ -209,6 +222,7 @@ export function retainedFromRun(input: {
   modelId?: string;
   candidates?: CandidateBucket[];
   filesRead?: number;
+  attachmentWarnings?: readonly AttachmentWarning[];
 }): RetainedRecord {
   return {
     review: input.review,
@@ -222,6 +236,7 @@ export function retainedFromRun(input: {
     modelId: input.modelId,
     candidates: input.candidates,
     filesRead: input.filesRead,
+    attachmentWarnings: input.attachmentWarnings,
   };
 }
 
@@ -238,6 +253,7 @@ export interface RetainedReview<D extends RetainedRecord> {
   submittedAt?: string;
   candidates: CandidateBucket[];
   filesRead?: number;
+  attachmentWarnings: readonly AttachmentWarning[];
 }
 
 /**
@@ -250,8 +266,17 @@ export function readRetained<D extends RetainedRecord>(
   raw: D | undefined,
 ): RetainedReview<D> | undefined {
   if (!raw?.review) return undefined;
+  const draft = {
+    ...raw,
+    attachmentWarnings: raw.attachmentWarnings ?? [],
+    review: {
+      ...raw.review,
+      effort: normalizeEffortLevel(raw.review.effort),
+      items: raw.review.items.map((item) => ({ ...item, anchored: isReviewItemAnchored(item) })),
+    },
+  } as D;
   return {
-    draft: raw,
+    draft,
     outcome: raw.outcome ?? 'findings',
     ranAt: raw.ranAt,
     agentId: raw.agentId ?? raw.review.agentId,
@@ -260,6 +285,7 @@ export function readRetained<D extends RetainedRecord>(
     submittedAt: raw.submittedAt,
     candidates: raw.candidates ?? [],
     filesRead: raw.filesRead,
+    attachmentWarnings: raw.attachmentWarnings ?? [],
   };
 }
 
