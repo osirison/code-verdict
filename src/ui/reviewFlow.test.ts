@@ -284,7 +284,7 @@ async function harness(seed?: SessionDraft): Promise<Harness> {
   workspaceState.updates = 0;
   const runs = fakeRuns();
   const deps: ReviewFlowDeps = {
-    podStore: { activePod: pod() } as ReviewFlowDeps['podStore'],
+    podStore: { activePod: pod(), upsert: vi.fn(() => Promise.resolve()) } as unknown as ReviewFlowDeps['podStore'],
     secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(), delete: () => Promise.resolve() },
     workspaceState,
     globalState: memoryStore(),
@@ -544,5 +544,52 @@ describe('coalesced record integrity', () => {
     expect(stored?.summaryText).toBe('Edited summary');
     expect(stored?.finalNote).toBe('A final note');
     expect(stored?.ranAt).toBe(RAN_AT);
+  });
+});
+
+// ---- 9.3 — the host holds every editable's in-progress text ---------------------
+
+describe('instructions text commits (task 9.3)', () => {
+  it('updates the in-memory criteria per keystroke and lands the one upsert on blur', async () => {
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+
+    // The debounced input commit: in-memory only — a podStore.upsert here
+    // would be one uncoalesced read-modify-write per character (task 4.5).
+    await h.post({ type: 'setInstructions', text: 'No nits' });
+    expect(h.deps.podStore.activePod?.criteria.extraInstructions).toBe('No nits');
+    expect(h.deps.podStore.upsert).not.toHaveBeenCalled();
+
+    // The blur commit carries the write.
+    await h.post({ type: 'commitInstructions', text: 'No nits.' });
+    expect(h.deps.podStore.activePod?.criteria.extraInstructions).toBe('No nits.');
+    expect(h.deps.podStore.upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ask drafts are held per finding (task 9.3)', () => {
+  it('stores a draft without rendering, and renders it back on the next repaint', async () => {
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    const before = panel.webview.html;
+
+    await h.post({ type: 'askDraft', itemId: 'i1', text: 'is the cache keyed?' });
+    // Stored and nothing more: a per-keystroke commit re-rendering the region
+    // holding #ask would fight the caret it exists to protect.
+    expect(panel.webview.html).toBe(before);
+
+    await h.post({ type: 'select', itemId: 'i1' });
+    expect(panel.webview.html).toContain('value="is the cache keyed?"');
+  });
+
+  it('drops the draft once the question is sent', async () => {
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'askDraft', itemId: 'i1', text: 'why?' });
+    await h.post({ type: 'ask', itemId: 'i1', preset: 'freeform', text: 'why?' });
+
+    // A repaint after the send must not resurrect the already-sent question.
+    await h.post({ type: 'select', itemId: 'i1' });
+    expect(panel.webview.html).not.toContain('value="why?"');
   });
 });

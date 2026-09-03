@@ -91,6 +91,21 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; }
 .footer-note { margin-left: auto; color: var(--fg-dimmer); font-size: 11px; }
 .remove-link { border: 0; background: none; padding: 0; color: var(--fg-dimmer); font-size: 11px; cursor: pointer; }
 .remove-link:hover { color: var(--sev-blocker); text-decoration: underline; }
+
+/* Loading-skeleton bars for this screen's first paint (issue #39 task 7.6),
+   named for the real element each stands in for and sized by a class here —
+   never a style attribute, which this page's CSP silently drops (issue #45).
+   Prefixed cs- (not dashboardHtml.ts's bare .skel-title etc.) so a future
+   CSS union (task 8.1) cannot pair this screen's sizing with another's
+   same-named class. */
+.skel-cs-title { width: 220px; height: 15px; }
+.skel-cs-meta { width: 60%; height: 10px; }
+.skel-cs-metric { width: 46px; height: 15px; }
+.skel-cs-label { width: 70px; height: 10.5px; }
+.skel-cs-note { width: 70%; height: 11.5px; }
+.skel-cs-line { width: 80%; height: 12px; }
+.skel-cs-step { width: 12px; height: 12px; border-radius: 50%; }
+.skel-cs-state { width: 60px; height: 10.5px; }
 `;
 
 /**
@@ -176,11 +191,52 @@ document.addEventListener('click', (ev) => {
 on('back', 'back');
 `;
 
-export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
+/**
+ * The data-dependent part of the page (issue #39 task 7.3): everything a
+ * repaint can change, wrapped by both the full page and the loading page in
+ * the same `id="cs-body"` container so a patch can replace either with the
+ * other — one source of markup, no duplication. `data-changeset-id` stays
+ * OUTSIDE this function, on the `<main>` shell in `renderChangesetHtml` below
+ * — it must survive a patch unchanged, since the delegated script (task 7.1)
+ * re-reads it from the DOM on every click rather than closing over it.
+ */
+export function renderChangesetBody(state: ChangesetViewState): string {
   const v = state.vocabulary;
   const allPipelines = state.pipelinesPassing === state.members.length;
   const allReviewed = state.reviewed === state.members.length;
   const members = state.members.map((member, index) => `<button class="member" data-repo="${e(member.repoId)}" data-number="${e(member.number)}"><span class="step">${index + 1}</span><span><span class="member-title">${e(member.refLabel)} · ${e(member.title)}</span><span class="member-meta">${e(member.project)}</span>${member.reason ? `<span class="reason">${e(member.reason)}</span>` : ''}</span><span class="state"><span class="${member.reviewed ? 'ok' : 'warn'}">${member.reviewed ? 'reviewed' : 'not reviewed'}</span><br><span class="${member.ciStatus === 'success' ? 'ok' : member.ciStatus === 'failed' ? 'bad' : 'dimmer'}">${e(v.ciNoun)} ${e(member.ciStatus ?? 'none')}</span></span></button>`).join('');
-  const body = `<main class="wrap" data-changeset-id="${e(state.id)}"><header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer></main>`;
+  return `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer>`;
+}
+
+export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
+  const body = `<main class="wrap" data-changeset-id="${e(state.id)}"><div id="cs-body">${renderChangesetBody(state)}</div></main>`;
   return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: state.name } });
+}
+
+/**
+ * First paint on navigation (issue #39 task 7.6), before `load()`'s member
+ * diff fetch: the active pod's name and the changeset id are known
+ * synchronously (the id is the route parameter itself), so the header shows
+ * real text instead of leaving the previous screen frozen for the whole
+ * fetch. `changesetLabel` is upgraded to the changeset's real name by the
+ * caller when the store (task 6.2) already holds this pod's platform data —
+ * `detectChangesets` runs over that synchronously — and falls back to the
+ * raw id on a cold open, where nothing is held yet. Everything past the
+ * header — added/removed, findings, merge order — needs the per-member diff
+ * fetch `load()` always makes, held data or not, so it is a skeleton
+ * regardless of which label this call got. Wrapped in the same `id="cs-body"`
+ * container the data patch replaces, and carries the same `SCRIPT` as the
+ * full page: this is the only document a cold open ever runs the script
+ * from, and the later data patch only ever patches into it.
+ */
+export function renderChangesetLoadingHtml(podName: string, changesetLabel: string, nonce: string): string {
+  const metrics = Array.from({ length: 3 })
+    .map(() => `<div class="metric"><div class="metric-value"><span class="skel skel-cs-metric"></span></div><div class="metric-label"><span class="skel skel-cs-label"></span></div></div>`)
+    .join('');
+  const memberRows = Array.from({ length: 3 })
+    .map(() => `<div class="member"><span class="step"><span class="skel skel-cs-step"></span></span><span><span class="member-title"><span class="skel skel-cs-title"></span></span><span class="member-meta"><span class="skel skel-cs-meta"></span></span></span><span class="state"><span class="skel skel-cs-state"></span></span></div>`)
+    .join('');
+  const bodyInner = `<header><div class="title-row"><span class="glyph">⧉</span><h1>${e(changesetLabel)}</h1></div><div class="subline">${e(podName)}</div></header><section class="readiness">${metrics}<div class="readiness-note"><span class="skel skel-cs-note"></span></div></section><section><div class="section-label">Findings that only exist between these repos</div><div class="empty-findings"><span class="skel skel-cs-line"></span></div></section><section><div class="section-label">Merge order</div><div class="order">${memberRows}</div></section><footer class="footer"><button class="btn" id="back">Back to dashboard</button></footer>`;
+  const body = `<main class="wrap"><div id="cs-body">${bodyInner}</div></main>`;
+  return renderPage({ title: `Verdict: Changeset · ${changesetLabel}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: changesetLabel } });
 }
