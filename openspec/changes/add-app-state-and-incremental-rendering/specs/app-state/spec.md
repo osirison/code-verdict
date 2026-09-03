@@ -104,7 +104,8 @@ An interaction that changes only local state SHALL NOT cause any platform reques
 #### Scenario: Navigating between screens
 
 - **WHEN** the reviewer moves from one screen to another within the freshness window
-- **THEN** no platform request is made
+- **THEN** no request is made for the pod's shared data
+- **AND** the only requests made are for data belonging to a single change request, which is not shared between pods and is not held
 
 #### Scenario: Resolving a posted thread
 

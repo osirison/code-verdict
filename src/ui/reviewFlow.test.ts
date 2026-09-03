@@ -8,6 +8,7 @@
  * poked directly.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AppStore } from '../app/appStore';
 import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
 import { DRAFT_WRITE_WINDOW_MS } from '../app/draftWriter';
 import {
@@ -25,6 +26,7 @@ import { clearProviders, registerProvider } from '../platform/registry';
 import type { ChangeRequestDiff, ChangeRequestRef, SubmitResult } from '../platform/types';
 import { GITHUB_VOCABULARY } from '../testing/specFixtures';
 import type { ReviewFlowDeps } from './reviewFlow';
+import { VerdictSidebarProvider, VerdictStatusBar } from './sidebar';
 
 // ---- vscode and module mocks ---------------------------------------------------
 
@@ -34,6 +36,9 @@ const handlers = vi.hoisted(() => ({
   viewState: undefined as ((event: { webviewPanel: { active: boolean; visible: boolean } }) => void) | undefined,
   windowState: undefined as ((state: { focused: boolean }) => void) | undefined,
 }));
+
+/** `VerdictStatusBar`'s segments, in creation order (verdict, agent, keys, …) — see statusBar.test.ts's own `segments()`. */
+const statusBarItems = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
 const panel = vi.hoisted(() => ({
   title: '',
@@ -60,6 +65,7 @@ const panel = vi.hoisted(() => ({
 vi.mock('vscode', () => ({
   ViewColumn: { One: 1, Beside: -2 },
   TextEditorRevealType: { InCenterIfOutsideViewport: 2 },
+  StatusBarAlignment: { Left: 1 },
   window: {
     createWebviewPanel: () => panel,
     showInformationMessage: vi.fn(() => Promise.resolve(undefined)),
@@ -69,6 +75,26 @@ vi.mock('vscode', () => ({
       handlers.windowState = handler;
       return { dispose: vi.fn() };
     },
+    // Only the gap-3 propagation test (task 10.1) builds a real
+    // `VerdictStatusBar` — every other test here never touches this.
+    createStatusBarItem: vi.fn((_alignment: number, priority: number) => {
+      const item = {
+        priority,
+        text: '',
+        tooltip: '',
+        command: '',
+        visible: false,
+        show(): void {
+          item.visible = true;
+        },
+        hide(): void {
+          item.visible = false;
+        },
+        dispose: vi.fn(),
+      };
+      statusBarItems.push(item as unknown as Record<string, unknown>);
+      return item;
+    }),
   },
   workspace: {
     getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
@@ -80,7 +106,9 @@ vi.mock('vscode', () => ({
     clipboard: { writeText: vi.fn(() => Promise.resolve(undefined)) },
     openExternal: vi.fn(),
   },
-  Uri: { parse: () => ({}) },
+  // `joinPath` backs the sidebar's codicon asset lookup (sidebar.ts's
+  // `codicons()`), evaluated unconditionally even when nothing reads it.
+  Uri: { parse: () => ({}), joinPath: (...segments: unknown[]) => segments },
 }));
 
 vi.mock('./agentRefresh', () => ({
@@ -120,6 +148,8 @@ const world = vi.hoisted(() => ({
   submitReview: undefined as ((submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => Promise<unknown>) | undefined,
   submitCalls: [] as Array<{ storedAtCall: unknown }>,
   workspaceState: undefined as (KeyValueStore & { updates: number }) | undefined,
+  /** Every platform call, so triage actions can be asserted to make none. */
+  calls: { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 },
   changeRequests: [] as ReturnType<typeof changeRequest>[],
   loadAgentSelection: vi.fn(),
   discoverModels: vi.fn(),
@@ -130,10 +160,25 @@ const world = vi.hoisted(() => ({
 vi.mock('../app/connections', () => ({
   connectionForPod: () =>
     Promise.resolve({
-      listOpenChangeRequests: () => Promise.resolve([...world.changeRequests]),
-      getChangeRequestDiff: (ref: ChangeRequestRef) => Promise.resolve(diffFor(ref)),
-      listWorkItems: () => Promise.resolve([]),
+      // Counted, so a triage action can be asserted to issue none; the
+      // bodies are main's, which serve per-ref diffs and a settable CR list.
+      listOpenChangeRequests: () => {
+        world.calls.changeRequests += 1;
+        return Promise.resolve([...world.changeRequests]);
+      },
+      getChangeRequestDiff: (ref: ChangeRequestRef) => {
+        world.calls.diffs += 1;
+        return Promise.resolve(diffFor(ref));
+      },
+      listWorkItems: () => {
+        world.calls.workItems += 1;
+        return Promise.resolve([]);
+      },
+      // Only the gap-3 propagation test (task 10.1) builds a real `AppStore`
+      // for the sidebar to read through — `fetchPodData` calls this too.
+      listCiRuns: () => Promise.resolve([]),
       submitReview: (_ref: unknown, submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => {
+        world.calls.submits += 1;
         // Snapshot what is on disk at the moment the platform is called — the
         // flush-before-submit assertions read it back.
         world.submitCalls.push({ storedAtCall: world.workspaceState?.get(draftKeyFor(REF)) });
@@ -341,6 +386,8 @@ beforeEach(() => {
   panel.webview.postMessage.mockClear();
   world.submitReview = undefined;
   world.submitCalls = [];
+  world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
+  statusBarItems.length = 0;
   world.changeRequests = [changeRequest(), changeRequest(REF_B, 'Change B')];
   world.loadAgentSelection.mockReset().mockResolvedValue({
     agents: [BUILTIN_AGENT_DESCRIPTOR],
@@ -697,5 +744,322 @@ describe('ask drafts are held per finding (task 9.3)', () => {
     // A repaint after the send must not resurrect the already-sent question.
     await h.post({ type: 'select', itemId: 'i1' });
     expect(panel.webview.html).not.toContain('value="why?"');
+  });
+});
+
+describe('a regenerate replaces the summary text (task 9.7)', () => {
+  it('renders the composed summary again, not the edit the reviewer had typed over it', async () => {
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'generateSummary' });
+
+    // The composed text, as the summary screen just rendered it.
+    const summaryOf = (html: string): string =>
+      /<textarea class="summary" id="summary-text">([\s\S]*?)<\/textarea>/.exec(html)?.[1] ?? '';
+    const generated = summaryOf(panel.webview.html);
+    expect(generated).not.toBe('');
+
+    await h.post({ type: 'editSummary', text: 'my own words' });
+    // A sentinel proves the regenerate really repainted — editSummary
+    // deliberately renders nothing, so without it a stale document would
+    // pass the assertions below for free.
+    panel.webview.html = 'sentinel';
+    await h.post({ type: 'regenerate' });
+
+    // The typed edit is deliberately NOT preserved: regenerate is the
+    // reviewer asking for the composed text back (the other direction of the
+    // typed-text requirement — see typedTextScript.test.ts for the page
+    // half, where REGIONS_SCRIPT must not restore the stale value either).
+    expect(panel.webview.html).not.toBe('sentinel');
+    expect(summaryOf(panel.webview.html)).toBe(generated);
+    expect(panel.webview.html).not.toContain('my own words');
+  });
+});
+
+// ---- triage is local: patches, no platform calls (spec: an action fetches ------
+// ---- only the data it could have changed / a state change redraws only the ----
+// ---- part of the screen it affects) --------------------------------------------
+
+describe('triage actions patch in place and never reach the platform', () => {
+  it('a verdict, a move and a severity-floor change each patch flow-body — zero platform calls, no document reassignment', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    // Arm the page the way REGIONS_SCRIPT does, so render() patches.
+    await h.post({ type: 'verdictReady' });
+    const htmlBefore = panel.webview.html;
+    const callsBefore = { ...world.calls };
+    panel.webview.postMessage.mockClear();
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'move', delta: 1 });
+    await h.post({ type: 'setFloor', floor: 'major' });
+
+    // Three patches, each the flow-body region and the breadcrumb.
+    const posted = panel.webview.postMessage.mock.calls
+      .map((call) => call[0] as { type: string; regions?: Record<string, string> })
+      .filter((message) => message.type === 'verdict:regions');
+    expect(posted).toHaveLength(3);
+    for (const message of posted) {
+      expect(Object.keys(message.regions ?? {}).sort()).toEqual(['app-crumb-current', 'flow-body']);
+    }
+    // The document was never reassigned, and nothing was fetched: every one
+    // of these interactions is local state.
+    expect(panel.webview.html).toBe(htmlBefore);
+    expect(world.calls).toEqual(callsBefore);
+  });
+});
+
+// ---- freshness applies to platform data, not to review results -----------------
+
+describe('a retained review does not expire (spec: freshness applies to platform data, not to review results)', () => {
+  it('opening a target whose review is far older than any freshness window shows it in full and starts no run', async () => {
+    // Ran three months ago — older than any poll interval by orders of
+    // magnitude. Freshness governs pod data; this record has no TTL.
+    const old = retainedRecord(['i1', 'i2'], '2026-06-01T08:00:00.000Z');
+    old.review.verdicts = { i1: { verdict: 'accepted', applyFix: false } };
+    const h = await harness(old);
+
+    await h.open();
+
+    // Shown in full, with its verdicts: the triage screen, opened on the
+    // one undecided finding, with the recorded verdict already counted.
+    expect(panel.webview.html).toContain('Finding i2');
+    expect(panel.webview.html).toContain('1 of 2 triaged');
+    expect(panel.webview.html).toContain('Run a new review');
+    // Queue mode lists every finding, decided ones included.
+    await h.post({ type: 'setMode', mode: 'queue' });
+    expect(panel.webview.html).toContain('Finding i1');
+    // And no new run was started to produce any of it.
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+});
+
+// ---- 10.2 — the background-review-runs invariants, re-run against the ----------
+// ---- coalesced persistence path ------------------------------------------------
+
+describe('background-review-runs invariants against the coalesced path (task 10.2)', () => {
+  it('a retained review, triaged through the coalescing writer, survives a restart in full', async () => {
+    vi.useFakeTimers();
+    const h1 = await harness(retainedRecord(['i1', 'i2']));
+    await h1.open();
+    await h1.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h1.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h1.post({ type: 'generateSummary' });
+    await h1.post({ type: 'editSummary', text: 'Summary that must survive' });
+    await h1.post({ type: 'setNote', text: 'Note that must survive' });
+    // The editor closes: dispose is the flush point.
+    handlers.dispose?.();
+    const onDisk = h1.stored();
+    expect(onDisk).toBeDefined();
+
+    // A restart: fresh module state, fresh panel, and the record read back
+    // through the same JSON round-trip a real Memento imposes — a Date or a
+    // Map smuggled into the record would not survive one.
+    vi.useRealTimers();
+    const carried = JSON.parse(JSON.stringify(onDisk)) as SessionDraft;
+    const h2 = await harness(carried);
+    await h2.open();
+
+    expect(panel.webview.html).toContain('Finding i1');
+    expect(panel.webview.html).toContain('2 of 2 triaged');
+    const reread = h2.stored();
+    expect(reread?.review.verdicts['i1']?.verdict).toBe('accepted');
+    expect(reread?.review.verdicts['i2']?.verdict).toBe('rejected');
+    expect(reread?.summaryText).toBe('Summary that must survive');
+    expect(reread?.finalNote).toBe('Note that must survive');
+    expect(reread?.ranAt).toBe(RAN_AT);
+    expect(reread?.outcome).toBe('findings');
+  });
+
+  it('a re-run that FAILS does not replace the retained review — the pending triage write still lands on it', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    expect(h.workspaceState.updates).toBe(0);
+
+    // The manager reports a failed re-run on this target. It wrote nothing
+    // (a failure never touches the retained record), so the panel's pending
+    // write belongs to the record still stored — it must NOT be dropped.
+    h.runs.settle({ key: runKeyForCr(REF), status: 'failed' });
+    await h.post({ type: 'noop' });
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.items.map((item) => item.id)).toEqual(['i1']);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('a re-run that is CANCELLED leaves the retained review and its fresh verdicts intact', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+
+    h.runs.settle({ key: runKeyForCr(REF), status: 'cancelled' });
+    await h.post({ type: 'noop' });
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+
+    // Cancellation re-enters the retained record (flushing the pending
+    // write first); the screen shows the review again, unchanged.
+    expect(panel.webview.html).toContain('Finding i1');
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('an in-flight run interrupted by a restart is reported interrupted, alongside an intact triage draft', async () => {
+    vi.useFakeTimers();
+    const h = await harness(retainedRecord(['i1']));
+    await h.open();
+    // A re-run is in flight, persistently recorded — what the manager writes
+    // when it starts executing.
+    const { InFlightRunStore, sweepInterruptedRuns } = await import('../app/reviewRunManager.js');
+    const { ReviewRunStore } = await import('../app/reviewRuns.js');
+    await new InFlightRunStore(h.deps.globalState).add({
+      key: runKeyForCr(REF),
+      podId: 'pod-1',
+      refLabel: '#7',
+      repoId: REF.repoId,
+      crNumber: REF.number,
+      startedAt: '2026-09-02T09:30:00.000Z',
+    });
+    // The reviewer triages meanwhile; the window losing focus flushes the
+    // coalesced write before the editor goes down.
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    handlers.windowState?.({ focused: false });
+
+    // The restart: the sweep runs before anything paints (extension.ts).
+    const swept = await sweepInterruptedRuns(h.deps.globalState);
+
+    expect(swept).toBe(1);
+    const run = new ReviewRunStore(h.deps.globalState).byRef().get(runKeyForCr(REF));
+    expect(run?.outcome).toBe('interrupted');
+    // Named with its own start time, not the sweep's.
+    expect(run?.ranAt).toBe('2026-09-02T09:30:00.000Z');
+    // The interruption is reported alongside the retained review, never in
+    // place of it: the draft still carries the run's result and the triage.
+    const stored = h.stored();
+    expect(stored?.ranAt).toBe(RAN_AT);
+    expect(stored?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+});
+
+// ---- task 10.3: what a triage session costs ------------------------------------
+
+describe('a full triage session (task 10.3)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('opens, records ten verdicts and submits, without a platform call per verdict', async () => {
+    const h = await harness(retainedRecord(Array.from({ length: 10 }, (_, i) => `i${i + 1}`)));
+    await h.open();
+
+    // What opening the target costs: the change-request lookup and the diff.
+    // Everything after this is the session proper.
+    const afterOpen = { ...world.calls };
+    const writesAfterOpen = h.workspaceState.updates;
+
+    for (let i = 1; i <= 10; i += 1) {
+      await h.post({ type: 'verdict', itemId: `i${i}`, verdict: 'accepted', applyFix: false });
+    }
+
+    // Ten verdicts, zero platform calls. Before this change each render fired
+    // onSidebarState, which refetched the whole pod — three calls a verdict,
+    // thirty for this loop — and each verdict wrote the entire record.
+    expect(world.calls).toEqual(afterOpen);
+    expect(h.workspaceState.updates - writesAfterOpen).toBeLessThanOrEqual(1);
+
+    // And the decisions are all there once the window closes: coalescing
+    // collapses the writes, it does not drop any of the state they carried.
+    await vi.advanceTimersByTimeAsync(DRAFT_WRITE_WINDOW_MS);
+    const stored = h.stored();
+    for (let i = 1; i <= 10; i += 1) {
+      expect(stored?.review.verdicts[`i${i}`]?.verdict).toBe('accepted');
+    }
+  });
+});
+
+// ---- task 10.1 gap 3: a verdict reaches every screen showing the review's progress
+
+describe("recording a verdict reaches every screen that shows the review's progress", () => {
+  it('propagates through onSidebarState to the sidebar\'s triage region and the status bar', async () => {
+    // The "no platform request" half of this scenario is covered throughout
+    // this file already (e.g. task 10.3's assertion above). What is missing
+    // is the AND clause: every screen showing the review's progress reflects
+    // the new verdict. Driven for real — a real AppStore, VerdictSidebarProvider
+    // and VerdictStatusBar, wired through onSidebarState exactly the way
+    // extension.ts wires them (sidebar.setActiveReview + statusBar.setActiveReview) —
+    // rather than asserting on a fake stand-in for either screen.
+    const sidebarPod = pod();
+    const podStoreFake = { activePod: sidebarPod, list: () => [sidebarPod] } as never;
+    const appStore = new AppStore({
+      podStore: podStoreFake,
+      secrets: {} as never,
+      reviewHistory: { list: () => [] } as never,
+      baseSeconds: () => 60,
+    });
+    const sidebarView = { html: '', postMessage: vi.fn() };
+    const sidebar = new VerdictSidebarProvider(podStoreFake, {
+      appStore,
+      extensionUri: {} as never,
+      globalState: memoryStore() as never,
+      openCr: () => undefined,
+    });
+    sidebar.resolveWebviewView({
+      webview: {
+        get html(): string {
+          return sidebarView.html;
+        },
+        set html(value: string) {
+          sidebarView.html = value;
+        },
+        postMessage: sidebarView.postMessage,
+        onDidReceiveMessage: () => ({ dispose: () => undefined }),
+        options: undefined,
+        cspSource: 'test:',
+        asWebviewUri: undefined,
+      },
+      onDidDispose: () => ({ dispose: () => undefined }),
+    } as never);
+    // The sidebar's own first pod read (unrelated to the review) lands here.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const statusBar = new VerdictStatusBar();
+    const verdictSegment = statusBarItems[0] as unknown as { text: string; tooltip: string };
+
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    h.deps.onSidebarState = (state) => {
+      sidebar.setActiveReview(state);
+      statusBar.setActiveReview(state);
+    };
+    await h.open();
+
+    // Baseline, before any triage: two undecided findings, nothing recorded.
+    expect(sidebarView.html).toContain('0 acc');
+    expect(sidebarView.html).toContain('2 left');
+    expect(verdictSegment.tooltip).toContain('0 accepted, 0 rejected, 0 skipped');
+    expect(verdictSegment.text).toContain('2 left');
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+
+    // Both screens reflect the actual new counts — not a string ("Verdict",
+    // "acc"/"left" labels) that would read the same regardless of which
+    // verdict was recorded, but the accepted/undecided numbers themselves.
+    expect(sidebarView.html).toContain('1 acc');
+    expect(sidebarView.html).toContain('1 left');
+    expect(sidebarView.html).toContain('1/2');
+    expect(verdictSegment.tooltip).toContain('1 accepted, 0 rejected, 0 skipped');
+    expect(verdictSegment.text).toContain('1 left');
+
+    statusBar.dispose();
   });
 });

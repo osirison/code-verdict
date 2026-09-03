@@ -25,6 +25,8 @@ const world = vi.hoisted(() => ({
   calls: { changeRequests: 0, workItems: 0, ciRuns: 0 },
   crs: [] as ChangeRequest[],
   workItems: [] as WorkItem[],
+  /** When set, every list call stalls behind it — for late-result races. */
+  gate: undefined as Promise<void> | undefined,
 }));
 
 const view = vi.hoisted(() => ({
@@ -52,17 +54,20 @@ vi.mock('vscode', () => ({
 vi.mock('../app/connections', () => ({
   connectionForPod: () =>
     Promise.resolve({
-      listOpenChangeRequests: () => {
+      listOpenChangeRequests: async () => {
         world.calls.changeRequests += 1;
-        return Promise.resolve(world.crs);
+        if (world.gate) await world.gate;
+        return world.crs;
       },
-      listWorkItems: () => {
+      listWorkItems: async () => {
         world.calls.workItems += 1;
-        return Promise.resolve(world.workItems);
+        if (world.gate) await world.gate;
+        return world.workItems;
       },
-      listCiRuns: () => {
+      listCiRuns: async () => {
         world.calls.ciRuns += 1;
-        return Promise.resolve([]);
+        if (world.gate) await world.gate;
+        return [];
       },
     }),
 }));
@@ -178,6 +183,7 @@ beforeEach(() => {
   world.calls = { changeRequests: 0, workItems: 0, ciRuns: 0 };
   world.crs = [changeRequest()];
   world.workItems = [];
+  world.gate = undefined;
   view.html = '';
   view.postMessage.mockClear();
   view.messageHandler = undefined;
@@ -334,5 +340,57 @@ describe('the sidebar stops fetching on every triage action', () => {
     expect(world.calls).toEqual({ changeRequests: 2, workItems: 2, ciRuns: 2 });
     expect(view.html).toBe(htmlBefore);
     expect(view.postMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('a stale result arriving late never overwrites a newer one', () => {
+  it('a slow fetch for the previous pod lands after a pod switch and is discarded', async () => {
+    const { VerdictSidebarProvider } = await import('./sidebar.js');
+    const { AppStore } = await import('../app/appStore.js');
+    const podA = pod();
+    const podB: Pod = { ...pod(), id: 'gateway', name: 'Gateway squad', sources: [{ kind: 'repository', repoId: 'acme/gateway' }], repos: [{ id: 'acme/gateway', path: 'acme/gateway', name: 'gateway' }] };
+    const pods = { active: podA };
+    const podStore = { get activePod() { return pods.active; }, list: () => [podA, podB] } as unknown as PodStore;
+    const appStore = new AppStore({
+      podStore,
+      secrets: {} as never,
+      reviewHistory: { list: () => [] } as never,
+      baseSeconds: () => 60,
+      now: () => 1_000_000,
+    });
+    const sidebar = new VerdictSidebarProvider(podStore, {
+      appStore,
+      extensionUri: {} as never,
+      globalState: { get: () => undefined, update: () => Promise.resolve() } as never,
+      openCr: () => undefined,
+    });
+
+    // Pod A's fetch is slow: it starts, then stalls behind the gate.
+    let open!: () => void;
+    world.gate = new Promise<void>((resolve) => { open = resolve; });
+    sidebar.resolveWebviewView(fakeWebviewView() as never);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The reviewer switches pods before it lands; pod B's fetch is fast.
+    world.gate = undefined;
+    pods.active = podB;
+    world.crs = [{ ...changeRequest(), ref: { repoId: 'acme/gateway', number: '9' }, title: 'Harden the gateway timeout' }];
+    sidebar.refresh();
+    await flush();
+    expect(view.html).toContain('Harden the gateway timeout');
+
+    // Now pod A's slow fetch lands. Its result must not paint over pod B —
+    // neither through render()'s sequence guard nor through the store
+    // subscription, which is keyed to the active pod.
+    world.crs = [changeRequest()];
+    open();
+    await flush();
+
+    expect(view.html).toContain('Harden the gateway timeout');
+    expect(view.html).not.toContain('Add per-tenant rate limiting');
+    // The late result is still held for pod A itself — discarded from the
+    // screen, not from the store.
+    expect(appStore.peek('platform')?.changeRequests[0]?.title).toBe('Add per-tenant rate limiting');
   });
 });

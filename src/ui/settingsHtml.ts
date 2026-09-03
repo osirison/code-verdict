@@ -4,7 +4,7 @@ import {
   type DigestCadence,
   type NotificationMode,
 } from '../domain/notifications';
-import { escapeHtml, renderPage } from './theme';
+import { escapeHtml, renderPage, type RouteAssets } from './theme';
 import type { Vocabulary } from './vocab';
 
 export type { DigestCadence, NotificationMode };
@@ -320,11 +320,14 @@ const SCRIPT = `
   });
 `;
 
+/** This screen's contribution to the resident shell (design D7, task 8.3). */
+export const SETTINGS_ROUTE: RouteAssets = { className: 'route-settings', css: CSS, script: SCRIPT };
+
 export function renderSettingsHtml(state: SettingsViewState, nonce: string): string {
   const regions = renderSettingsRegions(state);
   const body = `<main class="wrap">
     <h1>Settings</h1>
     ${SETTINGS_REGION_IDS.map((id) => `<div id="${id}">${regions[id]}</div>`).join('\n    ')}
   </main>`;
-  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Settings' } });
+  return renderPage({ title: 'Verdict: Settings', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Settings' }, routeClass: SETTINGS_ROUTE.className });
 }

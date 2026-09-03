@@ -1,7 +1,21 @@
-import { escapeHtml, renderPage } from './theme';
+import { escapeHtml, renderPage, type RouteAssets } from './theme';
 import type { TuningRate, TuningViewState } from './tuningState';
 
 export type TuningMessage = { type: 'applySuggestion'; suggestionId: string };
+
+/**
+ * `entry.rate` is continuous, so it cannot each get a named class — quantised
+ * to the nearest 5% instead, the only width a data-driven bar can take under
+ * this page's CSP (`style-src 'nonce-…'`), which drops the `style="width:…"`
+ * attribute this bar used to carry silently (issue #45). 5 points is under
+ * what a 6px-tall bar can show; the cost lands at the edges — a true rate
+ * under 2.5% rounds down to an invisible 0%-wide bar instead of a sliver.
+ */
+const WIDTH_STEP = 5;
+function widthClass(pct: number): string {
+  return `w-${Math.max(0, Math.min(100, Math.round(pct / WIDTH_STEP) * WIDTH_STEP))}`;
+}
+const WIDTH_CSS = Array.from({ length: 100 / WIDTH_STEP + 1 }, (_, i) => `.w-${i * WIDTH_STEP} { width: ${i * WIDTH_STEP}%; }`).join('\n');
 
 const CSS = `
 .wrap { max-width: 860px; padding: 26px 30px; display: flex; flex-direction: column; gap: 24px; }
@@ -18,6 +32,7 @@ h1 { color: var(--fg-max); font-size: 22px; font-weight: 600; line-height: 1.2; 
 .bar { display: block; height: 100%; background: var(--sev-blocker); }
 .bar.mid { background: var(--sev-major); }
 .bar.good { background: var(--ok); }
+${WIDTH_CSS}
 .rate { width: 42px; flex: none; text-align: right; font: 11px/1 var(--font-mono); }
 .counts { width: 52px; flex: none; text-align: right; color: var(--fg-dimmer); font: 10.5px/1 var(--font-mono); }
 .suggestions { gap: 10px; }
@@ -35,7 +50,7 @@ function rows(rates: readonly TuningRate[]): string {
   return rates.map((entry) => {
     const tone = entry.rate >= 70 ? 'good' : entry.rate >= 40 ? 'mid' : '';
     return `<div class="rate-row"><span class="rate-label ${entry.enabled === false ? 'off' : ''}">${escapeHtml(entry.label)}${entry.enabled === false ? ' · off' : ''}</span>
-      <span class="track"><span class="bar ${tone}" style="width:${entry.rate}%"></span></span>
+      <span class="track"><span class="bar ${tone} ${widthClass(entry.rate)}"></span></span>
       <span class="rate">${entry.produced > 0 ? `${entry.rate}%` : '—'}</span><span class="counts">${entry.accepted}/${entry.produced}</span></div>`;
   }).join('');
 }
@@ -91,7 +106,10 @@ export function renderTuningBody(state: TuningViewState): string {
     <section class="section suggestions"><div class="label">Tune the criteria</div>${suggestions}<span class="footnote">Applied changes land in this pod’s review criteria — the next run uses them.</span></section>`;
 }
 
+/** This screen's contribution to the resident shell (design D7, task 8.3). */
+export const TUNING_ROUTE: RouteAssets = { className: 'route-tuning', css: CSS, script: SCRIPT };
+
 export function renderTuningHtml(state: TuningViewState, nonce: string): string {
   const body = `<main class="wrap"><div id="tune-body">${renderTuningBody(state)}</div></main>`;
-  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Agent tuning' } });
+  return renderPage({ title: 'Verdict: Agent tuning', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Agent tuning' }, routeClass: TUNING_ROUTE.className });
 }

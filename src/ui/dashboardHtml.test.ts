@@ -5,6 +5,7 @@ import { NEUTRAL_VOCABULARY } from '../platform/provider';
 import { VERDICT_TOKENS_CSS } from './theme';
 import type { DashboardViewState } from './dashboardHtml';
 import { renderDashboardHtml, renderDashboardLoadingHtml, renderLoadFailure } from './dashboardHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: DashboardViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -100,7 +101,7 @@ describe('dashboard fidelity (spec §2)', () => {
     expect(html).toContain("btn.classList.add('busy')");
     expect(html.indexOf("classList.add('busy')")).toBeLessThan(html.indexOf("post({ type: 'refresh' })"));
     expect(html).toContain('.head-right .tool.busy .refresh-glyph { animation: spin');
-    expect(html).not.toContain('style="');
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('renders the pod picker menu and an issues section in the left panel', () => {
@@ -197,7 +198,7 @@ describe('loading skeleton (issue #39 — navigation must not wait on the fetch)
 
   it('sizes every skeleton placeholder from a CSS class, never a style attribute (issue #45 — the CSP blocks style attributes, not style elements)', () => {
     const html = renderDashboardLoadingHtml('Platform squad', '6 projects · 9 open MRs', 'nonce123');
-    expect(html).not.toContain('style="');
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('guards skeleton rows against posting an openCr with no ref — Number(undefined) is NaN', () => {
