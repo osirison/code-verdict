@@ -131,22 +131,61 @@ describe('changeset submission', () => {
     expect(plans.flatMap((plan) => plan.withheld)).toEqual([]);
   });
 
-  it('withholds a lost member finding and names it in only that member submission summary', () => {
-    const lostReview: Review = {
+  it('includes only each member accepted unanchored and withheld findings in its summary', () => {
+    const memberSummaryReview: Review = {
       ...review,
-      items: [{
-        ...review.items[0]!,
-        id: 'lost',
-        repoId: 'repo-a',
-        crNumber: '1',
-        file: 'src/shared.ts',
-        line: 999,
-        code: 'hallucinated();',
-        title: 'Lost member finding',
-      }],
-      verdicts: { lost: { verdict: 'accepted', applyFix: false } },
+      items: [
+        {
+          ...review.items[0]!,
+          id: 'attachment-a',
+          repoId: 'repo-a',
+          crNumber: '1',
+          file: 'docs/context-a.md',
+          anchored: false,
+          line: 4,
+          code: 'attachment context',
+          title: 'Attachment-only A',
+        },
+        {
+          ...review.items[0]!,
+          id: 'lost-a',
+          repoId: 'repo-a',
+          crNumber: '1',
+          file: 'src/shared.ts',
+          line: 999,
+          code: 'hallucinatedA();',
+          title: 'Lost anchored A',
+        },
+        {
+          ...review.items[0]!,
+          id: 'attachment-b',
+          repoId: 'repo-b',
+          crNumber: '2',
+          file: 'docs/context-b.md',
+          anchored: false,
+          line: 8,
+          code: 'other attachment context',
+          title: 'Attachment-only B',
+        },
+        {
+          ...review.items[0]!,
+          id: 'lost-b',
+          repoId: 'repo-b',
+          crNumber: '2',
+          file: 'src/other.ts',
+          line: 888,
+          code: 'hallucinatedB();',
+          title: 'Lost anchored B',
+        },
+      ],
+      verdicts: {
+        'attachment-a': { verdict: 'accepted', applyFix: false },
+        'lost-a': { verdict: 'accepted', applyFix: false },
+        'attachment-b': { verdict: 'accepted', applyFix: false },
+        'lost-b': { verdict: 'accepted', applyFix: false },
+      },
     };
-    const plans = buildChangesetSubmitPlans(lostReview, [
+    const plans = buildChangesetSubmitPlans(memberSummaryReview, [
       {
         ref: { repoId: 'repo-a', number: '1' },
         anchorRefs: { head: 'a' },
@@ -160,8 +199,18 @@ describe('changeset submission', () => {
     ], 'Agent', 'you', 'Summary.', false, false);
 
     expect(plans[0]?.submission.comments).toEqual([]);
-    expect(plans[0]?.withheld.map((item) => item.id)).toEqual(['lost']);
-    expect(plans[0]?.submission.summary).toContain('projectId=repo-a mrIid=1 file=src/shared.ts:999');
-    expect(plans[1]?.submission.summary).not.toContain('Lost member finding');
+    expect(plans[1]?.submission.comments).toEqual([]);
+    expect(plans[0]?.withheld.map((item) => item.id)).toEqual(['lost-a']);
+    expect(plans[1]?.withheld.map((item) => item.id)).toEqual(['lost-b']);
+    const repoASummary = plans[0]?.submission.summary ?? '';
+    const repoBSummary = plans[1]?.submission.summary ?? '';
+    expect(repoASummary).toContain('projectId=repo-a mrIid=1 file=src/shared.ts:999');
+    expect(repoBSummary).toContain('projectId=repo-b mrIid=2 file=src/other.ts:888');
+    expect(repoASummary.match(/Attachment-only A/g)).toHaveLength(1);
+    expect(repoASummary.match(/Lost anchored A/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Attachment-only B/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Lost anchored B/g)).toHaveLength(1);
+    expect(repoASummary).not.toMatch(/Attachment-only B|Lost anchored B/);
+    expect(repoBSummary).not.toMatch(/Attachment-only A|Lost anchored A/);
   });
 });

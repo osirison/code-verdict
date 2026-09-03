@@ -47,7 +47,7 @@ export class ContextReferenceResolutionCoordinator {
   }
 }
 
-const FILE_REFERENCE = /#file:([A-Za-z0-9_./\\-]+)(?::(\d+)-(\d+))?(?=$|[\s,;!?()[\]{}])/g;
+const FILE_REFERENCE = /#file:([A-Za-z0-9_./\\-]*[A-Za-z0-9_/\\-])(?::(\d+)-(\d+))?(?=$|[.\s,;!?()[\]{}])/g;
 const SYMBOL_REFERENCE = /#sym:([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)/g;
 
 /** Parse attachment references without rewriting or consuming the instruction text. */

@@ -60,6 +60,16 @@ describe('context references', () => {
     expect(text).toBe('Compare #file:auth.ts and #file:auth.ts:12-18 with #sym:verifyToken.');
   });
 
+  it('leaves sentence periods outside file references while preserving filename dots and ranges', () => {
+    expect(parseContextReferences(
+      'Read #file:src/a.ts. Then #file:src/a.test.ts:12-18. Also #file:config.release.test.json.',
+    )).toEqual([
+      { raw: '#file:src/a.ts', kind: 'file', name: 'src/a.ts' },
+      { raw: '#file:src/a.test.ts:12-18', kind: 'file', name: 'src/a.test.ts', range: { startLine: 12, endLine: 18 } },
+      { raw: '#file:config.release.test.json', kind: 'file', name: 'config.release.test.json' },
+    ]);
+  });
+
   it('does not downgrade an invalid range into a full-file reference', () => {
     expect(parseContextReferences('Check #file:auth.ts:18-12')).toEqual([]);
   });

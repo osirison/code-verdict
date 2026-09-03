@@ -71,7 +71,7 @@ export function buildChangesetSubmitPlans(
       ref: member.ref,
       submission: {
         comments,
-        summary: composeSummaryBody(summary, '', undefined, composition.withheld),
+        summary: composeSummaryBody(summary, '', memberReview, composition.withheld),
         requestChanges,
         asSingleThread,
       },
