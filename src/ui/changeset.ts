@@ -1,11 +1,11 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import type { AppStore } from '../app/appStore';
 import { detectChangesets } from '../app/changesets';
 import { collectCrossFindings } from '../app/changesetFindings';
 import { connectionForPod } from '../app/connections';
 import { ManualChangesetStore } from '../app/manualChangesets';
 import { deriveMergeOrder } from '../app/mergeOrder';
-import { fetchPodData } from '../app/podQuery';
 import type { PodStore } from '../app/pods';
 import { ReviewHistory } from '../app/reviewHistory';
 import { getProvider } from '../platform/registry';
@@ -19,6 +19,8 @@ import { AppSurface, type AppRoute } from './appSurface';
 
 export interface ChangesetPanelDeps {
   podStore: PodStore;
+  /** The shared pod-data copy (task 6.2); the member diffs stay on a direct connection. */
+  appStore: AppStore;
   secrets: SecretStore;
   globalState: KeyValueStore;
   /** The combined-review triage draft lives here (`codeVerdict.changesetDraft.<id>`). */
@@ -53,14 +55,24 @@ export class ChangesetPanel {
 
   private disposed = false;
   private loadSeq = 0;
+  /** The store subscription below — dropped with the route, or a dead
+   * screen would keep repainting the panel over whatever replaced it. */
+  private readonly storeWatch: { dispose(): void };
 
   private constructor(
     private readonly route: AppRoute,
     private readonly deps: ChangesetPanelDeps,
     private readonly changesetId: string,
   ) {
+    // Pod data now reaches this screen through the store (task 6.4): a poll
+    // that moved a member's CI state or the detected grouping repaints it.
+    // load() reads the store back, so the repaint costs the member diffs only.
+    this.storeWatch = deps.appStore.subscribe((data) => {
+      if (!this.disposed && data.pod.id === this.deps.podStore.activePod?.id) void this.load();
+    });
     route.onLeave(() => {
       this.disposed = true;
+      this.storeWatch.dispose();
       if (ChangesetPanel.current === this) ChangesetPanel.current = undefined;
     });
     route.onMessage((message) => void this.onMessage(message as ChangesetMessage));
@@ -71,13 +83,18 @@ export class ChangesetPanel {
     try {
       const pod = this.deps.podStore.activePod;
       if (!pod) return this.deps.openDashboard();
-      const connection = await connectionForPod(pod, this.deps.secrets);
-      const data = await fetchPodData(connection, pod, Date.now());
+      // The pod read goes through the store (task 6.2). The member diffs
+      // below stay on a direct connection: they are per change request,
+      // never pod-keyed, and the store holds pod data only.
+      const read = this.deps.appStore.read(pod);
+      const data = read.data ?? (await read.fetch!);
       if (this.disposed || seq !== this.loadSeq) return;
       const options = changesetDetectionOptions(this.deps.globalState, pod.id);
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options)
         .find((candidate) => candidate.id === this.changesetId);
       if (!changeset) return this.deps.openDashboard();
+      const connection = await connectionForPod(pod, this.deps.secrets);
+      if (this.disposed || seq !== this.loadSeq) return;
       const diffs = await Promise.all(changeset.members.map((member) => connection.getChangeRequestDiff(member.ref)));
       if (this.disposed || seq !== this.loadSeq) return;
       const stats = diffStats(diffs.flatMap((diff) => diff.files.map((file) => file.diff)));

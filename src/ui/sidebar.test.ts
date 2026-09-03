@@ -143,10 +143,23 @@ function flush(): Promise<void> {
 
 async function makeSidebar() {
   const { VerdictSidebarProvider } = await import('./sidebar.js');
+  const { AppStore } = await import('../app/appStore.js');
   const activePod = pod();
   const podStore = { activePod, list: () => [activePod] } as unknown as PodStore;
-  const sidebar = new VerdictSidebarProvider(podStore, {
+  // The sidebar's data path reads this store (task 6.2), over the same
+  // mocked connection module, so `world.calls` keeps counting the whole
+  // path. The clock is the store's freshness clock — advancing it is how a
+  // test moves the held entry outside the freshness window.
+  const clock = { t: 1_000_000 };
+  const appStore = new AppStore({
+    podStore,
     secrets: {} as never,
+    reviewHistory: { list: () => [] } as never,
+    baseSeconds: () => 60,
+    now: () => clock.t,
+  });
+  const sidebar = new VerdictSidebarProvider(podStore, {
+    appStore,
     extensionUri: {} as never,
     globalState: { get: () => undefined, update: () => Promise.resolve() } as never,
     openCr: () => undefined,
@@ -157,7 +170,7 @@ async function makeSidebar() {
   // The webview's own REGIONS_SCRIPT would post this back; simulate it so
   // patch() takes the postMessage path rather than its not-ready fallback.
   view.messageHandler?.({ type: 'verdictReady' });
-  return { sidebar, podStore };
+  return { sidebar, podStore, appStore, activePod, clock };
 }
 
 beforeEach(() => {
@@ -262,15 +275,64 @@ describe('the sidebar stops fetching on every triage action', () => {
     expect(lastPosted.regions['sidebar-nav']).toBe(expected['sidebar-nav']);
   });
 
-  it('a real pod refresh still fetches and repaints everything', async () => {
+  it('a pod refresh inside the freshness window repaints in full from held data, fetching nothing', async () => {
     const { sidebar } = await makeSidebar();
+    view.html = '';
     view.postMessage.mockClear();
 
     sidebar.refresh();
     await flush();
 
-    expect(world.calls).toEqual({ changeRequests: 2, workItems: 2, ciRuns: 2 });
+    // Deliberate behaviour change (task 6.2): the store serves a read inside
+    // the freshness window from the held copy, so even an explicit refresh
+    // costs nothing at the platform.
+    expect(world.calls).toEqual({ changeRequests: 1, workItems: 1, ciRuns: 1 });
     // A refresh is a full repaint, not a region patch.
+    expect(view.postMessage).not.toHaveBeenCalled();
+    expect(view.html).toContain('Add per-tenant rate limiting');
+  });
+
+  it('a refresh past the window paints held data at once and revalidates behind it', async () => {
+    const { sidebar, clock } = await makeSidebar();
+    clock.t += 60_000;
+    world.crs = [{ ...changeRequest(), title: 'Rename the tenant header' }];
+
+    sidebar.refresh();
+    // Stale-while-revalidate: the held copy is on screen before the fetch
+    // lands — the reviewer never waits behind a revalidation.
+    expect(view.html).toContain('Add per-tenant rate limiting');
+    await flush();
+
+    expect(world.calls).toEqual({ changeRequests: 2, workItems: 2, ciRuns: 2 });
+    // The revalidation changed something, so the store's notification
+    // repainted the lists from the new copy.
+    expect(view.html).toContain('Rename the tenant header');
+  });
+
+  it('a poll that finds changed data repaints the sidebar without the sidebar fetching', async () => {
+    const { appStore, activePod, clock } = await makeSidebar();
+    clock.t += 60_000;
+    world.crs = [{ ...changeRequest(), title: 'Rename the tenant header' }];
+
+    // The notifier's tick, not a sidebar action (task 6.4).
+    await appStore.revalidate(activePod);
+
+    expect(world.calls).toEqual({ changeRequests: 2, workItems: 2, ciRuns: 2 });
+    expect(view.html).toContain('Rename the tenant header');
+  });
+
+  it('a poll that finds nothing new repaints nothing', async () => {
+    const { appStore, activePod, clock } = await makeSidebar();
+    clock.t += 60_000;
+    const htmlBefore = view.html;
+    view.postMessage.mockClear();
+
+    await appStore.revalidate(activePod);
+
+    // The fetch happened — the data was stale — but nothing changed, so no
+    // notification, no repaint, no disturbed view state (task 6.6).
+    expect(world.calls).toEqual({ changeRequests: 2, workItems: 2, ciRuns: 2 });
+    expect(view.html).toBe(htmlBefore);
     expect(view.postMessage).not.toHaveBeenCalled();
   });
 });

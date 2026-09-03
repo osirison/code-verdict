@@ -1,12 +1,13 @@
 import * as vscode from 'vscode';
 import { ALL_COMMAND_IDS, COMMANDS, INTERNAL_COMMANDS } from './commands';
+import { AppStore } from './app/appStore';
 import { detectChangesets } from './app/changesets';
 import { runDebugBootstrap } from './app/debugBootstrap';
 import { ManualChangesetStore } from './app/manualChangesets';
 import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
 import { deleteTokenIfUnused } from './app/storage';
-import { fetchPodData, repoIdsOf } from './app/podQuery';
+import { repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
 import { getProvider, listRealProviders, tryGetProvider } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
@@ -36,7 +37,7 @@ import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
-import { VerdictNotifier } from './ui/notifier';
+import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
@@ -83,6 +84,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const secrets = context.secrets;
   const reviewHistory = new ReviewHistory(context.globalState);
   const reviewRuns = new ReviewRunStore(context.globalState);
+
+  /**
+   * One shared, freshness-tracked copy of each pod's platform data (design
+   * D1–D5). Every screen reads this instead of fetching its own copy, and the
+   * notifier's poll drives its revalidation. The poll-interval setting is
+   * injected as a read so the store stays `vscode`-free and picks up a
+   * changed setting on the next freshness check, not the next window.
+   */
+  const appStore = new AppStore({
+    podStore,
+    secrets,
+    reviewHistory,
+    baseSeconds: () => readPollIntervalSeconds(),
+  });
 
   // Before anything paints. A `vscode.lm` stream cannot be reattached after the
   // extension host stops, so whatever was running when the last window closed is
@@ -161,6 +176,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * Every surface that reads review state, repainted. A submit and a finished
    * run are different events (a clean run posts nothing), but both change
    * exactly these four views, so they share one fan-out rather than drifting.
+   *
+   * What this fan-out no longer does is fetch (task 6.4): pod data reaches
+   * every surface through its own `appStore` subscription, so these calls
+   * repaint from the held copy — one shared revalidation at most, where each
+   * used to issue its own pod fetch. The fan-out itself must stay, because
+   * the events it carries are local — run records and review history — and
+   * the store holds pod platform data only, so it can never announce them.
    */
   const repaintReviewSurfaces = (): void => {
     sidebar.refresh();
@@ -169,12 +191,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     TuningPanel.refreshIfOpen();
   };
 
-  /** One pod fetch → the detected changesets, with the current settings applied. */
+  /** One shared pod read → the detected changesets, with the current settings applied. */
   const detectForActivePod = async () => {
     const pod = podStore.activePod;
     if (!pod) return [];
-    const connection = await connectionForPod(pod, secrets);
-    const data = await fetchPodData(connection, pod, Date.now());
+    const read = appStore.read(pod);
+    const data = read.data ?? (await read.fetch!);
     return detectChangesets(pod, data.changeRequests, data.workItems, changesetOptions());
   };
 
@@ -204,6 +226,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const notifier = new VerdictNotifier({
     podStore,
+    appStore,
     secrets,
     reviewHistory,
     onBadgeCount: (count) => statusBar.setNotifications(count),
@@ -228,7 +251,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const sidebar = new VerdictSidebarProvider(podStore, {
-    secrets,
+    appStore,
     extensionUri: context.extensionUri,
     globalState: context.globalState,
     openCr: (ref) => void ReviewFlowPanel.open(flowDeps, ref),
@@ -264,6 +287,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const changesetReviewDeps = {
     podStore,
+    appStore,
     secrets,
     workspaceState: context.workspaceState,
     globalState: context.globalState,
@@ -279,6 +303,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const changesetPanelDeps = {
     podStore,
+    appStore,
     secrets,
     globalState: context.globalState,
     workspaceState: context.workspaceState,
@@ -303,8 +328,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     try {
-      const connection = await connectionForPod(pod, secrets);
-      const data = await fetchPodData(connection, pod, Date.now());
+      const read = appStore.read(pod);
+      const data = read.data ?? (await read.fetch!);
       const vocabulary = getProvider(pod.providerId).vocabulary;
       const picked = await vscode.window.showQuickPick(
         data.changeRequests.map((cr) => ({
@@ -376,7 +401,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return;
     }
-    await DashboardPanel.show(podStore, secrets, dashboardDeps);
+    await DashboardPanel.show(podStore, appStore, dashboardDeps);
   };
 
   /**
@@ -507,6 +532,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // triggered under, which is what the snapshot in `RunInput` is for.
     runManager.cancelForPod(target.id);
     await podStore.remove(target.id);
+    // Drop the store's held copy now (task 5.5). The store bounds its entries
+    // to PodStore on access, but with no pod left nothing below would ever
+    // read it again — and the demo and debug pods are re-created under fixed
+    // ids, which must start empty, never on a deleted pod's data.
+    appStore.forget(target.id);
     // Keyed by pod id and naming repositories only that pod resolved: orphaned
     // the moment it goes.
     await new ManualChangesetStore(context.globalState).removePod(target.id);

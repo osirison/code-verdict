@@ -74,6 +74,70 @@ h1 { color: var(--fg-max); font-size: 19px; font-weight: 600; line-height: 1.25;
 .footer-note { margin-left: auto; color: var(--fg-dimmer); font-size: 11px; }
 `;
 
+/**
+ * Bound once on `document`, not per element (issue #39): this screen is
+ * about to move to region patching (task 7.3), which replaces a container's
+ * innerHTML wholesale and would drop any listener bound directly to a node
+ * inside it. Delegation means the patched markup never needs re-binding.
+ *
+ * `#back` and `#next` read the current step from their own
+ * `data-current-step` attribute rather than closing over `state.step` at
+ * script-build time: the trap phase 1 hit is a value baked into the script
+ * string that stays correct only as long as the script is rebuilt on every
+ * state change. Once this screen patches instead of reassigning the whole
+ * document, the script outlives the state it was built from — a baked step
+ * number would keep sending the wizard back to (or past) whatever step was
+ * current when the page first painted. A distinct attribute name from the
+ * step nav's own `data-step` keeps the two `[data-step]`/`#back`/`#next`
+ * matchers from colliding.
+ */
+const SCRIPT = `
+const vscode = window.verdictVscode; const post = (message) => vscode.postMessage(message);
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-step]');
+  if (button) post({ type: 'goStep', step: Number(button.dataset.step) });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#test')) post({ type: 'testConnection', instanceUrl: document.getElementById('instance').value, token: document.getElementById('token').value });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#use-session')) post({ type: 'useSession', instanceUrl: document.getElementById('instance').value });
+});
+document.addEventListener('change', (ev) => {
+  if (ev.target.id === 'pod-name') post({ type: 'setName', name: ev.target.value });
+});
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-name]');
+  if (button) post({ type: 'setName', name: button.dataset.name });
+});
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-sample]');
+  if (button) { const input = document.getElementById('source'); if (input) input.value = button.dataset.sample; }
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#add')) post({ type: 'addSource', input: document.getElementById('source').value });
+});
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('[data-remove]');
+  if (button) post({ type: 'removeSource', key: button.dataset.remove });
+});
+document.addEventListener('click', (ev) => {
+  const row = ev.target.closest('[data-repo]');
+  if (row) post({ type: 'toggleProject', key: row.dataset.source, repoId: row.dataset.repo });
+});
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('#back');
+  if (button) post({ type: 'goStep', step: Math.max(1, Number(button.dataset.currentStep) - 1) });
+});
+document.addEventListener('click', (ev) => {
+  const button = ev.target.closest('#next');
+  if (!button) return;
+  const step = Number(button.dataset.currentStep);
+  if (step === 3) post({ type: 'createPod' });
+  else post({ type: 'goStep', step: step + 1 });
+});
+`;
+
 export function renderOnboardingHtml(state: OnboardingViewState, nonce: string): string {
   const e = escapeHtml;
   const v = state.vocabulary;
@@ -89,20 +153,6 @@ export function renderOnboardingHtml(state: OnboardingViewState, nonce: string):
     : state.step === 2
       ? `<section class="content"><h1>Name your pod</h1><p class="lede">A pod is a named set of ${e(v.platformName)} ${e(v.repoNounPlural)} you review together.</p><input class="input name" id="pod-name" value="${e(state.podName)}" placeholder="Platform squad"><div class="suggestions">${['Platform squad', 'Payments', 'My work'].map((name) => `<button class="chip" data-name="${name}">${name}</button>`).join('')}</div></section>`
       : `<section class="content"><h1>Add ${e(v.repoNounPlural)} to ${e(state.podName)}</h1><p class="lede">${e(h.sourceInputHint)} Choose which ${e(v.repoNounPlural)} the pod watches.</p><div class="source-input"><input class="input" id="source" placeholder="${e(h.sourceInputPlaceholder)}"><button class="btn btn-accent" id="add">Add</button></div><span class="status">${e(h.sourceInputHint)}</span><div class="samples">${h.sourceSamples.map((sample) => `<button class="chip" data-sample="${e(sample.value)}">${e(sample.label)}</button>`).join('')}</div><div class="sources">${sourceCards}</div></section>`;
-  const body = `<main class="wrap"><div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next">${state.step === 3 ? `Create pod · ${state.selectedProjects} ${e(v.repoNounPlural)}` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer></main>`;
-  const script = `
-    const vscode = window.verdictVscode; const post = (message) => vscode.postMessage(message);
-    document.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => post({ type: 'goStep', step: Number(button.dataset.step) })));
-    document.getElementById('test')?.addEventListener('click', () => post({ type: 'testConnection', instanceUrl: document.getElementById('instance').value, token: document.getElementById('token').value }));
-    document.getElementById('use-session')?.addEventListener('click', () => post({ type: 'useSession', instanceUrl: document.getElementById('instance').value }));
-    document.getElementById('pod-name')?.addEventListener('change', (event) => post({ type: 'setName', name: event.target.value }));
-    document.querySelectorAll('[data-name]').forEach((button) => button.addEventListener('click', () => post({ type: 'setName', name: button.dataset.name })));
-    document.querySelectorAll('[data-sample]').forEach((button) => button.addEventListener('click', () => { document.getElementById('source').value = button.dataset.sample; }));
-    document.getElementById('add')?.addEventListener('click', () => post({ type: 'addSource', input: document.getElementById('source').value }));
-    document.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', () => post({ type: 'removeSource', key: button.dataset.remove })));
-    document.querySelectorAll('[data-repo]').forEach((row) => row.addEventListener('click', () => post({ type: 'toggleProject', key: row.dataset.source, repoId: row.dataset.repo })));
-    document.getElementById('back')?.addEventListener('click', () => post({ type: 'goStep', step: ${Math.max(1, state.step - 1)} }));
-    document.getElementById('next')?.addEventListener('click', () => ${state.step === 3 ? "post({ type: 'createPod' })" : `post({ type: 'goStep', step: ${state.step + 1} })`});
-  `;
-  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script, breadcrumb: { current: `Connect ${v.platformName}` } });
+  const body = `<main class="wrap"><div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" data-current-step="${state.step}" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next" data-current-step="${state.step}">${state.step === 3 ? `Create pod · ${state.selectedProjects} ${e(v.repoNounPlural)}` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer></main>`;
+  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: `Connect ${v.platformName}` } });
 }

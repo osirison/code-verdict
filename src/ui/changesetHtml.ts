@@ -135,13 +135,52 @@ function renderFindings(state: ChangesetViewState): string {
   return `<div class="findings">${state.findings.map((finding) => `<button class="finding-card" data-finding="${e(finding.id)}"><div class="finding-head"><span class="sev sev-${finding.severity}">${finding.severity}</span><span class="finding-title">${e(finding.title)}</span>${finding.confidence === undefined ? '' : `<span class="finding-confidence">confidence ${finding.confidence}%</span>`}</div>${finding.sides.map((side) => `<div class="finding-side"><span class="side-repo">${e(side.project)}</span><span><span class="side-location">${e(side.location)}</span><span class="side-role">${e(side.role)}</span></span></div>`).join('')}</button>`).join('')}</div>`;
 }
 
+/**
+ * Bound once on `document`, not per element (issue #39): this screen is
+ * about to move to region patching (task 7.3), which replaces a container's
+ * innerHTML wholesale and would drop any listener bound directly to a node
+ * inside it. Delegation means the patched markup never needs re-binding, the
+ * same reasoning as reviewFlowHtml.ts:1267-1274.
+ *
+ * `changesetId` is read from `[data-changeset-id]` at click time rather than
+ * closed over at script-build time: the trap phase 1 hit (sidebarHtml.ts's
+ * `data-first-changeset-id`) is a value baked into the script string when it
+ * was still safe to assume the script never outlives the state it was built
+ * from. Once this screen patches instead of reassigning the whole document,
+ * the script survives across state changes it was not built from — a baked
+ * id would keep answering with whichever changeset was current when the
+ * page first painted.
+ */
+const SCRIPT = `
+const vscode = window.verdictVscode;
+const post = (m) => vscode.postMessage(m);
+const on = (id, type, extra) => document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#' + id)) return;
+  post({ type, ...(extra ?? {}) });
+});
+const changesetId = () => document.querySelector('[data-changeset-id]')?.dataset.changesetId;
+document.addEventListener('click', (ev) => {
+  const row = ev.target.closest('[data-repo]');
+  if (row) post({ type: 'openMember', repoId: row.dataset.repo, number: row.dataset.number });
+});
+document.addEventListener('click', (ev) => {
+  const card = ev.target.closest('[data-finding]');
+  if (card) post({ type: 'openFinding', changesetId: changesetId(), itemId: card.dataset.finding });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#review-together')) post({ type: 'reviewTogether', changesetId: changesetId() });
+});
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('#remove-changeset')) post({ type: 'removeChangeset', changesetId: changesetId() });
+});
+on('back', 'back');
+`;
+
 export function renderChangesetHtml(state: ChangesetViewState, nonce: string): string {
   const v = state.vocabulary;
   const allPipelines = state.pipelinesPassing === state.members.length;
   const allReviewed = state.reviewed === state.members.length;
   const members = state.members.map((member, index) => `<button class="member" data-repo="${e(member.repoId)}" data-number="${e(member.number)}"><span class="step">${index + 1}</span><span><span class="member-title">${e(member.refLabel)} · ${e(member.title)}</span><span class="member-meta">${e(member.project)}</span>${member.reason ? `<span class="reason">${e(member.reason)}</span>` : ''}</span><span class="state"><span class="${member.reviewed ? 'ok' : 'warn'}">${member.reviewed ? 'reviewed' : 'not reviewed'}</span><br><span class="${member.ciStatus === 'success' ? 'ok' : member.ciStatus === 'failed' ? 'bad' : 'dimmer'}">${e(v.ciNoun)} ${e(member.ciStatus ?? 'none')}</span></span></button>`).join('');
-  const body = `<main class="wrap"><header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer></main>`;
-  const changesetId = JSON.stringify(state.id);
-  const script = `const vscode=window.verdictVscode;const post=(message)=>vscode.postMessage(message);document.querySelectorAll('[data-repo]').forEach((row)=>row.addEventListener('click',()=>post({type:'openMember',repoId:row.dataset.repo,number:row.dataset.number})));document.querySelectorAll('[data-finding]').forEach((card)=>card.addEventListener('click',()=>post({type:'openFinding',changesetId:${changesetId},itemId:card.dataset.finding})));document.getElementById('review-together')?.addEventListener('click',()=>post({type:'reviewTogether',changesetId:${changesetId}}));document.getElementById('remove-changeset')?.addEventListener('click',()=>post({type:'removeChangeset',changesetId:${changesetId}}));document.getElementById('back')?.addEventListener('click',()=>post({type:'back'}));`;
-  return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script, breadcrumb: { current: state.name } });
+  const body = `<main class="wrap" data-changeset-id="${e(state.id)}"><header><div class="title-row"><span class="glyph">⧉</span><h1>${e(state.name)}</h1>${state.linkedIssue ? `<span class="issue">${e(state.linkedIssue)}</span>` : ''}</div><div class="subline">${e(countOf(v, state.members.length))} · ${e(repoCountOf(v, new Set(state.members.map((member) => member.repoId)).size))} · +${state.added} −${state.removed} · detected from ${e(state.detectionDetail)}</div></header><section class="readiness"><div class="metric"><div class="metric-value ${allPipelines ? 'ok' : ''}">${state.pipelinesPassing}/${state.members.length}</div><div class="metric-label">${e(v.ciNounPlural)}</div></div><div class="metric"><div class="metric-value ${allReviewed ? 'ok' : ''}">${state.reviewed}/${state.members.length}</div><div class="metric-label">reviewed</div></div><div class="metric"><div class="metric-value ${state.crossRepoBlockers === 0 ? 'ok' : ''}">${state.crossRepoBlockers ?? '—'}</div><div class="metric-label">cross-repo blockers</div></div><div class="readiness-note">${readinessSentence(state)}</div></section><section><div class="section-label">Findings that only exist between these repos <span class="agent-note">${agentNote(state)}</span></div>${renderFindings(state)}</section><section><div class="section-label">Merge order <span class="dimmer">· derived from what each ${e(v.changeRequestAbbrev)} reads and writes</span></div><div class="order">${members}</div></section><footer class="footer"><button class="btn btn-brand" id="review-together">Review all ${state.members.length} ${e(v.changeRequestAbbrev)}s together</button><button class="btn" id="back">Back to dashboard</button>${state.manual ? '<button class="remove-link" id="remove-changeset">Remove changeset</button>' : ''}<span class="footer-note">One agent run over every diff · one summary posted to all ${state.members.length} ${e(v.changeRequestAbbrev)}s</span></footer></main>`;
+  return renderPage({ title: `Verdict: Changeset · ${state.name}`, nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: state.name } });
 }

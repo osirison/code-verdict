@@ -1,10 +1,9 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import { COMMANDS } from '../commands';
-import { connectionForPod } from '../app/connections';
+import type { AppStore } from '../app/appStore';
 import type { PodStore } from '../app/pods';
-import { fetchPodData, repoIdsOf } from '../app/podQuery';
-import type { SecretStore } from '../app/storage';
+import { repoIdsOf } from '../app/podQuery';
 import type { DashboardMessage } from './dashboardHtml';
 import { renderDashboardBody, renderDashboardHtml, renderDashboardLoadingHtml, renderFallbackHtml, renderLoadFailure } from './dashboardHtml';
 import type { DashboardDeps } from './dashboardState';
@@ -17,7 +16,7 @@ import { repoCountOf } from './vocab';
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
 
-  static async show(podStore: PodStore, secrets: SecretStore, deps: DashboardDeps = {}): Promise<void> {
+  static async show(podStore: PodStore, appStore: AppStore, deps: DashboardDeps = {}): Promise<void> {
     if (DashboardPanel.current && !DashboardPanel.current.disposed) {
       AppSurface.reveal();
       await DashboardPanel.current.refresh();
@@ -25,7 +24,7 @@ export class DashboardPanel {
     }
     // Naming doc: the editor tab reads "Verdict: Dashboard".
     const route = AppSurface.show('dashboard', 'Verdict: Dashboard');
-    DashboardPanel.current = new DashboardPanel(route, podStore, secrets, deps);
+    DashboardPanel.current = new DashboardPanel(route, podStore, appStore, deps);
     await DashboardPanel.current.refresh();
   }
 
@@ -37,15 +36,27 @@ export class DashboardPanel {
   private refreshSeq = 0;
   /** First refresh on this instance paints the loading skeleton (#39); see refresh(). */
   private painted = false;
+  /** The store subscription below — dropped with the route, or a dead
+   * dashboard would keep repainting the panel over whatever replaced it. */
+  private readonly storeWatch: { dispose(): void };
 
   private constructor(
     private readonly route: AppRoute,
     private readonly podStore: PodStore,
-    private readonly secrets: SecretStore,
+    private readonly appStore: AppStore,
     private readonly deps: DashboardDeps,
   ) {
+    // Pod data now reaches this screen through the store (task 6.4): a poll
+    // or another screen's fetch that changed the active pod's data repaints
+    // the dashboard from the held copy — the refresh below finds a fresh
+    // entry and issues nothing. Guarded by pod id so a late revalidation for
+    // a pod no longer active cannot repaint over the active pod's screen.
+    this.storeWatch = appStore.subscribe((data) => {
+      if (!this.disposed && data.pod.id === this.podStore.activePod?.id) void this.refresh();
+    });
     route.onLeave(() => {
       this.disposed = true;
+      this.storeWatch.dispose();
       if (DashboardPanel.current === this) DashboardPanel.current = undefined;
     });
     // The document reloaded underneath this route (issue #39 follow-up) —
@@ -57,7 +68,7 @@ export class DashboardPanel {
       const message = rawMessage as DashboardMessage;
       switch (message.type) {
         case 'refresh':
-          void this.refresh();
+          void this.refreshNow();
           break;
         case 'switchPod':
           void vscode.commands.executeCommand(COMMANDS.switchPod);
@@ -94,6 +105,16 @@ export class DashboardPanel {
     });
   }
 
+  /**
+   * The ⟳ button. Distinct from `refresh()` because a person asking for fresh
+   * data must always get a fetch — see `AppStore.forceRefresh`.
+   */
+  async refreshNow(): Promise<void> {
+    const pod = this.podStore.activePod;
+    if (pod) await this.appStore.forceRefresh(pod).catch(() => undefined);
+    await this.refresh();
+  }
+
   async refresh(): Promise<void> {
     // Guard both races: writes after disposal throw, and a slow older fetch
     // must never repaint over a newer one (e.g. after a pod switch).
@@ -109,25 +130,30 @@ export class DashboardPanel {
       }
       return;
     }
+    // The store serves this read (task 6.1): held data paints at once — even
+    // a stale entry, which revalidates behind the paint, the subscription in
+    // the constructor repainting if that changed anything. Only a pod never
+    // fetched leaves the reviewer waiting on the interactive fetch below.
+    const read = this.appStore.read(pod);
     // First paint on navigation (#39): the pod name and a repo-count meta
     // line are known synchronously, so show the real header immediately
     // instead of leaving the previous screen frozen for the whole fetch. A
     // fresh DashboardPanel is created on every navigation to the dashboard
     // (AppSurface.activate leaves the previous route), so painted === false
     // means exactly "arrived here by navigation" — the ⟳ refresh button
-    // never re-triggers this skeleton.
-    if (!this.painted) {
+    // never re-triggers this skeleton. Skipped when the store holds data:
+    // held data must paint immediately, not behind a loading state.
+    if (!this.painted && !read.data) {
       const vocabulary = tryGetProvider(pod.providerId)?.vocabulary ?? NEUTRAL_VOCABULARY;
       this.route.setHtml(renderDashboardLoadingHtml(
         pod.name,
         repoCountOf(vocabulary, repoIdsOf(pod).length),
         crypto.randomBytes(16).toString('hex'),
       ));
-      this.painted = true;
     }
+    this.painted = true;
     try {
-      const connection = await connectionForPod(pod, this.secrets);
-      const data = await fetchPodData(connection, pod, Date.now());
+      const data = read.data ?? (await read.fetch!);
       if (!canRender()) return;
       const nonce = crypto.randomBytes(16).toString('hex');
       const submitted = this.deps.submittedRefs?.() ?? new Set<string>();

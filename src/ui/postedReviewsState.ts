@@ -3,7 +3,9 @@
  * can drive the exact pipeline the panel renders, the way `dashboardState.ts`
  * already does for the dashboard.
  */
-import type { PostedReviewView } from '../app/postedReviews';
+import { crKey, type PostedReviewView } from '../app/postedReviews';
+import type { PostedThreadView } from '../app/postedReviews';
+import { isWaitingOnYou } from '../domain/threadStatus';
 import type { ChangeRequest } from '../platform/types';
 import type { PostedRow } from './postedReviewsHtml';
 
@@ -100,4 +102,109 @@ export function selectedPostedRow(
     ? rows.find((row) => refMatches(row, selectedRef.repoId, selectedRef.number))
     : undefined;
   return found ?? rows[0];
+}
+
+/**
+ * Composite key for a thread's in-progress reply text (issue #46 task 9.3),
+ * scoped to the review the thread belongs to rather than the bare thread id:
+ * `ThreadFlags` (app/postedReviews.ts) already treats thread ids as
+ * review-scoped, never assumed globally unique across change requests — a
+ * draft map keyed on the id alone would reintroduce exactly the collision
+ * that keying was added to avoid, for a field that outlives a single render.
+ */
+export function replyDraftKey(repoId: string, crNumber: string, threadId: string): string {
+  return `${crKey(repoId, crNumber)}:${threadId}`;
+}
+
+/**
+ * The same counting rule `buildPostedReview` (app/postedReviews.ts) applies
+ * after a real fetch — duplicated rather than shared, because a local patch
+ * exists specifically to avoid the fetch that function needs (task 7.4).
+ * Kept in lockstep so a patched row's badge and breakdown never disagree with
+ * what a real refresh would compute for the same thread statuses.
+ */
+function deriveThreadCounts(threads: readonly PostedThreadView[]): PostedReviewView['counts'] {
+  const counts = { you: 0, author: 0, closed: 0 };
+  for (const t of threads) {
+    if (t.status === 'resolved' || t.status === 'conceded') counts.closed += 1;
+    else if (isWaitingOnYou(t.status)) counts.you += 1;
+    else counts.author += 1;
+  }
+  return counts;
+}
+
+/**
+ * Replace one thread's view inside `rows`, in place of a history refetch
+ * (task 7.4): `resolve`/`concede`/`reply` used to call `refresh()`, which
+ * re-ran `buildPostedReview` over every submitted review just to reflect one
+ * thread changing. This is now the only place that local copy is updated.
+ * Matched on repoId+crNumber as well as threadId, for the same reason
+ * `replyDraftKey` is — every other row, and every other thread on the
+ * matching row, comes back unchanged (by reference, so an unrelated render
+ * never treats them as changed).
+ */
+export function patchThreadInRows(
+  rows: readonly PostedRow[],
+  repoId: string,
+  crNumber: string,
+  threadId: string,
+  updater: (thread: PostedThreadView) => PostedThreadView,
+): PostedRow[] {
+  return rows.map((row) => {
+    if (row.view.repoId !== repoId || row.view.crNumber !== crNumber) return row;
+    const threads = row.view.threads.map((t) => (t.threadId === threadId ? updater(t) : t));
+    return { ...row, view: { ...row.view, threads, counts: deriveThreadCounts(threads) } };
+  });
+}
+
+/**
+ * After "Resolve thread" / "Re-open thread" succeeds on the platform (task
+ * 7.4): no fetch follows, so the new status is derived from what the panel
+ * already holds instead of from a fresh `listThreads`.
+ */
+export function resolveThreadView(
+  thread: PostedThreadView,
+  resolved: boolean,
+  you: string,
+): PostedThreadView {
+  if (resolved) {
+    return { ...thread, status: 'resolved', closedBy: `resolved by @${you}` };
+  }
+  // Reopening: recompute from the conversation's last note, the same rule
+  // `deriveThreadStatus` (domain/threadStatus.ts) applies once `resolved` is
+  // false. A thread whose anchor was ALSO lost before it got resolved would
+  // read 'stale' again on a real fetch — this local patch has no anchor data
+  // to check, so it falls back to the last-note rule, and the next real
+  // refresh (⟳, or reopening this screen) corrects the label if that guess
+  // was wrong. That needs a force-push *and* a prior resolve to even arise.
+  const last = thread.replies.at(-1);
+  return { ...thread, status: last && !last.yours ? 'replied' : 'awaiting', closedBy: undefined };
+}
+
+/**
+ * After "Concede — they're right" succeeds (task 7.4) — mirrors the status
+ * and label `toThreadView` (app/postedReviews.ts) assigns a conceded thread
+ * on a real fetch.
+ */
+export function concedeThreadView(thread: PostedThreadView): PostedThreadView {
+  return { ...thread, status: 'conceded', closedBy: 'conceded — they were right' };
+}
+
+/**
+ * After a reply posts successfully (task 7.4): appends the note locally and
+ * puts the thread back to "awaiting author" — you just spoke last — unless
+ * the anchor is already lost, which a reply cannot fix and which
+ * `deriveThreadStatus` checks ahead of the last-note rule.
+ */
+export function replyThreadView(
+  thread: PostedThreadView,
+  author: string,
+  body: string,
+  at: string,
+): PostedThreadView {
+  return {
+    ...thread,
+    replies: [...thread.replies, { author, body, at, yours: true }],
+    status: thread.status === 'stale' ? 'stale' : 'awaiting',
+  };
 }
