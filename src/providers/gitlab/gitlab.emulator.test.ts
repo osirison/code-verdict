@@ -27,12 +27,24 @@ function connect(emulator: GitLabEmulator, token = TOKEN) {
   });
 }
 
+// `!2833`'s base/head are `rng.hex(40)` — deterministic for seed 1, but not a
+// literal worth hardcoding; read off a reference world instead.
+const referenceMr = new GitLabEmulator({ seed: 1 }).world.mergeRequests.find(
+  (mr) => mr.project_id === 9101 && mr.iid === 2833,
+);
+if (!referenceMr) throw new Error('Seed 1 no longer seeds project 9101 MR !2833');
+
 describeProviderContract('gitlab provider against the emulator', {
   capabilities: createGitLabProvider().capabilities,
   makeConnection: () => connect(new GitLabEmulator({ seed: 1 })),
   makeFailingConnection: () => {
     const emulator = new GitLabEmulator({ seed: 1 });
     emulator.world.failures = { discussionPostFailAt: 2, discussionPostFailStatus: 400 };
+    return connect(emulator);
+  },
+  makeRateLimitedInvestigationConnection: () => {
+    const emulator = new GitLabEmulator({ seed: 1 });
+    emulator.world.failures = { investigationRateLimited: true };
     return connect(emulator);
   },
   inputs: {
@@ -50,6 +62,15 @@ describeProviderContract('gitlab provider against the emulator', {
   threadMutationsPersist: true,
   crRef: { repoId: '9101', number: '2833' },
   anchor: { filePath: 'src/ui/banner.ts', line: 14 },
+  investigation: {
+    baseSha: referenceMr.base_sha,
+    changedFilePath: 'src/ui/banner.ts',
+    // Emulator seed data has no binary file — the fixture and GitLab
+    // fake-fetch dedicated tests already prove binary handling thoroughly.
+    priorRevision: { baseSha: 'prior-base-1', headSha: 'prior-head-1' },
+    noMatchQuery: 'ZZZ_NOPE_NEVER_MATCHES',
+    matchQuery: 'resolveTheme',
+  },
 });
 
 describe('end-to-end flows against the emulator', () => {

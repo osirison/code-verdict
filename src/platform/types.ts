@@ -229,3 +229,243 @@ export type SourceResolution =
   /** A syntactically valid id the token cannot see. Never silently added. */
   | { kind: 'notVisible'; id: string }
   | { kind: 'noMatch' };
+
+/**
+ * Review-investigation contracts (design.md D7, `add-agentic-review-harness`,
+ * task 3.2). Neutral shapes only — no GitLab/GitHub payload appears here, per
+ * "Capabilities, not `if (gitlab)`" and "Anchors are opaque" in
+ * docs/ARCHITECTURE.md. Every request pins an explicit repository and
+ * revision; every result echoes that pin back so a caller can prove the
+ * provider answered the exact requested revision instead of a branch tip
+ * (task 3.7).
+ */
+
+/** Opaque continuation token for one bounded investigation operation; never inspected or built by neutral code. */
+export type InvestigationCursor = string;
+
+/** The immutable repository + base/head pair every investigation request and result is pinned to. */
+export interface InvestigationSnapshotRef {
+  repoId: string;
+  baseSha: string;
+  headSha: string;
+}
+
+/** Which side of an `InvestigationSnapshotRef` a single-revision read or search applies to. */
+export type PinnedRevision = 'base' | 'head';
+
+export type InvestigationState =
+  | 'complete'
+  | 'paginated'
+  | 'truncated'
+  | 'unavailable'
+  | 'binary'
+  | 'tooLarge'
+  | 'notFound'
+  | 'unknown';
+
+interface InvestigationResultBase {
+  snapshot: InvestigationSnapshotRef;
+}
+
+/**
+ * The common bounded result envelope every investigation operation returns
+ * (D7). `value` exists only on the states that can carry content; the other
+ * states have no `value` field to populate, so unavailable content can never
+ * be mistaken for an empty successful payload (task 3.4).
+ */
+export type InvestigationResult<T> =
+  | (InvestigationResultBase & { state: 'complete'; value: T })
+  | (InvestigationResultBase & { state: 'paginated'; value: T; cursor: InvestigationCursor })
+  | (InvestigationResultBase & { state: 'truncated'; value: T; knownRemainingUnits?: number })
+  | (InvestigationResultBase & { state: 'unavailable'; reason?: string })
+  | (InvestigationResultBase & { state: 'binary'; byteSize?: number })
+  | (InvestigationResultBase & { state: 'tooLarge'; byteSize?: number })
+  | (InvestigationResultBase & { state: 'notFound'; reason?: string })
+  | (InvestigationResultBase & { state: 'unknown'; reason?: string });
+
+/** Narrows to the states that carry content, without a caller special-casing every state. */
+export function investigationResultValue<T>(result: InvestigationResult<T>): T | undefined {
+  switch (result.state) {
+    case 'complete':
+    case 'paginated':
+    case 'truncated':
+      return result.value;
+    default:
+      return undefined;
+  }
+}
+
+// ---- Changed-file manifest --------------------------------------------------
+
+export type ChangedFileKind = 'added' | 'modified' | 'deleted' | 'renamed';
+
+/** Enough metadata to classify a changed file without its content. */
+export interface ChangedFileEntry {
+  path: string;
+  /** Present when `kind` is `'renamed'`. */
+  oldPath?: string;
+  kind: ChangedFileKind;
+  binary: boolean;
+  addedLines?: number;
+  removedLines?: number;
+  byteSize?: number;
+}
+
+export interface ChangedFileManifestRequest {
+  snapshot: InvestigationSnapshotRef;
+  cursor?: InvestigationCursor;
+}
+
+export type ChangedFileManifestResult = InvestigationResult<readonly ChangedFileEntry[]>;
+
+// ---- Bounded diff pages ------------------------------------------------------
+
+/** Where a line sits inside the immutable diff — provider-neutral, unlike `AnchorRefs`. */
+export interface DiffPosition {
+  path: string;
+  oldPath?: string;
+  side: 'old' | 'new';
+  line: number;
+  endLine?: number;
+}
+
+export interface DiffPageRequest {
+  snapshot: InvestigationSnapshotRef;
+  path: string;
+  cursor?: InvestigationCursor;
+}
+
+export interface DiffPage {
+  path: string;
+  oldPath?: string;
+  isRenamed?: boolean;
+  /** Unified-diff hunk text for this bounded page, in the same format as `FileDiff.diff`. */
+  patch: string;
+  /** Positions inside `patch` a citation can anchor to, independent of any provider's `AnchorRefs`. */
+  positions: readonly DiffPosition[];
+}
+
+export type DiffPageResult = InvestigationResult<DiffPage>;
+
+// ---- Base/head file ranges ---------------------------------------------------
+
+export interface FileRangeRequest {
+  snapshot: InvestigationSnapshotRef;
+  revision: PinnedRevision;
+  path: string;
+  startLine: number;
+  endLine: number;
+}
+
+export interface FileRange {
+  revision: PinnedRevision;
+  path: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
+
+export type FileRangeResult = InvestigationResult<FileRange>;
+
+// ---- Search matches -----------------------------------------------------------
+
+export interface RepositorySearchRequest {
+  snapshot: InvestigationSnapshotRef;
+  revision: PinnedRevision;
+  query: string;
+  pathScope?: string;
+  cursor?: InvestigationCursor;
+}
+
+export interface SearchMatch {
+  path: string;
+  line: number;
+  excerpt: string;
+}
+
+export type RepositorySearchResult = InvestigationResult<readonly SearchMatch[]>;
+
+export interface DiffSearchRequest {
+  snapshot: InvestigationSnapshotRef;
+  query: string;
+  pathScope?: string;
+  cursor?: InvestigationCursor;
+}
+
+export interface DiffSearchMatch {
+  position: DiffPosition;
+  excerpt: string;
+}
+
+export type DiffSearchResult = InvestigationResult<readonly DiffSearchMatch[]>;
+
+// ---- Normalized details ---------------------------------------------------------
+
+export type DetailSection = 'metadata' | 'commits' | 'discussion' | 'labels' | 'checkSummaries' | 'relationships';
+
+export interface NormalizedCommit {
+  sha: string;
+  message: string;
+  author: string;
+}
+
+export interface NormalizedCheckSummary {
+  name: string;
+  status: CiStatus;
+  summary?: string;
+}
+
+export interface NormalizedRelationship {
+  kind: string;
+  ref: string;
+}
+
+/**
+ * Full normalized detail shared by change-request and linked-issue retrieval
+ * (D4/D6); excludes patch content and full CI logs by construction — neither
+ * field exists here to populate.
+ */
+export interface NormalizedDetail {
+  title: string;
+  body?: string;
+  labels: readonly string[];
+  commits: readonly NormalizedCommit[];
+  discussion: readonly ThreadNote[];
+  checkSummaries: readonly NormalizedCheckSummary[];
+  relationships: readonly NormalizedRelationship[];
+  /** Sections this response could not populate; absence from here is never a silent drop. */
+  unavailableSections: readonly DetailSection[];
+}
+
+export interface ChangeRequestDetailRequest {
+  snapshot: InvestigationSnapshotRef;
+  /** Repo-scoped CR number — `snapshot` alone does not identify which change request. */
+  number: string;
+  section?: DetailSection;
+  cursor?: InvestigationCursor;
+}
+
+export type ChangeRequestDetailResult = InvestigationResult<NormalizedDetail>;
+
+export interface IssueDetailRequest {
+  /** The pinning run's own snapshot — linked-issue content is fetched as of this snapshot, even though an issue has no revision itself. */
+  snapshot: InvestigationSnapshotRef;
+  /** The linked issue's own identity, which may be a different repository than `snapshot.repoId`. */
+  issueRepoId: string;
+  issueNumber: string;
+  section?: DetailSection;
+  cursor?: InvestigationCursor;
+}
+
+export type IssueDetailResult = InvestigationResult<NormalizedDetail>;
+
+// ---- Current head -------------------------------------------------------------
+
+export type CurrentHeadState = 'resolved' | 'unavailable' | 'notFound';
+
+export interface CurrentHeadResult {
+  repoId: string;
+  state: CurrentHeadState;
+  /** Present only when `state` is `'resolved'`. */
+  headSha?: string;
+}

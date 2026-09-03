@@ -12,15 +12,34 @@ import type {
   HostDescriptor,
 } from '../../platform/provider';
 import type {
+  ChangedFileManifestRequest,
+  ChangedFileManifestResult,
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   CommentOutcome,
   ConnectionStatus,
+  CurrentHeadResult,
+  DiffPage,
+  DiffPageRequest,
+  DiffPageResult,
+  DiffSearchMatch,
+  DiffSearchRequest,
+  DiffSearchResult,
+  FileRange,
+  FileRangeRequest,
+  FileRangeResult,
+  IssueDetailRequest,
+  IssueDetailResult,
   Repository,
+  RepositorySearchRequest,
+  RepositorySearchResult,
   ReviewSubmission,
   ReviewThread,
+  SearchMatch,
   SourceResolution,
   SubmitProgressFn,
   SubmitResult,
@@ -32,6 +51,8 @@ import { parseSourceInput } from './sourceInput';
 import type { FetchLike } from './http';
 import { GitLabHttp, encodeRepoId } from './http';
 import type {
+  GlCommit,
+  GlCompareResult,
   GlDiscussion,
   GlGroup,
   GlIssue,
@@ -39,20 +60,36 @@ import type {
   GlMergeRequestChanges,
   GlPipelineRef,
   GlProject,
+  GlRepositoryFile,
+  GlSearchBlob,
   GlUser,
 } from './mappers';
 import {
   buildCommentBody,
   buildPosition,
+  isBinaryDiff,
+  linesFromUnifiedDiff,
+  nonSystemNotes,
   toChangeRequest,
+  toChangedFileEntry,
   toChangeRequestDiff,
   toCiRun,
   toCiStatus,
+  toNormalizedDetail,
+  toNormalizedDetailFromIssue,
   toRepoGroup,
   toRepository,
   toReviewThread,
+  toSearchMatchFromBlob,
   toWorkItem,
 } from './mappers';
+
+/** Declared review-investigation page bounds (design.md D7, task 4.3) \u2014 self-imposed, since GitLab returns each of these payloads in one call rather than paginating them itself. */
+const INVESTIGATION_MANIFEST_PAGE = 100;
+const INVESTIGATION_DIFF_LINE_PAGE = 200;
+const INVESTIGATION_FILE_LINE_PAGE = 200;
+/** Hard cap before a file's content is even decoded \u2014 checked against the metadata endpoint's own `size` field. */
+const MAX_FETCHABLE_FILE_BYTES = 256 * 1024;
 
 const CAPABILITIES: ProviderCapabilities = {
   suggestions: true,
@@ -64,6 +101,23 @@ const CAPABILITIES: ProviderCapabilities = {
   groupHierarchy: true,
   // Batched review would use the draft-notes API — not in v1.
   batchedReview: false,
+  // D7/task 4.3: manifest/diff/diff-search read the Compare API (snapshot-only,
+  // no merge-request iid needed — see docs/agent-notes and repo memory for why
+  // that rules out the MR-versions endpoint). Search requires GitLab Advanced
+  // Search or Exact Code Search on the target instance; declared supported
+  // like `approvals`/`requestChanges` above (a structural capability, not a
+  // per-instance toggle) — an instance that lacks it reports `unavailable` at
+  // call time instead of a silent capability lie.
+  reviewInvestigation: {
+    manifests: { supported: true, pageBound: { maxPageSize: INVESTIGATION_MANIFEST_PAGE } },
+    diffReads: { supported: true, pageBound: { maxPageSize: INVESTIGATION_DIFF_LINE_PAGE } },
+    fileReads: { supported: true, pageBound: { maxPageSize: INVESTIGATION_FILE_LINE_PAGE } },
+    repositorySearch: { supported: true },
+    diffSearch: { supported: true },
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: INVESTIGATION_MANIFEST_PAGE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -410,6 +464,219 @@ export class GitLabConnection implements Connection {
   private mrPath(ref: ChangeRequestRef): string {
     return `/projects/${encodeRepoId(ref.repoId)}/merge_requests/${ref.number}`;
   }
+
+  // ---- review-investigation operations (design.md D7, task 4.3) ------------
+  //
+  // `listChangedFiles`/`readDiff`/`searchDiff` all read the Compare API
+  // (`GET /repository/compare?from=&to=`), not an MR-diff endpoint: every
+  // MR-diff endpoint (`/changes`, `/diffs`, `/versions`) requires the MR
+  // `iid`, but the neutral request types here carry only `snapshot`
+  // (repoId+baseSha+headSha) — Compare is project+revision-scoped and fits
+  // that contract exactly, and also lets a pinned read outlive the MR's
+  // current diff. A 404 from Compare always means the revision pair itself
+  // does not resolve (Compare has no path parameter to get wrong), so it
+  // maps directly to `unavailable`, never `notFound`.
+
+  private async compare(repoId: string, baseSha: string, headSha: string): Promise<GlCompareResult | undefined> {
+    try {
+      return await this.http.get<GlCompareResult>(`/projects/${encodeRepoId(repoId)}/repository/compare`, {
+        from: baseSha,
+        to: headSha,
+        straight: true,
+      });
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') return undefined;
+      throw e;
+    }
+  }
+
+  async listChangedFiles(request: ChangedFileManifestRequest): Promise<ChangedFileManifestResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    const bound =
+      CAPABILITIES.reviewInvestigation!.manifests.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const { page, nextCursor } = paginateArray(compared.diffs.map(toChangedFileEntry), request.cursor, bound);
+    if (nextCursor) return { snapshot, state: 'paginated', value: page, cursor: nextCursor };
+    if (compared.compare_timeout) return { snapshot, state: 'truncated', value: page };
+    return { snapshot, state: 'complete', value: page };
+  }
+
+  async readDiff(request: DiffPageRequest): Promise<DiffPageResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    const file = compared.diffs.find((d) => d.new_path === request.path || d.old_path === request.path);
+    if (!file) return { snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+    // GitLab docs: when `compare_timeout` is true, an individual diff's
+    // content may come back empty because it exceeded limits — the same
+    // "excluded, cannot retrieve" outcome as an explicit `too_large`.
+    if (file.too_large || (compared.compare_timeout && file.diff === '')) return { snapshot, state: 'tooLarge' };
+    if (isBinaryDiff(file.diff)) return { snapshot, state: 'binary' };
+    const bound =
+      CAPABILITIES.reviewInvestigation!.diffReads.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const { page, nextCursor } = paginateArray(file.diff.split('\n'), request.cursor, bound);
+    const value: DiffPage = {
+      path: file.new_path,
+      oldPath: file.renamed_file ? file.old_path : undefined,
+      isRenamed: file.renamed_file,
+      patch: page.join('\n'),
+      positions: [],
+    };
+    if (nextCursor) return { snapshot, state: 'paginated', value, cursor: nextCursor };
+    return { snapshot, state: 'complete', value };
+  }
+
+  async readFile(request: FileRangeRequest): Promise<FileRangeResult> {
+    const { snapshot } = request;
+    const revisionSha = request.revision === 'base' ? snapshot.baseSha : snapshot.headSha;
+    let file: GlRepositoryFile;
+    try {
+      file = await this.http.get<GlRepositoryFile>(
+        `/projects/${encodeRepoId(snapshot.repoId)}/repository/files/${encodeURIComponent(request.path)}`,
+        { ref: revisionSha },
+      );
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') {
+        // GitLab's own wording differs for a bad ref vs. a bad path; a
+        // revision problem must never be retried against another revision,
+        // while a path problem is just an absent file at a known revision.
+        return /commit/i.test(e.message)
+          ? { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${revisionSha}` }
+          : { snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+      }
+      throw e;
+    }
+    if (file.size > MAX_FETCHABLE_FILE_BYTES) return { snapshot, state: 'tooLarge', byteSize: file.size };
+    const content = Buffer.from(file.content, 'base64');
+    if (content.includes(0)) return { snapshot, state: 'binary', byteSize: file.size };
+    const lines = content.toString('utf8').split('\n');
+    const bound =
+      CAPABILITIES.reviewInvestigation!.fileReads.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const start = Math.max(1, request.startLine);
+    if (start > lines.length) return { snapshot, state: 'notFound', reason: 'startLine beyond file length' };
+    const availableEnd = Math.min(request.endLine, lines.length);
+    const boundedEnd = Math.min(availableEnd, start + bound - 1);
+    const value: FileRange = {
+      revision: request.revision,
+      path: request.path,
+      startLine: start,
+      endLine: boundedEnd,
+      text: lines.slice(start - 1, boundedEnd).join('\n'),
+    };
+    if (boundedEnd < availableEnd) return { snapshot, state: 'truncated', value, knownRemainingUnits: availableEnd - boundedEnd };
+    return { snapshot, state: 'complete', value };
+  }
+
+  async searchRepository(request: RepositorySearchRequest): Promise<RepositorySearchResult> {
+    const { snapshot } = request;
+    const revisionSha = request.revision === 'base' ? snapshot.baseSha : snapshot.headSha;
+    const bound =
+      CAPABILITIES.reviewInvestigation!.repositorySearch.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const page = request.cursor ? Number(request.cursor) : 1;
+    let blobs: GlSearchBlob[];
+    try {
+      blobs = await this.http.get<GlSearchBlob[]>(`/projects/${encodeRepoId(snapshot.repoId)}/search`, {
+        scope: 'blobs',
+        search: request.query,
+        ref: revisionSha,
+        page,
+        per_page: bound,
+      });
+    } catch (e) {
+      // scope=blobs needs GitLab Advanced Search or Exact Code Search — a
+      // real per-instance/tier gap, reported as unavailable rather than an
+      // opaque throw.
+      if (isScmError(e) && (e.kind === 'insufficientScope' || e.kind === 'notFound')) {
+        return { snapshot, state: 'unavailable', reason: 'Repository search requires GitLab Advanced Search or Exact Code Search' };
+      }
+      throw e;
+    }
+    const value: SearchMatch[] = blobs
+      .filter((b) => !request.pathScope || b.path.startsWith(request.pathScope))
+      .map(toSearchMatchFromBlob);
+    if (blobs.length === bound) return { snapshot, state: 'paginated', value, cursor: String(page + 1) };
+    return { snapshot, state: 'complete', value };
+  }
+
+  async searchDiff(request: DiffSearchRequest): Promise<DiffSearchResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    // A diff GitLab itself could not fully compute cannot be claimed exhaustively searchable.
+    if (compared.compare_timeout) return { snapshot, state: 'unknown', reason: 'Diff exceeds size limits and cannot be exhaustively searched' };
+    const value: DiffSearchMatch[] = [];
+    for (const file of compared.diffs) {
+      if (file.too_large || isBinaryDiff(file.diff)) continue;
+      if (request.pathScope && !file.new_path.startsWith(request.pathScope)) continue;
+      linesFromUnifiedDiff(file.diff).forEach((line, index) => {
+        if (line.includes(request.query)) value.push({ position: { path: file.new_path, side: 'new', line: index + 1 }, excerpt: line.trim() });
+      });
+    }
+    return { snapshot, state: 'complete', value };
+  }
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    const { snapshot } = request;
+    const path = `/projects/${encodeRepoId(snapshot.repoId)}/merge_requests/${request.number}`;
+    let mr: GlMergeRequest;
+    try {
+      mr = await this.http.get<GlMergeRequest>(path);
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') return { snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+      throw e;
+    }
+    const [discussions, commits] = await Promise.all([
+      this.http.getAll<GlDiscussion>(`${path}/discussions`),
+      this.http.getAll<GlCommit>(`${path}/commits`),
+    ]);
+    const discussion = discussions.filter((d) => !d.individual_note).flatMap(nonSystemNotes);
+    return { snapshot, state: 'complete', value: toNormalizedDetail(mr, discussion, commits) };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    const { snapshot } = request;
+    const path = `/projects/${encodeRepoId(request.issueRepoId)}/issues/${request.issueNumber}`;
+    let issue: GlIssue;
+    try {
+      issue = await this.http.get<GlIssue>(path);
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+      }
+      throw e;
+    }
+    const discussions = await this.http.getAll<GlDiscussion>(`${path}/discussions`);
+    const discussion = discussions.filter((d) => !d.individual_note).flatMap(nonSystemNotes);
+    return { snapshot, state: 'complete', value: toNormalizedDetailFromIssue(issue, discussion) };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    try {
+      const mr = await this.http.get<GlMergeRequest>(this.mrPath(ref));
+      return { repoId: ref.repoId, state: 'resolved', headSha: mr.sha };
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') return { repoId: ref.repoId, state: 'notFound' };
+      throw e;
+    }
+  }
+}
+
+/** In-memory pagination over an already-fully-fetched array \u2014 GitLab returns each of Compare/search/files in one call; the cursor is host-defined and never inspected by GitLab. */
+function paginateArray<T>(
+  items: readonly T[],
+  cursor: string | undefined,
+  pageSize: number,
+): { page: readonly T[]; nextCursor?: string } {
+  const start = cursor ? Number(cursor) : 0;
+  const end = Math.min(start + pageSize, items.length);
+  return { page: items.slice(start, end), nextCursor: end < items.length ? String(end) : undefined };
 }
 
 export function createGitLabProvider(fetchImpl?: FetchLike): ScmProvider {

@@ -10,11 +10,17 @@
  * storing `path` alongside `id`.
  */
 import type {
+  ChangedFileEntry,
+  ChangedFileKind,
   ChangeRequest,
   ChangeRequestRef,
   CiRun,
   CiStatus,
   FileDiff,
+  NormalizedCheckSummary,
+  NormalizedCommit,
+  NormalizedDetail,
+  NormalizedRelationship,
   Repository,
   RepoGroup,
   ReviewThread,
@@ -48,12 +54,17 @@ export interface GhPull {
   merged_at?: string | null;
   draft?: boolean;
   head: { ref: string; sha: string };
-  base: { ref: string };
+  base: { ref: string; sha: string };
   user: GhUser | null;
   requested_reviewers?: GhUser[] | null;
   html_url: string;
   updated_at: string;
   changed_files?: number;
+  labels?: GhLabel[];
+}
+
+export interface GhLabel {
+  name: string;
 }
 
 export interface GhIssue {
@@ -67,6 +78,7 @@ export interface GhIssue {
   html_url: string;
   /** Present only when the "issue" is really a pull request. */
   pull_request?: unknown;
+  labels?: GhLabel[];
 }
 
 /**
@@ -101,6 +113,9 @@ export interface GhFile {
   previous_filename?: string;
   status: 'added' | 'removed' | 'modified' | 'renamed' | 'copied' | 'changed' | 'unchanged';
   patch?: string;
+  /** Present on both `/pulls/{n}/files` and Compare `Diff Entry` payloads; absent only via hand-trimmed fixtures. */
+  additions?: number;
+  deletions?: number;
 }
 
 export function toUserRef(user: GhUser | null | undefined): UserRef {
@@ -248,6 +263,10 @@ export interface GqlRollup {
       context?: string | null;
       state?: string | null;
       targetUrl?: string | null;
+      /** CheckRun's own short output text — not a log; the Checks API keeps logs on a separate, unfetched endpoint. */
+      summary?: string | null;
+      /** StatusContext's equivalent of `summary`. */
+      description?: string | null;
     } | null>;
   } | null;
 }
@@ -346,3 +365,170 @@ export function toReviewThread(crRef: ChangeRequestRef, thread: GqlThread): Revi
     line: thread.line ?? undefined,
   };
 }
+
+// ---- review-investigation (design.md D7, task 4.6) ---------------------------
+
+/**
+ * GitHub omits `patch` for a Diff Entry it cannot render as text, but does not
+ * document why. `additions`/`deletions` are computed by git itself
+ * (`git diff --numstat`), which reports 0 for binary content because it
+ * cannot count line changes in it — a large-but-text diff still carries
+ * non-zero counts even when its patch text was suppressed for size. Moderate,
+ * disclosed confidence, mirroring the GitLab provider's own disclosed-
+ * confidence revision/path disambiguation: GitHub's docs confirm binary
+ * content has no `patch` but do not enumerate every cause of an absent one.
+ */
+export function isBinaryCompareFile(file: GhFile): boolean {
+  return file.patch === undefined && (file.additions ?? 0) === 0 && (file.deletions ?? 0) === 0;
+}
+
+/** A patch GitHub knows the line counts for but declined to render — too large to show, not binary. */
+export function isTooLargeCompareFile(file: GhFile): boolean {
+  return file.patch === undefined && !isBinaryCompareFile(file);
+}
+
+function toChangedFileKind(file: GhFile): ChangedFileKind {
+  if (file.status === 'renamed') return 'renamed';
+  if (file.status === 'added') return 'added';
+  if (file.status === 'removed') return 'deleted';
+  return 'modified';
+}
+
+export function toChangedFileEntry(file: GhFile): ChangedFileEntry {
+  const binary = isBinaryCompareFile(file);
+  return {
+    path: file.filename,
+    oldPath: file.status === 'renamed' ? file.previous_filename : undefined,
+    kind: toChangedFileKind(file),
+    binary,
+    addedLines: binary ? undefined : file.additions,
+    removedLines: binary ? undefined : file.deletions,
+  };
+}
+
+/**
+ * `GET /repos/{owner}/{repo}/compare/{base}...{head}` — snapshot-scoped (no
+ * pull-request number needed), unlike `/pulls/{n}/files`. Only `files` is
+ * read; GitHub caps it at 300 entries for the whole comparison and shows it
+ * only on the first page (docs.github.com/en/rest/commits/commits#compare-two-commits).
+ */
+export interface GhCompareResult {
+  files?: GhFile[];
+}
+
+/** Keeps context and added lines, drops removed lines and hunk headers — a deterministic head-revision approximation, never invented file content (same technique as the GitLab provider; GitHub's patch format has no binary marker line to skip). */
+export function linesFromUnifiedDiff(patch: string): string[] {
+  const lines: string[] = [];
+  for (const raw of patch.split('\n')) {
+    if (raw.startsWith('@@')) continue;
+    if (raw.startsWith('-')) continue;
+    lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
+  }
+  return lines;
+}
+
+export interface GhPullCommit {
+  sha: string;
+  commit: { message: string; author?: { name?: string } | null };
+}
+
+function toNormalizedCommit(commit: GhPullCommit): NormalizedCommit {
+  return { sha: commit.sha, message: commit.commit.message, author: commit.commit.author?.name ?? 'unknown' };
+}
+
+/** Per-context status, distinct from `toCiStatus`: GraphQL's check enums are uppercase and shaped differently from the REST workflow-run enums that function reads. */
+function toContextStatus(node: { conclusion?: string | null; status?: string | null; state?: string | null }): CiStatus {
+  // StatusContext carries `state`; CheckRun carries `status`/`conclusion`.
+  if (node.state != null) return rollupState(node.state);
+  if (node.status !== 'COMPLETED') return node.status === 'IN_PROGRESS' ? 'running' : 'pending';
+  switch (node.conclusion) {
+    case 'SUCCESS':
+    case 'NEUTRAL':
+    case 'SKIPPED':
+      return 'success';
+    case 'FAILURE':
+    case 'TIMED_OUT':
+    case 'ACTION_REQUIRED':
+    case 'STARTUP_FAILURE':
+    case 'STALE':
+      return 'failed';
+    case 'CANCELLED':
+      return 'canceled';
+    default:
+      return 'none';
+  }
+}
+
+/** Every check on the change request, normalized — unlike `toCiSummary`, which picks one to link to. */
+export function toCheckSummariesFromRollup(rollup: GqlRollup | null | undefined): NormalizedCheckSummary[] {
+  const contexts = (rollup?.contexts?.nodes ?? []).filter((node): node is NonNullable<typeof node> => node != null);
+  return contexts.map((node) => ({
+    name: node.name ?? node.context ?? 'check',
+    status: toContextStatus(node),
+    // CheckRun's short output text / StatusContext's description — never the execution log, which lives on a separate, unfetched endpoint.
+    summary: node.summary ?? node.description ?? undefined,
+  }));
+}
+
+/** `Part-of: #123` is this product's own changeset-linkage convention (`DEFAULT_TRAILER` in `app/changesets.ts`), not a GitHub feature — same derivation the GitLab provider applies to its own description field. */
+function partOfRelationship(body: string | null | undefined): NormalizedRelationship[] {
+  const match = /Part-of: #(\d+)/.exec(body ?? '');
+  return match ? [{ kind: 'partOf', ref: match[1] as string }] : [];
+}
+
+export function toNormalizedDetail(
+  pull: GhPull,
+  commits: readonly GhPullCommit[],
+  discussion: ThreadNote[],
+  checkSummaries: NormalizedCheckSummary[],
+): NormalizedDetail {
+  return {
+    title: pull.title,
+    body: pull.body ?? undefined,
+    labels: (pull.labels ?? []).map((label) => label.name),
+    commits: commits.map(toNormalizedCommit),
+    discussion,
+    checkSummaries,
+    relationships: partOfRelationship(pull.body),
+    unavailableSections: [],
+  };
+}
+
+export function toNormalizedDetailFromIssue(issue: GhIssue, discussion: ThreadNote[]): NormalizedDetail {
+  return {
+    title: issue.title,
+    body: issue.body ?? undefined,
+    labels: (issue.labels ?? []).map((label) => label.name),
+    commits: [],
+    discussion,
+    checkSummaries: [],
+    relationships: [],
+    unavailableSections: ['commits', 'checkSummaries', 'relationships'],
+  };
+}
+
+/** `GET /repos/{owner}/{repo}/issues/{number}/comments` — plain issue comments; issues have no review threads. */
+export interface GhIssueComment {
+  id: number;
+  user: GhUser | null;
+  body: string;
+  created_at: string;
+}
+
+export function toThreadNoteFromIssueComment(comment: GhIssueComment): ThreadNote {
+  return { id: String(comment.id), author: toUserRef(comment.user), body: comment.body, createdAt: comment.created_at };
+}
+
+/**
+ * `GET /repos/{owner}/{repo}/contents/{path}` response for a file. GitHub
+ * itself withholds `content` once the file exceeds 1 MB (`encoding: 'none'`
+ * under the default JSON media type) rather than requiring a local byte cap
+ * the way the GitLab provider does.
+ */
+export interface GhContentFile {
+  type: 'file' | 'dir' | 'symlink' | 'submodule';
+  size: number;
+  encoding?: string;
+  content?: string;
+}
+

@@ -1,83 +1,83 @@
 ## 1. Dependency And Baseline
 
-- [ ] 1.1 Land or otherwise make `add-context-controls-and-thinking-effort` available before harness integration; verify its context selections, attachment evidence metadata, thinking effort, and out-of-diff summary routing tests pass unchanged.
-- [ ] 1.2 Add characterization tests around `ReviewRunManager` for one-active-run-per-target admission, FIFO global concurrency, immediate slot release on cancellation, write-before-notify completion, retained-review survival, and headless notification before changing its runner interface.
-- [ ] 1.3 Add fixture data for a small review, a paginated huge review, binary and renamed files, an unavailable oversized diff, nested `AGENTS.md`, a changed head, long issue/discussion details, and a multi-member changeset.
-- [ ] 1.4 Record the current legacy persisted shapes for run history, in-flight records, retained reviews, and triage drafts as migration fixtures.
+- [x] 1.1 Land or otherwise make `add-context-controls-and-thinking-effort` available before harness integration; verify its context selections, attachment evidence metadata, thinking effort, and out-of-diff summary routing tests pass unchanged.
+- [x] 1.2 Add characterization tests around `ReviewRunManager` for one-active-run-per-target admission, FIFO global concurrency, immediate slot release on cancellation, write-before-notify completion, retained-review survival, and headless notification before changing its runner interface.
+- [x] 1.3 Add fixture data for a small review, a paginated huge review, binary and renamed files, an unavailable oversized diff, nested `AGENTS.md`, a changed head, long issue/discussion details, and a multi-member changeset.
+- [x] 1.4 Record the current legacy persisted shapes for run history, in-flight records, retained reviews, and triage drafts as migration fixtures.
 
 ## 2. Domain Models And Policy
 
-- [ ] 2.1 Add versioned run, lineage, and attempt identifiers plus canonical lifecycle and independent `none | partial | complete` result completeness types under `src/domain/`.
-- [ ] 2.2 Define `ReviewRunSnapshot` and member snapshot types for immutable provider/repository identity, base/head SHAs, agent/persona digest, model, thinking effort, criteria, context controls, attachments, policy, tool-contract version, and provider capability signature.
-- [ ] 2.3 Define typed public plan, stable plan-item identifiers, plan revisions, plan-item states, sanitized activity events, limitations, attention state, and `RunProjection` types.
-- [ ] 2.4 Define changed-file inventory, risk classification, inspection state, per-member coverage, unresolved work, budget consumption, and completion-decision types.
-- [ ] 2.5 Define evidence source metadata, source citations, candidate validation states, validated finding provenance, and protocol provenance including `legacy-one-shot`.
-- [ ] 2.6 Add `HarnessPolicy` with the design's injectable initial limits, reserve percentages, retries, protocol repairs, checkpoint cadence, and retention bounds; validate unusable values by falling back to documented defaults.
-- [ ] 2.7 Add serialization and migration tests proving unknown or malformed persisted enum values fail closed and legacy successful reviews remain readable without fabricated plan, evidence, or coverage.
+- [x] 2.1 Add versioned run, lineage, and attempt identifiers plus canonical lifecycle and independent `none | partial | complete` result completeness types under `src/domain/`.
+- [x] 2.2 Define `ReviewRunSnapshot` and member snapshot types for immutable provider/repository identity, base/head SHAs, agent/persona digest, model, thinking effort, criteria, context controls, attachments, policy, tool-contract version, and provider capability signature.
+- [x] 2.3 Define typed public plan, stable plan-item identifiers, plan revisions, plan-item states, sanitized activity events, limitations, attention state, and `RunProjection` types.
+- [x] 2.4 Define changed-file inventory, risk classification, inspection state, per-member coverage, unresolved work, budget consumption, and completion-decision types.
+- [x] 2.5 Define evidence source metadata, source citations, candidate validation states, validated finding provenance, and protocol provenance including `legacy-one-shot`.
+- [x] 2.6 Add `HarnessPolicy` with the design's injectable initial limits, reserve percentages, retries, protocol repairs, checkpoint cadence, and retention bounds; validate unusable values by falling back to documented defaults.
+- [x] 2.7 Add serialization and migration tests proving unknown or malformed persisted enum values fail closed and legacy successful reviews remain readable without fabricated plan, evidence, or coverage.
 
 ## 3. Neutral Provider Contracts
 
-- [ ] 3.1 Extend `ProviderCapabilities` in `src/platform/provider.ts` with structured review-investigation support and declared bounds for manifests, pinned reads, searches, details, and pagination.
-- [ ] 3.2 Add neutral request and result types in `src/platform/types.ts` for snapshot identity, cursors, changed-file manifests, bounded diff pages, base/head file ranges, search matches, normalized details, and common completeness states.
-- [ ] 3.3 Extend `Connection` with manifest, diff-read, revision-pinned file-read, repository-search, diff-search, change-request-detail, linked-issue-detail, and current-head operations; require explicit repository and revision identity on every request.
-- [ ] 3.4 Normalize complete, paginated, truncated, unavailable, binary, too-large, not-found, and unknown-completeness results without representing unavailable content as an empty successful payload.
-- [ ] 3.5 Carry retryability and provider `Retry-After` or reset guidance through the existing neutral error taxonomy without exposing platform payloads.
-- [ ] 3.6 Extend `src/platform/contract/providerContract.ts` with reusable manifest pagination, immutable revision, range bound, binary, truncation, empty-complete, unavailable capability, detail normalization, search, and rate-limit cases.
-- [ ] 3.7 Add a conformance assertion that no investigation caller branches on provider identity or substitutes an unpinned branch tip for a requested SHA.
+- [x] 3.1 Extend `ProviderCapabilities` in `src/platform/provider.ts` with structured review-investigation support and declared bounds for manifests, pinned reads, searches, details, and pagination.
+- [x] 3.2 Add neutral request and result types in `src/platform/types.ts` for snapshot identity, cursors, changed-file manifests, bounded diff pages, base/head file ranges, search matches, normalized details, and common completeness states.
+- [x] 3.3 Extend `Connection` with manifest, diff-read, revision-pinned file-read, repository-search, diff-search, change-request-detail, linked-issue-detail, and current-head operations; require explicit repository and revision identity on every request.
+- [x] 3.4 Normalize complete, paginated, truncated, unavailable, binary, too-large, not-found, and unknown-completeness results without representing unavailable content as an empty successful payload.
+- [x] 3.5 Carry retryability and provider `Retry-After` or reset guidance through the existing neutral error taxonomy without exposing platform payloads.
+- [x] 3.6 Extend `src/platform/contract/providerContract.ts` with reusable manifest pagination, immutable revision, range bound, binary, truncation, empty-complete, unavailable capability, detail normalization, search, and rate-limit cases.
+- [x] 3.7 Add a conformance assertion that no investigation caller branches on provider identity or substitutes an unpinned branch tip for a requested SHA.
 
 ## 4. Provider Implementations
 
-- [ ] 4.1 Implement every investigation operation in `src/providers/fixture/fixtureProvider.ts` first, using deterministic cursors and all explicit result states needed by harness tests.
-- [ ] 4.2 Make `src/providers/fixture/fixture.contract.test.ts` pass the expanded shared provider suite, including the huge, binary, renamed, stale-revision, and rate-limited fixtures.
-- [ ] 4.3 Extend `src/providers/gitlab/gitlabProvider.ts`, mappers, and HTTP helpers with manifest, pinned diff/file reads, bounded searches, normalized details, current-head checks, and honest capability declarations.
-- [ ] 4.4 Extend `src/providers/gitlab/fakeGitLab.ts` and GitLab tests with platform pagination, truncation, binary, missing revision, linked issues, discussion, check-summary, and `Retry-After` behavior.
-- [ ] 4.5 Make `src/providers/gitlab/gitlab.contract.test.ts` and emulator tests pass the expanded conformance suite without leaking GitLab payload shapes above the provider.
-- [ ] 4.6 Extend `src/providers/github/githubProvider.ts`, mappers, and HTTP helpers with manifest, pinned diff/file reads, bounded searches, normalized details, current-head checks, and honest capability declarations.
-- [ ] 4.7 Extend `src/providers/github/fakeGitHub.ts` and GitHub tests with platform pagination and limits, binary files, missing revisions, linked issues, reviews, check summaries without full logs, and rate-limit reset behavior.
-- [ ] 4.8 Make `src/providers/github/github.contract.test.ts` and emulator tests pass the expanded conformance suite while preserving existing ETag and rate-budget behavior.
+- [x] 4.1 Implement every investigation operation in `src/providers/fixture/fixtureProvider.ts` first, using deterministic cursors and all explicit result states needed by harness tests.
+- [x] 4.2 Make `src/providers/fixture/fixture.contract.test.ts` pass the expanded shared provider suite, including the huge, binary, renamed, stale-revision, and rate-limited fixtures.
+- [x] 4.3 Extend `src/providers/gitlab/gitlabProvider.ts`, mappers, and HTTP helpers with manifest, pinned diff/file reads, bounded searches, normalized details, current-head checks, and honest capability declarations.
+- [x] 4.4 Extend `src/providers/gitlab/fakeGitLab.ts` and GitLab tests with platform pagination, truncation, binary, missing revision, linked issues, discussion, check-summary, and `Retry-After` behavior.
+- [x] 4.5 Make `src/providers/gitlab/gitlab.contract.test.ts` and emulator tests pass the expanded conformance suite without leaking GitLab payload shapes above the provider.
+- [x] 4.6 Extend `src/providers/github/githubProvider.ts`, mappers, and HTTP helpers with manifest, pinned diff/file reads, bounded searches, normalized details, current-head checks, and honest capability declarations.
+- [x] 4.7 Extend `src/providers/github/fakeGitHub.ts` and GitHub tests with platform pagination and limits, binary files, missing revisions, linked issues, reviews, check summaries without full logs, and rate-limit reset behavior.
+- [x] 4.8 Make `src/providers/github/github.contract.test.ts` and emulator tests pass the expanded conformance suite while preserving existing ETag and rate-budget behavior.
 
 ## 5. Sanitized Activity Protocol
 
-- [ ] 5.1 Create an activity module under `src/app/` with the ordered typed union and common run, lineage, attempt, sequence, timestamp, phase, and elapsed fields from `review-run-activity`.
-- [ ] 5.2 Implement an append-only activity builder that assigns monotonic sequence values, deduplicates event identifiers, and preserves attempt boundaries after resume.
-- [ ] 5.3 Implement public plan creation, revision, and plan-item transition events with stable item identifiers and retained prior revisions.
-- [ ] 5.4 Implement the pure activity reducer that derives one `RunProjection` for lifecycle, completeness, current action, sanitized target, elapsed time, progress mode, coverage, attention, checkpoint, limitations, and result.
-- [ ] 5.5 Add an allowlist sanitizer for public rationale, tool targets, completion/failure summaries, and error metadata; reject raw prompts, model fragments, secrets, full arguments, and full output payloads.
-- [ ] 5.6 Test out-of-order and duplicate events, plan revision history, stable identifiers, partial results, attempt boundaries, determinate units, indeterminate waits, secret redaction, and terminal events bypassing progress throttling.
+- [x] 5.1 Create an activity module under `src/app/` with the ordered typed union and common run, lineage, attempt, sequence, timestamp, phase, and elapsed fields from `review-run-activity`.
+- [x] 5.2 Implement an append-only activity builder that assigns monotonic sequence values, deduplicates event identifiers, and preserves attempt boundaries after resume.
+- [x] 5.3 Implement public plan creation, revision, and plan-item transition events with stable item identifiers and retained prior revisions.
+- [x] 5.4 Implement the pure activity reducer that derives one `RunProjection` for lifecycle, completeness, current action, sanitized target, elapsed time, progress mode, coverage, attention, checkpoint, limitations, and result.
+- [x] 5.5 Add an allowlist sanitizer for public rationale, tool targets, completion/failure summaries, and error metadata; reject raw prompts, model fragments, secrets, full arguments, and full output payloads.
+- [x] 5.6 Test out-of-order and duplicate events, plan revision history, stable identifiers, partial results, attempt boundaries, determinate units, indeterminate waits, secret redaction, and terminal events bypassing progress throttling.
 
 ## 6. Snapshot, Bootstrap, And Policy Resolution
 
-- [ ] 6.1 Replace the mutable run-input payload with a snapshot builder that resolves and hashes every agent, model, effort, criteria, context-control, attachment, provider-capability, repository, and revision input before dispatch.
-- [ ] 6.2 Add normalized bootstrap section models for full linked-issue and change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships, excluding patches and full CI logs.
-- [ ] 6.3 Implement base-revision root and nested `AGENTS.md` resolution from repository root to each changed path, with explicit absence, ordered policy composition, per-base/path caching, and non-citable classification.
-- [ ] 6.4 Implement a bootstrap builder that isolates every author-controlled section as untrusted data and keeps host instructions, policy, criteria, tool schemas, evidence rules, and completion rules structurally authoritative.
-- [ ] 6.5 Make large detail sections reopenable through stable section references, digests, truncation state, and bounded detail-tool cursors rather than blind concatenation.
-- [ ] 6.6 Count bootstrap tokens for the selected model, replace reopenable sections before shortening non-normative host descriptions, and fail with completeness `none` when the minimum authoritative envelope still cannot fit.
-- [ ] 6.7 Add adversarial tests for forged tool names, policy markers, evidence identifiers, section boundaries, diff labels, attachment delimiters, and mandatory-envelope overflow.
+- [x] 6.1 Replace the mutable run-input payload with a snapshot builder that resolves and hashes every agent, model, effort, criteria, context-control, attachment, provider-capability, repository, and revision input before dispatch.
+- [x] 6.2 Add normalized bootstrap section models for full linked-issue and change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships, excluding patches and full CI logs.
+- [x] 6.3 Implement base-revision root and nested `AGENTS.md` resolution from repository root to each changed path, with explicit absence, ordered policy composition, per-base/path caching, and non-citable classification.
+- [x] 6.4 Implement a bootstrap builder that isolates every author-controlled section as untrusted data and keeps host instructions, policy, criteria, tool schemas, evidence rules, and completion rules structurally authoritative.
+- [x] 6.5 Make large detail sections reopenable through stable section references, digests, truncation state, and bounded detail-tool cursors rather than blind concatenation.
+- [x] 6.6 Count bootstrap tokens for the selected model, replace reopenable sections before shortening non-normative host descriptions, and fail with completeness `none` when the minimum authoritative envelope still cannot fit.
+- [x] 6.7 Add adversarial tests for forged tool names, policy markers, evidence identifiers, section boundaries, diff labels, attachment delimiters, and mandatory-envelope overflow.
 
 ## 7. Evidence Ledger And Candidate Validation
 
-- [ ] 7.1 Create an append-only in-memory evidence ledger that assigns stable source identifiers and cryptographic digests to the exact content returned to the model.
-- [ ] 7.2 Bind every source to run, lineage, attempt, repository, base/head, revision, origin, path/range/page, completeness, trust, and citable status; reject cross-head or cross-member aliasing.
-- [ ] 7.3 Register exact diff pages, file ranges, search excerpts, detail pages, and explicit context-control attachments only after they are included in a model-visible result.
-- [ ] 7.4 Mark auto-derived intent and every `AGENTS.md` policy source non-citable; mark changed diff evidence citable; mark reviewer-selected attachments citable under upstream summary-routing rules.
-- [ ] 7.5 Implement citation resolution against source identifier, digest, and exact returned range instead of refetching by path at validation time.
-- [ ] 7.6 Implement incremental candidate validation for schema, criteria, member identity, citation, revision, location, citable status, and primary-target eligibility with accepted, repairable, and rejected outcomes.
-- [ ] 7.7 Enforce that unchanged repository evidence can corroborate a changed primary target but cannot become an unrelated primary finding unless it is an explicit citable attachment.
-- [ ] 7.8 Revalidate citations after synthesis and verification, and keep unresolved candidates out of triage while blocking complete status.
-- [ ] 7.9 Test omitted ranges, fabricated source identifiers, changed digests, intent/policy citations, another head, unchanged surprise findings, changed-line inline anchors, out-of-diff attachment summary routing, and resume evidence reuse.
+- [x] 7.1 Create an append-only in-memory evidence ledger that assigns stable source identifiers and cryptographic digests to the exact content returned to the model.
+- [x] 7.2 Bind every source to run, lineage, attempt, repository, base/head, revision, origin, path/range/page, completeness, trust, and citable status; reject cross-head or cross-member aliasing.
+- [x] 7.3 Register exact diff pages, file ranges, search excerpts, detail pages, and explicit context-control attachments only after they are included in a model-visible result.
+- [x] 7.4 Mark auto-derived intent and every `AGENTS.md` policy source non-citable; mark changed diff evidence citable; mark reviewer-selected attachments citable under upstream summary-routing rules.
+- [x] 7.5 Implement citation resolution against source identifier, digest, and exact returned range instead of refetching by path at validation time.
+- [x] 7.6 Implement incremental candidate validation for schema, criteria, member identity, citation, revision, location, citable status, and primary-target eligibility with accepted, repairable, and rejected outcomes.
+- [x] 7.7 Enforce that unchanged repository evidence can corroborate a changed primary target but cannot become an unrelated primary finding unless it is an explicit citable attachment.
+- [x] 7.8 Revalidate citations after synthesis and verification, and keep unresolved candidates out of triage while blocking complete status.
+- [x] 7.9 Test omitted ranges, fabricated source identifiers, changed digests, intent/policy citations, another head, unchanged surprise findings, changed-line inline anchors, out-of-diff attachment summary routing, and resume evidence reuse.
 
 ## 8. Coverage, Budgets, And Completion
 
-- [ ] 8.1 Implement per-member manifest accumulation that does not expose a total denominator until enumeration is explicitly complete.
-- [ ] 8.2 Implement changed-file transitions through unvisited, classified, inspected, policy-excluded, unavailable, binary, and oversized states with public reasons and real counts.
-- [ ] 8.3 Implement host risk floors from manifest facts and resolved policy, with injected path/category weights that can be tuned without changing the state model.
-- [ ] 8.4 Implement hierarchical global, run, phase, turn, tool, evidence, and elapsed-time budgets with atomic reservations and actual-use reconciliation.
-- [ ] 8.5 Partition and enforce ordinary investigation, unvisited/high-risk, and final-verification reserves so earlier work cannot consume protected capacity.
-- [ ] 8.6 Implement per-member minimum turns, tool calls, evidence bytes, and risk reserves before changeset members may consume shared budget.
-- [ ] 8.7 Implement the deterministic completion gate for stable head, complete inventories, classifications, configured risk coverage, no unresolved fetches/candidates, valid citations, contradiction pass, deduplication, and final verification.
-- [ ] 8.8 Map completion-gate outcomes to complete findings, complete clean, partial findings with limitations, or failed/none without ever treating incomplete no-findings as clean.
-- [ ] 8.9 Test early completion requests, incomplete inventory, high-risk reserve use, exhausted ordinary and hard budgets, unavailable oversized patches, provider limits, timeout, changed head, unresolved candidates, complete clean, and complete findings.
+- [x] 8.1 Implement per-member manifest accumulation that does not expose a total denominator until enumeration is explicitly complete.
+- [x] 8.2 Implement changed-file transitions through unvisited, classified, inspected, policy-excluded, unavailable, binary, and oversized states with public reasons and real counts.
+- [x] 8.3 Implement host risk floors from manifest facts and resolved policy, with injected path/category weights that can be tuned without changing the state model.
+- [x] 8.4 Implement hierarchical global, run, phase, turn, tool, evidence, and elapsed-time budgets with atomic reservations and actual-use reconciliation.
+- [x] 8.5 Partition and enforce ordinary investigation, unvisited/high-risk, and final-verification reserves so earlier work cannot consume protected capacity.
+- [x] 8.6 Implement per-member minimum turns, tool calls, evidence bytes, and risk reserves before changeset members may consume shared budget.
+- [x] 8.7 Implement the deterministic completion gate for stable head, complete inventories, classifications, configured risk coverage, no unresolved fetches/candidates, valid citations, contradiction pass, deduplication, and final verification.
+- [x] 8.8 Map completion-gate outcomes to complete findings, complete clean, partial findings with limitations, or failed/none without ever treating incomplete no-findings as clean.
+- [x] 8.9 Test early completion requests, incomplete inventory, high-risk reserve use, exhausted ordinary and hard budgets, unavailable oversized patches, provider limits, timeout, changed head, unresolved candidates, complete clean, and complete findings.
 
 ## 9. Host Tool Dispatcher And Retry Policy
 

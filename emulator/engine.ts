@@ -87,6 +87,9 @@ export class GitLabEmulator {
     if (this.world.rateLimited) {
       return json(429, { message: '429 Too Many Requests' }, { 'retry-after': '38' });
     }
+    if (this.world.failures.investigationRateLimited && isInvestigationPath(rawPath)) {
+      return json(429, { message: '429 Too Many Requests' }, { 'retry-after': '30' });
+    }
 
     if (req.method === 'POST' && rawPath === '/api/graphql') {
       return this.graphql(req.body);
@@ -236,6 +239,85 @@ export class GitLabEmulator {
       return this.paginated(items, query);
     }
 
+    // Review-investigation: snapshot-only (no MR iid needed) \u2014 matched
+    // against any seeded MR's own base_sha/head_sha, never a branch tip.
+    m = rawPath.match(/^\/api\/v4\/projects\/([^/]+)\/repository\/compare$/);
+    if (method === 'GET' && m) {
+      const project = this.findProject(dec(m[1]));
+      if (!project) return message(404, '404 Project Not Found');
+      const from = query.get('from');
+      const to = query.get('to');
+      const mr = w.mergeRequests.find((x) => x.project_id === project.id && x.base_sha === from && x.head_sha === to);
+      if (!mr) return message(404, '404 Commit Not Found');
+      return json(200, {
+        commits: [{ id: mr.head_sha, short_id: mr.head_sha.slice(0, 8), title: mr.title, message: mr.title, author_name: mr.author.name }],
+        diffs: mr.files.map((f) => ({
+          old_path: f.old_path,
+          new_path: f.new_path,
+          diff: f.diff,
+          new_file: f.new_file ?? false,
+          deleted_file: f.deleted_file ?? false,
+          renamed_file: f.renamed_file ?? false,
+          too_large: false,
+        })),
+        compare_timeout: false,
+        compare_same_ref: from === to,
+      });
+    }
+
+    m = rawPath.match(/^\/api\/v4\/projects\/([^/]+)\/repository\/files\/(.+)$/);
+    if (method === 'GET' && m) {
+      const project = this.findProject(dec(m[1]));
+      if (!project) return message(404, '404 Project Not Found');
+      const filePath = dec(m[2]);
+      const ref = query.get('ref');
+      const mr = w.mergeRequests.find((x) => x.project_id === project.id && (x.base_sha === ref || x.head_sha === ref));
+      if (!mr) return message(404, '404 Commit Not Found');
+      const file = mr.files.find((f) => f.new_path === filePath || f.old_path === filePath);
+      if (!file) return message(404, '404 File Not Found');
+      const text = reconstructLines(file.diff).join('\n');
+      return json(200, {
+        file_name: filePath.split('/').pop(),
+        file_path: filePath,
+        size: text.length,
+        encoding: 'base64',
+        content: Buffer.from(text, 'utf8').toString('base64'),
+        content_sha256: 'x',
+        ref,
+        blob_id: 'x',
+        commit_id: mr.head_sha,
+        last_commit_id: mr.head_sha,
+      });
+    }
+
+    m = rawPath.match(/^\/api\/v4\/projects\/([^/]+)\/search$/);
+    if (method === 'GET' && m) {
+      const project = this.findProject(dec(m[1]));
+      if (!project) return message(404, '404 Project Not Found');
+      if (query.get('scope') !== 'blobs') return message(400, '400 Bad Request');
+      const ref = query.get('ref');
+      const search = query.get('search') ?? '';
+      const mr = w.mergeRequests.find((x) => x.project_id === project.id && (x.base_sha === ref || x.head_sha === ref));
+      if (!mr) return json(200, []);
+      const blobs: Record<string, unknown>[] = [];
+      for (const file of mr.files) {
+        reconstructLines(file.diff).forEach((line, index) => {
+          if (search !== '' && line.includes(search)) {
+            blobs.push({
+              basename: file.new_path.split('/').pop(),
+              data: line,
+              path: file.new_path,
+              filename: file.new_path,
+              ref,
+              startline: index + 1,
+              project_id: project.id,
+            });
+          }
+        });
+      }
+      return json(200, blobs);
+    }
+
     m = rawPath.match(/^\/api\/v4\/projects\/([^/]+)$/);
     if (method === 'GET' && m) {
       const project = this.findProject(dec(m[1]));
@@ -272,6 +354,12 @@ export class GitLabEmulator {
         .filter((d) => d.project_id === mr.project_id && d.mr_iid === mr.iid)
         .map((d) => this.discussionJson(d));
       return this.paginated(items, query);
+    }
+
+    if (method === 'GET' && sub === '/commits') {
+      return json(200, [
+        { id: mr.head_sha, short_id: mr.head_sha.slice(0, 8), title: mr.title, message: mr.title, author_name: mr.author.name },
+      ]);
     }
 
     let m = sub.match(/^\/discussions\/([^/]+)\/notes$/);
@@ -641,4 +729,19 @@ function randomSha(): string {
   let out = '';
   for (let i = 0; i < 40; i++) out += Math.floor(Math.random() * 16).toString(16);
   return out;
+}
+
+/** Keeps context and added lines, drops removed lines and hunk headers — a deterministic head-revision approximation of a seeded `EmFile.diff`, mirroring the same technique the fixture and GitLab providers use. */
+function reconstructLines(diff: string): string[] {
+  const lines: string[] = [];
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('@@') || raw.startsWith('Binary files ') || raw.startsWith('-')) continue;
+    lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
+  }
+  return lines;
+}
+
+/** Whether a path is one of the review-investigation routes, for `FailureInjection.investigationRateLimited`. */
+function isInvestigationPath(rawPath: string): boolean {
+  return /^\/api\/v4\/projects\/[^/]+\/(repository\/(compare|files\/)|search)/.test(rawPath);
 }

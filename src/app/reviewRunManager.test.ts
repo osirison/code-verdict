@@ -256,6 +256,24 @@ describe('one run per target, several targets at once', () => {
     expect(pending.size).toBe(1);
   });
 
+  it('returns the identical queued record when the same target is triggered again before it starts', async () => {
+    const { started, pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    // Fill the only slot with a different target so the next trigger for '2841' queues.
+    runs.trigger(crInput('other'), 1);
+    const queued = runs.trigger(crInput('2841'), 1);
+    expect(queued.status).toBe('queued');
+
+    const second = runs.trigger(crInput('2841'), 1);
+    expect(second).toBe(queued);
+
+    pending.get('!other')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!other', '!2841']));
+    // The repeated trigger did not queue a second dispatch for the same target.
+    expect(started.filter((label) => label === '!2841')).toHaveLength(1);
+  });
+
   it('runs two different change requests at the same time', async () => {
     const { started, pending, runners } = controllableRunners();
     const { runs, workspaceState } = manager({ runners });
@@ -410,6 +428,24 @@ describe('cancellation', () => {
 
     expect(cancelled).toEqual(['!1']);
     expect(runs.active().map((r) => r.input.podId)).toEqual(['pod-b']);
+  });
+});
+
+describe('a later success replaces the retained review', () => {
+  it('overwrites the retained review written by an earlier successful run on the same target', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(response(2));
+    await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
+    expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(2);
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(response(5));
+    await vi.waitFor(() => {
+      expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(5);
+    });
   });
 });
 

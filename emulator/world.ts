@@ -143,6 +143,8 @@ export interface FailureInjection {
   discussionPostFailAt?: number;
   /** HTTP status for that failure (default 400 stale-anchor). */
   discussionPostFailStatus?: number;
+  /** Every review-investigation route fails with 429, unlike `World.rateLimited` which limits everything (task 4.4). */
+  investigationRateLimited?: boolean;
 }
 
 /** Default time anchor: fixed, so the default world is fully deterministic. */

@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Connection, ProviderCapabilities } from '../provider';
 import type { ChangeRequestRef, ReviewCommentDraft } from '../types';
+import { investigationResultValue } from '../types';
 
 export interface ProviderContractHarness {
   capabilities: ProviderCapabilities;
@@ -49,6 +50,32 @@ export interface ProviderContractHarness {
   crRef: ChangeRequestRef;
   /** A file/line pair inside that diff a comment can anchor to. */
   anchor: { filePath: string; line: number };
+  /**
+   * Review-investigation inputs (design.md D7, tasks 3.6/3.7). Required only
+   * once `capabilities.reviewInvestigation` is declared; every case below is
+   * a no-op otherwise, until a provider's implementation and honest
+   * capability declaration land together (section 4).
+   */
+  investigation?: {
+    /** The base SHA `crRef`'s diff is relative to — `ChangeRequestDiff` itself carries only `headSha`. */
+    baseSha: string;
+    /** A non-binary path present in `crRef`'s diff. */
+    changedFilePath: string;
+    /** A path known to be binary at `crRef`'s head; omit to skip the binary case. */
+    binaryFilePath?: string;
+    /** A base/head pair strictly older than `crRef`'s current tip, proving no branch-tip substitution (task 3.7). */
+    priorRevision?: { baseSha: string; headSha: string };
+    /** A search query guaranteed to match nothing. */
+    noMatchQuery: string;
+    /** A search query guaranteed to match at least once under `changedFilePath`. */
+    matchQuery: string;
+  };
+  /**
+   * A connection whose review-investigation reads always fail with a
+   * `rateLimited` `ScmError` — exercises task 3.5's retryability without a
+   * real 429.
+   */
+  makeRateLimitedInvestigationConnection?(): Connection | Promise<Connection>;
 }
 
 export function describeProviderContract(label: string, harness: ProviderContractHarness): void {
@@ -218,6 +245,149 @@ export function describeProviderContract(label: string, harness: ProviderContrac
         expect(second?.error?.kind).toBe('staleAnchor');
         expect(result.summaryPosted).toBe(false);
       });
+    }
+
+    // Review-investigation contract (design.md D7, tasks 3.6/3.7). Gated per
+    // operation on the harness's own declared capability, mirroring
+    // `groupHierarchy` above — every case here is a no-op until a provider
+    // declares `reviewInvestigation` and implements it (section 4).
+    if (harness.capabilities.reviewInvestigation && harness.investigation) {
+      const caps = harness.capabilities.reviewInvestigation;
+      const inv = harness.investigation;
+      const snapshotAt = (headSha: string) => ({ repoId: expected.repoId, baseSha: inv.baseSha, headSha });
+
+      if (caps.manifests.supported) {
+        it('manifest pagination enumerates every changed file and terminates complete', async () => {
+          const conn = await harness.makeConnection();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          const snapshot = snapshotAt(diff.headSha);
+          const seenPaths = new Set<string>();
+          let cursor: string | undefined;
+          for (let page = 0; page < 50; page++) {
+            const result = await conn.listChangedFiles!({ snapshot, cursor });
+            expect(result.snapshot).toEqual(snapshot);
+            for (const file of investigationResultValue(result) ?? []) seenPaths.add(file.path);
+            if (result.state !== 'paginated') {
+              expect(result.state).toBe('complete');
+              break;
+            }
+            cursor = result.cursor;
+          }
+          expect(seenPaths.has(inv.changedFilePath)).toBe(true);
+        });
+      }
+
+      if (caps.fileReads.supported && inv.priorRevision) {
+        const priorRevision = inv.priorRevision;
+        it('pins a file read to the exact requested revision, never a branch tip (task 3.7)', async () => {
+          const conn = await harness.makeConnection();
+          const snapshot = { repoId: expected.repoId, baseSha: priorRevision.baseSha, headSha: priorRevision.headSha };
+          const result = await conn.readFile!({ snapshot, revision: 'head', path: inv.changedFilePath, startLine: 1, endLine: 1 });
+          expect(result.snapshot).toEqual(snapshot);
+        });
+      }
+
+      if (caps.fileReads.supported) {
+        it('bounds a file range read to the declared page bound', async () => {
+          const conn = await harness.makeConnection();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          const bound = (caps.fileReads.pageBound ?? caps.pagination).maxPageSize;
+          const result = await conn.readFile!({
+            snapshot: snapshotAt(diff.headSha),
+            revision: 'head',
+            path: inv.changedFilePath,
+            startLine: 1,
+            endLine: bound + 1000,
+          });
+          const value = investigationResultValue(result);
+          if (value) expect(value.endLine - value.startLine + 1).toBeLessThanOrEqual(bound);
+        });
+
+        if (inv.binaryFilePath) {
+          const binaryFilePath = inv.binaryFilePath;
+          it('reports a binary file as binary, never as empty text', async () => {
+            const conn = await harness.makeConnection();
+            const diff = await conn.getChangeRequestDiff(harness.crRef);
+            const result = await conn.readFile!({
+              snapshot: snapshotAt(diff.headSha),
+              revision: 'head',
+              path: binaryFilePath,
+              startLine: 1,
+              endLine: 1,
+            });
+            expect(result.state).toBe('binary');
+          });
+        }
+      }
+
+      if (caps.repositorySearch.supported) {
+        it('reports an exhaustive no-match search as complete and empty, not unavailable', async () => {
+          const conn = await harness.makeConnection();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          const result = await conn.searchRepository!({ snapshot: snapshotAt(diff.headSha), revision: 'head', query: inv.noMatchQuery });
+          expect(result.state).toBe('complete');
+          expect(investigationResultValue(result)).toEqual([]);
+        });
+
+        it('search returns at least one match for a query known to hit', async () => {
+          const conn = await harness.makeConnection();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          const result = await conn.searchRepository!({ snapshot: snapshotAt(diff.headSha), revision: 'head', query: inv.matchQuery });
+          expect(investigationResultValue(result)?.length ?? 0).toBeGreaterThan(0);
+        });
+      }
+
+      if (caps.changeRequestDetails.supported) {
+        it('normalizes change-request details with explicit unavailable sections, never a raw payload', async () => {
+          const conn = await harness.makeConnection();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          const result = await conn.getChangeRequestDetails!({ snapshot: snapshotAt(diff.headSha), number: harness.crRef.number });
+          const value = investigationResultValue(result);
+          if (!value) return;
+          expect(typeof value.title).toBe('string');
+          expect(Array.isArray(value.unavailableSections)).toBe(true);
+        });
+      }
+
+      it('withholds or reports unavailable for every operation the provider does not declare supported', async () => {
+        const conn = await harness.makeConnection();
+        const diff = await conn.getChangeRequestDiff(harness.crRef);
+        const snapshot = snapshotAt(diff.headSha);
+
+        function assertNotComplete(result: { state: string } | undefined): void {
+          if (result) expect(result.state).not.toBe('complete');
+        }
+
+        if (!caps.manifests.supported) assertNotComplete(await conn.listChangedFiles?.({ snapshot }));
+        if (!caps.diffReads.supported) assertNotComplete(await conn.readDiff?.({ snapshot, path: inv.changedFilePath }));
+        if (!caps.fileReads.supported) {
+          assertNotComplete(
+            await conn.readFile?.({ snapshot, revision: 'head', path: inv.changedFilePath, startLine: 1, endLine: 1 }),
+          );
+        }
+        if (!caps.repositorySearch.supported) {
+          assertNotComplete(await conn.searchRepository?.({ snapshot, revision: 'head', query: inv.matchQuery }));
+        }
+        if (!caps.diffSearch.supported) assertNotComplete(await conn.searchDiff?.({ snapshot, query: inv.matchQuery }));
+        if (!caps.changeRequestDetails.supported) {
+          assertNotComplete(await conn.getChangeRequestDetails?.({ snapshot, number: harness.crRef.number }));
+        }
+        if (!caps.issueDetails.supported) {
+          assertNotComplete(
+            await conn.getIssueDetails?.({ snapshot, issueRepoId: expected.repoId, issueNumber: harness.crRef.number }),
+          );
+        }
+      });
+
+      if (harness.makeRateLimitedInvestigationConnection && caps.fileReads.supported) {
+        it('surfaces a rate-limited investigation read as the neutral retryable error', async () => {
+          const conn = await harness.makeRateLimitedInvestigationConnection!();
+          const diff = await conn.getChangeRequestDiff(harness.crRef);
+          await expect(
+            conn.readFile!({ snapshot: snapshotAt(diff.headSha), revision: 'head', path: inv.changedFilePath, startLine: 1, endLine: 1 }),
+          ).rejects.toMatchObject({ kind: 'rateLimited' });
+        });
+      }
     }
   });
 }

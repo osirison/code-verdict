@@ -27,6 +27,7 @@
  * fixture-local hash rather than GitHub's own — only its shape is copied.
  */
 import type { FetchLike, FetchResponseLike } from './http';
+import { linesFromUnifiedDiff } from './mappers';
 
 export interface RequestLog {
   /** Every path requested, in order. GraphQL appears as `/graphql`. */
@@ -54,6 +55,8 @@ export interface FakeGitHubOptions {
   refuseVerdict?: boolean;
   /** Extra headers on every response — used to drive rate-limit mapping. */
   headers?: Record<string, string>;
+  /** Every review-investigation route (compare/contents/commits) fails with the neutral rate-limited error, reset-header form (task 4.7). */
+  investigationRateLimited?: boolean;
 }
 
 const ORG = { login: 'acme', name: 'Acme Engineering' };
@@ -65,6 +68,16 @@ const REPOS = [
 ];
 
 const HEAD_SHA = '9f2c1ab4e5d6708192a3b4c5d6e7f8091a2b3c4d';
+/** Reuses the same literal already seeded as `main`'s workflow-run `head_sha` below — both represent the current tip of `main`. */
+const BASE_SHA = '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091';
+/** Strictly older than #2841's own base/head — proves a pinned read never substitutes the branch tip (task 3.7). */
+const PRIOR_BASE_SHA = 'prior-base-1';
+const PRIOR_HEAD_SHA = 'prior-head-1';
+const PRIOR_FILE_DIFF = '@@ -1,1 +1,1 @@\n-old\n+older\n';
+
+const LINKED_ISSUE_COMMENTS = [
+  { id: 70101, user: { login: 'dana' }, body: 'This needs the retry envelope from #2841.', created_at: '2026-08-18T09:00:00Z' },
+];
 
 const PULLS: Record<string, unknown[]> = {
   'acme/core': [
@@ -76,12 +89,13 @@ const PULLS: Record<string, unknown[]> = {
       merged_at: null,
       draft: false,
       head: { ref: 'feat/rate-limit', sha: HEAD_SHA },
-      base: { ref: 'main' },
+      base: { ref: 'main', sha: BASE_SHA },
       user: { login: 'dana' },
       requested_reviewers: [{ login: 'you' }],
       html_url: 'https://github.com/acme/core/pull/2841',
       updated_at: '2026-08-20T10:00:00Z',
       changed_files: 4,
+      labels: [{ name: 'rate-limiting' }],
     },
   ],
   'acme/auth-service': [
@@ -134,15 +148,23 @@ const FILES = [
     filename: 'src/limiter.ts',
     status: 'modified',
     patch: '@@ -10,6 +10,12 @@\n context\n+const a = 1\n+const b = 2\n',
+    additions: 2,
+    deletions: 0,
   },
-  { filename: 'src/added.ts', status: 'added', patch: '@@ -0,0 +1,3 @@\n+new file\n' },
-  { filename: 'src/gone.ts', status: 'removed', patch: '@@ -1,3 +0,0 @@\n-old file\n' },
+  { filename: 'src/added.ts', status: 'added', patch: '@@ -0,0 +1,3 @@\n+new file\n', additions: 1, deletions: 0 },
+  { filename: 'src/gone.ts', status: 'removed', patch: '@@ -1,3 +0,0 @@\n-old file\n', additions: 0, deletions: 1 },
   {
     filename: 'src/renamed-new.ts',
     previous_filename: 'src/renamed-old.ts',
     status: 'renamed',
     patch: '@@ -1,1 +1,1 @@\n-a\n+b\n',
+    additions: 1,
+    deletions: 1,
   },
+  // Binary: git counts no line changes it cannot diff, so both counts are 0 (task 4.6/4.7 binary-vs-tooLarge heuristic).
+  { filename: 'assets/logo.png', status: 'modified', additions: 0, deletions: 0 },
+  // Too large: GitHub still counts the change but withholds the patch text.
+  { filename: 'package-lock.json', status: 'modified', additions: 4000, deletions: 3000 },
 ];
 
 /**
@@ -339,6 +361,19 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
     }
     if (!known) return error(404, 'Not Found', extraHeaders);
 
+    // Task 4.7: every review-investigation route fails with the neutral
+    // rate-limited error in its RESET-header form (`x-ratelimit-remaining: 0`
+    // + `x-ratelimit-reset`), distinct from the `retry-after` form other
+    // fake-fetch tests already exercise.
+    const isInvestigationRoute = /^\/(compare|contents)\//.test(tail) || /^\/pulls\/\d+\/commits$/.test(tail);
+    if (options.investigationRateLimited && isInvestigationRoute && method === 'GET') {
+      return error(403, 'API rate limit exceeded', {
+        ...extraHeaders,
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 45),
+      });
+    }
+
     if (tail === '/pulls' && method === 'GET') return json(PULLS[repoId] ?? [], extraHeaders);
     if (tail === '/issues' && method === 'GET') return json(ISSUES[repoId] ?? [], extraHeaders);
     if (tail === '/actions/runs' && method === 'GET') {
@@ -348,6 +383,44 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
       const runs = (WORKFLOW_RUNS[repoId] ?? []).slice(0, Number.isFinite(perPage) ? perPage : 30);
       return json({ total_count: (WORKFLOW_RUNS[repoId] ?? []).length, workflow_runs: runs }, extraHeaders);
     }
+
+    const compareMatch = tail.match(/^\/compare\/(.+)$/);
+    if (compareMatch && method === 'GET') {
+      const basehead = decodeURIComponent(compareMatch[1] as string);
+      const [from, to] = basehead.split('...');
+      if (from === BASE_SHA && to === HEAD_SHA) return json({ files: FILES }, extraHeaders);
+      if (from === PRIOR_BASE_SHA && to === PRIOR_HEAD_SHA) {
+        return json({ files: [{ filename: 'src/legacy/old.ts', status: 'modified', patch: PRIOR_FILE_DIFF, additions: 1, deletions: 1 }] }, extraHeaders);
+      }
+      return error(404, 'Not Found', extraHeaders);
+    }
+
+    const contentsMatch = tail.match(/^\/contents\/(.+)$/);
+    if (contentsMatch && method === 'GET') {
+      const filePath = decodeURIComponent(contentsMatch[1] as string);
+      const ref = url.searchParams.get('ref');
+      if (ref !== BASE_SHA && ref !== HEAD_SHA && ref !== PRIOR_BASE_SHA && ref !== PRIOR_HEAD_SHA) {
+        return error(404, `No commit found for the ref ${ref}`, extraHeaders);
+      }
+      if (filePath === 'assets/logo.png') {
+        const content = Buffer.from([0, 1, 2, 3, 0]).toString('base64');
+        return json({ type: 'file', size: 5, encoding: 'base64', content }, extraHeaders);
+      }
+      if (filePath === 'src/limiter.ts' && (ref === BASE_SHA || ref === HEAD_SHA)) {
+        const text = linesFromUnifiedDiff(FILES[0]?.patch ?? '').join('\n');
+        return json({ type: 'file', size: text.length, encoding: 'base64', content: Buffer.from(text, 'utf8').toString('base64') }, extraHeaders);
+      }
+      if (filePath === 'src/legacy/old.ts' && ref === PRIOR_HEAD_SHA) {
+        const text = linesFromUnifiedDiff(PRIOR_FILE_DIFF).join('\n');
+        return json({ type: 'file', size: text.length, encoding: 'base64', content: Buffer.from(text, 'utf8').toString('base64') }, extraHeaders);
+      }
+      return error(404, 'Not Found', extraHeaders);
+    }
+
+    if (tail === '/issues/1180' && method === 'GET') {
+      return json((ISSUES['acme/core'] ?? []).find((issue) => (issue as { number: number }).number === 1180), extraHeaders);
+    }
+    if (tail === '/issues/1180/comments' && method === 'GET') return json(LINKED_ISSUE_COMMENTS, extraHeaders);
 
     const pullMatch = tail.match(/^\/pulls\/(\d+)(.*)$/);
     if (pullMatch) {
@@ -359,6 +432,12 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
         return pull ? json(pull, extraHeaders) : error(404, 'Not Found', extraHeaders);
       }
       if (rest === '/files' && method === 'GET') return json(FILES, extraHeaders);
+      if (rest === '/commits' && method === 'GET') {
+        return json(
+          [{ sha: HEAD_SHA, commit: { message: 'Refactor rate limiter', author: { name: 'dana' } } }],
+          extraHeaders,
+        );
+      }
 
       // A batched review's own comments, in creation order.
       if (/^\/reviews\/\d+\/comments$/.test(rest) && method === 'GET') {
@@ -496,6 +575,49 @@ function graphqlResponse(body: string, threads: FakeThreadNode[]): unknown {
       });
     }
     return { data: { addPullRequestReviewThreadReply: { comment: { id } } } };
+  }
+  // Task 4.6/4.7: the single-PR rollup query `getChangeRequestDetails` sends
+  // (`pullRequest(number: ...) { commits { ... statusCheckRollup } }`) —
+  // checked before the plural `pullRequests(states: OPEN...)` list query
+  // below, since both queries contain `statusCheckRollup`.
+  if (/pullRequest\(number:/.test(query) && /statusCheckRollup/.test(query)) {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            commits: {
+              nodes: [{
+                commit: {
+                  statusCheckRollup: {
+                    state: 'SUCCESS',
+                    contexts: {
+                      nodes: [
+                        {
+                          __typename: 'CheckRun',
+                          databaseId: 93178061854,
+                          name: 'ci',
+                          conclusion: 'SUCCESS',
+                          status: 'COMPLETED',
+                          permalink: 'https://github.com/acme/core/actions/runs/1/job/1',
+                          summary: '12 tests passed, 0 failed',
+                        },
+                        {
+                          __typename: 'StatusContext',
+                          context: 'license/cla',
+                          state: 'SUCCESS',
+                          targetUrl: 'https://cla.example/acme/core/2841',
+                          description: 'All committers have signed the CLA.',
+                        },
+                      ],
+                    },
+                  },
+                },
+              }],
+            },
+          },
+        },
+      },
+    };
   }
   if (/statusCheckRollup/.test(query)) {
     const repoId = `${parsed.variables?.owner as string}/${parsed.variables?.repo as string}`;
