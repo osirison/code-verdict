@@ -530,6 +530,7 @@ describe('freshness applies to platform data, not to review results', () => {
       items: [
         {
           id: 'itm_1',
+          anchored: true,
           file: 'src/a.ts',
           line: 1,
           severity: 'major',

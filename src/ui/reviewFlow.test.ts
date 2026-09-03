@@ -1,8 +1,7 @@
 /**
- * The review-flow panel's draft persistence: the coalescing writer, its flush
- * points, the carry-forward of the run-manager's result fields, and the
- * generation guard that keeps a deferred write from landing on top of a newer
- * run's retained review (design D9).
+ * The review-flow panel's navigation race guards and draft persistence: run
+ * preparation cannot land on a newer target, while coalesced writes retain
+ * result fields and cannot overwrite a newer run's review (design D9).
  *
  * Everything here drives the real panel through its message handler against an
  * in-memory `KeyValueStore`, the way the reviewer does — the writer is never
@@ -100,6 +99,7 @@ vi.mock('vscode', () => ({
   workspace: {
     getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
     workspaceFolders: [],
+    onDidChangeConfiguration: () => ({ dispose: vi.fn() }),
   },
   commands: { executeCommand: vi.fn(() => Promise.resolve(undefined)) },
   env: {
@@ -111,20 +111,28 @@ vi.mock('vscode', () => ({
   Uri: { parse: () => ({}), joinPath: (...segments: unknown[]) => segments },
 }));
 
-// The pickers' discovery walks the filesystem and `vscode.lm`; the tests are
-// about persistence, so a fixed selection is enough.
 vi.mock('./agentRefresh', () => ({
-  loadAgentSelection: () =>
-    Promise.resolve({
-      agents: [BUILTIN_AGENT_DESCRIPTOR],
-      models: [{ id: 'lm:acme/turbo', label: 'Turbo' }],
-      skippedAgents: [],
-      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
-      modelId: 'lm:acme/turbo',
-      selectionNotices: [],
-    }),
+  loadAgentSelection: (...args: unknown[]) => world.loadAgentSelection(...args),
   watchAgentSources: () => [],
 }));
+
+vi.mock('../app/lmAgent', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, discoverModels: world.discoverModels };
+});
+
+vi.mock('./contextAttachmentPicker', () => ({
+  attachmentFileTarget: vi.fn(),
+  attachmentRange: vi.fn(),
+  findReferenceFile: world.findReferenceFile,
+  modelVisibleWorkspaceRoots: vi.fn(() => []),
+  pickContextAttachment: vi.fn(),
+}));
+
+vi.mock('../app/attachments', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, resolveAttachment: world.resolveAttachment };
+});
 
 vi.mock('./inDiffEditor', () => ({
   InDiffEditor: class {
@@ -142,18 +150,25 @@ const world = vi.hoisted(() => ({
   workspaceState: undefined as (KeyValueStore & { updates: number }) | undefined,
   /** Every platform call, so triage actions can be asserted to make none. */
   calls: { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 },
+  changeRequests: [] as ReturnType<typeof changeRequest>[],
+  loadAgentSelection: vi.fn(),
+  discoverModels: vi.fn(),
+  findReferenceFile: vi.fn(),
+  resolveAttachment: vi.fn(),
 }));
 
 vi.mock('../app/connections', () => ({
   connectionForPod: () =>
     Promise.resolve({
+      // Counted, so a triage action can be asserted to issue none; the
+      // bodies are main's, which serve per-ref diffs and a settable CR list.
       listOpenChangeRequests: () => {
         world.calls.changeRequests += 1;
-        return Promise.resolve([changeRequest()]);
+        return Promise.resolve([...world.changeRequests]);
       },
-      getChangeRequestDiff: () => {
+      getChangeRequestDiff: (ref: ChangeRequestRef) => {
         world.calls.diffs += 1;
-        return Promise.resolve(DIFF);
+        return Promise.resolve(diffFor(ref));
       },
       listWorkItems: () => {
         world.calls.workItems += 1;
@@ -184,6 +199,7 @@ function defaultSubmitReview(submission: { comments: Array<{ key: string }>; req
 // ---- fixtures ------------------------------------------------------------------
 
 const REF: ChangeRequestRef = { repoId: 'acme/repo-0', number: '7' };
+const REF_B: ChangeRequestRef = { repoId: REF.repoId, number: '8' };
 const RAN_AT = '2026-09-01T10:14:00.000Z';
 
 const DIFF: ChangeRequestDiff = {
@@ -196,18 +212,25 @@ const DIFF: ChangeRequestDiff = {
   anchorRefs: {},
 };
 
-function changeRequest() {
+function diffFor(ref: ChangeRequestRef): ChangeRequestDiff {
+  return ref.number === REF.number
+    ? DIFF
+    : { ...DIFF, ref, headSha: `head-${ref.number}` };
+}
+
+function changeRequest(ref: ChangeRequestRef = REF, title = 'Add per-tenant rate limiting') {
   return {
-    ref: REF,
-    title: 'Add per-tenant rate limiting',
+    ref,
+    title,
+    description: `${title} context`,
     state: 'open' as const,
-    sourceBranch: 'feat/rate-limit',
+    sourceBranch: `feat/${ref.number}`,
     targetBranch: 'main',
     author: { username: 'author' },
     reviewers: [],
-    webUrl: 'https://example.test/pr/7',
+    webUrl: `https://example.test/pr/${ref.number}`,
     updatedAt: '2026-08-20T09:00:00Z',
-    headSha: 'aaaa',
+    headSha: diffFor(ref).headSha,
   };
 }
 
@@ -222,6 +245,7 @@ function review(itemIds: string[]): Review {
     items: itemIds.map((id, index) => ({
       id,
       file: 'src/a.ts',
+      anchored: true,
       line: index + 1,
       severity: 'major' as const,
       category: 'security' as const,
@@ -364,6 +388,24 @@ beforeEach(() => {
   world.submitCalls = [];
   world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
   statusBarItems.length = 0;
+  world.changeRequests = [changeRequest(), changeRequest(REF_B, 'Change B')];
+  world.loadAgentSelection.mockReset().mockResolvedValue({
+    agents: [BUILTIN_AGENT_DESCRIPTOR],
+    models: [{ id: 'lm:acme/turbo', label: 'Turbo' }],
+    skippedAgents: [],
+    agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+    modelId: 'lm:acme/turbo',
+    selectionNotices: [],
+  });
+  world.discoverModels.mockReset().mockResolvedValue([{ id: 'lm:acme/turbo', label: 'Turbo' }]);
+  world.findReferenceFile.mockReset().mockResolvedValue(undefined);
+  world.resolveAttachment.mockReset().mockResolvedValue({
+    id: 'old-a-reference',
+    kind: 'file',
+    label: 'a.ts',
+    path: 'a.ts',
+    content: 'old A context',
+  });
 });
 
 afterEach(() => {
@@ -373,6 +415,72 @@ afterEach(() => {
   handlers.viewState = undefined;
   handlers.windowState = undefined;
   vi.useRealTimers();
+});
+
+describe('run preparation stays bound to the target that started it', () => {
+  it('drops delayed reference preparation after navigating to another change request', async () => {
+    const h = await harness();
+    await h.open();
+    let releaseReference!: (target: { uri: unknown; workspaceFolder: unknown; relativePath: string }) => void;
+    world.findReferenceFile.mockImplementationOnce(() => new Promise((resolve) => {
+      releaseReference = resolve;
+    }));
+
+    void h.post({ type: 'run', instructions: 'Review #file:a.ts' });
+    await vi.waitFor(() => expect(releaseReference).toBeTypeOf('function'));
+
+    await h.open(REF_B);
+    const beforeResolution = panel.webview.html;
+    expect(beforeResolution).toContain('Change B');
+    expect(beforeResolution).toContain('#file:a.ts did not resolve.');
+
+    releaseReference({ uri: {}, workspaceFolder: {}, relativePath: 'a.ts' });
+    await vi.waitFor(() => expect(world.resolveAttachment).toHaveBeenCalledOnce());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(beforeResolution);
+  });
+
+  it('drops a run after navigation while pod selection persistence is pending', async () => {
+    const h = await harness();
+    await h.open();
+    let releaseUpsert!: () => void;
+    vi.mocked(h.deps.podStore.upsert).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseUpsert = resolve;
+    }));
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(releaseUpsert).toBeTypeOf('function'));
+
+    await h.open(REF_B);
+    const beforePersistence = panel.webview.html;
+    releaseUpsert();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(beforePersistence);
+  });
+
+  it('drops a run after navigation while model discovery is pending', async () => {
+    const h = await harness();
+    await h.open();
+    let releaseDiscovery!: (models: Array<{ id: string; label: string }>) => void;
+    world.discoverModels.mockImplementationOnce(() => new Promise((resolve) => {
+      releaseDiscovery = resolve;
+    }));
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(releaseDiscovery).toBeTypeOf('function'));
+
+    await h.open(REF_B);
+    const beforeDiscovery = panel.webview.html;
+    releaseDiscovery([{ id: 'lm:acme/turbo', label: 'Turbo' }]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(beforeDiscovery);
+  });
 });
 
 // ---- 4.3a — the carry-forward is a repair, not just a prerequisite -------------

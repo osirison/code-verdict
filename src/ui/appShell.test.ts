@@ -36,6 +36,15 @@ const settingsState: SettingsViewState = {
   vocabulary: GITHUB_VOCABULARY,
   instanceUrl: 'https://github.example',
   connectionStatus: 'connected as @you · api scope',
+  context: {
+    sectionBudget: 4_000,
+    totalBudget: 12_000,
+    maxLinkedItems: 5,
+    includeTitle: true,
+    includeDescription: true,
+    includeLinkedItems: true,
+    usageEnabled: true,
+  },
   connected: true,
   hasToken: true,
   quietMode: false,
@@ -181,7 +190,12 @@ describe('every screen\'s script armed at once (tasks 8.1, 8.3)', () => {
 
 describe('the first-paint size bound (task 8.7)', () => {
   /**
-   * Measured 94,500 characters when set (union of seven routes' CSS and
+   * Raised from 108,000 when the context-controls change (#62/#63) landed on
+   * main: it added ~300 lines to the review flow's renderer and ~70 to
+   * settings, and the union carries both. That is this bound working as
+   * intended — growth is allowed, but it has to be noticed and restated.
+   *
+   * Measured 110,234 characters when set (union of seven routes' CSS and
    * scripts plus tokens, base CSS and the keys overlay); 103,011 after
    * REGIONS_SCRIPT grew the view-state snapshot/restore and the per-route
    * retention (design D8, tasks 9.1/9.4) — that growth is the mechanism and
@@ -192,7 +206,7 @@ describe('the first-paint size bound (task 8.7)', () => {
    * and raise the number consciously, with the cost stated. The shell is
    * paid once per panel lifetime; before D7 every navigation paid ~40k.
    */
-  const BUDGET_CHARS = 108_000;
+  const BUDGET_CHARS = 116_000;
 
   it(`the shell document stays under ${BUDGET_CHARS} characters`, () => {
     const doc = renderShellDocument({

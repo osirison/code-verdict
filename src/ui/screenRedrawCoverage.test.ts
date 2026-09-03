@@ -75,6 +75,7 @@ vi.mock('vscode', () => ({
       get: (_key: string, fallback?: unknown) => fallback,
       update: () => Promise.resolve(undefined),
     }),
+    onDidChangeConfiguration: () => ({ dispose: vi.fn() }),
     workspaceFolders: [],
   },
   commands: { executeCommand: vi.fn(() => Promise.resolve(undefined)) },
@@ -259,8 +260,8 @@ describe('every screen redraws in place on a state change, never a rebuild', () 
     const workspaceState = memoryKv({
       [draftKeyFor(ref)]: retainedFromRun({
         review: retainedReview([
-          { id: 'i1', file: 'src/limits.ts', line: 3, severity: 'major', category: 'security', confidence: 90, title: 'First finding', body: 'b', code: 'c' },
-          { id: 'i2', file: 'src/gateway.ts', line: 9, severity: 'minor', category: 'style', confidence: 80, title: 'Second finding', body: 'b', code: 'c' },
+          { id: 'i1', anchored: true, file: 'src/limits.ts', line: 3, severity: 'major', category: 'security', confidence: 90, title: 'First finding', body: 'b', code: 'c' },
+          { id: 'i2', anchored: true, file: 'src/gateway.ts', line: 9, severity: 'minor', category: 'style', confidence: 80, title: 'Second finding', body: 'b', code: 'c' },
         ]),
         ranAt: '2026-09-01T10:14:00.000Z',
         agentId: BUILTIN_AGENT_DESCRIPTOR.id,
@@ -326,8 +327,8 @@ describe('every screen redraws in place on a state change, never a rebuild', () 
       [changesetDraftKeyFor(changesetId)]: retainedFromRun({
         review: {
           ...retainedReview([
-            { id: 'i1', file: 'src/limits.ts', line: 3, severity: 'major', category: 'security', confidence: 90, title: 'Rate limit window is per instance', body: 'b', code: 'c', repoId: 'acme/repo', crNumber: '7' },
-            { id: 'i2', file: 'src/gateway.ts', line: 9, severity: 'minor', category: 'style', confidence: 80, title: 'Gateway retries without jitter', body: 'b', code: 'c', repoId: 'acme/repo', crNumber: '8' },
+            { id: 'i1', anchored: true, file: 'src/limits.ts', line: 3, severity: 'major', category: 'security', confidence: 90, title: 'Rate limit window is per instance', body: 'b', code: 'c', repoId: 'acme/repo', crNumber: '7' },
+            { id: 'i2', anchored: true, file: 'src/gateway.ts', line: 9, severity: 'minor', category: 'style', confidence: 80, title: 'Gateway retries without jitter', body: 'b', code: 'c', repoId: 'acme/repo', crNumber: '8' },
           ]),
           repoId: 'changeset',
           crNumber: changesetId,

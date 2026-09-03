@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Review } from '../domain/types';
 import {
+  carryRetainedResult,
   clearChangesetSubmitLedger,
   clearSubmitLedger,
+  mergeRetainedDraft,
   pruneClosedRetained,
   readRetained,
   retainedFromRun,
@@ -24,6 +26,7 @@ function review(overrides: Partial<Review> = {}): Review {
       {
         id: 'i1',
         file: 'src/a.ts',
+        anchored: true,
         line: 10,
         severity: 'major',
         category: 'security',
@@ -64,6 +67,36 @@ describe('readRetained', () => {
     expect(retained?.submittedAt).toBeUndefined();
   });
 
+  it('reads an absent anchored field on a stored review item as true', () => {
+    const current = review();
+    const legacyItem = { ...current.items[0] } as { anchored?: boolean };
+    delete legacyItem.anchored;
+    const legacy = {
+      review: { ...current, items: [legacyItem] },
+      threads: {},
+      summaryText: '',
+      finalNote: '',
+    } as unknown as SessionDraft;
+
+    expect(readRetained(legacy)?.draft.review.items[0]?.anchored).toBe(true);
+  });
+
+  it('normalizes an absent or invalid stored effort to none', () => {
+    const legacy = {
+      review: review({ effort: undefined }),
+      threads: {},
+      summaryText: '',
+      finalNote: '',
+    } satisfies SessionDraft;
+    const invalid = {
+      ...legacy,
+      review: { ...legacy.review, effort: 'retired-level' },
+    } as unknown as SessionDraft;
+
+    expect(readRetained(legacy)?.draft.review.effort).toBe('none');
+    expect(readRetained(invalid)?.draft.review.effort).toBe('none');
+  });
+
   it('prefers the record\'s own agent and model over the review\'s', () => {
     // They diverge when the agent file changed after the run: the record's
     // copy is what actually produced the findings.
@@ -93,6 +126,97 @@ describe('readRetained', () => {
     // Defensive: `globalState`/`workspaceState` hold whatever a previous
     // version wrote, and a record without a review cannot render any screen.
     expect(readRetained({ threads: {}, summaryText: '', finalNote: '' } as unknown as SessionDraft)).toBeUndefined();
+  });
+});
+
+describe('merging UI edits into retained results', () => {
+  const warning = {
+    code: 'attachment-unreadable' as const,
+    attachmentId: 'schema',
+    label: 'schema.ts',
+    path: 'api/src/schema.ts',
+    reason: 'file was deleted',
+  };
+
+  const metadata = {
+    outcome: 'findings' as const,
+    ranAt: '2026-08-28T10:00:00.000Z',
+    agentId: 'agent:workspace/security',
+    agentLabel: 'Security Reviewer',
+    modelId: 'lm:acme/turbo',
+    submittedAt: '2026-08-28T11:00:00.000Z',
+    candidates: [{
+      reason: 'belowConfidence' as const,
+      count: 2,
+      severity: 'minor' as const,
+      category: 'tests' as const,
+      confidence: 60,
+    }],
+    filesRead: 7,
+    attachmentWarnings: [warning],
+  };
+
+  it('carries every run metadata field into a coalesced whole-record write', () => {
+    expect(carryRetainedResult(metadata)).toEqual(metadata);
+  });
+
+  it('keeps all run metadata through verdict, summary, note, and follow-up edits then reopen', () => {
+    let stored: SessionDraft = { ...retainedFromRun({
+      review: review(),
+      ranAt: metadata.ranAt,
+      agentId: metadata.agentId,
+      agentLabel: metadata.agentLabel,
+      modelId: metadata.modelId,
+      candidates: metadata.candidates,
+      filesRead: metadata.filesRead,
+      attachmentWarnings: metadata.attachmentWarnings,
+    }), submittedAt: metadata.submittedAt };
+    let edited: SessionDraft = {
+      review: review({ verdicts: { i1: { verdict: 'accepted', applyFix: false } } }),
+      threads: {},
+      summaryText: '',
+      finalNote: '',
+    };
+
+    stored = mergeRetainedDraft(stored, edited);
+    edited = { ...edited, summaryText: 'Edited summary' };
+    stored = mergeRetainedDraft(stored, edited);
+    edited = { ...edited, finalNote: 'Edited note' };
+    stored = mergeRetainedDraft(stored, edited);
+    edited = { ...edited, threads: { i1: [{ label: 'agent · reply', text: 'Follow-up' }] } };
+    stored = mergeRetainedDraft(stored, edited);
+
+    const reopened = readRetained(stored);
+    expect(reopened?.draft.review.verdicts.i1?.verdict).toBe('accepted');
+    expect(reopened?.draft.summaryText).toBe('Edited summary');
+    expect(reopened?.draft.finalNote).toBe('Edited note');
+    expect(reopened?.draft.threads.i1?.[0]?.text).toBe('Follow-up');
+    expect(reopened).toMatchObject(metadata);
+  });
+
+  it('keeps the same metadata when a changeset draft edits its submit state', () => {
+    const initial: ChangesetDraft = { ...retainedFromRun({
+      review: review(),
+      ranAt: metadata.ranAt,
+      agentId: metadata.agentId,
+      agentLabel: metadata.agentLabel,
+      modelId: metadata.modelId,
+      candidates: metadata.candidates,
+      filesRead: metadata.filesRead,
+      attachmentWarnings: metadata.attachmentWarnings,
+    }), submittedAt: metadata.submittedAt };
+    const edited = mergeRetainedDraft(initial, {
+      review: review({ verdicts: { i1: { verdict: 'rejected', applyFix: false } } }),
+      threads: { i1: [{ label: 'agent · explain', text: 'Changeset follow-up' }] },
+      summaryText: 'Changeset summary',
+      finalNote: 'Changeset note',
+      submitState: { postedCommentKeys: ['i1'], summaryRefs: [], requestChangesRefs: [], threadIds: {} },
+    });
+
+    const reopened = readRetained(edited);
+    expect(reopened?.draft.review.verdicts.i1?.verdict).toBe('rejected');
+    expect(reopened?.draft.submitState?.postedCommentKeys).toEqual(['i1']);
+    expect(reopened).toMatchObject(metadata);
   });
 });
 

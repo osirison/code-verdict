@@ -21,10 +21,14 @@ const state: FlowViewState = {
   agents: [{ id: 'agent', label: 'HVE Core / PR Review', description: 'Reviews diffs', source: 'workspace', instructions: 'Review it.', origin: '.github/agents' }],
   agentId: 'agent',
   agentOpen: false,
-  models: [{ id: 'lm:copilot/gpt-5', label: 'GPT-5', description: 'copilot · gpt-5', vendor: 'copilot', family: 'gpt-5' }],
+  models: [{ id: 'lm:copilot/gpt-5', label: 'GPT-5', description: 'copilot · gpt-5', vendor: 'copilot', family: 'gpt-5', maxInputTokens: 1_000 }],
   modelId: 'lm:copilot/gpt-5',
   modelOpen: false,
+  effort: 'none',
+  effortOpen: false,
+  effortComparisonDisclosure: false,
   selectionNotices: [],
+  attachmentWarnings: [],
   skippedAgents: [],
   criteria: {
     severityFloor: 'minor',
@@ -32,6 +36,9 @@ const state: FlowViewState = {
     categories: ['security'],
     extraInstructions: '',
   },
+  attachments: [],
+  autoContextItems: [],
+  unresolvedContextReferences: [],
   runSteps: [],
   runStep: 0,
   mode: 'diff',
@@ -39,6 +46,7 @@ const state: FlowViewState = {
     item: {
       id: 'finding-1',
       file: 'src/auth/token.ts',
+      anchored: true,
       line: 63,
       severity: 'blocker',
       category: 'security',
@@ -68,6 +76,100 @@ const state: FlowViewState = {
   doneSentence: '',
   crWebUrl: 'https://gitlab.example/hve/platform/core/-/merge_requests/2841',
 };
+
+function generatedScript(html: string): string {
+  return generatedScripts(html)[0] as string;
+}
+
+function generatedScripts(html: string): string[] {
+  const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
+    .map((match) => match[1] as string);
+  expect(scripts.length).toBeGreaterThan(0);
+  return scripts;
+}
+
+describe('generated review-flow script', () => {
+  const script = generatedScript(renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n'));
+
+  it('compiles as JavaScript', () => {
+    expect(() => new Function(script)).not.toThrow();
+  });
+
+  it('keeps its only shortcut map inside the keyboard handler', () => {
+    expect(script.match(/\bconst map =/g)).toHaveLength(1);
+    expect(script).toContain("a: () => verdict('accepted', !ev.shiftKey && acceptCanApplyFix())");
+  });
+
+  it('compiles every script for complete single and changeset context fixtures', () => {
+    const attachment = {
+      id: 'repo-a:schema',
+      kind: 'file' as const,
+      label: 'schema <strict> "quoted".ts',
+      path: 'repo-a/config/schema <strict>.ts',
+      content: 'mode: "strict"\n</script>',
+      truncated: false,
+    };
+    const warning = {
+      code: 'attachment-unreadable' as const,
+      attachmentId: 'gone',
+      label: 'gone <after-run>.ts',
+      path: 'repo-b/src/gone.ts',
+      reason: 'ENOENT "gone"',
+    };
+    const contextState: FlowViewState = {
+      ...state,
+      screen: 'agent',
+      criteria: {
+        ...state.criteria,
+        extraInstructions: 'Compare #file:repo-a/config/schema.ts with #file:repo-b/config/missing.ts',
+      },
+      autoContextItems: [
+        { id: 'auto:title', kind: 'title', label: 'Title <current>', enabled: true },
+        { id: 'auto:description', kind: 'description', label: 'Description & intent', enabled: true },
+      ],
+      attachments: [attachment],
+      unresolvedContextReferences: ['#file:repo-b/config/missing.ts'],
+      attachmentWarnings: [warning],
+    };
+    const resultState: FlowViewState = {
+      ...contextState,
+      screen: 'triage',
+      context: {
+        open: true,
+        truncated: false,
+        entries: [{
+          label: 'repo-a · !42',
+          context: { title: 'Root A <title>', description: 'Resolved reference context', linkedItems: [] },
+        }],
+      },
+    };
+    const changeset = {
+      id: 'multi-root',
+      name: 'Root A + Root B',
+      memberCount: 2,
+      projectCount: 2,
+      refs: ['!42', '!43'],
+      repoLabels: { 'repo-a': 'Root A', 'repo-b': 'Root B' },
+    };
+    const pages = [
+      renderReviewFlowHtml(contextState, 'Security <Reviewer>', 'single-context'),
+      renderReviewFlowHtml(resultState, 'Security <Reviewer>', 'single-result'),
+      renderReviewFlowHtml({ ...contextState, changeset }, 'Security <Reviewer>', 'changeset-context'),
+      renderReviewFlowHtml({ ...resultState, changeset }, 'Security <Reviewer>', 'changeset-result'),
+    ];
+
+    for (const page of pages) {
+      for (const generated of generatedScripts(page)) {
+        expect(() => new Function(generated)).not.toThrow();
+      }
+    }
+    const rendered = pages.join('\n');
+    expect(rendered).toContain('schema &lt;strict&gt; &quot;quoted&quot;.ts');
+    expect(rendered).toContain('#file:repo-b/config/missing.ts did not resolve.');
+    expect(rendered).toContain('gone &lt;after-run&gt;.ts');
+    expect(rendered).toContain('Root A + Root B');
+  });
+});
 
 describe('follow-up answers patch in place (#37, #38)', () => {
   const html = renderReviewFlowHtml(state, 'HVE Core / PR Review', 'n');
@@ -239,6 +341,52 @@ describe('in-diff triage fidelity (spec §5)', () => {
     expect(html).toContain('Accept &amp; apply');
     expect(html).toContain('Accept, comment only');
     expect(html).toContain("type: 'verdict', itemId: id, verdict: 'accepted', applyFix: false");
+  });
+
+  it('withholds suggestion application for summary-only findings and explains why', () => {
+    const base = state.items[0]!;
+    const unanchored = [{ ...base, item: { ...base.item, anchored: false } }];
+
+    for (const mode of ['split', 'queue', 'diff'] as const) {
+      const body = renderReviewFlowBody({ ...state, mode, items: unanchored }, 'HVE Core / PR Review');
+      expect(body).toContain('summary only');
+      expect(body).toContain('There is no diff line for a suggestion block to attach to');
+      expect(body).not.toContain('Accept &amp; apply');
+      expect(body).toContain('data-apply-fix="false"');
+    }
+  });
+
+  it('counts summary-only accepted findings separately on the submit screen', () => {
+    const base = state.items[0]!;
+    const body = renderReviewFlowBody({
+      ...state,
+      screen: 'summary',
+      items: [
+        { ...base, verdict: 'accepted' },
+        { ...base, verdict: 'accepted', item: { ...base.item, id: 'finding-2', anchored: false, title: 'Summary finding' } },
+      ],
+      counts: { accepted: 2, rejected: 0, skipped: 0, undecided: 0 },
+    }, 'HVE Core / PR Review');
+
+    expect(body).toContain('1 accepted finding will go to the summary rather than inline.');
+    expect(body).toContain('Line comments to post (1)');
+    expect(body).not.toContain('Summary finding');
+  });
+
+  it('discloses accepted changed-file findings withheld by current line validation', () => {
+    const base = state.items[0]!;
+    const body = renderReviewFlowBody({
+      ...state,
+      screen: 'summary',
+      items: [{ ...base, verdict: 'accepted' }],
+      counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 },
+      withheldInlineItemIds: ['finding-1'],
+    }, 'HVE Core / PR Review');
+
+    expect(body).toContain('1 accepted finding no longer has matching code on a current added line');
+    expect(body).toContain('it will be withheld from inline submission and included in the summary');
+    expect(body).toContain('Line comments to post (0)');
+    expect(body).toContain('No accepted finding has a current added-line anchor for inline submission.');
   });
 });
 
@@ -416,7 +564,7 @@ describe('loading skeleton and region patching (issue #39)', () => {
 
   it('ships the full page script on the loading page so delegated listeners are already armed', () => {
     const html = renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n');
-    expect(html).toContain("on('run', 'run')");
+    expect(html).toContain("post({ type: 'run', instructions })");
   });
 
   it('renderReviewFlowBody output is a substring of the full page for the same state', () => {
@@ -727,11 +875,37 @@ describe('the agent and model pickers (spec: review-agents)', () => {
   const run = (over: Partial<FlowViewState>) =>
     renderReviewFlowBody({ ...state, screen: 'agent', ...over } as FlowViewState, 'x');
 
+  it('offers the exact add-context action with a plus icon', () => {
+    const html = renderReviewFlowHtml({ ...state, screen: 'agent' }, 'x', 'n');
+
+    expect(html).toContain('id="add-context"');
+    expect(html).toContain('class="codicon codicon-add"');
+    expect(html).toContain('Add Context…');
+    expect(html).toContain("on('add-context', 'addContext')");
+  });
+
+  it('flushes the current instructions with Run instead of racing the input debounce', () => {
+    const html = renderReviewFlowHtml({ ...state, screen: 'agent' }, 'x', 'n');
+
+    expect(html).toContain("const instructions = document.getElementById('extra')?.value");
+    expect(html).toContain("post({ type: 'run', instructions })");
+  });
+
   it('renders both pickers, each labelled', () => {
     const html = run({});
     expect(html).toContain('>Agent</div>');
     expect(html).toContain('>Model</div>');
     expect(html).toContain('GPT-5');
+  });
+
+  it('states the live changed-file and attachment count', () => {
+    const html = run({ attachments: [
+      { id: 'a', kind: 'file', label: 'a.ts', path: 'src/a.ts', content: 'a', truncated: false },
+      { id: 'b', kind: 'file', label: 'b.ts', path: 'src/b.ts', content: 'b', truncated: false },
+      { id: 'c', kind: 'file', label: 'c.ts', path: 'src/c.ts', content: 'c', truncated: false },
+    ] });
+    expect(html).toContain('9 changed files + 3 attachments go to the agent.');
+    expect(html).not.toContain('never the whole repo');
   });
 
   it('no longer claims agents come from the Copilot workspace', () => {
@@ -756,8 +930,17 @@ describe('the agent and model pickers (spec: review-agents)', () => {
 
   it('neutralises the model picker for the demo agent, which calls no model', () => {
     const html = run({ agents: [BUILTIN, DEMO], agentId: DEMO.id });
+    const page = renderReviewFlowHtml({
+      ...state,
+      screen: 'agent',
+      agents: [BUILTIN, DEMO],
+      agentId: DEMO.id,
+    }, 'x', 'n');
     expect(html).toContain('Not used by this agent');
     expect(html).not.toContain('id="model-toggle"');
+    expect(html).toContain('id="effort-toggle"');
+    expect(html).toContain('model-picker-config-hidden');
+    expect(page).toContain('.model-picker-config-hidden { display: none; }');
   });
 
   it('states why a run is unavailable when no model exists, and disables Run', () => {
@@ -770,6 +953,44 @@ describe('the agent and model pickers (spec: review-agents)', () => {
   it('leaves Run enabled for the demo agent even with no model', () => {
     const html = run({ models: [], modelId: undefined, agents: [BUILTIN, DEMO], agentId: DEMO.id });
     expect(html).not.toMatch(/id="run"[^>]*disabled/);
+  });
+
+  it('renders thinking effort as a plain-text second segment with the Configure Model tooltip', () => {
+    const html = run({ effort: 'xhigh' });
+    const picker = html.slice(html.indexOf('<div class="model-picker-split">'), html.indexOf('<div class="crit-grid">'));
+
+    expect(picker).toContain('id="effort-toggle"');
+    expect(picker).toContain('title="Configure Model"');
+    expect(picker).toContain('>Extra High</button>');
+    expect(picker).not.toContain('Extra High &gt;');
+    expect(picker).not.toContain('· Extra High');
+  });
+
+  it('renders all effort levels as one accessible radio group with descriptions and the default marked', () => {
+    const html = run({ effort: 'high', effortOpen: true });
+
+    expect(html).toContain('role="menu" aria-label="Thinking Effort"');
+    expect(html.match(/role="menuitemradio"/g)).toHaveLength(7);
+    expect(html.match(/aria-checked="true"/g)).toHaveLength(1);
+    expect(html).toContain('data-effort="high" title="reason carefully; consider alternatives before reporting"');
+    expect(html).toContain('<span class="effort-default">Default</span>');
+    expect(html).toContain("Applied as review instructions in the prompt, not as the model's own reasoning configuration.");
+  });
+
+  it('restores the selected level after the CSS-hidden control becomes applicable again', () => {
+    const hidden = run({ agents: [BUILTIN, DEMO], agentId: DEMO.id, effort: 'max' });
+    const shown = run({ agents: [BUILTIN, DEMO], agentId: BUILTIN.id, effort: 'max' });
+
+    expect(hidden).toContain('model-picker-config-hidden');
+    expect(hidden).toContain('>Max</button>');
+    expect(shown).toContain('id="effort-toggle"');
+    expect(shown).toContain('>Max</button>');
+  });
+
+  it('discloses that a differently instructed rerun is not comparable with existing findings', () => {
+    const html = run({ effortComparisonDisclosure: true, effortOpen: true });
+
+    expect(html).toContain('next run not comparable with the findings already in hand');
   });
 
   it('renders reconciliation notices on the screen rather than as a toast', () => {
@@ -803,6 +1024,114 @@ describe('the agent and model pickers (spec: review-agents)', () => {
   });
 });
 
+describe('the pre-run context area', () => {
+  const run = (over: Partial<FlowViewState> = {}): string => renderReviewFlowHtml({
+    ...state,
+    screen: 'agent',
+    autoContextItems: [
+      { id: 'auto:title', kind: 'title', label: 'Refactor token refresh', enabled: true },
+      { id: 'auto:description', kind: 'description', label: 'Change request description', enabled: false },
+      { id: 'auto:linked:1180', kind: 'linkedItem', label: '#1180 · Rotate keys', enabled: true },
+    ],
+    attachments: [{
+      id: 'schema.ts', kind: 'file', label: 'schema.ts', path: 'src/schema.ts', content: 'schema', truncated: false,
+    }],
+    ...over,
+  }, 'x', 'n');
+
+  it('shows every auto-derived item with its independent enabled state', () => {
+    const html = run();
+
+    expect(html).toContain('Refactor token refresh');
+    expect(html).toContain('Change request description');
+    expect(html).toContain('#1180 · Rotate keys');
+    expect(html).toContain('Automatically derived');
+    expect(html).toContain('data-auto-context="auto:description" aria-pressed="false"');
+    expect(html).toContain("type: 'toggleAutoContextItem'");
+  });
+
+  it('renders accessible removable attachment chips with all removal gestures', () => {
+    const html = run();
+
+    expect(html).toContain('class="context-chip context-attachment" role="button" tabindex="0"');
+    expect(html).toContain('title="Remove from context"');
+    expect(html).toContain('aria-label="Remove from context"');
+    expect(html).toContain("ev.key === 'Backspace' || ev.key === 'Delete'");
+    expect(html).toContain("document.addEventListener('auxclick'");
+    expect(html).toContain("type: 'removeContextItem'");
+    expect(html).not.toContain('more context');
+  });
+
+  it('states the empty context case directly', () => {
+    expect(run({ autoContextItems: [], attachments: [] }))
+      .toContain('No context will be sent beyond the changed-file diffs.');
+  });
+
+  it('discloses truncated attachments and unresolved typed references', () => {
+    const html = run({
+      attachments: [{ id: 'large', kind: 'file', label: 'large.log', path: 'large.log', content: 'x', truncated: true }],
+      unresolvedContextReferences: ['#file:missing.ts'],
+    });
+
+    expect(html).toContain('Part sent');
+    expect(html).toContain('#file:missing.ts did not resolve.');
+    expect(html).toContain('role="status"');
+  });
+
+  it('uses classes rather than inline styles throughout the context area', () => {
+    const html = run({ contextUsage: { usedTokens: 760, totalTokens: 1_000 } });
+    const area = html.slice(html.indexOf('<div class="context-area"'), html.indexOf('<div class="footer-row">'));
+
+    expect(area).toContain('context-usage-warning');
+    expect(area).not.toContain('style=');
+  });
+
+  it.each([
+    [500, 'context-usage-normal', false],
+    [750, 'context-usage-warning', true],
+    [900, 'context-usage-error', true],
+  ])('renders %i tokens with the expected usage state', (usedTokens, cssClass, warned) => {
+    const html = run({ contextUsage: { usedTokens, totalTokens: 1_000 } });
+
+    expect(html).toContain(cssClass);
+    expect(html).toContain(`aria-label="Context window usage: ${usedTokens / 10}%"`);
+    expect(html).toContain(`title="${usedTokens} / 1000 tokens"`);
+    expect(html.includes('Quality may decline as limit nears.')).toBe(warned);
+  });
+
+  it('hides usage entirely when no reliable count is supplied', () => {
+    expect(run({ contextUsage: undefined })).not.toContain('class="context-usage context-usage-');
+  });
+
+  it('hides stale usage for unknown capacity, no model, and a model-free agent', () => {
+    const staleUsage = { usedTokens: 500, totalTokens: 1_000 };
+    const unknownCapacity = state.models.map((model) => ({ ...model, maxInputTokens: undefined }));
+    const demo = { id: 'demo', label: 'Demo', description: 'No model', source: 'demo' as const, instructions: '' };
+
+    expect(run({ models: unknownCapacity, contextUsage: staleUsage })).not.toContain('context-usage-normal');
+    expect(run({ models: [], modelId: undefined, contextUsage: staleUsage })).not.toContain('context-usage-normal');
+    expect(run({ agents: [demo], agentId: demo.id, contextUsage: staleUsage })).not.toContain('context-usage-normal');
+  });
+
+  it('shows the same context controls for a changeset with member-labelled attachments', () => {
+    const html = run({
+      changeset: {
+        id: 'cs', name: 'Release', memberCount: 2, projectCount: 2, refs: ['!1', '!2'],
+      },
+      attachments: [{
+        id: 'repo-1!1:schema', kind: 'file', label: 'org/api · schema.ts', path: 'schema.ts', content: 'x', truncated: false,
+      }],
+      autoContextItems: [{
+        id: 'auto:repo-1!1:title', kind: 'title', label: 'org/api · Title · API', enabled: true,
+      }],
+    });
+
+    expect(html).toContain('id="add-context"');
+    expect(html).toContain('org/api · schema.ts');
+    expect(html).toContain('org/api · Title · API');
+  });
+});
+
 describe('a stored review says what produced it (task 7.4)', () => {
   it('names the model beside the agent on a finding', () => {
     const html = renderReviewFlowBody({ ...state, screen: 'triage', mode: 'split', reviewModelLabel: 'GPT-5' } as FlowViewState, 'Security Reviewer');
@@ -813,6 +1142,17 @@ describe('a stored review says what produced it (task 7.4)', () => {
   it('says the model is unknown for a review stored before models were recorded', () => {
     const html = renderReviewFlowBody({ ...state, screen: 'triage', mode: 'split', reviewModelLabel: undefined } as FlowViewState, 'Verdict · Demo Review');
     expect(html).toContain('model unknown');
+  });
+
+  it('shows the recorded effort in the review header', () => {
+    const html = renderReviewFlowBody({
+      ...state,
+      screen: 'triage',
+      mode: 'split',
+      reviewEffortLabel: 'Extra High',
+    } as FlowViewState, 'Security Reviewer');
+
+    expect(html).toContain('effort Extra High');
   });
 });
 
@@ -841,6 +1181,25 @@ describe('a retained review, and the way back to it', () => {
     expect(html).toContain('Security Reviewer');
     expect(html).toContain('GPT-5');
     expect(html).toContain('Ran ');
+  });
+
+  it('shows retained attachment omissions on both findings and clean results', () => {
+    const attachmentWarnings = [{
+      code: 'attachment-unreadable' as const,
+      attachmentId: 'schema',
+      label: 'schema.ts',
+      path: 'src/schema.ts',
+      reason: 'ENOENT',
+    }];
+
+    for (const html of [
+      body({ screen: 'triage', attachmentWarnings }),
+      body({ screen: 'clean', attachmentWarnings }),
+    ]) {
+      expect(html).toContain('Some attached context could not be read at run start and was excluded');
+      expect(html).toContain('schema.ts');
+      expect(html).toContain('ENOENT');
+    }
   });
 
   it('offers a new review from a submitted result', () => {
@@ -1058,7 +1417,7 @@ describe('a patch preserves scroll position on the real in-diff triage screen', 
    * genuinely unrelated to the diff on screen rather than a no-op. */
   const otherFinding = {
     item: {
-      id: 'finding-2', file: 'src/auth/session.ts', line: 10, severity: 'minor' as const,
+      id: 'finding-2', anchored: true, file: 'src/auth/session.ts', line: 10, severity: 'minor' as const,
       category: 'style' as const, confidence: 80, title: 'Unrelated finding',
       body: 'Not the one being read.', code: 'x',
     },

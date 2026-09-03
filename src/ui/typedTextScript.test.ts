@@ -31,6 +31,15 @@ function flowState(overrides: Partial<FlowViewState> = {}): FlowViewState {
   return {
     vocabulary: GITLAB_VOCABULARY,
     screen: 'summary',
+    // Required since the context-controls change landed. This fixture is
+    // about the editable text fields, so every context list is empty.
+    effort: 'none',
+    effortOpen: false,
+    effortComparisonDisclosure: false,
+    attachments: [],
+    autoContextItems: [],
+    unresolvedContextReferences: [],
+    attachmentWarnings: [],
     header: {
       refLabel: '!2841',
       projectPath: 'hve/platform/core',
@@ -55,6 +64,7 @@ function flowState(overrides: Partial<FlowViewState> = {}): FlowViewState {
     items: [{
       item: {
         id: 'finding-1',
+        anchored: true,
         file: 'src/auth/token.ts',
         line: 63,
         severity: 'blocker',

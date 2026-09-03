@@ -63,6 +63,7 @@ vi.mock('vscode', () => ({
   },
   workspace: {
     getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
+    onDidChangeConfiguration: () => ({ dispose: vi.fn() }),
     workspaceFolders: [],
   },
   commands: { executeCommand: vi.fn(() => Promise.resolve(undefined)) },
@@ -165,6 +166,7 @@ function retainedChangesetRecord(): ChangesetDraft {
     items: [
       {
         id: 'i1',
+        anchored: true,
         file: 'src/limits.ts',
         line: 3,
         severity: 'major',
@@ -178,6 +180,7 @@ function retainedChangesetRecord(): ChangesetDraft {
       },
       {
         id: 'i2',
+        anchored: true,
         file: 'src/gateway.ts',
         line: 9,
         severity: 'minor',

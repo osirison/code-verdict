@@ -47,6 +47,8 @@ export const INTERNAL_COMMANDS = {
   jumpSeverity: 'codeVerdict.internal.jumpSeverity',
   /** `?` — the keyboard overlay, from the status bar or the keybinding. */
   keyboardHelp: 'codeVerdict.internal.keyboardHelp',
+  /** `Ctrl+/` — open attachment choices while the single-review context area has focus. */
+  addContext: 'codeVerdict.internal.addContext',
   /** The status bar's `🔔 n` segment — list what is waiting, then clear it. */
   showNotifications: 'codeVerdict.internal.showNotifications',
   /** The sidebar's per-run ✕ — stop one review, freeing its slot for the next. */

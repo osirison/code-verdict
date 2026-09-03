@@ -13,11 +13,13 @@ Both are modelled on the Copilot panel because that is where the reviewer alread
 ### Context
 
 - A **context area** above the run controls, holding everything that will be sent: an **"Add Context…"** button (the panel's own label and its `Ctrl+/` binding), a chip row, and a **context-usage indicator**.
-- **Attachments** the reviewer adds: files, folders, a selection, symbols, problems/diagnostics, and pasted text. Each becomes a removable chip, following the panel's interaction set — an X titled "Remove from context", middle-click, and Backspace/Delete on a focused chip.
+- **Attachments** the reviewer adds: files, folders, a selection, symbols, problems/diagnostics, and pasted text. Each becomes a removable chip, following the panel's interaction set — an X titled "Remove from context", middle-click, and Backspace/Delete on a focused chip. File identities remain workspace-root-qualified in multi-root workspaces.
 - **Auto-derived context becomes visible and controllable.** Title, description and each linked work item render as chips of their own, each individually removable for this run. What was implicit is now shown.
 - **`#` references** in the Extra instructions box — `#file:<name>`, `#file:<name>:<start>-<end>`, `#sym:<name>` — resolving to the same attachments as the picker, matching the panel's syntax.
-- **BREAKING (prompt contract):** attached files are **reviewable evidence**, not intent. Today `CONTEXT_END_FENCE` states "the diffs are the only material a finding may cite" and the screen promises "never the whole repo". Both become false by design: a finding may now cite an attached file. Attachments therefore move out of the CONTEXT fence into a new reviewable section, and the fence's wording changes to match.
+- **BREAKING (prompt contract):** attached files are **reviewable evidence**, not intent. Today `CONTEXT_END_FENCE` states "the diffs are the only material a finding may cite" and the screen promises "never the whole repo". Both become false by design: a finding may now cite an attached file. Attachments therefore move out of the CONTEXT fence into a new reviewable section, and the fence's wording changes to match. A host-generated manifest limits accepted citations to actual model-visible file paths and positive-integer line ranges; wrapper labels alone are not evidence.
 - **Findings outside the diff route to the summary.** `ReviewCommentDraft` requires a `DiffAnchor` and no unanchored-comment path exists, so an accepted finding against an attached file that the diff does not touch is collected into the summary body rather than posted inline. The reviewer is told this before submitting.
+- **Attachment failures remain visible.** Dropped or unreadable attachment warnings are persisted with the run and disclosed before triage, including after a background completion.
+- **Context behavior is universal.** The demo agent deterministically inspects visible attachments, and changeset reviews use the latest instructions on Run with the same `#` resolution, unresolved-reference reporting, and Add Context keyboard routing as single change-request reviews.
 - The three budgets (`CONTEXT_SECTION_BUDGET`, `CONTEXT_TOTAL_BUDGET`, `CONTEXT_MAX_LINKED_ITEMS`) become settings, and attachments get a budget of their own so they can never crowd out the diffs.
 
 ### Thinking effort
@@ -30,7 +32,7 @@ Both are modelled on the Copilot panel because that is where the reviewer alread
 ## Capabilities
 
 ### New Capabilities
-- `review-context-controls`: What context reaches the agent, how a reviewer inspects, adds to and removes from it, the budget policy that keeps attachments from displacing diffs, and the evidence status of an attached file including where a finding against one is posted.
+- `review-context-controls`: What context reaches every review agent and surface, how a reviewer inspects, adds to and removes from it, the budget and provenance policy for attachment evidence, and where a finding against that evidence is posted.
 - `review-thinking-effort`: The effort levels a reviewer may choose, how the choice is presented and persisted, and what it is honestly claimed to do given that it cannot be sent as a provider parameter.
 
 ### Modified Capabilities
@@ -46,11 +48,12 @@ Both are modelled on the Copilot panel because that is where the reviewer alread
 | Area | Effect |
 | --- | --- |
 | `src/app/reviewContext.ts` | `ReviewContext` gains attachments and per-source enable flags. The three budget constants become injected values. `CONTEXT_PREAMBLE` and `CONTEXT_END_FENCE` are rewritten: attachments are reviewable, so the fence can no longer say diffs are the only citable material. |
-| New attachment module | Resolves a picker choice or a `#` reference into content, applies the per-attachment budget, and reports truncation. |
+| New attachment module | Resolves a picker choice or a `#` reference into content, applies the per-attachment budget, emits root-qualified model-visible evidence ranges, and reports truncation or dropped content. |
 | `src/app/lmAgent.ts` | The prompt gains a reviewable `<attachments>` section between the context fence and the diffs, and an effort-instruction line. `runLmChangesetAgent` takes attachments per member. |
-| `src/ui/reviewFlowHtml.ts` | Context area: chips, "Add Context…", usage indicator. Model picker gains the second segment. |
-| `src/ui/reviewFlow.ts`, `src/ui/changesetReview.ts` | Attachment state, the picker Quick Pick, `#` resolution, effort persistence. |
-| `src/domain/agentResponse.ts` | An item may cite a file outside the diff; parsing must accept it and mark it. |
+| `src/app/demoAgent.ts` | The deterministic agent inspects the same model-visible attachment content and uses the same provenance and routing contract. |
+| `src/ui/reviewFlowHtml.ts` | Context area: chips, "Add Context…", usage indicator. Model picker gains the second segment. Generated scripts gain a compilation regression gate. |
+| `src/ui/reviewFlow.ts`, `src/ui/changesetReview.ts` | Attachment state, persisted warnings, active-panel keyboard routing, latest-instruction `#` resolution, and effort persistence. |
+| `src/domain/agentResponse.ts` | An item may cite a host-manifested file range outside the diff; parsing validates it before changed-file anchor classification. |
 | `src/app/submit.ts` | Accepted findings with no diff anchor are folded into the summary body instead of becoming `ReviewCommentDraft`s. |
 | `src/domain/types.ts` | `ReviewItem` records whether its file is in the diff; `Review` records the effort level that produced it; `Pod` records effort per model id. |
 | `package.json` | Budget settings, `codeVerdict.context.*` toggles, `codeVerdict.contextUsage.enabled`. |

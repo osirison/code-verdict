@@ -74,15 +74,30 @@ Not in the palette — reached from a control, a keybinding, or a status-bar seg
 
 `codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.agentLocations`, `codeVerdict.severityFloor`,
 `codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
-`codeVerdict.autoAdvance`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
-`codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`, `codeVerdict.agentRun.ceilingSeconds`,
-`codeVerdict.agentRun.maxConcurrent`.
+`codeVerdict.autoAdvance`, `codeVerdict.context.sectionBudget`, `codeVerdict.context.totalBudget`,
+`codeVerdict.context.maxLinkedItems`, `codeVerdict.context.includeTitle`,
+`codeVerdict.context.includeDescription`, `codeVerdict.context.includeLinkedItems`,
+`codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
+`codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`,
+`codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`.
 
 The three `agentRun` settings share one convention: `0` removes that limit. For the two windows
 that means "never time out on this"; for `maxConcurrent` it means "run as many reviews at once as
 are triggered".
 
 The access token is never a setting — it lives in the VS Code secret store.
+
+## Context and evidence wording
+
+An attachment is a file, folder, selection, symbol, Problems snapshot, or pasted text that the
+reviewer explicitly adds to a run. Change request titles, descriptions, and linked work items are
+intent and cannot be cited as findings. Attachments and changed-file diffs are reviewable evidence.
+An accepted finding against an attached file outside the diff goes to the summary, not an inline
+comment.
+
+Never state that only the diff is sent or that the whole repository is never sent. Use the live run
+footer: `N changed files + M attachments go to the agent.` Thinking Effort is applied as review
+instructions in the prompt, not as the model provider's native reasoning setting.
 
 ## UI strings as shipped
 

@@ -10,6 +10,7 @@ import { detectChangesets } from '../../app/changesets';
 import { runDemoChangesetAgent } from '../../app/combinedAgent';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../../app/changesetSubmit';
 import { DEFAULT_CRITERIA } from '../../domain/criteria';
+import { addedLines } from '../../domain/diffHunks';
 import { createReview, setVerdict } from '../../domain/reviewState';
 import type { Pod } from '../../domain/types';
 import { describeProviderContract } from '../../platform/contract/providerContract';
@@ -92,7 +93,14 @@ describe('end-to-end flows against the emulator', () => {
     review = setVerdict(review, cross?.id ?? '', 'accepted', true);
     const plans = buildChangesetSubmitPlans(
       review,
-      members.map((member) => ({ ref: member.ref, anchorRefs: member.diff.anchorRefs })),
+      members.map((member) => ({
+        ref: member.ref,
+        anchorRefs: member.diff.anchorRefs,
+        candidatesFor: (file: string) => {
+          const changed = member.diff.files.find((candidate) => candidate.newPath === file);
+          return changed ? addedLines(changed.diff) : undefined;
+        },
+      })),
       response.agentLabel,
       'you',
       'Combined changeset summary.',

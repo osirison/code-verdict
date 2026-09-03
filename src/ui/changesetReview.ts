@@ -8,15 +8,36 @@ import { preferredModelFor, selectionFromPod } from '../app/podSelection';
 import type { DetectedChangeset } from '../app/changesets';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetAgentMember } from '../app/combinedAgent';
-import { changesetHeadSha, parseChangesetHeadSha } from '../app/combinedAgent';
+import { changesetHeadSha, changesetMemberForAttachment, parseChangesetHeadSha } from '../app/combinedAgent';
 import { connectionForPod } from '../app/connections';
-import type { ChangesetSubmitState } from '../app/changesetSubmit';
+import type { ChangesetSubmitMember, ChangesetSubmitState } from '../app/changesetSubmit';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../app/changesetSubmit';
 import { DEMO_AGENT_ID } from '../app/demoAgent';
-import { changesetContextEntries } from '../app/lmAgent';
+import { modelVisiblePath, modelVisibleRootLabelForProject, workspaceRootForProject } from '../app/modelVisiblePath';
+import { AgentRunError, assembleChangesetReviewPrompt, changesetContextEntries, countPromptTokens, runFollowUpPrompt } from '../app/lmAgent';
 import type { AppStore } from '../app/appStore';
 import type { PodStore } from '../app/pods';
-import { buildReviewContext, reviewContextTruncatedForPrompt } from '../app/reviewContext';
+import {
+  budgetAttachments,
+  buildReviewContext,
+  reviewContextTruncatedForPrompt,
+  type Attachment,
+  type ContextBudgets,
+  type ReviewContext,
+} from '../app/reviewContext';
+import {
+  attachmentKey,
+  deduplicateAttachments,
+  resolveAttachment,
+  type SymbolAttachmentTarget,
+} from '../app/attachments';
+import {
+  ContextReferenceResolutionCoordinator,
+  parseContextReferences,
+  prepareContextReferencesForRun,
+  resolveContextReferences,
+  type ContextReferenceCache,
+} from '../app/contextReferences';
 import { ReviewHistory } from '../app/reviewHistory';
 import {
   carryRetainedResult,
@@ -32,21 +53,46 @@ import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunMana
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import {
+  effortForModel,
+  effortLabel,
+  isEffortLevel,
+  normalizeEffortsByModel,
+  setEffortForModel,
+} from '../domain/effort';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import { composeSummary, type AgentVoice } from '../domain/summary';
 import { allDecided, clearVerdict, nextUndecided, setVerdict, verdictCounts } from '../domain/reviewState';
-import type { Category, Review, Severity } from '../domain/types';
+import { isReviewItemAnchored, type Category, type Review, type ReviewItem, type Severity } from '../domain/types';
 import { getProvider } from '../platform/registry';
+import { toScmError } from '../platform/errors';
 import { repoCountOf } from './vocab';
 import { agentRunConcurrency, agentRunTimeouts } from './agentRunOptions';
+import {
+  contextSourceEnabledByDefault,
+  readContextBudgets,
+  readContextSourceDefaults,
+  readContextUsageEnabled,
+} from './contextOptions';
+import { ContextUsageCounter } from './contextUsage';
+import {
+  attachmentFileTarget,
+  attachmentRange,
+  findReferenceFile,
+  modelVisibleWorkspaceRoots,
+  pickContextAttachment,
+} from './contextAttachmentPicker';
 import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
-import type { FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
+import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { livenessView } from './runLiveness';
 import { escapeHtml } from './theme';
 import { AppSurface, type AppRoute } from './appSurface';
+import { locateInWorkspace } from './inDiffEditor';
 import type { SidebarActiveReview } from './sidebarHtml';
+import { renderMarkdown } from './markdown';
+import { findingFollowUpPrompt, followUpQuestion, type AskPreset } from './findingFollowUp';
 
 export interface ChangesetReviewDeps {
   podStore: PodStore;
@@ -61,6 +107,12 @@ export interface ChangesetReviewDeps {
   openDashboard: () => void;
   onSubmitted?: () => void;
   onSidebarState?: (state?: SidebarActiveReview) => void;
+}
+
+interface MemberAttachment {
+  repoId: string;
+  crNumber: string;
+  attachment: Attachment;
 }
 
 export class ChangesetReviewPanel {
@@ -84,11 +136,16 @@ export class ChangesetReviewPanel {
 
   static handleCommand(command: string, arg?: unknown): boolean {
     const panel = ChangesetReviewPanel.current;
-    if (!panel || panel.disposed) return false;
+    if (!panel || panel.disposed || !ChangesetReviewPanel.isCommandTargetActive()) return false;
     const message = flowCommandMessage(command, arg, panel.selectedId);
     if (!message) return false;
     void panel.onMessage(message);
     return true;
+  }
+
+  static isCommandTargetActive(): boolean {
+    const panel = ChangesetReviewPanel.current;
+    return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
   }
 
   static selectItem(itemId: string): void {
@@ -101,6 +158,7 @@ export class ChangesetReviewPanel {
 
   private disposed = false;
   private pendingSelectId?: string;
+  private reviewFocusActive = false;
   /** First load() on this instance paints the loading skeleton (task 7.6);
    * see load(). */
   private painted = false;
@@ -112,6 +170,7 @@ export class ChangesetReviewPanel {
   private models: ModelDescriptor[] = [];
   private modelId?: string;
   private modelOpen = false;
+  private effortOpen = false;
   private selectionNotices: string[] = [];
   private skippedAgents: SkippedDefinition[] = [];
   /** Same three sources the single-CR panel watches; this screen is the same screen. */
@@ -119,6 +178,19 @@ export class ChangesetReviewPanel {
   private agentOpen = false;
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
+  private readonly contextBudgets: ContextBudgets = readContextBudgets();
+  private memberAttachments: MemberAttachment[] = [];
+  private referenceAttachments: MemberAttachment[] = [];
+  private referenceAttachmentCache: ContextReferenceCache = new Map();
+  private removedAttachmentKeys = new Set<string>();
+  private unresolvedContextReferences: string[] = [];
+  private readonly referenceResolution = new ContextReferenceResolutionCoordinator();
+  private autoContextEnabled = new Map<string, boolean>();
+  private readonly autoContextDefaults = readContextSourceDefaults();
+  private contextUsage?: ContextUsageView;
+  private contextUsageEnabled = readContextUsageEnabled();
+  private readonly contextUsageCounter = new ContextUsageCounter();
+  private contextUsageWatch?: vscode.Disposable;
   private screen: FlowScreen = 'agent';
   private mode: 'split' | 'queue' | 'diff' = 'split';
   private review?: Review;
@@ -166,6 +238,9 @@ export class ChangesetReviewPanel {
       this.agentWatches = [];
       this.focusWatch?.dispose();
       this.focusWatch = undefined;
+      this.contextUsageWatch?.dispose();
+      this.contextUsageWatch = undefined;
+      this.contextUsageCounter.cancel();
       this.windowFocusWatch?.dispose();
       this.windowFocusWatch = undefined;
       this.setReviewFocus(false);
@@ -195,10 +270,22 @@ export class ChangesetReviewPanel {
     // page (task 7.6) is the right thing to leave on screen.
     route.onReload(() => this.render());
     route.onMessage((message) => void this.onMessage(message as FlowMessage));
+    this.contextUsageWatch = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('codeVerdict.contextUsage.enabled')) return;
+      this.contextUsageEnabled = readContextUsageEnabled();
+      this.scheduleContextUsage();
+      this.render();
+    });
   }
 
   private setReviewFocus(active: boolean): void {
-    void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', active && !this.disposed);
+    this.reviewFocusActive = active && !this.disposed;
+    void vscode.commands.executeCommand('setContext', 'verdict.reviewFocus', this.reviewFocusActive);
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewContextFocus',
+      this.reviewFocusActive && this.screen === 'agent',
+    );
   }
 
   private get panel(): vscode.WebviewPanel { return this.route.panel; }
@@ -211,6 +298,225 @@ export class ChangesetReviewPanel {
 
   private draftKey(): string {
     return changesetDraftKeyFor(this.changesetId);
+  }
+
+  private memberKey(member: Pick<ChangesetAgentMember, 'ref'>): string {
+    return `${member.ref.repoId}!${member.ref.number}`;
+  }
+
+  private autoContextId(member: ChangesetAgentMember, kind: string): string {
+    return `auto:${this.memberKey(member)}:${kind}`;
+  }
+
+  private autoContextItems(): AutoContextItemView[] {
+    return this.members.flatMap((member) => {
+      const context = member.context;
+      if (!context) return [];
+      const prefix = member.projectPath;
+      const items: AutoContextItemView[] = [{
+        id: this.autoContextId(member, 'title'),
+        kind: 'title',
+        label: `${prefix} · Title · ${context.title}`,
+        enabled: this.autoContextEnabled.get(this.autoContextId(member, 'title'))
+          ?? contextSourceEnabledByDefault('title', this.autoContextDefaults),
+      }];
+      if (context.description) {
+        items.push({
+          id: this.autoContextId(member, 'description'),
+          kind: 'description',
+          label: `${prefix} · Change request description`,
+          enabled: this.autoContextEnabled.get(this.autoContextId(member, 'description'))
+            ?? contextSourceEnabledByDefault('description', this.autoContextDefaults),
+        });
+      }
+      context.linkedItems.forEach((item, index) => {
+        const id = this.autoContextId(member, `linked:${index}:${item.number}`);
+        items.push({
+          id,
+          kind: 'linkedItem',
+          label: `${prefix} · #${item.number}${item.title ? ` · ${item.title}` : ''}`,
+          detail: item.resolved ? item.state : 'reference only',
+          enabled: this.autoContextEnabled.get(id)
+            ?? contextSourceEnabledByDefault('linkedItem', this.autoContextDefaults),
+        });
+      });
+      return items;
+    });
+  }
+
+  private promptContext(member: ChangesetAgentMember): ReviewContext | undefined {
+    const context = member.context;
+    if (!context) return undefined;
+    const includeTitle = this.autoContextEnabled.get(this.autoContextId(member, 'title'))
+      ?? contextSourceEnabledByDefault('title', this.autoContextDefaults);
+    const includeDescription = context.description
+      ? this.autoContextEnabled.get(this.autoContextId(member, 'description'))
+        ?? contextSourceEnabledByDefault('description', this.autoContextDefaults)
+      : true;
+    const linkedItems = context.linkedItems.filter((item, index) =>
+      this.autoContextEnabled.get(this.autoContextId(member, `linked:${index}:${item.number}`))
+        ?? contextSourceEnabledByDefault('linkedItem', this.autoContextDefaults),
+    );
+    if (!includeTitle && (!context.description || !includeDescription) && linkedItems.length === 0) return undefined;
+    return { ...context, includeTitle, includeDescription, linkedItems };
+  }
+
+  private attachmentsForMember(member: ChangesetAgentMember): Attachment[] {
+    return this.attachmentEntries()
+      .filter((entry) => entry.repoId === member.ref.repoId && entry.crNumber === member.ref.number)
+      .map((entry) => entry.attachment);
+  }
+
+  private attachmentEntryKey(entry: MemberAttachment): string {
+    return `${entry.repoId}!${entry.crNumber}:${attachmentKey(entry.attachment)}`;
+  }
+
+  private attachmentEntries(): MemberAttachment[] {
+    const entries = new Map<string, MemberAttachment>();
+    for (const entry of [...this.memberAttachments, ...this.referenceAttachments]) {
+      const key = this.attachmentEntryKey(entry);
+      if (!this.removedAttachmentKeys.has(key) && !entries.has(key)) entries.set(key, entry);
+    }
+    return [...entries.values()];
+  }
+
+  private promptMembers(): ChangesetAgentMember[] {
+    return this.members.map((member) => ({
+      ...member,
+      context: this.promptContext(member),
+      attachments: this.attachmentsForMember(member),
+    }));
+  }
+
+  private attachmentViewId(entry: MemberAttachment): string {
+    return `${entry.repoId}!${entry.crNumber}:${entry.attachment.id}`;
+  }
+
+  private attachmentViews(): Attachment[] {
+    return this.attachmentEntries().map((entry) => {
+      const member = this.members.find((candidate) => (
+        candidate.ref.repoId === entry.repoId && candidate.ref.number === entry.crNumber
+      ));
+      return {
+        ...entry.attachment,
+        id: this.attachmentViewId(entry),
+        label: `${member?.projectPath ?? entry.repoId} · ${entry.attachment.label}`,
+      };
+    });
+  }
+
+  private async addContext(): Promise<void> {
+    const member = this.members.length === 1
+      ? this.members[0]
+      : (await vscode.window.showQuickPick(
+          this.members.map((candidate) => ({
+            label: candidate.projectPath,
+            description: `!${candidate.ref.number}`,
+            member: candidate,
+          })),
+          { placeHolder: 'Select changeset member' },
+        ))?.member;
+    if (!member || this.disposed) return;
+    const attachment = await pickContextAttachment();
+    if (!attachment || this.disposed) return;
+    const entry = { repoId: member.ref.repoId, crNumber: member.ref.number, attachment };
+    this.removedAttachmentKeys.delete(this.attachmentEntryKey(entry));
+    const existing = this.memberAttachments
+      .filter((candidate) => candidate.repoId === member.ref.repoId && candidate.crNumber === member.ref.number)
+      .map((candidate) => candidate.attachment);
+    const deduplicated = deduplicateAttachments([...existing, attachment]);
+    this.memberAttachments = [
+      ...this.memberAttachments.filter((entry) => (
+        entry.repoId !== member.ref.repoId || entry.crNumber !== member.ref.number
+      )),
+      ...deduplicated.map((candidate) => ({
+        repoId: member.ref.repoId,
+        crNumber: member.ref.number,
+        attachment: candidate,
+      })),
+    ];
+    this.scheduleContextUsage();
+    this.render();
+  }
+
+  private async findReferenceSymbol(name: string): Promise<SymbolAttachmentTarget | undefined> {
+    const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+      'vscode.executeWorkspaceSymbolProvider',
+      name,
+    ) ?? [];
+    const exact = symbols.filter((symbol) => symbol.name === name);
+    if (exact.length !== 1) return undefined;
+    const symbol = exact[0] as vscode.SymbolInformation;
+    return {
+      ...attachmentFileTarget(symbol.location.uri),
+      name: symbol.name,
+      range: attachmentRange(new vscode.Selection(symbol.location.range.start, symbol.location.range.end)),
+    };
+  }
+
+  private resolveInstructionReferences(
+    text: string,
+    targetIsCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    return this.referenceResolution.resolve(text, async (isCurrent) => {
+      if (!targetIsCurrent()) return;
+      const references = parseContextReferences(text);
+      const current = new Set(references.map((reference) => reference.raw));
+      for (const reference of this.referenceAttachmentCache.keys()) {
+        if (!current.has(reference)) this.referenceAttachmentCache.delete(reference);
+      }
+      const result = await resolveContextReferences(text, {
+        findFile: findReferenceFile,
+        findSymbol: (name) => this.findReferenceSymbol(name),
+        resolveAttachment: (kind, target) => resolveAttachment(kind, target),
+      }, this.referenceAttachmentCache);
+      if (this.disposed || !targetIsCurrent() || !isCurrent()) return;
+      const unresolved = new Set(result.unresolved);
+      this.referenceAttachments = references.flatMap((reference) => {
+        const attachment = this.referenceAttachmentCache.get(reference.raw);
+        if (!attachment) return [];
+        const member = changesetMemberForAttachment(this.members, attachment);
+        if (!member) {
+          unresolved.add(reference.raw);
+          return [];
+        }
+        return [{ repoId: member.ref.repoId, crNumber: member.ref.number, attachment }];
+      });
+      this.unresolvedContextReferences = [...unresolved];
+    });
+  }
+
+  private scheduleContextUsage(): void {
+    const model = this.models.find((candidate) => candidate.id === this.modelId);
+    if (
+      !this.contextUsageEnabled
+      || this.screen !== 'agent'
+      || this.selectedAgent().source === 'demo'
+      || !model?.maxInputTokens
+      || this.members.length === 0
+    ) {
+      this.contextUsageCounter.cancel();
+      this.contextUsage = undefined;
+      return;
+    }
+    const prompt = assembleChangesetReviewPrompt(
+      this.selectedAgent(),
+      this.promptMembers(),
+      this.pod().criteria,
+      { contextBudgets: this.contextBudgets, effort: this.selectedEffort() },
+    );
+    const promptHash = crypto.createHash('sha256').update(prompt).digest('hex');
+    this.contextUsage = undefined;
+    this.contextUsageCounter.schedule({
+      cacheKey: `${model.id}\0${promptHash}`,
+      prompt,
+      totalTokens: model.maxInputTokens,
+      countTokens: (assembled) => countPromptTokens(model.id, assembled),
+    }, (usage) => {
+      if (this.disposed) return;
+      this.contextUsage = usage;
+      this.render();
+    });
   }
 
   private async load(): Promise<void> {
@@ -246,18 +552,26 @@ export class ChangesetReviewPanel {
       const changeset = detectChangesets(pod, data.changeRequests, data.workItems, options).find((candidate) => candidate.id === this.changesetId);
       if (!changeset) throw new Error('Changeset is no longer available');
       this.changeset = changeset;
+      const workspaceRoots = modelVisibleWorkspaceRoots();
       const [members, selection] = await Promise.all([
-        Promise.all(changeset.members.map(async (member) => ({
-          ref: member.ref,
-          projectPath: member.projectPath,
-          diff: await connection.getChangeRequestDiff(member.ref),
-          // fetchPodData already fetched the pod's work items for detection —
-          // resolving each member's links off that batch costs no request.
-          context: buildReviewContext(member, data.workItems, { trailer: options.trailer }),
-        }))),
+        Promise.all(changeset.members.map(async (member) => {
+          const repository = pod.repos?.find((candidate) => candidate.id === member.ref.repoId);
+          const projectIdentifiers = [member.projectPath, repository?.path, repository?.name];
+          return {
+            ref: member.ref,
+            projectPath: member.projectPath,
+            diff: await connection.getChangeRequestDiff(member.ref),
+            // fetchPodData already fetched the pod's work items for detection —
+            // resolving each member's links off that batch costs no request.
+            context: buildReviewContext(member, data.workItems, { trailer: options.trailer }),
+            workspaceRootLabel: modelVisibleRootLabelForProject(projectIdentifiers, workspaceRoots),
+            workspaceRootSourceUri: workspaceRootForProject(projectIdentifiers, workspaceRoots)?.sourceUri,
+          };
+        })),
         loadAgentSelection(selectionFromPod(pod)),
       ]);
       this.members = members;
+      await this.resolveInstructionReferences(pod.criteria.extraInstructions);
       this.applySelection(selection);
       this.armAgentWatches();
       // Same precedence as the single-change-request panel: a run happening now,
@@ -273,6 +587,7 @@ export class ChangesetReviewPanel {
         this.selectedId = this.pendingSelectId;
       }
       this.pendingSelectId = undefined;
+      this.scheduleContextUsage();
       this.render();
     } catch (error) {
       void vscode.window.showErrorMessage(`Verdict: ${error instanceof Error ? error.message : String(error)}`);
@@ -338,8 +653,10 @@ export class ChangesetReviewPanel {
   private async run(): Promise<void> {
     const pod = this.pod();
     const runVocabulary = getProvider(pod.providerId).vocabulary;
+    const effort = this.selectedEffort();
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
+    pod.effortByModel = normalizeEffortsByModel(pod.effortByModel);
     await this.deps.podStore.upsert(pod);
     if (this.disposed) return;
 
@@ -354,14 +671,16 @@ export class ChangesetReviewPanel {
     }
 
     const input: RunInput = {
-      target: { kind: 'changeset', changesetId: this.changesetId, members: this.members },
+      target: { kind: 'changeset', changesetId: this.changesetId, members: this.promptMembers() },
       refLabel: this.changeset.name,
       podId: pod.id,
       criteria: pod.criteria,
       agent: this.selectedAgent(),
       agentLabel: this.selectedAgent().label || this.agentId,
       modelId: demo ? undefined : this.modelId,
+      effort,
       timeouts: agentRunTimeouts(),
+      contextBudgets: this.contextBudgets,
       steps: [
         'Resolving agent from Copilot workspace…',
         `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
@@ -476,8 +795,20 @@ export class ChangesetReviewPanel {
         if (preferred.notice) this.selectionNotices = [preferred.notice];
         break;
       }
-      case 'toggleModelOpen': this.modelOpen = !this.modelOpen; break;
-      case 'selectModel': this.modelId = message.modelId; this.modelOpen = false; break;
+      case 'toggleModelOpen': this.modelOpen = !this.modelOpen; this.effortOpen = false; break;
+      case 'selectModel': this.modelId = message.modelId; this.modelOpen = false; this.effortOpen = false; break;
+      case 'toggleEffortOpen':
+        if (this.selectedAgent().source !== 'demo' && this.models.some((model) => model.id === this.modelId)) {
+          this.effortOpen = !this.effortOpen;
+          this.modelOpen = false;
+        }
+        break;
+      case 'selectEffort':
+        if (!this.modelId || !isEffortLevel(message.effort)) break;
+        pod.effortByModel = setEffortForModel(pod.effortByModel, this.modelId, message.effort);
+        await this.deps.podStore.upsert(pod);
+        this.effortOpen = false;
+        break;
       case 'dismissNotices': this.selectionNotices = []; break;
       case 'showSkippedAgents':
         void vscode.window.showWarningMessage(
@@ -494,13 +825,45 @@ export class ChangesetReviewPanel {
         await this.deps.podStore.upsert(pod);
         break;
       }
-      // Per-keystroke, from debounced input (task 9.3): in-memory only, and
-      // return — the tail render would repaint the region holding the field
-      // being typed in, and a podStore.upsert here would be one uncoalesced
-      // read-modify-write per character (task 4.5). The upsert lands on blur.
-      case 'setInstructions': pod.criteria.extraInstructions = message.text; return;
-      case 'commitInstructions': pod.criteria.extraInstructions = message.text; await this.deps.podStore.upsert(pod); return;
-      case 'run': void this.run(); return;
+      case 'setInstructions':
+        pod.criteria.extraInstructions = message.text;
+        await this.resolveInstructionReferences(message.text);
+        this.scheduleContextUsage();
+        this.render();
+        return;
+      case 'commitInstructions':
+        pod.criteria.extraInstructions = message.text;
+        await this.deps.podStore.upsert(pod);
+        await this.resolveInstructionReferences(message.text);
+        break;
+      case 'addContext': await this.addContext(); return;
+      case 'removeContextItem': {
+        const entry = this.attachmentEntries().find((candidate) => this.attachmentViewId(candidate) === message.itemId);
+        if (entry) this.removedAttachmentKeys.add(this.attachmentEntryKey(entry));
+        break;
+      }
+      case 'toggleAutoContextItem': {
+        const item = this.autoContextItems().find((candidate) => candidate.id === message.itemId);
+        if (item) this.autoContextEnabled.set(message.itemId, !item.enabled);
+        break;
+      }
+      case 'run': {
+        const targetIsCurrent = (): boolean => !this.disposed;
+        const instructions = message.instructions ?? pod.criteria.extraInstructions;
+        await prepareContextReferencesForRun(
+          instructions,
+          pod.criteria.extraInstructions,
+          async (latest) => {
+            if (!targetIsCurrent()) return;
+            pod.criteria.extraInstructions = latest;
+            await this.deps.podStore.upsert(pod);
+          },
+          (latest) => this.resolveInstructionReferences(latest, targetIsCurrent),
+        );
+        if (!targetIsCurrent()) return;
+        void this.run();
+        return;
+      }
       // Two meanings on one message — see `ReviewFlowPanel`. A live run is
       // stopped; a failed one is dismissed back to the pickers, which is what
       // the failure screen's "Switch agent" asks for.
@@ -524,6 +887,9 @@ export class ChangesetReviewPanel {
         // from what produced it — see `ReviewFlowPanel.preselectFromRetained`.
         this.newRunFromResult = this.retained !== undefined;
         this.preselectFromRetained();
+        this.memberAttachments = [];
+        this.removedAttachmentKeys = new Set();
+        await this.resolveInstructionReferences(pod.criteria.extraInstructions);
         this.screen = 'agent';
         break;
       case 'backToResult':
@@ -535,7 +901,12 @@ export class ChangesetReviewPanel {
       case 'verdict': {
         if (!this.review) return;
         const item = this.review.items.find((candidate) => candidate.id === message.itemId);
-        this.review = setVerdict(this.review, message.itemId, message.verdict, message.applyFix && Boolean(item?.suggestion));
+        this.review = setVerdict(
+          this.review,
+          message.itemId,
+          message.verdict,
+          message.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item)),
+        );
         if (vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true)) {
           this.selectedId = nextUndecided(this.review, message.itemId)?.id ?? this.selectedId;
         }
@@ -561,25 +932,32 @@ export class ChangesetReviewPanel {
       case 'ask': {
         const item = this.review?.items.find((candidate) => candidate.id === message.itemId);
         if (!item) return;
-        // The question was sent and the page cleared its field (task 9.3) —
-        // a held draft would be painted back into #ask by the tail render.
+        // The question was sent and the page cleared its field; do not paint
+        // an in-memory draft back into it while the live follow-up runs.
         if (message.preset === 'freeform') delete this.askDrafts[item.id];
-        const list = (this.threads[item.id] ??= []);
-        const label = message.preset === 'freeform' ? 'agent · reply' : `agent · ${message.preset}`;
-        if (message.preset === 'freeform' || !list.some((entry) => entry.label === label)) {
-          list.push({ label, text: message.preset === 'freeform' ? `On "${message.text?.trim()}": compare both repository contracts before changing either side.` : item.answers?.[message.preset] ?? 'The combined diff provides no further detail.' });
-        }
-        this.persist();
-        break;
+        await this.ask(item, message.preset, message.text);
+        return;
       }
-      case 'openInEditor':
-        void vscode.window.showTextDocument(vscode.Uri.file(message.file), { preview: true }).then(
-          undefined,
-          () => vscode.window.showInformationMessage(
+      case 'openInEditor': {
+        const item = this.review?.items.find((candidate) => (
+          candidate.file === message.file && candidate.line === message.line
+        ));
+        const located = item ? await locateInWorkspace(item) : undefined;
+        if (!located) {
+          void vscode.window.showInformationMessage(
             `Verdict: ${message.file} is not in this workspace — it lives in the reviewed repository.`,
-          ),
+          );
+          return;
+        }
+        const editor = await vscode.window.showTextDocument(located.document, { preview: true });
+        const position = new vscode.Position(located.line - 1, 0);
+        editor.selection = new vscode.Selection(position, position);
+        editor.revealRange(
+          located.document.lineAt(located.line - 1).range,
+          vscode.TextEditorRevealType.InCenterIfOutsideViewport,
         );
         return;
+      }
       case 'generateSummary':
         if (!this.review || !allDecided(this.review)) return;
         this.summaryText = this.generateSummary();
@@ -591,7 +969,12 @@ export class ChangesetReviewPanel {
       case 'setNote': this.finalNote = message.text; this.persist(); return;
       case 'toggleOption': if (message.option === 'postThread') this.postThread = !this.postThread; else this.requestChanges = !this.requestChanges; break;
       case 'submit': case 'retrySubmit': void this.submit(); return;
-      case 'copyMarkdown': await vscode.env.clipboard.writeText(composeSummaryBody(this.summaryText, this.finalNote)); return;
+      case 'copyMarkdown': await vscode.env.clipboard.writeText(composeSummaryBody(
+        this.summaryText,
+        this.finalNote,
+        this.review,
+        this.withheldInlineItems(),
+      )); return;
       case 'backToTriage': this.screen = 'triage'; break;
       case 'lowerBar': {
         const index = SEVERITY_ORDER.indexOf(pod.criteria.severityFloor);
@@ -635,6 +1018,7 @@ export class ChangesetReviewPanel {
       case 'reconnect': await vscode.commands.executeCommand('codeVerdict.signIn'); return;
       case 'reanchor': void this.run(); return;
     }
+    this.scheduleContextUsage();
     this.render();
   }
 
@@ -642,6 +1026,87 @@ export class ChangesetReviewPanel {
     if (!this.review) return '';
     const voice = vscode.workspace.getConfiguration('codeVerdict').get<AgentVoice>('agentVoice', 'terse');
     return composeSummary(this.review, this.agentLabel(), voice);
+  }
+
+  private async ask(item: Review['items'][number], preset: AskPreset, text?: string): Promise<void> {
+    const question = followUpQuestion(preset, text);
+    if (question === '') return;
+    const label = preset === 'freeform' ? 'agent · reply' : `agent · ${preset}`;
+    const list = (this.threads[item.id] ??= []);
+    const canned = preset === 'freeform' ? undefined : item.answers?.[preset];
+    if (canned !== undefined) {
+      list.push({ label, text: canned });
+      this.postThreadUpdate(item.id, list);
+      await this.persist();
+      return;
+    }
+    if (this.modelId === undefined || this.selectedAgent().source === 'demo') {
+      list.push({ label, text: 'This agent does not answer follow-up questions.' });
+      this.postThreadUpdate(item.id, list);
+      await this.persist();
+      return;
+    }
+
+    list.push({ label, text: 'Thinking…' });
+    const entry = list[list.length - 1] as { label: string; text: string };
+    this.postThreadUpdate(item.id, list);
+    try {
+      const member = this.members.find((candidate) => (
+        candidate.ref.repoId === item.repoId && candidate.ref.number === item.crNumber
+      ));
+      const hunk = member?.diff.files.find((file) => (
+        modelVisiblePath(file.newPath, member.workspaceRootLabel) === item.file
+      ))?.diff;
+      entry.text = await runFollowUpPrompt(
+        this.selectedAgent(),
+        this.modelId,
+        findingFollowUpPrompt(item, question, hunk),
+        { timeouts: agentRunTimeouts(), effort: this.selectedEffort() },
+      );
+    } catch (error) {
+      const message = error instanceof AgentRunError ? error.message : toScmError(error).message;
+      entry.text = `The agent could not answer: ${message}`;
+    }
+    this.postThreadUpdate(item.id, list);
+    await this.persist();
+  }
+
+  private postThreadUpdate(itemId: string, list: Array<{ label: string; text: string }>): void {
+    if (this.disposed) return;
+    void this.panel.webview.postMessage({
+      type: 'verdict:thread',
+      itemId,
+      thread: list.map((entry) => ({ ...entry, html: renderMarkdown(entry.text) })),
+    });
+  }
+
+  private submitMembers(): ChangesetSubmitMember[] {
+    return this.members.map((member) => ({
+      ref: member.ref,
+      anchorRefs: member.diff.anchorRefs,
+      candidatesFor: (file: string) => {
+        const changed = member.diff.files.find((candidate) => (
+          modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
+        ));
+        return changed ? addedLines(changed.diff) : undefined;
+      },
+      projectLabel: member.projectPath,
+      workspaceRootLabel: member.workspaceRootLabel,
+    }));
+  }
+
+  private withheldInlineItems(): ReviewItem[] {
+    if (!this.review) return [];
+    const pod = this.pod();
+    return buildChangesetSubmitPlans(
+      this.review,
+      this.submitMembers(),
+      this.agentLabel(),
+      pod.username ?? 'you',
+      '',
+      false,
+      false,
+    ).flatMap((plan) => plan.withheld);
   }
 
   private async submit(): Promise<void> {
@@ -653,10 +1118,10 @@ export class ChangesetReviewPanel {
     const provider = getProvider(pod.providerId);
     const issueRef = this.changeset.linkedIssue ? ` (${this.changeset.linkedIssue})` : '';
     const footer = `Part of changeset “${this.changeset.name}”${issueRef} — reviewed together across ${this.members.length} repositories with ${this.agentLabel()}.`;
-    const summary = `${composeSummaryBody(this.summaryText, this.finalNote)}\n\n---\n\n${footer}`;
+    const summary = `${composeSummaryBody(this.summaryText, this.finalNote, this.review)}\n\n---\n\n${footer}`;
     const plans = buildChangesetSubmitPlans(
       this.review,
-      this.members.map((member) => ({ ref: member.ref, anchorRefs: member.diff.anchorRefs, projectLabel: member.projectPath })),
+      this.submitMembers(),
       this.agentLabel(),
       pod.username ?? 'you',
       summary,
@@ -766,12 +1231,17 @@ export class ChangesetReviewPanel {
     const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
     if (this.disposed) return;
     this.applySelection(next);
+    this.scheduleContextUsage();
     if (this.screen === 'agent') this.render();
   }
 
   /** Never undefined: the built-in agent is always in `this.agents`. */
   private selectedAgent(): AgentDescriptor {
     return this.agents.find((agent) => agent.id === this.agentId) ?? BUILTIN_AGENT_DESCRIPTOR;
+  }
+
+  private selectedEffort() {
+    return effortForModel(this.pod().effortByModel, this.modelId);
   }
 
   /**
@@ -815,7 +1285,7 @@ export class ChangesetReviewPanel {
     const selectedMember = this.members.find((member) => member.ref.repoId === selected?.item.repoId && member.ref.number === selected.item.crNumber);
     const diffLines = this.mode === 'diff'
       ? selectedMember?.diff.files
-        .filter((file) => file.newPath === selected?.item.file)
+        .filter((file) => modelVisiblePath(file.newPath, selectedMember.workspaceRootLabel) === selected?.item.file)
         .flatMap((file) => parseHunks(file.diff).flatMap((hunk) => hunk.lines))
       : undefined;
     const counts = this.review ? verdictCounts(this.review) : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
@@ -857,11 +1327,19 @@ export class ChangesetReviewPanel {
       models: this.models,
       modelId: this.modelId,
       modelOpen: this.modelOpen,
+      effort: this.selectedEffort(),
+      effortOpen: this.effortOpen,
+      effortComparisonDisclosure: (this.retained?.draft.review.items.length ?? 0) > 0 && this.screen === 'agent',
       reviewModelLabel: this.reviewModelLabel(),
+      reviewEffortLabel: this.review ? effortLabel(this.review.effort) : undefined,
       selectionNotices: this.selectionNotices,
       skippedAgents: this.skippedAgents,
       agentOpen: this.agentOpen,
       criteria: pod.criteria,
+      attachments: budgetAttachments(this.attachmentViews()),
+      autoContextItems: this.autoContextItems(),
+      contextUsage: this.contextUsage,
+      unresolvedContextReferences: this.unresolvedContextReferences,
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
       runSteps: this.runRecord?.steps ?? [],
       runStep: this.runRecord?.step ?? 0,
@@ -872,7 +1350,7 @@ export class ChangesetReviewPanel {
       runQueued: this.runRecord?.status === 'queued',
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
-        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel() }
+        ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
         : undefined,
       mode: this.mode,
       items,
@@ -882,7 +1360,7 @@ export class ChangesetReviewPanel {
       context: contextEntries.length > 0
         ? {
             open: this.contextOpen,
-            truncated: reviewContextTruncatedForPrompt(changesetContextEntries(this.members)),
+            truncated: reviewContextTruncatedForPrompt(changesetContextEntries(this.members), this.contextBudgets),
             entries: contextEntries,
           }
         : undefined,
@@ -890,7 +1368,9 @@ export class ChangesetReviewPanel {
       // From the retained record — see `ReviewFlowPanel`.
       candidates: this.retained?.candidates ?? [],
       filesRead: this.retained?.filesRead ?? totalFiles,
+      attachmentWarnings: this.retained?.attachmentWarnings ?? [],
       summaryText: this.summaryText,
+      withheldInlineItemIds: this.withheldInlineItems().map((item) => item.id),
       finalNote: this.finalNote,
       postThread: this.postThread,
       requestChanges: this.requestChanges,
@@ -902,6 +1382,11 @@ export class ChangesetReviewPanel {
     };
     const abbrev = `${this.members.length} ${vocabulary.changeRequestAbbrev}s`;
     this.panel.title = this.screen === 'done' ? `Verdict: Posted · ${abbrev}` : `Verdict: Review · ${abbrev}`;
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewContextFocus',
+      this.reviewFocusActive && this.screen === 'agent',
+    );
     // Patch the region in place rather than replacing the whole document
     // (task 7.2) — every state change on this screen funnels through render(),
     // so this is what stops a verdict or a screen transition from rebuilding
@@ -954,7 +1439,9 @@ function spanAnchor(
   const file = location.slice(0, separator);
   const line = Number(location.slice(separator + 1));
   if (!Number.isInteger(line)) return undefined;
-  const diffFile = member.diff.files.find((candidate) => candidate.newPath === file);
+  const diffFile = member.diff.files.find((candidate) => (
+    modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
+  ));
   const added = diffFile ? addedLines(diffFile.diff).find((candidate) => candidate.line === line) : undefined;
   return added ? { file, line, text: added.text.trim() } : undefined;
 }

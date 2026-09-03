@@ -28,10 +28,11 @@
  * that `vscode.CancellationTokenSource` also satisfies.
  */
 import type { AgentDescriptor } from './agents';
+import type { AttachmentWarning } from './attachments';
 import type { ChangesetAgentMember } from './combinedAgent';
 import type { AgentCancellationToken, AgentRunTimeouts } from './lmAgent';
 import type { AgentRunProgress } from './agentTrace';
-import type { ReviewContext } from './reviewContext';
+import type { Attachment, ContextBudgets, ReviewContext } from './reviewContext';
 import { ReviewRunStore } from './reviewRuns';
 import {
   changesetDraftKeyFor,
@@ -43,6 +44,7 @@ import {
 import type { KeyValueStore } from './storage';
 import { createReview } from '../domain/reviewState';
 import type { AgentReviewResponse } from '../domain/agentResponse';
+import type { EffortLevel } from '../domain/effort';
 import type { Criteria } from '../domain/types';
 import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 
@@ -64,6 +66,10 @@ export interface CrRunTarget {
   ref: ChangeRequestRef;
   diff: ChangeRequestDiff;
   reviewContext?: ReviewContext;
+  /** Cached evidence selected before the immutable run snapshot is created. */
+  attachments?: readonly Attachment[];
+  /** Host-assigned qualification for changed-file paths in a multi-root workspace. */
+  workspaceRootLabel?: string;
 }
 
 /** A changeset, reviewed as one distributed unit. */
@@ -96,7 +102,11 @@ export interface RunInput {
   agentLabel: string;
   /** Absent only for the demo agent, which calls no model. */
   modelId?: string;
+  /** Prompt-level review effort captured with the model selection. */
+  effort: EffortLevel;
   timeouts: AgentRunTimeouts;
+  /** Normalized UI settings captured with the rest of the run input. */
+  contextBudgets: ContextBudgets;
   /** The log the running screen walks. The demo runner supplies its own instead. */
   steps: string[];
   /** The demo agent produces findings from the diff without calling a model. */
@@ -141,17 +151,21 @@ export interface RunRecord {
   progress?: RunProgress;
   response?: AgentReviewResponse;
   failure?: RunFailure;
+  /** Filesystem-backed attachments dropped at run start. */
+  attachmentWarnings?: readonly AttachmentWarning[];
 }
 
 /** The demo agent's synchronous result, shaped as `demoAgent.ts` returns it. */
 export interface DemoRunResult {
   response: AgentReviewResponse;
   steps: string[];
+  attachmentWarnings?: readonly AttachmentWarning[];
 }
 
 export interface RunnerOptions {
   timeouts: AgentRunTimeouts;
   onProgress: (progress: AgentRunProgress) => void;
+  onAttachmentWarnings: (warnings: readonly AttachmentWarning[]) => void;
   cancellation: AgentCancellationToken;
 }
 
@@ -163,7 +177,7 @@ export interface ReviewRunners {
   /** Model-backed. Rejects with `AgentRunError`. */
   lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse>;
   /** Demo agent: no model, no network, its own step log. */
-  demo(input: RunInput): DemoRunResult;
+  demo(input: RunInput): DemoRunResult | Promise<DemoRunResult>;
 }
 
 export interface ReviewReadyInfo {
@@ -441,8 +455,9 @@ export class ReviewRunManager {
   private async executeDemo(key: string): Promise<void> {
     const record = this.records.get(key);
     if (!record) return;
-    const result = this.deps.runners.demo(record.input);
-    this.patch(key, { steps: result.steps });
+    const result = await this.deps.runners.demo(record.input);
+    if (!this.isRunning(key)) return;
+    this.patch(key, { steps: result.steps, attachmentWarnings: result.attachmentWarnings });
     // The log is walked rather than skipped: the demo agent exists to show what
     // a review looks like, and a result that appears instantly shows nothing.
     // It walks in the manager now, so navigating away mid-walk no longer ends
@@ -471,6 +486,7 @@ export class ReviewRunManager {
       const response = await this.deps.runners.lm(record.input, {
         timeouts: record.input.timeouts,
         onProgress: (progress) => this.recordProgress(key, progress),
+        onAttachmentWarnings: (warnings) => this.patch(key, { attachmentWarnings: warnings }),
         cancellation: cancellation.token,
       });
       if (!this.isRunning(key)) return;
@@ -529,6 +545,7 @@ export class ReviewRunManager {
       crNumber: identity.crNumber,
       agentId: input.agent.id,
       modelId: input.modelId,
+      effort: input.effort,
       criteria: input.criteria,
       response,
     });
@@ -543,6 +560,7 @@ export class ReviewRunManager {
       modelId: input.modelId,
       candidates: response.candidates,
       filesRead: response.stats?.filesRead,
+      attachmentWarnings: record.attachmentWarnings,
     });
 
     // The write comes FIRST, before anything is told the run succeeded.

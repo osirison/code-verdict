@@ -9,9 +9,9 @@ const review: Review = {
   repoId: 'changeset', crNumber: 'trailer:1180', agentId: 'agent', headSha: 'combined', summary: '',
   criteria: { severityFloor: 'minor', minConfidence: 70, categories: ['apiContract'], extraInstructions: '' },
   items: [
-    { id: 'gateway', repoId: '9103', crNumber: '381', file: 'src/routes/session.ts', line: 88, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Gateway contract changed', body: 'The response changed.', code: 'expires_at' },
-    { id: 'console-a', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 41, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Console reads old field', body: 'The old field remains.', code: 'data.expiry', cross: true, spans: [{ repoId: '9103', location: 'src/routes/session.ts:88', role: 'renames the field' }, { repoId: '9210', location: 'src/api/session.ts:41', role: 'reads the old field' }] },
-    { id: 'console-b', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 42, severity: 'minor', category: 'apiContract', confidence: 80, title: 'Missing compatibility test', body: 'Add a test.', code: 'expect(expiry)' },
+    { id: 'gateway', repoId: '9103', crNumber: '381', file: 'src/routes/session.ts', anchored: true, line: 88, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Gateway contract changed', body: 'The response changed.', code: 'expires_at' },
+    { id: 'console-a', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', anchored: true, line: 41, severity: 'blocker', category: 'apiContract', confidence: 94, title: 'Console reads old field', body: 'The old field remains.', code: 'data.expiry', cross: true, spans: [{ repoId: '9103', location: 'src/routes/session.ts:88', role: 'renames the field' }, { repoId: '9210', location: 'src/api/session.ts:41', role: 'reads the old field' }] },
+    { id: 'console-b', repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', anchored: true, line: 42, severity: 'minor', category: 'apiContract', confidence: 80, title: 'Missing compatibility test', body: 'Add a test.', code: 'expect(expiry)' },
   ],
   verdicts: {
     gateway: { verdict: 'accepted', applyFix: false },
@@ -20,13 +20,17 @@ const review: Review = {
   },
 };
 
+const memberCandidates = (repoId: string) => (file: string) => review.items
+  .filter((item) => item.repoId === repoId && item.file === file)
+  .map((item) => ({ line: item.line, text: item.code }));
+
 describe('changeset submission', () => {
   it('completes when the platform refuses the verdict, instead of retrying forever', async () => {
     // Neither GitHub nor GitLab lets an author request changes on their own
     // change request. Treating that as retryable never reports complete, so
     // the flow is stuck while every comment is already live on the platform.
     const plans = buildChangesetSubmitPlans(review, [
-      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' } },
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, candidatesFor: memberCandidates('9103') },
     ], 'Agent', 'you', 'Summary.', true, true);
     const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
       comments: submission.comments.map((c) => ({ key: c.key, ok: true, threadId: `thread-${c.key}` })),
@@ -51,7 +55,7 @@ describe('changeset submission', () => {
 
   it('still retries a verdict that failed for an ordinary reason', async () => {
     const plans = buildChangesetSubmitPlans(review, [
-      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' } },
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, candidatesFor: memberCandidates('9103') },
     ], 'Agent', 'you', 'Summary.', true, true);
     const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
       comments: submission.comments.map((c) => ({ key: c.key, ok: true, threadId: `t-${c.key}` })),
@@ -67,8 +71,8 @@ describe('changeset submission', () => {
 
   it('routes comments by owning MR and retries only missing operations', async () => {
     const plans = buildChangesetSubmitPlans(review, [
-      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, projectLabel: 'hve/platform/gateway' },
-      { ref: { repoId: '9210', number: '1509' }, anchorRefs: { head: 'console' }, projectLabel: 'hve/platform/console' },
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, candidatesFor: memberCandidates('9103'), projectLabel: 'hve/platform/gateway' },
+      { ref: { repoId: '9210', number: '1509' }, anchorRefs: { head: 'console' }, candidatesFor: memberCandidates('9210'), projectLabel: 'hve/platform/console' },
     ], 'HVE Core / PR Review', 'you', 'Combined summary.', true, true);
     expect(plans[0]?.submission.comments.map((comment) => comment.key)).toEqual(['gateway']);
     expect(plans[1]?.submission.comments.map((comment) => comment.key)).toEqual(['console-a', 'console-b']);
@@ -96,5 +100,117 @@ describe('changeset submission', () => {
     const retrySubmission = submitReview.mock.calls[2]?.[1];
     expect(retrySubmission?.comments.map((comment) => comment.key)).toEqual(['console-b']);
     expect(second.state.summaryRefs).toEqual(['9103!381', '9210!1509']);
+  });
+
+  it('resolves identical paths against each changeset member own added lines', () => {
+    const memberReview: Review = {
+      ...review,
+      items: [
+        { ...review.items[0]!, id: 'repo-a', repoId: 'repo-a', crNumber: '1', file: 'src/shared.ts', line: 10, code: 'shared();' },
+        { ...review.items[0]!, id: 'repo-b', repoId: 'repo-b', crNumber: '2', file: 'src/shared.ts', line: 10, code: 'shared();' },
+      ],
+      verdicts: {
+        'repo-a': { verdict: 'accepted', applyFix: false },
+        'repo-b': { verdict: 'accepted', applyFix: false },
+      },
+    };
+    const plans = buildChangesetSubmitPlans(memberReview, [
+      {
+        ref: { repoId: 'repo-a', number: '1' },
+        anchorRefs: { head: 'a' },
+        candidatesFor: () => [{ line: 21, text: 'shared();' }],
+      },
+      {
+        ref: { repoId: 'repo-b', number: '2' },
+        anchorRefs: { head: 'b' },
+        candidatesFor: () => [{ line: 34, text: 'shared();' }],
+      },
+    ], 'Agent', 'you', 'Summary.', false, false);
+
+    expect(plans.map((plan) => plan.submission.comments[0]?.anchor.line)).toEqual([21, 34]);
+    expect(plans.flatMap((plan) => plan.withheld)).toEqual([]);
+  });
+
+  it('includes only each member accepted unanchored and withheld findings in its summary', () => {
+    const memberSummaryReview: Review = {
+      ...review,
+      items: [
+        {
+          ...review.items[0]!,
+          id: 'attachment-a',
+          repoId: 'repo-a',
+          crNumber: '1',
+          file: 'docs/context-a.md',
+          anchored: false,
+          line: 4,
+          code: 'attachment context',
+          title: 'Attachment-only A',
+        },
+        {
+          ...review.items[0]!,
+          id: 'lost-a',
+          repoId: 'repo-a',
+          crNumber: '1',
+          file: 'src/shared.ts',
+          line: 999,
+          code: 'hallucinatedA();',
+          title: 'Lost anchored A',
+        },
+        {
+          ...review.items[0]!,
+          id: 'attachment-b',
+          repoId: 'repo-b',
+          crNumber: '2',
+          file: 'docs/context-b.md',
+          anchored: false,
+          line: 8,
+          code: 'other attachment context',
+          title: 'Attachment-only B',
+        },
+        {
+          ...review.items[0]!,
+          id: 'lost-b',
+          repoId: 'repo-b',
+          crNumber: '2',
+          file: 'src/other.ts',
+          line: 888,
+          code: 'hallucinatedB();',
+          title: 'Lost anchored B',
+        },
+      ],
+      verdicts: {
+        'attachment-a': { verdict: 'accepted', applyFix: false },
+        'lost-a': { verdict: 'accepted', applyFix: false },
+        'attachment-b': { verdict: 'accepted', applyFix: false },
+        'lost-b': { verdict: 'accepted', applyFix: false },
+      },
+    };
+    const plans = buildChangesetSubmitPlans(memberSummaryReview, [
+      {
+        ref: { repoId: 'repo-a', number: '1' },
+        anchorRefs: { head: 'a' },
+        candidatesFor: () => [{ line: 21, text: 'realAddedLine();' }],
+      },
+      {
+        ref: { repoId: 'repo-b', number: '2' },
+        anchorRefs: { head: 'b' },
+        candidatesFor: () => [{ line: 34, text: 'otherAddedLine();' }],
+      },
+    ], 'Agent', 'you', 'Summary.', false, false);
+
+    expect(plans[0]?.submission.comments).toEqual([]);
+    expect(plans[1]?.submission.comments).toEqual([]);
+    expect(plans[0]?.withheld.map((item) => item.id)).toEqual(['lost-a']);
+    expect(plans[1]?.withheld.map((item) => item.id)).toEqual(['lost-b']);
+    const repoASummary = plans[0]?.submission.summary ?? '';
+    const repoBSummary = plans[1]?.submission.summary ?? '';
+    expect(repoASummary).toContain('projectId=repo-a mrIid=1 file=src/shared.ts:999');
+    expect(repoBSummary).toContain('projectId=repo-b mrIid=2 file=src/other.ts:888');
+    expect(repoASummary.match(/Attachment-only A/g)).toHaveLength(1);
+    expect(repoASummary.match(/Lost anchored A/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Attachment-only B/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Lost anchored B/g)).toHaveLength(1);
+    expect(repoASummary).not.toMatch(/Attachment-only B|Lost anchored B/);
+    expect(repoBSummary).not.toMatch(/Attachment-only A|Lost anchored A/);
   });
 });

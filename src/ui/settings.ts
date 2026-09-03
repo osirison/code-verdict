@@ -20,6 +20,24 @@ import {
 import { AppSurface, type AppRoute } from './appSurface';
 import { getProvider } from '../platform/registry';
 import { cap } from './vocab';
+import {
+  readContextBudgets,
+  readContextSourceDefaults,
+  readContextUsageEnabled,
+} from './contextOptions';
+
+const CONTEXT_BUDGET_KEYS = {
+  sectionBudget: 'context.sectionBudget',
+  totalBudget: 'context.totalBudget',
+  maxLinkedItems: 'context.maxLinkedItems',
+} as const;
+
+const CONTEXT_TOGGLE_KEYS = {
+  includeTitle: 'context.includeTitle',
+  includeDescription: 'context.includeDescription',
+  includeLinkedItems: 'context.includeLinkedItems',
+  usageEnabled: 'contextUsage.enabled',
+} as const;
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -125,6 +143,8 @@ export class SettingsPanel {
   private buildState(pod: { providerId: string; instanceUrl: string }): SettingsViewState {
     const config = vscode.workspace.getConfiguration('codeVerdict');
     const vocabulary = getProvider(pod.providerId).vocabulary;
+    const contextBudgets = readContextBudgets();
+    const contextSources = readContextSourceDefaults();
     return {
       vocabulary,
       instanceUrl: pod.instanceUrl,
@@ -134,6 +154,11 @@ export class SettingsPanel {
       quietMode: config.get<boolean>('notifications.quietMode', false),
       digestCadence: config.get<SettingsViewState['digestCadence']>('notifications.digestCadence', 'End of day'),
       shareRates: config.get<boolean>('shareAcceptRejectRates', false),
+      context: {
+        ...contextBudgets,
+        ...contextSources,
+        usageEnabled: readContextUsageEnabled(),
+      },
       agentLocations: this.agentLocations,
       notifications: NOTIFICATION_EVENTS.map((event) => ({
         key: event.key,
@@ -230,6 +255,20 @@ export class SettingsPanel {
         await config.update('notifications.digestCadence', message.value, vscode.ConfigurationTarget.Global);
         this.paint(['set-notifications', 'set-json']);
         return;
+      case 'setContextBudget': {
+        const key = CONTEXT_BUDGET_KEYS[message.key];
+        if (!key || !Number.isInteger(message.value) || message.value <= 0) return;
+        await config.update(key, message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-context', 'set-json']);
+        return;
+      }
+      case 'setContextToggle': {
+        const key = CONTEXT_TOGGLE_KEYS[message.key];
+        if (!key || typeof message.value !== 'boolean') return;
+        await config.update(key, message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-context', 'set-json']);
+        return;
+      }
       case 'setShareRates':
         await config.update('shareAcceptRejectRates', message.value, vscode.ConfigurationTarget.Global);
         this.paint(['set-privacy', 'set-json']);

@@ -198,6 +198,27 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     expect(panel.webview.html).not.toContain('connection failed');
   });
 
+  it('a context setting patches only context and JSON without running live checks', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+    world.testConnection.mockClear();
+    world.discoverAgents.mockClear();
+
+    handlers.message?.({ type: 'setContextBudget', key: 'sectionBudget', value: 6000 });
+    await flush();
+
+    expect(world.testConnection).not.toHaveBeenCalled();
+    expect(world.discoverAgents).not.toHaveBeenCalled();
+    expect(configBacking.get('context.sectionBudget')).toBe(6000);
+    const posted = lastPosted();
+    expect(Object.keys(posted.regions).sort()).toEqual(['set-context', 'set-json']);
+    expect(posted.regions['set-context']).toContain('data-context-budget="sectionBudget" type="number" min="1" step="1" value="6000"');
+    expect(posted.regions['set-json']).toContain('&quot;codeVerdict.context.sectionBudget&quot;: 6000');
+  });
+
   it('the explicit re-test control does call testConnection, and only then does the status change', async () => {
     const { deps } = makeDeps();
     const { SettingsPanel } = await import('./settings.js');
@@ -217,7 +238,7 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     // remaining path that picks up a config edit made outside this page
     // while it was already open (see `testLiveState`'s comment).
     expect(Object.keys(posted.regions).sort()).toEqual(
-      ['set-agents', 'set-connection', 'set-json', 'set-notifications', 'set-privacy'].sort(),
+      ['set-agents', 'set-connection', 'set-context', 'set-json', 'set-notifications', 'set-privacy'].sort(),
     );
     expect(posted.regions['set-connection']).toContain('connection failed');
   });

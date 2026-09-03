@@ -18,6 +18,7 @@ import { pruneClosedRetained } from './app/retainedReview';
 import { RunStatusGate } from './app/runStatusGate';
 import { runDemoAgent } from './app/demoAgent';
 import { runDemoChangesetAgent } from './app/combinedAgent';
+import { revalidateAttachments } from './app/attachments';
 import { runLmAgent, runLmChangesetAgent } from './app/lmAgent';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
@@ -38,6 +39,7 @@ import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
+import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -130,17 +132,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               input.target.diff,
               input.criteria,
               input.target.reviewContext,
-              options,
+              {
+                ...options,
+                attachments: input.target.attachments,
+                contextBudgets: input.contextBudgets,
+                effort: input.effort,
+                workspaceRootLabel: input.target.workspaceRootLabel,
+              },
             )
-          : runLmChangesetAgent(input.agent, input.modelId ?? '', input.target.members, input.criteria, options),
-      demo: (input: RunInput) =>
-        input.target.kind === 'cr'
-          ? runDemoAgent(input.target.diff, input.criteria)
-          : runDemoChangesetAgent(
-              input.target.members,
-              input.criteria,
-              tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
-            ),
+          : runLmChangesetAgent(input.agent, input.modelId ?? '', input.target.members, input.criteria, {
+              ...options,
+              contextBudgets: input.contextBudgets,
+              effort: input.effort,
+            }),
+      demo: async (input: RunInput) => {
+        if (input.target.kind === 'cr') {
+          const validated = await revalidateAttachments(input.target.attachments ?? []);
+          return {
+            ...runDemoAgent(input.target.diff, input.criteria, {
+              attachments: validated.attachments,
+              workspaceRootLabel: input.target.workspaceRootLabel,
+            }),
+            attachmentWarnings: validated.warnings,
+          };
+        }
+        const validated = await Promise.all(input.target.members.map(async (member) => {
+          const result = await revalidateAttachments(member.attachments ?? []);
+          return { member: { ...member, attachments: result.attachments }, warnings: result.warnings };
+        }));
+        return {
+          ...runDemoChangesetAgent(
+            validated.map((result) => result.member),
+            input.criteria,
+            tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
+          ),
+          attachmentWarnings: validated.flatMap((result) => result.warnings),
+        };
+      },
     },
     onChange: (record) => {
       // The run list and the status-bar count read live run state, so one
@@ -696,7 +724,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(id, (arg?: unknown) => {
-        if (!ReviewFlowPanel.handleCommand(id, arg)) ChangesetReviewPanel.handleCommand(id, arg);
+        routeToActiveReviewCommand(id, arg, [
+          {
+            isActive: () => ReviewFlowPanel.isCommandTargetActive(),
+            handle: (command, value) => ReviewFlowPanel.handleCommand(command, value),
+          },
+          {
+            isActive: () => ChangesetReviewPanel.isCommandTargetActive(),
+            handle: (command, value) => ChangesetReviewPanel.handleCommand(command, value),
+          },
+        ]);
       }),
     );
   }
@@ -710,6 +747,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'Verdict keys — A accept · ⇧A comment-only · R reject · S skip · J/K move · 1–4 severity · U undo. Open any Verdict screen for the full map.',
         );
       }
+    }),
+    vscode.commands.registerCommand(INTERNAL_COMMANDS.addContext, () => {
+      routeToActiveReviewCommand(INTERNAL_COMMANDS.addContext, undefined, [
+        {
+          isActive: () => ReviewFlowPanel.isCommandTargetActive(),
+          handle: (command, value) => ReviewFlowPanel.handleCommand(command, value),
+        },
+        {
+          isActive: () => ChangesetReviewPanel.isCommandTargetActive(),
+          handle: (command, value) => ChangesetReviewPanel.handleCommand(command, value),
+        },
+      ]);
     }),
     vscode.commands.registerCommand(INTERNAL_COMMANDS.showNotifications, () =>
       void notifier.showPending(),

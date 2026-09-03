@@ -46,4 +46,40 @@ describe('demo agent', () => {
     expect(steps[1]).toMatch(/Indexing \d+ changed files \(\+\d+ −\d+\)/);
     expect(steps[4]).toMatch(/\d+ items ready/);
   });
+
+  it('uses the host root qualification for every model-visible changed-file path', async () => {
+    const diff = await flagshipDiff();
+    const result = runDemoAgent(diff, DEFAULT_CRITERIA, { workspaceRootLabel: 'api' });
+    expect(result.response.items.every((item) => item.file.startsWith('api/'))).toBe(true);
+  });
+
+  it('inspects post-budget attachment lines through manifest validation and marks them summary-only', async () => {
+    const diff = await flagshipDiff();
+    const result = runDemoAgent(diff, {
+      ...DEFAULT_CRITERIA,
+      severityFloor: 'nit',
+      minConfidence: 0,
+      categories: [...DEFAULT_CRITERIA.categories, 'apiContract', 'docs', 'style'],
+    }, {
+      attachments: [{
+        id: 'schema',
+        kind: 'file',
+        label: 'schema.ts',
+        path: 'api/config/schema.ts',
+        content: 'mode: strict\nunsafe: true',
+        truncated: false,
+        evidence: [{
+          path: 'api/config/schema.ts',
+          range: { startLine: 10, endLine: 11 },
+          contentStart: 0,
+          contentEnd: 25,
+        }],
+      }],
+    });
+
+    const attachmentItem = result.response.items.find((item) => item.id.startsWith('dem_attachment_'));
+    expect(attachmentItem).toMatchObject({ file: 'api/config/schema.ts', anchored: false });
+    expect([10, 11]).toContain(attachmentItem?.line);
+    expect(() => JSON.stringify(result.response)).not.toThrow();
+  });
 });
