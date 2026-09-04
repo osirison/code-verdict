@@ -94,9 +94,9 @@
 
 - [x] 10.1 Define and parse the bounded model protocol for plan creation/revision, plan-item transitions, public rationale, tool requests, candidate submissions, checkpoint suggestions, and completion requests.
 - [ ] 10.2 Replace raw final-response parsing in the review path with phase-specific typed turns and bounded protocol repair; keep follow-up questions outside the review harness unless separately specified.
-- [ ] 10.3 Implement `HarnessAttempt` phase transitions for bootstrap/inventory, planning, risk classification, logical-unit investigation, checkpoint, synthesis, verification/contradiction/deduplication, host validation, and persistence.
-- [ ] 10.4 Reuse the selected model and persona across planning, investigation, synthesis, and verification by default, preserving phase-specific contracts and budgets without requiring another model.
-- [ ] 10.5 Implement the small-review fast path as fewer turns through the same plan, evidence, coverage, verification, completion, activity, and persistence machinery.
+- [x] 10.3 Implement `HarnessAttempt` phase transitions for bootstrap/inventory, planning, risk classification, logical-unit investigation, checkpoint, synthesis, verification/contradiction/deduplication, host validation, and persistence.
+- [x] 10.4 Reuse the selected model and persona across planning, investigation, synthesis, and verification by default, preserving phase-specific contracts and budgets without requiring another model.
+- [x] 10.5 Implement the small-review fast path as fewer turns through the same plan, evidence, coverage, verification, completion, activity, and persistence machinery.
 - [ ] 10.6 Implement deterministic synthesis grouping and deduplication by primary location and semantic claim, followed by model contradiction checks against exact cited evidence.
 - [ ] 10.7 Implement a deterministic demo participant that emits the same protocol and uses the same tools, evidence, coverage, completion, activity, cancellation, and persistence path without a model request.
 - [ ] 10.8 Ensure built-in, discovered, demo, individual, changeset, initial, and rerun entry points can invoke only the universal harness in shipped runtime wiring.
