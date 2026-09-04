@@ -9,6 +9,7 @@ import {
   type HarnessModelSeam,
   type SynthesisVerificationRunner,
 } from './harnessAttempt';
+import { createSynthesisVerification } from './harnessSynthesisVerification';
 import type { AgentCancellationToken } from './lmAgent';
 import { createBudgetTracker } from './harnessBudgets';
 import { DEFAULT_RISK_FLOOR_RULES } from './harnessRiskFloors';
@@ -575,6 +576,117 @@ describe('HarnessAttempt.run (10.3 phase transitions)', () => {
     expect(planningCalls).toHaveLength(2);
     expect(result.activityLog.events.some((e) => e.kind === 'toolFailed' && e.tool === 'modelTurn')).toBe(true);
     expect(result.outcome.limitations.some((l) => l.code === 'noPlan')).toBe(true);
+  });
+});
+
+describe('HarnessAttempt.run (10.9: candidate flow — invalid citation blocks completion)', () => {
+  it('a finding whose cited evidence fails post-verification revalidation is dropped, not counted as retained, and blocks a complete verdict', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    // Simulates a citation that becomes unresolvable by the time synthesis/verification hands
+    // back its findings (e.g. a tampered/drifted digest) — every verification pass reports
+    // complete, isolating the effect to the host's own post-verification citation revalidation
+    // (`revalidateFindings`, called from `harnessAttempt.ts`'s `runSynthesisVerification`), never
+    // to a stage the collaborator itself failed to run.
+    const tamperingVerification: SynthesisVerificationRunner = async (input) => ({
+      findings: input.findings.map((finding) => ({
+        ...finding,
+        evidence: { ...finding.evidence, primary: { ...finding.evidence.primary, digest: '0'.repeat(64) } },
+      })),
+      contradictionPassComplete: true,
+      deduplicationComplete: true,
+      finalVerificationComplete: true,
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: tamperingVerification }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.outcome.completeness).not.toBe('complete');
+    // The invalidated finding is not silently kept as if it were still valid.
+    expect(result.findings).toHaveLength(0);
+    expect(result.outcome.limitations.some((l) => l.code === 'invalidCitations')).toBe(true);
+  });
+});
+
+describe('HarnessAttempt.run (10.9: the real 10.6 collaborator, end to end — a skipped stage refuses the gate, a genuinely completed one does not)', () => {
+  it('a contradiction stage that never gets a parseable verdict leaves contradictionPassComplete false end to end, and the gate refuses a complete verdict', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      // The first three calls are the real collaborator's contradiction check (1 initial ask +
+      // `protocolRepairsPerPhase` (2) repairs, all unparseable); the next two are the phase loop's
+      // own turn: a completion request the host must refuse, then a stop.
+      verifying: ['not parseable as a verdict', 'still not parseable', 'never parseable', COMPLETION_TURN, STOP_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.outcome.completeness).not.toBe('complete');
+    expect(result.outcome.limitations.some((l) => l.code === 'contradictionPending')).toBe(true);
+    // Not silently dropped: the unconfirmed finding is kept (a verification-machinery failure is
+    // not grounds to discard an already-validated finding), so this is a truthful partial, not a
+    // bare failure with nothing to show.
+    expect(result.findings).toHaveLength(1);
+    expect(result.outcome.kind).toBe('partialFindings');
+  });
+
+  it('a contradiction stage that genuinely runs and contradicts the only finding removes it and reaches a complete clean outcome', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const respondToVerifyingCall: ScriptEntry = (call) => {
+      if (call.repairInstruction === undefined) return COMPLETION_TURN;
+      const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+      if (!match) throw new Error(`unexpected verifying repairInstruction shape: ${call.repairInstruction}`);
+      return JSON.stringify({ candidateId: match[1], contradicted: true, reason: 'Contradicted by evidence two lines up.' });
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [respondToVerifyingCall],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.kind).toBe('completeClean');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.findings).toHaveLength(0);
   });
 });
 

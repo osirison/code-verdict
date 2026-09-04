@@ -97,10 +97,10 @@
 - [x] 10.3 Implement `HarnessAttempt` phase transitions for bootstrap/inventory, planning, risk classification, logical-unit investigation, checkpoint, synthesis, verification/contradiction/deduplication, host validation, and persistence.
 - [x] 10.4 Reuse the selected model and persona across planning, investigation, synthesis, and verification by default, preserving phase-specific contracts and budgets without requiring another model.
 - [x] 10.5 Implement the small-review fast path as fewer turns through the same plan, evidence, coverage, verification, completion, activity, and persistence machinery.
-- [ ] 10.6 Implement deterministic synthesis grouping and deduplication by primary location and semantic claim, followed by model contradiction checks against exact cited evidence.
-- [ ] 10.7 Implement a deterministic demo participant that emits the same protocol and uses the same tools, evidence, coverage, completion, activity, cancellation, and persistence path without a model request.
+- [x] 10.6 Implement deterministic synthesis grouping and deduplication by primary location and semantic claim, followed by model contradiction checks against exact cited evidence.
+- [x] 10.7 Implement a deterministic demo participant that emits the same protocol and uses the same tools, evidence, coverage, completion, activity, cancellation, and persistence path without a model request.
 - [ ] 10.8 Ensure built-in, discovered, demo, individual, changeset, initial, and rerun entry points can invoke only the universal harness in shipped runtime wiring.
-- [ ] 10.9 Test malformed protocol and repair limits, plan revision, same-model phases, fast-path invariants, candidate flow, contradiction, deduplication, demo parity, and absence of a one-shot bypass.
+- [x] 10.9 Test malformed protocol and repair limits, plan revision, same-model phases, fast-path invariants, candidate flow, contradiction, deduplication, demo parity, and absence of a one-shot bypass.
 
 ## 11. Checkpoint Persistence And Resume
 

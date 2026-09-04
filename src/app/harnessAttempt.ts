@@ -201,12 +201,20 @@ export interface SynthesisVerificationInput {
   readonly elapsedMs: () => number;
 }
 
+/** One finding the contradiction pass excluded, with a bounded public reason — task 10.6's collaborator (`./harnessSynthesisVerification.ts`) populates this so a contradicted finding is recorded, never silently dropped; the honest no-op default below and any collaborator that skips the stage simply omit it. */
+export interface ContradictedFindingRecord {
+  readonly candidateId: string;
+  readonly reason: string;
+}
+
 export interface SynthesisVerificationOutput {
   /** The findings that survive grouping/deduplication/contradiction; a default pass-through implementation returns `input.findings` unchanged. */
   readonly findings: readonly ValidatedFinding[];
   readonly contradictionPassComplete: boolean;
   readonly deduplicationComplete: boolean;
   readonly finalVerificationComplete: boolean;
+  /** Optional: findings the contradiction pass excluded, each with why. Absent from the honest no-op default and from any collaborator that does not run a contradiction pass. */
+  readonly contradicted?: readonly ContradictedFindingRecord[];
 }
 
 export type SynthesisVerificationRunner = (input: SynthesisVerificationInput) => Promise<SynthesisVerificationOutput>;

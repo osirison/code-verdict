@@ -175,6 +175,62 @@ function detectedAttachmentLines(rendered: RenderedAttachments): AttachmentLine[
   return [...detected.values()];
 }
 
+/**
+ * Deterministic candidate findings for one file's added lines, given its
+ * `newPath`-qualified `filePath`, the composite/head sha the seed is drawn
+ * from, and the file's own unified-diff patch text. Extracted out of
+ * {@link runDemoAgent}'s per-file loop (task 10.7 of
+ * `add-agentic-review-harness`) so the deterministic demo participant can
+ * reuse the exact same finding logic one file at a time, from just that
+ * file's own patch bytes (its `readDiff` tool result) — never from a whole
+ * `ChangeRequestDiff` object it was never given. `sequenceStart` is the
+ * running item-sequence counter a caller already owns (kept solely for id
+ * uniqueness across files, matching `runDemoAgent`'s original behavior
+ * exactly); a fresh caller with no running counter may pass `0`.
+ */
+export function demoFindingsForFile(headSha: string, filePath: string, patch: string, sequenceStart: number): ReviewItem[] {
+  const anchors = addedLines(patch);
+  if (anchors.length === 0) return [];
+  // Deterministic per file: which anchors get findings, and which template.
+  const seed = hash(`${headSha}:${filePath}`);
+  const take = Math.min(anchors.length, 1 + (seed % 2));
+  const used = new Set<number>();
+  const items: ReviewItem[] = [];
+  let sequence = sequenceStart;
+  for (let i = 0; i < take; i++) {
+    // Distinct anchors per file — step patterns can collide when the
+    // anchor count divides the stride.
+    let index = (seed + i * 7) % anchors.length;
+    while (used.has(index)) index = (index + 1) % anchors.length;
+    used.add(index);
+    const anchor = anchors[index];
+    if (!anchor) continue;
+    const template = TEMPLATES[(seed + i) % TEMPLATES.length] as Template;
+    // Unsigned shift — a signed one goes negative for high hashes and
+    // drags every confidence under the floor.
+    const confidence = 58 + ((seed >>> (4 + i)) % 40);
+    const snippet = anchor.text.trim();
+    items.push({
+      id: `dem_${hash(`${filePath}:${anchor.line}`).toString(16)}_${sequence++}`,
+      file: filePath,
+      anchored: true,
+      line: anchor.line,
+      severity: template.severity,
+      category: template.category,
+      confidence,
+      title: template.title(snippet),
+      body: template.body,
+      code: snippet,
+      suggestion:
+        template.suggest && template.suggest(snippet) !== snippet
+          ? { old: snippet, new: template.suggest(snippet) }
+          : undefined,
+      answers: { ...template.answers },
+    });
+  }
+  return items;
+}
+
 export function runDemoAgent(
   diff: ChangeRequestDiff,
   criteria: Criteria,
@@ -212,44 +268,9 @@ export function runDemoAgent(
 
   for (const file of diff.files) {
     const filePath = modelVisiblePath(file.newPath, options.workspaceRootLabel);
-    const anchors = addedLines(file.diff);
-    if (anchors.length === 0) continue;
-    // Deterministic per file: which anchors get findings, and which template.
-    const seed = hash(`${diff.headSha}:${filePath}`);
-    const take = Math.min(anchors.length, 1 + (seed % 2));
-    const used = new Set<number>();
-    for (let i = 0; i < take; i++) {
-      // Distinct anchors per file — step patterns can collide when the
-      // anchor count divides the stride.
-      let index = (seed + i * 7) % anchors.length;
-      while (used.has(index)) index = (index + 1) % anchors.length;
-      used.add(index);
-      const anchor = anchors[index];
-      if (!anchor) continue;
-      const template = TEMPLATES[(seed + i) % TEMPLATES.length] as Template;
-      // Unsigned shift — a signed one goes negative for high hashes and
-      // drags every confidence under the floor.
-      const confidence = 58 + ((seed >>> (4 + i)) % 40);
-      const snippet = anchor.text.trim();
-      const item: ReviewItem = {
-        id: `dem_${hash(`${filePath}:${anchor.line}`).toString(16)}_${sequence++}`,
-        file: filePath,
-        anchored: true,
-        line: anchor.line,
-        severity: template.severity,
-        category: template.category,
-        confidence,
-        title: template.title(snippet),
-        body: template.body,
-        code: snippet,
-        suggestion:
-          template.suggest && template.suggest(snippet) !== snippet
-            ? { old: snippet, new: template.suggest(snippet) }
-            : undefined,
-        answers: { ...template.answers },
-      };
-      recordItem(item);
-    }
+    const fileFindings = demoFindingsForFile(diff.headSha, filePath, file.diff, sequence);
+    sequence += fileFindings.length;
+    for (const item of fileFindings) recordItem(item);
   }
 
   for (const line of detectedAttachmentLines(renderedAttachments)) {
