@@ -407,10 +407,41 @@ export interface ReviewRunManagerDeps {
   now?: () => number;
   /** Injected so a legacy-adapted demo walk's step pauses do not make a test wait for them. */
   delay?: (ms: number) => Promise<void>;
+  /**
+   * How long `cancel()` waits, once cancellation has reached a dispatched
+   * attempt, for that attempt's own cancelled result to settle the record
+   * before this module gives up on it and settles with none itself (see
+   * `armCancelGrace`). Defaults to a real production-sized window — a test
+   * that means to exercise the fallback overrides `cancelGrace` below with a
+   * deterministic stand-in rather than actually waiting out this many
+   * milliseconds.
+   */
+  cancelGraceMs?: number;
+  /**
+   * The sleep `armCancelGrace` waits on, deliberately its own injection
+   * point rather than a reuse of `delay` above: `delay` paces the
+   * legacy-adapted demo walk, and every test's default resolves it at once
+   * (so a step-by-step walk does not make a test actually wait) — sharing
+   * that default here would let the grace timer race ahead of, and discard,
+   * the very findings this exists to keep, on every single cancellation in
+   * every test that has no interest in the timeout at all. Defaults to a
+   * real `setTimeout`.
+   */
+  cancelGrace?: (ms: number) => Promise<void>;
 }
 
 /** How long a legacy-adapted demo walk pauses on each step (see `legacyRunnersToHarnessFactory`). */
 const DEMO_STEP_MS = 320;
+
+/**
+ * `cancel()`'s own bounded wait — see `ReviewRunManagerDeps.cancelGraceMs`.
+ * Long enough that a cooperative attempt's own settlement (which always
+ * reaches the record first when the attempt actually answers — see
+ * `armCancelGrace`) has every realistic chance to arrive before this does;
+ * short enough that an attempt which truly never answers does not strand the
+ * record in `cancelling` for the rest of the session.
+ */
+const DEFAULT_CANCEL_GRACE_MS = 30_000;
 
 /**
  * A cancellation source with no `vscode` in it. `streamText` takes the
@@ -817,6 +848,8 @@ export class ReviewRunManager {
   private readonly harnessRunStore: HarnessRunStore;
   /** Always a real `ReviewHarnessFactory` by the time the constructor returns — `deps.runners`'s legacy shape, if that is what was injected, is normalized once here (see `legacyRunnersToHarnessFactory`). Nothing past this point branches on which one was supplied. */
   private readonly harnessFactory: ReviewHarnessFactory;
+  /** Resolved once here from `deps.cancelGrace` — see `armCancelGrace`. */
+  private readonly cancelGrace: (ms: number) => Promise<void>;
 
   constructor(private readonly deps: ReviewRunManagerDeps) {
     this.runs = new ReviewRunStore(deps.globalState);
@@ -827,6 +860,7 @@ export class ReviewRunManager {
           delay: (ms) => this.deps.delay?.(ms) ?? new Promise((resolve) => setTimeout(resolve, ms)),
         })
       : deps.runners;
+    this.cancelGrace = deps.cancelGrace ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   private now(): number {
@@ -896,26 +930,94 @@ export class ReviewRunManager {
   }
 
   /**
-   * Stop a run. A queued one never reaches the transport at all; a running,
-   * waiting, paused or resuming one always crosses the observable
-   * `cancelling` state on the way to `cancelled` (spec
-   * `background-review-runs`), and its cancellation token — if this key ever
-   * held one — is triggered regardless of which of those states it is in,
-   * because a `waiting` attempt's underlying call is still alive in the
-   * background even though its slot has already been released.
+   * Stop a run. A queued one never reached the transport at all — nothing
+   * will ever report back for it, so it settles as `cancelled` at once, the
+   * same as always. Every other nonterminal state (running, waiting, paused,
+   * resuming) instead crosses the observable `cancelling` state and *stays*
+   * there (spec `background-review-runs`): this call does not itself settle
+   * the record. What settles it is the dispatched attempt's own cancelled
+   * result, arriving through the normal `executeAttempt` ->
+   * `completeAttempt` -> `settle` path — the same path a failure already
+   * uses (D11: "cancellation may preserve already validated findings only as
+   * partial"). The old synchronous settle here used to beat that result to
+   * the record every time, discarding findings the attempt had already
+   * validated; letting the attempt answer for itself is the whole fix.
+   *
+   * Two things do not wait for that answer, though, and both happen
+   * synchronously, right here:
+   * - **The concurrency slot.** Task 12.4's published guarantee — the next
+   *   queued run must not wait for a provider or model to notice it was
+   *   asked to stop.
+   * - **The cancellation token**, if this key ever held one — triggered
+   *   regardless of which state it is in, because a `waiting` or `paused`
+   *   attempt's underlying call is still alive in the background even though
+   *   its slot has already been released (see the file header: no seam this
+   *   pass drives can genuinely suspend a live attempt).
+   *
+   * A provider or model that ignores the token entirely (design.md's own
+   * named risk) must still not strand the record in `cancelling` forever —
+   * `armCancelGrace` below is the bounded fallback for exactly that.
    */
   cancel(key: string): void {
     const record = this.records.get(key);
-    if (!record || isTerminalLifecycle(record.lifecycle)) return;
+    if (!record || isTerminalLifecycle(record.lifecycle) || record.lifecycle === 'cancelling') return;
     if (record.lifecycle === 'queued' || record.lifecycle === 'resuming') {
       this.queue = this.queue.filter((queued) => queued !== key);
     }
+    // Whatever slot this key currently holds — only an active phase ever
+    // does, per `slotHolders`'s own doc comment — is released right now,
+    // before anything downstream of a live attempt gets a chance to run.
+    if (this.slotHolders.delete(key)) this.running = Math.max(0, this.running - 1);
+    // A registered cancellation is exactly "this key was actually
+    // dispatched" (`executeAttempt` is the only place one is created, and
+    // only a terminal `settle` ever removes it) — the same distinction the
+    // token call below already needs.
+    const dispatched = this.cancellations.has(key);
     // The token stops the request: that is what makes the tokens stop being
     // spent. A no-op for a state that was never dispatched (queued) or whose
     // dispatch never got a token (a runner with no live call at all) —
     // `RunCancellation`'s own `cancel` is itself idempotent.
     this.cancellations.get(key)?.cancel();
-    this.settle(record, { lifecycle: 'cancelled' });
+    if (!dispatched) {
+      // Never reached the transport — nothing will ever report back, so
+      // there is nothing to wait for. `settle` releases nothing here (the
+      // slot was never held) and pumps the queue on the way out.
+      this.settle(record, { lifecycle: 'cancelled' });
+      return;
+    }
+    // Every nonterminal source has a direct edge to `cancelling`
+    // (`buildLegalRunTransitions`'s own table) — `applied` is defensive, not
+    // a real failure path.
+    if (!this.transition(record, 'cancelling')) return;
+    this.pump();
+    this.armCancelGrace(key);
+  }
+
+  /**
+   * The bounded wait behind `cancel()`'s `cancelling` state. A cooperative
+   * attempt — harness-backed or legacy-adapted — settles the record itself,
+   * through `executeAttempt`'s ordinary success/catch handling, well before
+   * this ever fires; see `cancel`'s own doc comment. This exists for the one
+   * risk design.md names directly: a provider or model that never notices
+   * the cancellation token at all. When that happens, the record settles as
+   * `cancelled` with no findings — the same shape `executeAttempt`'s own
+   * catch-block cancellation already produces for a runner that rejects
+   * outright, just reached by a different route.
+   *
+   * Guarded on the record still being `cancelling` when the wait ends: a
+   * cooperative attempt's own settlement is what usually gets there first,
+   * and this must never overwrite it. `settle`'s own terminal-refusal guard
+   * (task 12.4) would refuse a stale settlement anyway, but checking first
+   * also skips it for the ordinary case rather than relying on that guard
+   * alone.
+   */
+  private armCancelGrace(key: string): void {
+    const graceMs = this.deps.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
+    void this.cancelGrace(graceMs).then(() => {
+      const record = this.records.get(key);
+      if (!record || record.lifecycle !== 'cancelling') return;
+      this.settle(record, { lifecycle: 'cancelled' });
+    });
   }
 
   /**
@@ -1142,12 +1244,20 @@ export class ReviewRunManager {
       await this.completeAttempt(key, result);
     } catch (error) {
       if (!this.isSettleable(key)) return;
+      const current = this.records.get(key)!;
       const failure = asRunFailure(error, record.input.timeouts);
-      if (failure === 'cancelled') {
-        this.settle(this.records.get(key)!, { lifecycle: 'cancelled' });
+      // A genuine crash (not the cancellation-token rejection convention
+      // itself) arriving after the reviewer already asked this run to stop:
+      // `cancelling`'s only legal edge is to `cancelled`
+      // (`buildLegalRunTransitions`), so settling this as `failed` would
+      // silently no-op and strand the record. A rejection carries no
+      // findings either way, so this settles exactly like a cooperative
+      // cancellation with none.
+      if (failure === 'cancelled' || current.lifecycle === 'cancelling') {
+        this.settle(current, { lifecycle: 'cancelled' });
         return;
       }
-      this.settle(this.records.get(key)!, { lifecycle: 'failed', failure });
+      this.settle(current, { lifecycle: 'failed', failure });
     }
   }
 
@@ -1256,7 +1366,7 @@ export class ReviewRunManager {
    * matching what `legacyRunnersToHarnessFactory` also reports, rather than
    * a fabricated bucket.
    */
-  private async completeAttempt(key: string, result: HarnessAttemptResult): Promise<void> {
+  private async completeAttempt(key: string, rawResult: HarnessAttemptResult): Promise<void> {
     // An entry guard of its own, not only reliance on `executeAttempt`'s own
     // pre-call check: this keeps "never touch storage for a record that
     // is not settleable" a property of this method itself, provable without
@@ -1264,6 +1374,31 @@ export class ReviewRunManager {
     if (!this.isSettleable(key)) return;
     const record = this.records.get(key)!;
     const { input } = record;
+    // The reviewer already asked this run to stop (the record is already
+    // `cancelling`) before this result arrived. `cancelling`'s only legal
+    // edge is to `cancelled` (`buildLegalRunTransitions`) — an attempt that
+    // ignores the cancellation token and reports `succeeded` or `failed`
+    // anyway must not settle as either below: `succeeded` would silently
+    // report a run the reviewer stopped as ready (retained review, run
+    // history, `onReviewReady`, all fired for real), and `failed` has no
+    // edge out of `cancelling` at all and would strand the record until
+    // `armCancelGrace`'s bounded fallback finally gives up on it. Reclassify
+    // it as a cancellation instead: whatever it validated is still kept, but
+    // only as a partial (D11), through exactly the same path below a
+    // genuinely cooperative cancellation already takes — never as a
+    // replacing success.
+    const result: HarnessAttemptResult =
+      record.lifecycle === 'cancelling' && rawResult.lifecycle !== 'cancelled'
+        ? {
+            ...rawResult,
+            lifecycle: 'cancelled',
+            outcome: {
+              ...rawResult.outcome,
+              completeness: rawResult.findings.length > 0 ? 'partial' : 'none',
+              replacesRetainedReview: false,
+            },
+          }
+        : rawResult;
     const items = result.findings.map((finding) => finding.item);
 
     if (result.lifecycle === 'succeeded') {

@@ -321,6 +321,13 @@ function manager(
     runners: { lm: async () => response(1), demo: () => ({ response: response(1), steps: [] }) },
     onChange: (record) => changes.push(record),
     delay: async () => {},
+    // Never resolves by default: a test that does not care about the cancel
+    // grace timeout must never have it race ahead of a live attempt's own
+    // cancelled result (see `reviewRunManager.ts`'s own doc comment on
+    // `ReviewRunManagerDeps.cancelGrace` for why sharing `delay`'s
+    // resolves-at-once default would do exactly that). Only the dedicated
+    // timeout test below overrides this with something that actually settles.
+    cancelGrace: () => new Promise<void>(() => {}),
     ...over,
   });
   return { runs, workspaceState, globalState, changes };
@@ -609,8 +616,167 @@ describe('cancellation', () => {
 
     runs.cancelForPod('pod-a');
 
+    // The token fires at once; '!1' itself only reaches `cancelling` here — it
+    // settles once its own cancelled result reports back (this legacy runner
+    // auto-rejects on the token, but only the `executeAttempt` catch that
+    // rejection resolves into is what actually moves the record on).
     expect(cancelled).toEqual(['!1']);
-    expect(runs.active().map((r) => r.input.podId)).toEqual(['pod-b']);
+    await vi.waitFor(() => expect(runs.active().map((r) => r.input.podId)).toEqual(['pod-b']));
+  });
+});
+
+describe('reviewer-initiated cancellation keeps validated findings (D11\'s cancellation MAY, resolved)', () => {
+  const PARTIAL_KEY = partialDraftKeyFor({ repoId: 'repo-1', number: '2841' });
+
+  it('cancelling a run with already-validated findings keeps them as a partial, explicitly marked incomplete, persisted before the notification fires', async () => {
+    const { pending, runners } = controllableAttempts();
+    const seenAtNotify: unknown[] = [];
+    const { runs, workspaceState } = manager({
+      runners,
+      onChange: (record) => {
+        if (record.status === 'cancelled') seenAtNotify.push(workspaceState.get(PARTIAL_KEY));
+      },
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    // The reviewer's cancel does not itself settle the record — it moves to
+    // `cancelling` and waits for the dispatched attempt's own answer.
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    // The attempt reports back with whatever it had already validated before
+    // the cancellation reached it.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+    await vi.waitFor(() => expect(seenAtNotify).toHaveLength(1));
+
+    // Write-before-notify: the durable partial was already there the moment
+    // a listener reacted to the cancelled notification — the same discipline
+    // the failed path's own durable write already keeps.
+    expect(seenAtNotify[0]).toBeDefined();
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Never the target's retained review — a cancelled run never replaces a
+    // complete one, partial or not (D11).
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('cancelling a run with no findings yet settles as cancelled with no partial written', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 0));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('an attempt that ignores cancellation and never reports back settles as cancelled with no findings once the bounded timeout elapses, rather than staying in cancelling forever', async () => {
+    const { pending, runners } = controllableAttempts();
+    let expireGrace: (() => void) | undefined;
+    const { runs, workspaceState } = manager({
+      runners,
+      cancelGrace: () => new Promise<void>((resolve) => { expireGrace = resolve; }),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    // This fixture's attempt never resolves or rejects at all — nothing
+    // cooperative is coming. Only the bounded grace timeout moves the record
+    // on; firing it here stands in for real time actually elapsing.
+    expireGrace?.();
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+
+    // A late report, arriving after the grace timeout already gave up, must
+    // not resurrect or overwrite the record either — the same late-result
+    // guard (task 12.4) that protects every other terminal settlement.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(runs.get(record.key)).toBeUndefined();
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  // `cancelling`'s only legal edge is to `cancelled` (`buildLegalRunTransitions`).
+  // The three tests below prove every other shape a dispatched attempt can still
+  // report — a plain crash, a `failed` result, or a `succeeded` one, each from an
+  // attempt that never actually noticed the cancellation token — is reclassified
+  // as a cancellation rather than settling illegally (silently stranding the
+  // record in `cancelling` until `armCancelGrace`'s fallback) or, worse for the
+  // `succeeded` case, reporting a run the reviewer stopped as done.
+
+  it('a plain crash arriving after the reviewer cancelled settles promptly as cancelled, without waiting on the grace timeout', async () => {
+    const { pending, runners } = controllableAttempts();
+    // The default `cancelGrace` never resolves — settling promptly here
+    // proves this path does not depend on it at all.
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.reject(new Error('boom'));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  it('a failed result with validated findings, arriving after the reviewer cancelled, still keeps them as a partial rather than stranding the record', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('a succeeded result from an attempt that ignored cancellation is never reported as success — it settles cancelled, keeping findings only as a partial', async () => {
+    const { pending, runners } = controllableAttempts();
+    const ready: unknown[] = [];
+    const { runs, globalState, workspaceState } = manager({
+      runners,
+      onReviewReady: (info) => ready.push(info),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    // No "review ready" notification, and no retained review written — the
+    // reviewer cancelled this run; it must not silently report as done.
+    expect(ready).toHaveLength(0);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    // What the model validated before the manager stopped listening for a
+    // success is still kept — as a partial, exactly like any other cancellation.
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Run history records this as a partial outcome too, never as a clean
+    // success — the succeeded branch's own 'findings'/'clean' write never runs.
+    expect(new ReviewRunStore(globalState).list()).toEqual([
+      expect.objectContaining({ outcome: 'partial', findingCount: 2 }),
+    ]);
   });
 });
 
@@ -1054,7 +1220,7 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     await vi.waitFor(() => expect(runs.active().some((r) => r.key === third.key && r.status === 'running')).toBe(true));
   });
 
-  it('cancellation from queued, active, waiting and paused each ends promptly and releases the slot at once', async () => {
+  it('cancellation from queued, active, waiting and paused each releases the slot at once, without waiting on the attempt', async () => {
     const { started, cancelled, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
@@ -1084,13 +1250,28 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     runs.cancel(pausedRun.key);
     runs.cancel(activeRun.key);
 
-    expect(runs.active()).toHaveLength(0);
+    // 'q' never reached the transport at all — nothing will ever report back
+    // for it, so it settles at once, exactly as before this pass.
+    expect(runs.get(queuedRun.key)).toBeUndefined();
+    // 'w', 'p' and 'a' each had a live dispatch: cancelling them crosses into
+    // `cancelling` and *stays* there — settling as `cancelled` is now the
+    // dispatched attempt's own cancelled result to report (through the
+    // ordinary `executeAttempt` path), not something this call does
+    // synchronously. None of the three ever resolves in this test, so all
+    // three are still `cancelling` below; that they got there — and, more to
+    // the point, released their slot getting there — is what this test is
+    // actually about. See "cancelling a run with already-validated findings
+    // keeps them as a partial" below for the attempt actually reporting back.
+    expect(runs.get(waitingRun.key)?.lifecycle).toBe('cancelling');
+    expect(runs.get(pausedRun.key)?.lifecycle).toBe('cancelling');
+    expect(runs.get(activeRun.key)?.lifecycle).toBe('cancelling');
     // Only the three that ever held a live dispatch had a token to stop;
     // the queued run never made a request at all.
     expect(cancelled).toEqual(['!w', '!p', '!a']);
     expect(started).toEqual(['!w', '!p', '!a']);
 
-    // The slot cancelling 'a' released is usable at once.
+    // The slot cancelling 'a' released is usable at once — released
+    // synchronously by `cancel()` itself, not by 'a' actually finishing.
     runs.trigger(crInput('fresh'), 1);
     expect(started).toContain('!fresh');
   });
@@ -1139,14 +1320,30 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
 describe('task 12.4: late model/provider work cannot settle an already-terminal attempt', () => {
   it('a late success arriving after cancellation does not overwrite the cancelled state or write a retained review', async () => {
     const { pending, runners } = unresponsiveRunner();
-    const { runs, workspaceState } = manager({ runners });
+    let expireGrace: (() => void) | undefined;
+    const { runs, workspaceState } = manager({
+      runners,
+      // This fixture never reacts to the cancellation token at all — nothing
+      // will ever settle the record on its own, so the bounded grace timer
+      // `cancel()` arms is what has to. Triggered explicitly below, rather
+      // than left to the default (never-resolving) stand-in.
+      cancelGrace: () => new Promise<void>((resolve) => { expireGrace = resolve; }),
+    });
 
     const record = runs.trigger(crInput('2841'), 3);
     runs.cancel(record.key);
-    expect(runs.get(record.key)).toBeUndefined();
+    // Cancelling a dispatched run no longer settles it synchronously — see
+    // "cancelling a run with already-validated findings keeps them as a
+    // partial" below for the path where the attempt actually answers. This
+    // fixture's attempt never will, so the grace timer is what eventually
+    // settles it.
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+    expireGrace?.();
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
 
     // Arrives late; this fixture, unlike `controllableRunners`, never reacted
-    // to the cancellation token at all.
+    // to the cancellation token at all, and now arrives even later than the
+    // grace timer that gave up waiting on it.
     pending.get('!2841')!.resolve(response(3));
     await new Promise((resolve) => setTimeout(resolve, 10));
 
