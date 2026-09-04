@@ -49,7 +49,7 @@ function envelopeInput(overrides: Partial<BuildBootstrapEnvelopeInput> = {}): Bu
     effort: 'medium',
     effortInstruction: 'Review effort instruction: reason through the diff before reporting.',
     contextDeclaration: 'Auto-context: title, description. No explicit attachments.',
-    rootPolicy: { present: false },
+    rootPolicies: [{ memberId: 'm1', source: { present: false } }],
     toolContractVersion: '1',
     harnessPolicyVersion: '1',
     memberSections: [memberSections],
@@ -124,9 +124,27 @@ describe('buildBootstrapEnvelope (task 6.4)', () => {
 
   it('carries the composed AGENTS.md policy text as authoritative, not untrusted', () => {
     const envelope = buildBootstrapEnvelope(envelopeInput({
-      rootPolicy: { present: true, sourceId: 'agents-policy:base-1:.', digest: 'p1', text: 'Never log secrets.' },
+      rootPolicies: [{ memberId: 'm1', source: { present: true, sourceId: 'agents-policy:base-1:.', digest: 'p1', text: 'Never log secrets.' } }],
     }));
-    expect(envelope.authoritative.rootPolicy.text).toBe('Never log secrets.');
+    expect(envelope.authoritative.rootPolicies).toEqual([
+      { memberId: 'm1', source: { present: true, sourceId: 'agents-policy:base-1:.', digest: 'p1', text: 'Never log secrets.' } },
+    ]);
+  });
+
+  it('carries a distinct root policy per member, never collapsed to one member\'s identity (task 15.1)', () => {
+    const envelope = buildBootstrapEnvelope(envelopeInput({
+      members: [
+        { memberId: 'core', repoId: 'repo-core', baseSha: 'base-core', headSha: 'head-core' },
+        { memberId: 'billing', repoId: 'repo-billing', baseSha: 'base-billing', headSha: 'head-billing' },
+      ],
+      rootPolicies: [
+        { memberId: 'core', source: { present: true, sourceId: 'agents-policy:base-core:.', digest: 'core-digest', text: 'Core policy.' } },
+        { memberId: 'billing', source: { present: false } },
+      ],
+    }));
+    const byMember = new Map(envelope.authoritative.rootPolicies.map((entry) => [entry.memberId, entry.source]));
+    expect(byMember.get('core')).toEqual({ present: true, sourceId: 'agents-policy:base-core:.', digest: 'core-digest', text: 'Core policy.' });
+    expect(byMember.get('billing')).toEqual({ present: false });
   });
 });
 

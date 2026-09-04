@@ -13,6 +13,8 @@ import {
 import { createSynthesisVerification } from './harnessSynthesisVerification';
 import type { AgentCancellationToken } from './lmAgent';
 import { createBudgetTracker } from './harnessBudgets';
+import { sha256Hex } from './contentDigest';
+import type { Attachment } from './reviewContext';
 import { DEFAULT_RISK_FLOOR_RULES } from './harnessRiskFloors';
 import type { DispatcherRetryResumingInfo, DispatcherRetryWaitInfo, HostToolResult } from './harnessToolDispatcher';
 import { normalizeHarnessPolicy, HARNESS_POLICY_VERSION, type HarnessPolicy } from '../domain/harnessPolicy';
@@ -1037,5 +1039,217 @@ describe('HarnessAttempt.run (9.6: a long retry delay moves through waiting to r
     expect(last.coverage.inspected).toBe(1);
     expect(last.coverage.classified).toBe(1);
     expect(last.coverage.total).toBe(1);
+  });
+});
+
+// ---- 15.1/15.2/15.3: explicit attachments become citable evidence for individual runs -----
+
+function snapshotWithAttachments(declared: readonly { attachmentId: string; label: string; contentDigest: string }[]): ReviewRunSnapshot {
+  return testSnapshot({
+    members: [
+      {
+        memberId: 'm1',
+        providerId: 'fixture',
+        instanceUrl: 'https://example.test',
+        ref: { repoId: SNAPSHOT_REF.repoId, number: '42' },
+        baseSha: SNAPSHOT_REF.baseSha,
+        headSha: SNAPSHOT_REF.headSha,
+        providerCapabilitySignature: 'sig-1',
+        rootAgentsPolicy: { present: false },
+        context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: declared },
+      },
+    ],
+  });
+}
+
+function memberWithAttachments(connection: Connection, attachments: readonly Attachment[]): HarnessAttemptMemberInput {
+  return { memberId: 'm1', connection, capabilities: fullCapabilities(), attachments };
+}
+
+function outcomeFor(results: readonly HostToolResult[], candidateId: string): { state: string; reasons: readonly string[] } | undefined {
+  for (const result of results) {
+    if (result.state === 'complete' && result.content.tool === 'submitCandidateFinding' && result.content.candidateId === candidateId) {
+      return result.content.outcome;
+    }
+  }
+  return undefined;
+}
+
+describe('HarnessAttempt.run (15.1/15.2: an explicit attachment becomes citable only once bootstrap actually returns it to the model)', () => {
+  it('a candidate may cite an out-of-diff attachment once bootstrap registers it, and the finding routes to the summary', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const attachmentContent = 'export function computeTotal() {\n  return 1;\n}\n';
+    const attachment: Attachment = {
+      id: 'att-1',
+      kind: 'file',
+      label: 'billing/total.ts',
+      path: 'billing/total.ts',
+      content: attachmentContent,
+      truncated: false,
+      evidence: [{ path: 'billing/total.ts', range: { startLine: 1, endLine: 3 }, contentStart: 0, contentEnd: attachmentContent.length }],
+    };
+    const snapshot = snapshotWithAttachments([{ attachmentId: 'att-1', label: 'billing/total.ts', contentDigest: sha256Hex(attachmentContent) }]);
+
+    let attachmentRef: { sourceId: string; digest: string } | undefined;
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [
+        () => {
+          if (!attachmentRef) throw new Error('attachment was not registered by the time investigating started');
+          return messages(candidateSubmissionMessage('cand-att-1', 'billing/total.ts', attachmentRef));
+        },
+        STOP_TURN,
+      ],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [memberWithAttachments(connection, [attachment])],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        const found = info.evidenceSources.find((source) => source.origin === 'attachment');
+        if (found) attachmentRef = { sourceId: found.sourceId, digest: found.digest };
+      },
+    });
+
+    const result = await attempt.run();
+
+    expect(attachmentRef).toBeDefined();
+    expect(result.findings).toHaveLength(1);
+    const finding = result.findings[0]!;
+    expect(finding.routing).toBe('summary'); // 'billing/total.ts' is not among the changed files
+    expect(finding.evidence.primary.origin).toBe('attachment');
+    expect(finding.evidence.primary.sourceId).toBe(attachmentRef!.sourceId);
+  });
+
+  it('a candidate citing an attachment path that is also a changed file routes inline (15.3 survives citation validation)', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const attachmentContent = 'line one\nline two\n';
+    const attachment: Attachment = {
+      id: 'att-1',
+      kind: 'file',
+      label: 'file1.ts',
+      path: 'file1.ts',
+      content: attachmentContent,
+      truncated: false,
+      evidence: [{ path: 'file1.ts', range: { startLine: 1, endLine: 2 }, contentStart: 0, contentEnd: attachmentContent.length }],
+    };
+    const snapshot = snapshotWithAttachments([{ attachmentId: 'att-1', label: 'file1.ts', contentDigest: sha256Hex(attachmentContent) }]);
+
+    let attachmentRef: { sourceId: string; digest: string } | undefined;
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [
+        () => {
+          // 'file1.ts' is already known as a changed path from bootstrap's manifest paging (D3/13.5),
+          // independent of whether investigation has read its diff yet.
+          if (!attachmentRef) throw new Error('attachment was not registered by the time investigating started');
+          return messages(candidateSubmissionMessage('cand-att-2', 'file1.ts', attachmentRef));
+        },
+        STOP_TURN,
+      ],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [memberWithAttachments(connection, [attachment])],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        const found = info.evidenceSources.find((source) => source.origin === 'attachment');
+        if (found) attachmentRef = { sourceId: found.sourceId, digest: found.digest };
+      },
+    });
+
+    const result = await attempt.run();
+
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]!.routing).toBe('inline');
+    expect(result.findings[0]!.evidence.primary.origin).toBe('attachment');
+  });
+
+  it('a candidate citing a line the budgeting truncated away is rejected, while a candidate citing the visible prefix of the same attachment is accepted', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const lineCount = 5_000;
+    const attachmentContent = Array.from({ length: lineCount }, (_, index) => `line ${String(index + 1).padStart(4, '0')}`).join('\n');
+    expect(attachmentContent.length).toBeGreaterThan(30_000); // comfortably over the default attachment budget
+    const attachment: Attachment = {
+      id: 'att-1',
+      kind: 'file',
+      label: 'notes/big.md',
+      path: 'notes/big.md',
+      content: attachmentContent,
+      truncated: false,
+      evidence: [{ path: 'notes/big.md', range: { startLine: 1, endLine: lineCount }, contentStart: 0, contentEnd: attachmentContent.length }],
+    };
+    const snapshot = snapshotWithAttachments([{ attachmentId: 'att-1', label: 'notes/big.md', contentDigest: sha256Hex(attachmentContent) }]);
+
+    let attachmentRef: { sourceId: string; digest: string } | undefined;
+    let submissionResults: readonly HostToolResult[] = [];
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [
+        () => {
+          if (!attachmentRef) throw new Error('attachment was not registered by the time investigating started');
+          return messages(
+            { kind: 'candidateSubmission', candidate: {
+              candidateId: 'cand-visible',
+              memberId: 'm1',
+              file: 'notes/big.md',
+              line: 1,
+              endLine: 1,
+              severity: 'major',
+              category: 'craftsmanship',
+              confidence: 80,
+              title: 'Visible finding',
+              body: 'Cites the visible prefix.',
+              citations: { primary: { sourceId: attachmentRef.sourceId, digest: attachmentRef.digest, path: 'notes/big.md', range: { startLine: 1, endLine: 1 } } },
+            } },
+            { kind: 'candidateSubmission', candidate: {
+              candidateId: 'cand-invisible',
+              memberId: 'm1',
+              file: 'notes/big.md',
+              line: lineCount,
+              endLine: lineCount,
+              severity: 'major',
+              category: 'craftsmanship',
+              confidence: 80,
+              title: 'Invisible finding',
+              body: 'Cites a line budgeting truncated away.',
+              citations: { primary: { sourceId: attachmentRef.sourceId, digest: attachmentRef.digest, path: 'notes/big.md', range: { startLine: lineCount, endLine: lineCount } } },
+            } },
+          );
+        },
+        (call) => {
+          submissionResults = call.toolResults;
+          return STOP_TURN;
+        },
+      ],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [memberWithAttachments(connection, [attachment])],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        const found = info.evidenceSources.find((source) => source.origin === 'attachment');
+        if (found) attachmentRef = { sourceId: found.sourceId, digest: found.digest };
+      },
+    });
+
+    const result = await attempt.run();
+
+    expect(result.findings.map((finding) => finding.candidateId)).toEqual(['cand-visible']);
+    const invisibleOutcome = outcomeFor(submissionResults, 'cand-invisible');
+    expect(invisibleOutcome?.state).toBe('rejected');
+    expect(invisibleOutcome?.reasons.some((reason) => reason.includes('rangeOutsideEvidence') || reason.includes('pathMismatch'))).toBe(true);
   });
 });

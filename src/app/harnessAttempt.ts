@@ -61,17 +61,33 @@
  *   `await`ed to a definite result before the turn loop continues; there is
  *   no pending/queued fetch state for `UnresolvedWork.unresolvedFetches` to
  *   count.
- * - *Bootstrap `rootPolicy`* is built from `snapshot.members[i].rootAgentsPolicy`
+ * - *Bootstrap `rootPolicies`* is built from `snapshot.members[i].rootAgentsPolicy`
  *   (already resolved into the immutable snapshot, D3) rather than a fresh
  *   `resolvePolicy` dispatch: `resolvePolicy`'s `allowedPhases` does not
  *   include `bootstrap` (`harnessTools.ts`), so a bootstrap-phase dispatch of
  *   it would be refused `phaseNotAllowed`. `BootstrapPolicySource.text` is
- *   optional, so the envelope is honest either way.
+ *   optional, so the envelope is honest either way. One entry is built per
+ *   member (task 15.1) — an earlier version of this function collapsed the
+ *   whole envelope to `options.members[0]`'s policy alone, silently dropping
+ *   every other changeset member's root `AGENTS.md` identity from bootstrap.
  * - *Issue-detail bootstrap sections are never fetched.* `getIssueDetails`
  *   needs an explicit `issueRepoId`, which
  *   `ReviewRunContextSelections.linkedItemIdsIncluded` does not carry (only
  *   numbers). Bootstrap ships change-request sections only; `issueDetails`
  *   is always `[]`.
+ * - *Explicit attachments become citable in `runBootstrap`, not earlier.*
+ *   `renderAttachmentsForModel` (`reviewContext.ts`) is called once per
+ *   member to build both the bootstrap `attachments` section (task 15.2's
+ *   record of exactly what is shown) and the ledger registration input —
+ *   the same budgeted/truncated bytes, never recomputed twice. Registration
+ *   happens only after `fitBootstrapToModel` reports `ok: true`: a bootstrap
+ *   that overflows never asks the model anything, so nothing was returned
+ *   and nothing may become citable. Auto-derived title/body/discussion needs
+ *   no separate registration call: it already reaches the ledger through
+ *   `fetchMemberSections` -> `registerChangeRequestDetail`/`registerIssueDetail`,
+ *   whose origins sit outside `CITABLE_ORIGINS` by construction (task 7.4) —
+ *   a second `registerIntent` of the same bytes would just double-book the
+ *   evidence-byte budget for content already correctly non-citable.
  *
  * **No `vscode` import, nothing from `src/providers/`.** The model call
  * arrives as the injected `modelSeam`; the provider arrives as an injected
@@ -146,10 +162,13 @@ import {
   type HostToolRetryOptions,
 } from './harnessToolDispatcher';
 import { runHarnessTurn, type AskModel as PhaseAskModel } from './harnessTurn';
+import { renderAttachmentsForModel, type Attachment } from './reviewContext';
 import {
   buildBootstrapEnvelope,
   buildBootstrapSection,
+  type BootstrapAttachmentSection,
   type BootstrapMemberIdentity,
+  type BootstrapMemberRootPolicy,
   type BootstrapMemberSections,
   type BootstrapPolicySource,
 } from '../domain/harnessBootstrap';
@@ -315,11 +334,22 @@ export type OnPersist = (outcome: HarnessAttemptOutcome, log: ActivityLog) => vo
  * a live `Connection` and the full `ProviderCapabilities` it was signed
  * from. Never resolved from `src/providers/` here — the caller (runtime
  * wiring, task 10.8) owns that lookup.
+ *
+ * `attachments` is the *content* side of this member's explicit citable
+ * evidence (task 15.2): the snapshot (`ReviewRunContextSelections.attachments`)
+ * pins only each attachment's id, label, and content digest — D3's snapshot
+ * never carries mutable content — so the full `Attachment` (with its actual
+ * bytes) travels here instead, exactly mirroring how `ReviewRunSnapshotMemberInput`
+ * separates the two (`reviewRunSnapshotBuilder.ts`). Absent for a member with
+ * no explicit attachments. The caller must pass the *same* content used to
+ * build the snapshot; `ledger.registerAttachment`'s digest check (D3/D8) is
+ * what catches drift between the two, not this module.
  */
 export interface HarnessAttemptMemberInput {
   readonly memberId: string;
   readonly connection: Connection;
   readonly capabilities: ProviderCapabilities;
+  readonly attachments?: readonly Attachment[];
 }
 
 export interface HarnessAttemptOptions {
@@ -1013,15 +1043,70 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       .join(' | ');
   }
 
-  function rootPolicyFor(): BootstrapPolicySource {
-    const first = options.members[0];
-    if (!first) return { present: false };
-    const resolved = snapshotMember(first.memberId).rootAgentsPolicy;
-    // `text` is optional on `BootstrapPolicySource`: the snapshot (D3) carries only identity
-    // (sourceId/digest), never content, and `resolvePolicy` is not bootstrap-legal (its
-    // `allowedPhases` excludes `bootstrap`, `harnessTools.ts`) — presence/identity is honest
-    // without a fresh fetch here.
-    return resolved.present ? { present: true, sourceId: resolved.sourceId, digest: resolved.digest } : { present: false };
+  /** One `AGENTS.md` root-policy identity per member (task 15.1 fix — see the file header). */
+  function rootPoliciesFor(): readonly BootstrapMemberRootPolicy[] {
+    return options.members.map((member): BootstrapMemberRootPolicy => {
+      const resolved = snapshotMember(member.memberId).rootAgentsPolicy;
+      // `text` is optional on `BootstrapPolicySource`: the snapshot (D3) carries only identity
+      // (sourceId/digest), never content, and `resolvePolicy` is not bootstrap-legal (its
+      // `allowedPhases` excludes `bootstrap`, `harnessTools.ts`) — presence/identity is honest
+      // without a fresh fetch here.
+      const source: BootstrapPolicySource = resolved.present
+        ? { present: true, sourceId: resolved.sourceId, digest: resolved.digest }
+        : { present: false };
+      return { memberId: member.memberId, source };
+    });
+  }
+
+  interface PendingAttachmentRegistration {
+    readonly memberId: string;
+    readonly attachment: Attachment;
+    readonly expectedDigest: string;
+  }
+
+  /**
+   * Renders this member's explicit attachments exactly once (task 15.2:
+   * `renderAttachmentsForModel` is the single computation of "what the model
+   * is shown" — the bootstrap section below and the ledger registration
+   * both read the same budgeted result, so they cannot drift from each
+   * other). Returns the bootstrap-envelope section (always) and the
+   * registration work (only for attachments the snapshot actually declared
+   * for this member — an input attachment with no matching declaration is
+   * never registered, and is reported as a limitation rather than silently
+   * dropped, matching the `bootstrapDetailUnavailable` precedent above).
+   */
+  function attachmentSectionsFor(member: HarnessAttemptMemberInput): {
+    readonly sections: readonly BootstrapAttachmentSection[];
+    readonly pending: readonly PendingAttachmentRegistration[];
+  } {
+    const originals = member.attachments ?? [];
+    if (originals.length === 0) return { sections: [], pending: [] };
+    const rendered = renderAttachmentsForModel(originals);
+    const declaredAttachments = snapshotMember(member.memberId).context.attachments;
+    const sections: BootstrapAttachmentSection[] = [];
+    const pending: PendingAttachmentRegistration[] = [];
+    for (const budgeted of rendered.attachments) {
+      sections.push({ id: budgeted.id, label: budgeted.label, path: budgeted.path, content: budgeted.content, truncated: budgeted.truncated });
+      const original = originals.find((candidate) => candidate.id === budgeted.id);
+      const declared = declaredAttachments.find((candidate) => candidate.attachmentId === budgeted.id);
+      if (!original || !declared) {
+        extraLimitations.push({
+          code: 'attachmentNotDeclared',
+          message: `Attachment ${budgeted.id} for member ${member.memberId} was supplied to the attempt but is not declared in the run snapshot; it will not become citable.`,
+        });
+        continue;
+      }
+      // `registerAttachment` (D3/D8) hashes `attachment.content` against the snapshot's digest of
+      // the *full* pre-budget content, then uses `visibleContentLength` to bound what is citable —
+      // so the object passed here keeps the original's full content and only carries budgeting's
+      // computed truncation forward, never the budgeted (marker-appended) content itself.
+      pending.push({
+        memberId: member.memberId,
+        attachment: { ...original, truncated: budgeted.truncated, visibleContentLength: budgeted.visibleContentLength },
+        expectedDigest: declared.contentDigest,
+      });
+    }
+    return { sections, pending };
   }
 
   async function fetchMemberSections(member: HarnessAttemptMemberInput): Promise<BootstrapMemberSections> {
@@ -1096,7 +1181,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       return { memberId: member.memberId, repoId: snap.ref.repoId, baseSha: snap.baseSha, headSha: snap.headSha };
     });
     const memberSections: BootstrapMemberSections[] = [];
-    for (const member of options.members) memberSections.push(await fetchMemberSections(member));
+    const pendingAttachments: PendingAttachmentRegistration[] = [];
+    for (const member of options.members) {
+      const sections = await fetchMemberSections(member);
+      const attachmentWork = attachmentSectionsFor(member);
+      memberSections.push({ ...sections, attachments: attachmentWork.sections });
+      pendingAttachments.push(...attachmentWork.pending);
+    }
 
     const envelope = buildBootstrapEnvelope({
       members: memberIdentities,
@@ -1106,7 +1197,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       effort: snapshot.effort,
       effortInstruction: effortPrompt(snapshot.effort),
       contextDeclaration: buildContextDeclaration(),
-      rootPolicy: rootPolicyFor(),
+      rootPolicies: rootPoliciesFor(),
       toolContractVersion: snapshot.toolContractVersion,
       harnessPolicyVersion: snapshot.harnessPolicyVersion,
       memberSections,
@@ -1118,6 +1209,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       countTokens: options.countTokens ?? (async () => undefined),
     });
     if (!fit.ok) return { ok: false, limitation: fit.limitation };
+
+    // Task 15.2's citability boundary: an attachment becomes a citable ledger source only here,
+    // after the envelope carrying it is confirmed to actually fit the model — never earlier (an
+    // overflowing bootstrap makes no model request, so nothing in it was ever returned).
+    for (const entry of pendingAttachments) {
+      const outcome = ledger.registerAttachment(entry.memberId, entry.attachment, entry.expectedDigest);
+      if (!outcome.ok) {
+        extraLimitations.push({
+          code: 'attachmentRegistrationFailed',
+          message: `Attachment ${entry.attachment.id} for member ${entry.memberId} could not be registered as evidence: ${outcome.code}.`,
+        });
+      }
+    }
 
     for (const member of options.members) await pageManifestToExhaustion(member);
     appendActivity(coverageChangedFact(inventory, riskCoverageRules.requireInspection), 'bootstrap');

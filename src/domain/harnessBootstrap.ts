@@ -103,10 +103,32 @@ export function buildBootstrapSection(input: BuildBootstrapSectionInput): Bootst
   };
 }
 
+/**
+ * One explicit reviewer-selected attachment, rendered exactly as it is
+ * returned to the model (task 15.2, D8: "explicit citable attachments...
+ * bound to their snapshot digest"). `content` is the *post-budget* text —
+ * whatever `renderAttachmentsForModel` (`src/app/reviewContext.ts`) actually
+ * produced, truncation marker included when `truncated` is true — because
+ * this section exists to be an honest record of what the model was shown,
+ * the same role `changeRequestDetails.content` already plays for provider
+ * text. The app layer (`harnessAttempt.ts`) is the only place that both
+ * builds this section and registers the matching evidence-ledger source, so
+ * the two can never drift; this type alone does not guarantee that.
+ */
+export interface BootstrapAttachmentSection {
+  readonly id: string;
+  readonly label: string;
+  readonly path: string;
+  readonly content: string;
+  readonly truncated: boolean;
+}
+
 export interface BootstrapMemberSections {
   readonly memberId: string;
   readonly changeRequestDetails: BootstrapSection;
   readonly issueDetails: readonly BootstrapSection[];
+  /** Absent for a member with no explicit attachments; never absent-vs-empty-meaningfully otherwise. */
+  readonly attachments?: readonly BootstrapAttachmentSection[];
 }
 
 export interface BootstrapMemberIdentity {
@@ -143,6 +165,19 @@ export interface BootstrapPolicySource {
   readonly text?: string;
 }
 
+/**
+ * One member's own base-revision root `AGENTS.md` identity (task 15.1's
+ * member-ownership fix). Every member walks its *own* repository root, so a
+ * changeset envelope names one `BootstrapPolicySource` per member rather
+ * than one for the whole run — collapsing to a single value silently
+ * dropped every member but the first, which is exactly the bug this shape
+ * exists to make impossible to reintroduce.
+ */
+export interface BootstrapMemberRootPolicy {
+  readonly memberId: string;
+  readonly source: BootstrapPolicySource;
+}
+
 export interface BootstrapAuthoritative {
   readonly members: readonly BootstrapMemberIdentity[];
   readonly personaLabel: string;
@@ -152,7 +187,7 @@ export interface BootstrapAuthoritative {
   readonly effortInstruction: string;
   /** States which auto-context sources and attachments are present, so the model knows what is (and is not) citable — never the content itself. */
   readonly contextDeclaration: string;
-  readonly rootPolicy: BootstrapPolicySource;
+  readonly rootPolicies: readonly BootstrapMemberRootPolicy[];
   readonly toolCatalog: readonly BootstrapToolSchema[];
   readonly toolContractVersion: string;
   readonly harnessPolicyVersion: string;
@@ -176,7 +211,7 @@ export interface BuildBootstrapEnvelopeInput {
   effort: EffortLevel;
   effortInstruction: string;
   contextDeclaration: string;
-  rootPolicy: BootstrapPolicySource;
+  rootPolicies: readonly BootstrapMemberRootPolicy[];
   toolContractVersion: string;
   harnessPolicyVersion: string;
   memberSections: readonly BootstrapMemberSections[];
@@ -192,7 +227,7 @@ export function buildBootstrapEnvelope(input: BuildBootstrapEnvelopeInput): Boot
       effort: input.effort,
       effortInstruction: input.effortInstruction,
       contextDeclaration: input.contextDeclaration,
-      rootPolicy: input.rootPolicy,
+      rootPolicies: input.rootPolicies,
       toolCatalog: HOST_TOOL_CATALOG,
       toolContractVersion: input.toolContractVersion,
       harnessPolicyVersion: input.harnessPolicyVersion,

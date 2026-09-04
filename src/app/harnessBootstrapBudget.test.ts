@@ -38,7 +38,7 @@ function envelope(bodyLength = 200): BootstrapEnvelope {
     effort: 'medium',
     effortInstruction: 'Review effort instruction: reason through the diff before reporting.',
     contextDeclaration: 'Auto-context: title, description. No explicit attachments.',
-    rootPolicy: { present: false },
+    rootPolicies: [{ memberId: 'm1', source: { present: false } }],
     toolContractVersion: '1',
     harnessPolicyVersion: '1',
     memberSections: [memberSections],
