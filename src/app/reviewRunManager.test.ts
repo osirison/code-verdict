@@ -9,13 +9,20 @@ import {
   legacyStatusFor,
   sweepInterruptedRuns,
   type DemoRunResult,
+  type HarnessAttemptRunOptions,
+  type ReviewHarnessFactory,
   type RunInput,
   type RunRecord,
   type RunnerOptions,
   type RunStatus,
 } from './reviewRunManager';
+import type { CheckpointInfo, HarnessAttemptResult } from './harnessAttempt';
+import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
+import type { ValidatedFinding } from './harnessCandidateValidation';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { RUN_LIFECYCLES, type RunLifecycle } from '../domain/harnessLifecycle';
+import type { RunPhase } from '../domain/harnessActivity';
+import type { BudgetConsumption } from '../domain/harnessCoverage';
 import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { ChangeRequestDiff } from '../platform/types';
@@ -90,35 +97,33 @@ function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
   };
 }
 
-/** A runner whose every call is resolved by the test, one deferred per target. */
+/**
+ * A pre-harness `{lm, demo}` runner whose every call is resolved by the
+ * test, one deferred per target — exercised only through
+ * `legacyRunnersToHarnessFactory`'s adapter (`reviewRunManager.ts`), which is
+ * why `options` here is the narrow `RunnerOptions` shape with no
+ * checkpoint/waiting/resuming hooks (`extension.ts` still injects exactly
+ * this shape today). Tests that need those hooks use `controllableAttempts`
+ * below instead, which drives a real `ReviewHarnessFactory` directly.
+ */
 function controllableRunners() {
   const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
   const started: string[] = [];
   const cancelled: string[] = [];
   const progressOf = new Map<string, RunnerOptions['onProgress']>();
   const warningsOf = new Map<string, RunnerOptions['onAttachmentWarnings']>();
-  // Task 12.4/9.6: captures each call's `onEnterWaiting`/`onResuming` hooks so
-  // a test can simulate a harness-attempt-backed `lm` reporting a long
-  // backoff wait and its later resumption, the same way `progressOf`/
-  // `warningsOf` above already let a test simulate progress and warnings.
-  const waitingOf = new Map<string, NonNullable<RunnerOptions['onEnterWaiting']>>();
-  const resumingOf = new Map<string, NonNullable<RunnerOptions['onResuming']>>();
   return {
     started,
     cancelled,
     pending,
     progressOf,
     warningsOf,
-    waitingOf,
-    resumingOf,
     runners: {
       lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse> {
         const key = input.refLabel;
         started.push(key);
         progressOf.set(key, options.onProgress);
         warningsOf.set(key, options.onAttachmentWarnings);
-        if (options.onEnterWaiting) waitingOf.set(key, options.onEnterWaiting);
-        if (options.onResuming) resumingOf.set(key, options.onResuming);
         return new Promise<AgentReviewResponse>((resolve, reject) => {
           pending.set(key, { resolve, reject });
           options.cancellation.onCancellationRequested(() => {
@@ -133,6 +138,137 @@ function controllableRunners() {
       },
     },
   };
+}
+
+// ---- Task 12.1: a real `ReviewHarnessFactory`, driven directly ---------------------
+
+/** A minimal, all-zero `BudgetConsumption` — no test below reads it back. */
+const ZERO_BUDGET: BudgetConsumption = {
+  modelTurnsUsed: 0,
+  toolCallsUsed: 0,
+  evidenceBytesUsed: 0,
+  elapsedMs: 0,
+  highRiskReserveUsed: 0,
+  verificationReserveUsed: 0,
+};
+
+/** An activity log whose one event is tagged `phase` — enough for `reduceActivity` (inside `applyCheckpoint`) to derive the matching `RunLifecycle`. */
+function activityLogAt(phase: RunPhase, runId: string): CheckpointInfo['activityLog'] {
+  const log = createActivityLog(runId, runId, 1);
+  return appendActivityEvent(
+    log,
+    { kind: 'actionStarted', action: `Entering ${phase}` },
+    { occurredAt: new Date().toISOString(), phase, elapsedMs: 0 },
+  );
+}
+
+/** A `CheckpointInfo` reporting phase `phase` for `refLabel` — what a real attempt's `onCheckpoint` hands the manager. */
+function checkpointAt(phase: RunPhase, refLabel: string): CheckpointInfo {
+  return {
+    checkpointId: `ckpt-${refLabel}-${phase}`,
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    phase,
+    reason: 'phaseBoundary',
+    occurredAt: new Date().toISOString(),
+    elapsedMs: 0,
+    activityLog: activityLogAt(phase, refLabel),
+    evidenceSources: [],
+    candidates: [],
+    contradicted: [],
+    budget: ZERO_BUDGET,
+    coverage: [],
+    unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+  };
+}
+
+/** A terminal `HarnessAttemptResult` built from the same `response(...)` shape every other test already uses — `.item` is the only `ValidatedFinding` field `completeAttempt` ever reads (`reviewRunManager.ts`'s own note). */
+function succeededResult(itemCount: number, refLabel = 'run'): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'succeeded',
+    outcome: {
+      kind: itemCount > 0 ? 'completeFindings' : 'completeClean',
+      completeness: 'complete',
+      findingCount: itemCount,
+      limitations: [],
+      replacesRetainedReview: true,
+      clean: itemCount === 0,
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: false,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/** `itemCount > 0` produces a `partial` outcome with real findings (D11: "the run persists a partial result plus... limitation report") rather than a plain `none`-completeness failure. */
+function failedResult(message: string, refLabel = 'run', itemCount = 0): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'failed',
+    outcome: {
+      kind: itemCount > 0 ? 'partialFindings' : 'failed',
+      completeness: itemCount > 0 ? 'partial' : 'none',
+      findingCount: itemCount,
+      limitations: [{ code: 'harness.test', message }],
+      replacesRetainedReview: false,
+      clean: false,
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: false,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/**
+ * A `ReviewHarnessFactory` whose every attempt is driven entirely by the
+ * test: `pending.get(key)!.resolve(...)`/`.reject(...)` conclude `.run()`
+ * directly with a `HarnessAttemptResult` (or a thrown error, for the
+ * genuine-crash path `executeAttempt`'s `catch` still covers), and
+ * `optionsOf.get(key)!.onCheckpoint`/`.onEnterWaiting`/`.onResuming` invoke
+ * the exact hooks `HarnessAttemptRunOptions` exposes — task 12.1's real
+ * integration point, exercised directly rather than through the legacy
+ * `{lm, demo}` adapter, which has no such hooks.
+ */
+function controllableAttempts(): {
+  started: string[];
+  cancelled: string[];
+  pending: Map<string, { resolve(result: HarnessAttemptResult): void; reject(error: unknown): void }>;
+  optionsOf: Map<string, HarnessAttemptRunOptions>;
+  runners: ReviewHarnessFactory;
+} {
+  const pending = new Map<string, { resolve(result: HarnessAttemptResult): void; reject(error: unknown): void }>();
+  const optionsOf = new Map<string, HarnessAttemptRunOptions>();
+  const started: string[] = [];
+  const cancelled: string[] = [];
+  function build(input: RunInput, options: HarnessAttemptRunOptions) {
+    started.push(input.refLabel);
+    optionsOf.set(input.refLabel, options);
+    options.cancellation.onCancellationRequested(() => cancelled.push(input.refLabel));
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(input.refLabel, { resolve, reject });
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build };
+  return { started, cancelled, pending, optionsOf, runners };
 }
 
 function manager(
@@ -839,7 +975,7 @@ describe('task 12.3: the one validated transition path', () => {
 
 describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairness', () => {
   it('releases the slot on entering waiting, lets the next queued run start, and resumes without losing queue position', async () => {
-    const { started, pending, waitingOf, resumingOf, runners } = controllableRunners();
+    const { started, pending, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
     const first = runs.trigger(crInput('1'), 1); // limit 1: holds the only slot
@@ -847,9 +983,12 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     expect(started).toEqual(['!1']);
     expect(second.status).toBe('queued');
 
-    // '1' enters a long backoff wait — the slot is released at once, so '2'
+    // '1' reports a real checkpoint advancing it to `investigating`, then
+    // enters a long backoff wait — the slot is released at once, so '2'
     // starts even though '1' has not finished.
-    waitingOf.get('!1')!({ reason: 'A transient provider issue requires a longer wait.' });
+    optionsOf.get('!1')!.onCheckpoint(checkpointAt('investigating', '!1'));
+    expect(runs.get(first.key)?.lifecycle).toBe('investigating');
+    optionsOf.get('!1')!.onEnterWaiting!({ reason: 'A transient provider issue requires a longer wait.' });
     expect(runs.get(first.key)?.lifecycle).toBe('waiting');
     await vi.waitFor(() => expect(started).toEqual(['!1', '!2']));
 
@@ -863,30 +1002,32 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     const third = runs.trigger(crInput('3'), 1);
     expect(third.status).toBe('queued');
 
-    resumingOf.get('!1')!();
+    optionsOf.get('!1')!.onResuming!();
     expect(runs.get(first.key)?.lifecycle).toBe('resuming');
 
-    // '2' finishes, freeing the slot. '1' (resuming, original queuedAt) goes
-    // before '3' (queued after it) — original admission order, not FIFO by
-    // resume time.
-    pending.get('!2')!.resolve(response(0));
+    // '2' finishes, freeing the slot. '1' (resuming, original admission
+    // order) goes before '3' (queued after it) — original admission order,
+    // not FIFO by resume time.
+    pending.get('!2')!.resolve(succeededResult(0, '!2'));
     await vi.waitFor(() => expect(runs.get(first.key)?.lifecycle).toBe('investigating'));
-    // No second dispatch for '1': this pass's coarse lm/demo seam has no
-    // per-turn continuation to re-issue — the original call is still live.
+    // No second dispatch for '1': a resumed attempt's own continuation from
+    // checkpoint is task 12.7's job (a *lost* attempt across a restart) —
+    // within one still-live process, the original `.run()` call is still the
+    // one unresolved promise.
     expect(started).toEqual(['!1', '!2']);
     expect(runs.get(third.key)?.status).toBe('queued');
 
-    pending.get('!1')!.resolve(response(0));
+    pending.get('!1')!.resolve(succeededResult(0, '!1'));
     await vi.waitFor(() => expect(runs.active().some((r) => r.key === third.key && r.status === 'running')).toBe(true));
   });
 
   it('cancellation from queued, active, waiting and paused each ends promptly and releases the slot at once', async () => {
-    const { started, cancelled, waitingOf, runners } = controllableRunners();
+    const { started, cancelled, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
     // 'w' takes the only slot, then enters `waiting` (releasing it).
     const waitingRun = runs.trigger(crInput('w'), 1);
-    waitingOf.get('!w')!();
+    optionsOf.get('!w')!.onEnterWaiting!();
     expect(runs.get(waitingRun.key)?.lifecycle).toBe('waiting');
 
     // 'p' takes the freed slot, then is explicitly paused (releasing it again).
@@ -896,7 +1037,7 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
 
     // 'a' takes the slot and stays active.
     const activeRun = runs.trigger(crInput('a'), 1);
-    expect(runs.get(activeRun.key)?.lifecycle).toBe('investigating');
+    expect(runs.get(activeRun.key)?.lifecycle).toBe('planning');
 
     // 'q' finds the slot taken and queues behind it.
     const queuedRun = runs.trigger(crInput('q'), 1);
@@ -930,13 +1071,13 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     // slot alone. This does, chaining the same relay through both cases:
     // 'w' (waiting, released) -> 'b' (active) -> 'b' (paused, released) ->
     // 'c' (active, was queued) -> 'd' (queued).
-    const { started, waitingOf, runners } = controllableRunners();
+    const { started, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
     const waitingRun = runs.trigger(crInput('w'), 1); // takes the only slot
-    waitingOf.get('!w')!(); // enters `waiting`, releasing it
+    optionsOf.get('!w')!.onEnterWaiting!(); // enters `waiting`, releasing it
     const holder = runs.trigger(crInput('b'), 1); // takes the freed slot
-    expect(runs.get(holder.key)?.lifecycle).toBe('investigating');
+    expect(runs.get(holder.key)?.lifecycle).toBe('planning');
     const queuedBehindHolder = runs.trigger(crInput('c'), 1); // must stay queued
     expect(queuedBehindHolder.status).toBe('queued');
 
@@ -951,7 +1092,7 @@ describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairnes
     // queued — legitimately takes it.
     runs.pause(holder.key);
     expect(runs.get(holder.key)?.lifecycle).toBe('paused');
-    expect(runs.get(queuedBehindHolder.key)?.lifecycle).toBe('investigating');
+    expect(runs.get(queuedBehindHolder.key)?.lifecycle).toBe('planning');
     const queuedBehindNextHolder = runs.trigger(crInput('d'), 1); // must stay queued
     expect(queuedBehindNextHolder.status).toBe('queued');
 
@@ -980,32 +1121,55 @@ describe('task 12.4: late model/provider work cannot settle an already-terminal 
     expect(runs.get(record.key)).toBeUndefined();
   });
 
-  it('a late waiting/resuming signal arriving after failure does not move the failed record', async () => {
-    const { pending, waitingOf, resumingOf, runners } = controllableRunners();
+  it('a late waiting/resuming/checkpoint signal arriving after failure does not move the failed record', async () => {
+    const { pending, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
     const record = runs.trigger(crInput('2841'), 3);
-    pending.get('!2841')!.reject(Object.assign(new Error('boom'), { requestId: 'r1' }));
+    pending.get('!2841')!.reject(new Error('boom'));
     await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
 
-    // A stray hook call racing the rejection — the same seam that could have
-    // reported `onEnterWaiting` calling it (or `onResuming`) after the
+    // Stray hook calls racing the rejection — the same seam that could have
+    // reported a checkpoint, `onEnterWaiting`, or `onResuming` after the
     // promise it belonged to already settled the record.
-    waitingOf.get('!2841')?.();
-    resumingOf.get('!2841')?.();
+    optionsOf.get('!2841')!.onCheckpoint(checkpointAt('verifying', '!2841'));
+    optionsOf.get('!2841')!.onEnterWaiting!();
+    optionsOf.get('!2841')!.onResuming!();
 
     expect(runs.get(record.key)?.status).toBe('failed');
     expect(runs.get(record.key)?.lifecycle).toBe('failed');
+  });
+
+  it('a late success resolving after the manager already settled the attempt as failed does not overwrite it', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(new Error('crash'));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const finishedAt = runs.get(record.key)?.finishedAt;
+
+    // The same deferred cannot resolve twice, so this proves the guard the
+    // other way: `completeAttempt` itself refuses to move an already-failed
+    // record even when handed a fresh, well-formed succeeded result. Reached
+    // via bracket access since it is private — deliberately, to prove the
+    // guard fires independently of which public entry point calls it.
+    type CompleteAttempt = (key: string, result: HarnessAttemptResult) => Promise<void>;
+    await (runs as unknown as { completeAttempt: CompleteAttempt }).completeAttempt(record.key, succeededResult(2, '!2841'));
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.finishedAt).toBe(finishedAt);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
   });
 });
 
 describe('task 12.2/12.4: one active run per target holds through waiting', () => {
   it('refuses a second trigger for a waiting target while a different target runs independently', async () => {
-    const { started, waitingOf, runners } = controllableRunners();
+    const { started, optionsOf, runners } = controllableAttempts();
     const { runs } = manager({ runners });
 
     const waiting = runs.trigger(crInput('waiter'), 2);
-    waitingOf.get('!waiter')!();
+    optionsOf.get('!waiter')!.onEnterWaiting!();
     expect(runs.get(waiting.key)?.lifecycle).toBe('waiting');
 
     // Retriggering the same target returns the existing waiting record, not
@@ -1018,5 +1182,56 @@ describe('task 12.2/12.4: one active run per target holds through waiting', () =
     const other = runs.trigger(crInput('other'), 2);
     expect(started).toEqual(['!waiter', '!other']);
     expect(other.status).toBe('running');
+  });
+});
+
+describe('task 12.1/12.2: completeness, limitations, and partial result come from the attempt\'s own outcome', () => {
+  it('a succeeded result reports the attempt\'s own completeness and limitations, not a manager guess', async () => {
+    const { pending, runners } = controllableAttempts();
+    const changes: RunRecord[] = [];
+    const { runs } = manager({ runners, onChange: (r) => changes.push(r) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+
+    // A succeeded record is deleted from `records` once notified (existing
+    // behavior) — the notification itself is where this pass's completeness
+    // plumbing has to be checked.
+    await vi.waitFor(() => expect(changes.some((r) => r.status === 'succeeded')).toBe(true));
+    const succeeded = changes.find((r) => r.status === 'succeeded')!;
+    expect(succeeded.completeness).toBe('complete');
+    expect(succeeded.limitations).toEqual([]);
+  });
+
+  it('a failed result with no findings reports completeness "none" and a message built from the outcome\'s limitations', async () => {
+    const { pending, runners } = controllableAttempts();
+    const changes: RunRecord[] = [];
+    const { runs } = manager({ runners, onChange: (r) => changes.push(r) });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed-file inventory is incomplete.', '!2841'));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    expect(failed.completeness).toBe('none');
+    expect(failed.limitations).toEqual([{ code: 'harness.test', message: 'The changed-file inventory is incomplete.' }]);
+    expect(failed.failure?.message).toContain('The changed-file inventory is incomplete.');
+    expect(failed.partialResult).toBeUndefined();
+  });
+
+  it('a failed result with validated findings is retained only as an in-memory partial result, never as the retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    expect(failed.completeness).toBe('partial');
+    expect(failed.partialResult?.items).toHaveLength(2);
+    // Never written as the target's retained review — only a `succeeded`
+    // result with `outcome.replacesRetainedReview` ever reaches that path.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
   });
 });
