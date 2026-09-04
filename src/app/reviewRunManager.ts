@@ -26,7 +26,41 @@
  * Deliberately `vscode`-free, like the rest of `src/app`: the runners are
  * injected, and cancellation goes through the structural token in `lmAgent.ts`
  * that `vscode.CancellationTokenSource` also satisfies.
+ *
+ * ---
+ *
+ * **Task 12.1-12.4 of `add-agentic-review-harness` (design.md D1/D2/D12/D14).**
+ * `ReviewRunners` is renamed `ReviewHarnessFactory`: its two members are no
+ * longer read as "call this and get a finished review back" but as "run one
+ * `HarnessAttempt` for this target" — the demo path is not a second runner
+ * (task 10.7 already built a demo participant that drives the same harness);
+ * the manager selects a model seam, not a runner. Both members keep their
+ * exact `lm`/`demo` names and signatures — extension.ts (out of scope, task
+ * 15.7) and this module's own characterization tests inject the pre-harness
+ * `{lm, demo}` shape unchanged, which design.md's migration plan explicitly
+ * sanctions ("tests may inject the old runner only as a fixture"). What
+ * changes is what the manager *does* with one call: it now drives the record
+ * through the full canonical lifecycle (`../domain/harnessLifecycle.ts`) via
+ * one validated transition path (`isLegalRunTransition`/`transition`, 12.3)
+ * instead of flipping a five-value `status` directly. `RunnerOptions` gains
+ * two optional hooks, `onEnterWaiting`/`onResuming`, mirroring
+ * `harnessRetry.ts`'s own `RetryHooks` — a harness-attempt-backed `lm`
+ * (wired in a later task) reports a long backoff through them exactly as
+ * `harnessAttempt.ts` already reports it to its own `onCheckpoint`; this
+ * module is what actually releases and re-admits the concurrency slot that
+ * `harnessRetry.ts`'s own header names as "section 12's job" (closing the
+ * open half of task 9.6 — see `enterPausedState`/`beginResuming` below).
+ *
+ * Because this pass's `lm`/`demo` seam has no per-phase feedback of its own
+ * (that is task 10.2/10.8, explicitly out of scope here), the manager drives
+ * only the phases it can honestly report: `queued -> planning ->
+ * investigating` before dispatch, then `investigating -> completing ->
+ * succeeded/failed` on the way out (skipping `verifying`, which nothing
+ * behind this seam performs — see `isLegalRunTransition`'s forward-skip
+ * allowance). A real `HarnessAttempt`'s finer-grained phase reporting slots
+ * into the same transition path without widening it.
  */
+import { randomBytes } from 'node:crypto';
 import type { AgentDescriptor } from './agents';
 import type { AttachmentWarning } from './attachments';
 import type { ChangesetAgentMember } from './combinedAgent';
@@ -42,9 +76,20 @@ import {
   runKeyForCr,
 } from './retainedReview';
 import type { KeyValueStore } from './storage';
+import type { PersistedCheckpoint } from './harnessCheckpoint';
 import { createReview } from '../domain/reviewState';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { EffortLevel } from '../domain/effort';
+import type { Limitation, RunPhase, RunProjection } from '../domain/harnessActivity';
+import {
+  isActiveLifecycle,
+  isTerminalLifecycle,
+  type AttemptNumber,
+  type LineageId,
+  type ResultCompleteness,
+  type RunId,
+  type RunLifecycle,
+} from '../domain/harnessLifecycle';
 import type { Criteria } from '../domain/types';
 import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
 
@@ -130,16 +175,57 @@ export interface RunFailure {
 /**
  * `queued → running → (succeeded | failed | cancelled)`.
  *
- * `interrupted` is not here: it is not a transition anything can make, only
- * what the activation sweep concludes about a run that was `running` when the
- * extension host stopped. See `InFlightRunStore`.
+ * The five-value compatibility projection over `RunRecord.lifecycle`'s full
+ * thirteen-value canonical union (`../domain/harnessLifecycle.ts`), for UI
+ * code that has not migrated to the canonical lifecycle (task 14.x) — see
+ * `legacyStatusFor` for the one place the mapping is defined.
+ *
+ * `interrupted` is not here: it is not a transition anything in this module
+ * makes, only what the activation sweep concludes about a run that was
+ * nonterminal when the extension host stopped. See `InFlightRunStore`.
  */
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface RunRecord {
   key: string;
   input: RunInput;
+  /**
+   * The canonical lifecycle (D2). `transition()` — the one validated path
+   * task 12.3 asks for — is the only place this module ever writes it.
+   */
+  lifecycle: RunLifecycle;
+  /** Derived from `lifecycle` via `legacyStatusFor`, never written independently. */
   status: RunStatus;
+  /** Independent of `lifecycle` (D2): a run can fail with a partial result or succeed clean. */
+  completeness: ResultCompleteness;
+  /** The target-level invocation identity — distinct from `key`, which names the target itself. */
+  runId: RunId;
+  /** Stable across a checkpoint-based resume of this run; a fresh `trigger()` always starts a new lineage. */
+  lineageId: LineageId;
+  /** Monotonic within the lineage. Always `1` in this pass — resuming a *lost* attempt across restarts is task 12.7. */
+  attempt: AttemptNumber;
+  /**
+   * What every surface renders from (D14) — `../domain/harnessActivity.ts`'s
+   * own `RunProjection` type, populated from this record's own known fields
+   * rather than reduced from a full activity log (this pass has none to
+   * reduce; see the file header).
+   */
+  projection: RunProjection;
+  /**
+   * The active phase to return to on `resuming` (D2: "`waiting -> resuming ->
+   * prior active phase`"). Set on entering `waiting`/`paused`, consumed and
+   * cleared on `resuming`. Manager-internal bookkeeping, not itself a
+   * `RunProjection` field.
+   */
+  resumeTo?: RunLifecycle;
+  /** The public reason shown while waiting or paused, surfaced through `projection.currentAction` (mirrors `harnessActivityProjection.ts`'s own repurposing of that field). */
+  waitReason?: string;
+  /** The attempt's latest checkpoint, once a real harness attempt supplies one through a store (task 12.5+). Always absent from this pass's coarse `lm`/`demo` path. */
+  checkpoint?: PersistedCheckpoint;
+  /** Always `[]` from this pass's coarse path — no budget/coverage tracking behind `lm`/`demo` yet — but threaded through so a later attempt can report real ones. */
+  limitations: readonly Limitation[];
+  /** Findings validated before a run ended without reaching `complete` (D11). Always absent from this pass — no partial concept exists behind the coarse `lm`/`demo` seam; task 12.5/12.6 give it real content. */
+  partialResult?: AgentReviewResponse;
   /** When it was triggered — queue order, and what the sidebar counts elapsed from. */
   queuedAt: number;
   /** When it actually started; absent while queued. */
@@ -167,16 +253,30 @@ export interface RunnerOptions {
   onProgress: (progress: AgentRunProgress) => void;
   onAttachmentWarnings: (warnings: readonly AttachmentWarning[]) => void;
   cancellation: AgentCancellationToken;
+  /**
+   * Task 12.4/9.6: a harness-attempt-backed `lm` may call this when
+   * `harnessRetry.ts` classifies a delay as long enough to enter `waiting`
+   * (its own `RetryHooks.onEnterWaiting`) — the manager releases this run's
+   * concurrency slot at once and keeps the record and its target ownership
+   * intact. Optional so every `lm` that never enters a host-managed wait
+   * (every implementation that exists today) keeps compiling unchanged.
+   */
+  onEnterWaiting?: (info?: { reason?: string }) => void;
+  /** Mirrors `RetryHooks.onResuming`: fires once execution is about to continue after a wait this same seam reported through `onEnterWaiting`. */
+  onResuming?: () => void;
 }
 
 /**
- * The two ways a review is produced, injected so this module never imports the
- * transport and a test never needs a fake `vscode`.
+ * The two ways one harness attempt is run for an admitted target, injected so
+ * this module never imports the transport and a test never needs a fake
+ * `vscode` (D1: "Its injected `ReviewRunners` abstraction becomes an injected
+ * `ReviewHarnessFactory`"). See the file header for what changed and what did
+ * not.
  */
-export interface ReviewRunners {
+export interface ReviewHarnessFactory {
   /** Model-backed. Rejects with `AgentRunError`. */
   lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse>;
-  /** Demo agent: no model, no network, its own step log. */
+  /** The demo participant (task 10.7): no model, no network, its own step log. */
   demo(input: RunInput): DemoRunResult | Promise<DemoRunResult>;
 }
 
@@ -198,7 +298,7 @@ export interface ReviewRunManagerDeps {
   workspaceState: KeyValueStore;
   /** `ReviewRunStore` and `InFlightRunStore`. */
   globalState: KeyValueStore;
-  runners: ReviewRunners;
+  runners: ReviewHarnessFactory;
   onChange?: (record: RunRecord) => void;
   onReviewReady?: (info: ReviewReadyInfo) => void;
   /** Fired only after the store write resolves — see `finish` below. */
@@ -285,12 +385,167 @@ function reviewIdentityFor(target: RunTarget): { repoId: string; crNumber: strin
     : { repoId: CHANGESET_REPO_ID, crNumber: target.changesetId };
 }
 
+// ---- 12.3: the one validated lifecycle-transition path -----------------------------
+
+/** Ordered so "a forward skip among active phases" (below) has something to compare ranks against. */
+const ACTIVE_PHASE_ORDER: readonly RunLifecycle[] = ['planning', 'investigating', 'verifying', 'completing'];
+
+/**
+ * The legal-transition table (D2's lifecycle diagram, plus spec
+ * `background-review-runs`'s "it transitions through cancelling to
+ * cancelled" — applied uniformly, not only to an active phase, because that
+ * scenario is stated generally). Built once at module load; every edge below
+ * is a documented, deliberate reading of the diagram:
+ *
+ * - `queued -> planning` is the only way a run starts (never straight into a
+ *   later phase — the diagram shows exactly one edge out of `queued`).
+ * - A forward skip **among active phases** (e.g. `planning -> completing`) is
+ *   legal, never a backward one: this pass's coarse `lm`/`demo` seam has no
+ *   per-phase feedback of its own (file header) and drives only the phases it
+ *   can honestly report, while a future finer-grained attempt can still visit
+ *   every phase in order through the same table.
+ * - `succeeded` is reachable only from `completing` — the diagram funnels
+ *   success through the whole active chain, never from an earlier phase.
+ * - `waiting`/`paused` are reachable from any active phase (D12's long
+ *   backoff can fire from any phase that dispatches a tool, not only
+ *   `investigating` — the diagram's single column under `investigating` is
+ *   layout, not a constraint the prose states).
+ * - `resuming` can land on any active phase because the "prior active phase"
+ *   varies per attempt; `resumeStart` below always supplies the record's own
+ *   recorded `resumeTo`, never an arbitrary caller-chosen target.
+ * - Every nonterminal state has an edge to `cancelling`, and `cancelling`'s
+ *   only edge is to `cancelled` — cancellation always crosses that observable
+ *   state, from any source, per the spec scenario above.
+ * - Every nonterminal state also has an edge to `interrupted`, for the
+ *   activation sweep (task 12.7, not built by this pass) closing a lost
+ *   attempt from *outside* live execution.
+ * - `succeeded | failed | cancelled | interrupted` have no row at all: zero
+ *   outgoing edges is the structural guarantee task 12.4 depends on — late
+ *   model/provider work cannot move an attempt that already settled, because
+ *   no entry above ever adds one.
+ */
+function buildLegalRunTransitions(): ReadonlyMap<RunLifecycle, ReadonlySet<RunLifecycle>> {
+  const table = new Map<RunLifecycle, Set<RunLifecycle>>();
+  const allow = (from: RunLifecycle, ...to: readonly RunLifecycle[]): void => {
+    const set = table.get(from) ?? new Set<RunLifecycle>();
+    for (const target of to) set.add(target);
+    table.set(from, set);
+  };
+
+  allow('queued', 'planning', 'cancelling', 'interrupted');
+  ACTIVE_PHASE_ORDER.forEach((from, index) => {
+    const laterPhases = ACTIVE_PHASE_ORDER.slice(index + 1);
+    allow(from, ...laterPhases, 'waiting', 'paused', 'cancelling', 'failed', 'interrupted');
+  });
+  allow('completing', 'succeeded');
+  allow('waiting', 'resuming', 'cancelling', 'interrupted');
+  allow('paused', 'resuming', 'cancelling', 'interrupted');
+  allow('resuming', ...ACTIVE_PHASE_ORDER, 'cancelling', 'interrupted');
+  allow('cancelling', 'cancelled');
+
+  return table;
+}
+
+const LEGAL_RUN_TRANSITIONS = buildLegalRunTransitions();
+
+/**
+ * The one predicate every lifecycle change is validated against (task 12.3).
+ * Exported so the full thirteen-value table can be characterized directly,
+ * without simulating a whole run per edge.
+ */
+export function isLegalRunTransition(from: RunLifecycle, to: RunLifecycle): boolean {
+  return LEGAL_RUN_TRANSITIONS.get(from)?.has(to) ?? false;
+}
+
+/**
+ * The documented legacy mapping (12.2) — the *only* place a `RunLifecycle`
+ * becomes a `RunStatus`, so it cannot drift between callers.
+ *
+ * | Canonical lifecycle                                              | Legacy `status` |
+ * | ----------------------------------------------------------------- | ---------------- |
+ * | `queued`                                                          | `queued`         |
+ * | `planning`, `investigating`, `verifying`, `completing`            | `running`        |
+ * | `waiting`, `paused`, `resuming`, `cancelling`                     | `running`        |
+ * | `succeeded`                                                       | `succeeded`      |
+ * | `failed`                                                          | `failed`         |
+ * | `cancelled`                                                       | `cancelled`      |
+ * | `interrupted`                                                     | `failed`         |
+ *
+ * The eight active/transient rows all read as "still in progress" to a
+ * consumer that only distinguishes queued/running/terminal — exactly what
+ * `RunLifecycle`'s own doc comment calls the `running` compatibility
+ * projection. `interrupted` has no legacy analogue; `failed` is the nearest
+ * honest one (no longer in flight, not a success) — never fabricated as
+ * `succeeded` or silently left as `running`.
+ */
+export function legacyStatusFor(lifecycle: RunLifecycle): RunStatus {
+  switch (lifecycle) {
+    case 'queued':
+      return 'queued';
+    case 'succeeded':
+      return 'succeeded';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'interrupted':
+      return 'failed';
+    case 'planning':
+    case 'investigating':
+    case 'verifying':
+    case 'completing':
+    case 'waiting':
+    case 'paused':
+    case 'resuming':
+    case 'cancelling':
+      return 'running';
+    default: {
+      const exhaustive: never = lifecycle;
+      throw new Error(`Unmapped run lifecycle: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+function activePhaseFor(lifecycle: RunLifecycle): RunPhase | undefined {
+  switch (lifecycle) {
+    case 'planning':
+      return 'planning';
+    case 'investigating':
+      return 'investigating';
+    case 'verifying':
+      return 'verifying';
+    case 'completing':
+      return 'completing';
+    default:
+      return undefined;
+  }
+}
+
+function mintHarnessId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString('hex')}`;
+}
+
 export class ReviewRunManager {
   private readonly records = new Map<string, RunRecord>();
   private readonly cancellations = new Map<string, RunCancellation>();
-  /** Keys waiting for a slot, in trigger order. */
+  /** Keys waiting for a slot, in trigger order — both freshly queued and `resuming` keys re-entering FIFO. */
   private queue: string[] = [];
   private running = 0;
+  /** Exactly the keys currently holding one of `running`'s slots — the single source of truth `settle`/`enterPausedState` release from, so a state that never held one (queued/waiting/paused) can never double-release (task 12.4). */
+  private readonly slotHolders = new Set<string>();
+  /**
+   * Original admission order, for `beginResuming`'s "re-enter the queue at
+   * its original position" (D12) — a monotonic counter, never `queuedAt`
+   * (wall-clock milliseconds): two runs triggered within the same
+   * millisecond would tie under a timestamp comparison, and `Array.sort`'s
+   * stability would then leave whichever was already later in `this.queue`
+   * (the just-triggered one) ahead of the one resuming, silently breaking
+   * the exact fairness guarantee this exists to keep. Cleared once a record
+   * reaches a terminal lifecycle (`settle`) — a sequence number is never
+   * needed again after that.
+   */
+  private nextAdmissionSequence = 0;
+  private readonly admissionSequence = new Map<string, number>();
   /**
    * The limit the last trigger was made under. The queue pumps on a terminal
    * transition, where no caller is present to supply one; a lowered limit
@@ -321,10 +576,10 @@ export class ReviewRunManager {
     return this.records.get(key);
   }
 
-  /** Everything queued or running, in trigger order — the sidebar's list. */
+  /** Everything not yet terminal, in trigger order — the sidebar's list. Includes `waiting`/`paused`/`resuming`/`cancelling`: one-active-run-per-target holds through all of them (D2). */
   active(): RunRecord[] {
     return [...this.records.values()]
-      .filter((record) => record.status === 'queued' || record.status === 'running')
+      .filter((record) => !isTerminalLifecycle(record.lifecycle))
       .sort((a, b) => a.queuedAt - b.queuedAt);
   }
 
@@ -339,22 +594,32 @@ export class ReviewRunManager {
    * The refusal is the point: silently superseding would throw away a run the
    * reviewer is waiting on, and starting a second would spend twice for one
    * answer. The caller gets the existing record back and shows its progress.
+   * "In flight" is any nonterminal lifecycle, not only `queued`/`running`:
+   * a `waiting` or `paused` attempt still owns its target (D2).
    */
   trigger(input: RunInput, limit: number): RunRecord {
     this.limit = limit;
     const key = runKeyFor(input.target);
     const existing = this.records.get(key);
-    if (existing && (existing.status === 'queued' || existing.status === 'running')) return existing;
+    if (existing && !isTerminalLifecycle(existing.lifecycle)) return existing;
 
-    const record: RunRecord = {
+    const base: Omit<RunRecord, 'projection'> = {
       key,
       input,
+      lifecycle: 'queued',
       status: 'queued',
+      completeness: 'none',
+      runId: mintHarnessId('run'),
+      lineageId: mintHarnessId('lineage'),
+      attempt: 1,
+      limitations: [],
       queuedAt: this.now(),
       steps: input.steps,
       step: 0,
     };
+    const record: RunRecord = { ...base, projection: this.buildProjection(base) };
     this.records.set(key, record);
+    this.admissionSequence.set(key, this.nextAdmissionSequence++);
     this.queue.push(key);
     this.emit(record);
     this.pump();
@@ -364,32 +629,26 @@ export class ReviewRunManager {
   }
 
   /**
-   * Stop a run. A queued one never reaches the transport at all; a running one
-   * has its request cancelled, which is what makes the slot it frees usable
-   * rather than merely accounted for.
+   * Stop a run. A queued one never reaches the transport at all; a running,
+   * waiting, paused or resuming one always crosses the observable
+   * `cancelling` state on the way to `cancelled` (spec
+   * `background-review-runs`), and its cancellation token — if this key ever
+   * held one — is triggered regardless of which of those states it is in,
+   * because a `waiting` attempt's underlying call is still alive in the
+   * background even though its slot has already been released.
    */
   cancel(key: string): void {
     const record = this.records.get(key);
-    if (!record) return;
-    if (record.status === 'queued') {
+    if (!record || isTerminalLifecycle(record.lifecycle)) return;
+    if (record.lifecycle === 'queued' || record.lifecycle === 'resuming') {
       this.queue = this.queue.filter((queued) => queued !== key);
-      this.settle(record, { status: 'cancelled' });
-      this.pump();
-      return;
     }
-    if (record.status !== 'running') return;
-    // Two things, in this order, and both of them necessary.
-    //
     // The token stops the request: that is what makes the tokens stop being
-    // spent, and it is the half that was missing entirely before.
+    // spent. A no-op for a state that was never dispatched (queued) or whose
+    // dispatch never got a token (a runner with no live call at all) —
+    // `RunCancellation`'s own `cancel` is itself idempotent.
     this.cancellations.get(key)?.cancel();
-    // The transition happens here rather than in the runner's catch, because
-    // the slot must be free *now*. A provider that ignores its token would
-    // otherwise hold the slot for as long as it kept streaming, which defeats
-    // the queue; and the demo agent has no token at all, so its walk would
-    // never stop. Whatever the runner does afterwards lands on a record that is
-    // no longer running, and `isRunning` drops it.
-    this.settle(record, { status: 'cancelled' });
+    this.settle(record, { lifecycle: 'cancelled' });
   }
 
   /**
@@ -407,13 +666,30 @@ export class ReviewRunManager {
   }
 
   /**
-   * Drop a terminal record once its screen has shown it. Only `failed` records
-   * are held: a success already wrote the retained review the target opens on,
-   * and a cancellation leaves the previous state exactly as it was.
+   * Reviewer/policy-driven pause (task 14.6 wires the UI control onto this;
+   * this pass closes the manager-side mechanics only). Legal only from a live
+   * active phase — pausing something that has not started, or that is
+   * already waiting/paused/terminal, is refused by `transition` as a no-op.
    */
+  pause(key: string, reason?: string): void {
+    this.enterPausedState(key, 'paused', reason);
+  }
+
+  /**
+   * Reviewer-initiated resume from `paused` (task 14.6's UI control calls
+   * this directly). Also handles `waiting`, though the production trigger for
+   * that is the automatic `RunnerOptions.onResuming` hook, not this method.
+   */
+  resume(key: string): void {
+    this.beginResuming(key);
+  }
+
+  /** Drop a terminal record once its screen has shown it. Only `failed` records
+   * are held: a success already wrote the retained review the target opens on,
+   * and a cancellation leaves the previous state exactly as it was. */
   acknowledge(key: string): void {
     const record = this.records.get(key);
-    if (!record || record.status === 'queued' || record.status === 'running') return;
+    if (!record || !isTerminalLifecycle(record.lifecycle)) return;
     this.records.delete(key);
   }
 
@@ -427,18 +703,23 @@ export class ReviewRunManager {
       const key = this.queue.shift();
       if (key === undefined) return;
       const record = this.records.get(key);
-      // A record cancelled while queued was already removed from the queue,
-      // but a re-trigger could in principle re-add a key whose record moved on.
-      if (!record || record.status !== 'queued') continue;
-      this.start(record);
+      // A record cancelled while queued/resuming was already removed from the
+      // queue, but a re-trigger could in principle re-add a key whose record
+      // moved on.
+      if (!record) continue;
+      if (record.lifecycle === 'queued') {
+        this.start(record);
+      } else if (record.lifecycle === 'resuming') {
+        this.resumeStart(record);
+      }
     }
   }
 
   private start(record: RunRecord): void {
     this.running += 1;
+    this.slotHolders.add(record.key);
     const startedAt = this.now();
-    const started: RunRecord = { ...record, status: 'running', startedAt, step: 0 };
-    this.records.set(record.key, started);
+    this.transition(record, 'planning', { startedAt, step: 0 });
     // Written before the request goes out, so a host that stops mid-run leaves
     // the evidence the sweep needs.
     void this.inFlight.add({
@@ -448,26 +729,101 @@ export class ReviewRunManager {
       ...reviewIdentityFor(record.input.target),
       startedAt: new Date(startedAt).toISOString(),
     });
-    this.emit(started);
+    const planning = this.records.get(record.key) ?? record;
+    // `investigating` is where this pass's coarse `lm`/`demo` seam actually
+    // does its work (file header) — `planning` is real but instantaneous
+    // here, never skipped, because `queued -> planning` is the table's only
+    // entry edge.
+    this.transition(planning, 'investigating');
     void (record.input.demo ? this.executeDemo(record.key) : this.executeLm(record.key));
+  }
+
+  /**
+   * Re-admits a `resuming` record dequeued by `pump` — the other half of
+   * closing task 9.6's open half: FIFO re-entry happened in `beginResuming`
+   * (by original `queuedAt`, never appended at the tail), and this is where
+   * the slot is actually re-acquired once it is this key's turn.
+   *
+   * No second dispatch happens here: this pass's coarse `lm`/`demo` seam has
+   * no per-turn continuation to re-issue (file header) — the original
+   * `executeLm`/`executeDemo` call for this key is still the one unresolved
+   * promise, and its eventual resolution settles this record normally, now
+   * that `isSettleable` sees an active lifecycle again. A real harness
+   * attempt's own resume-from-checkpoint continuation is task 12.7's job.
+   */
+  private resumeStart(record: RunRecord): void {
+    this.running += 1;
+    this.slotHolders.add(record.key);
+    const target = record.resumeTo ?? 'investigating';
+    const applied = this.transition(record, target, { resumeTo: undefined });
+    if (!applied) {
+      // Should be unreachable — `resuming -> <any active phase>` is always
+      // legal — but keep slot accounting honest rather than leak a slot.
+      this.running = Math.max(0, this.running - 1);
+      this.slotHolders.delete(record.key);
+      return;
+    }
+    void this.inFlight.add({
+      key: record.key,
+      podId: record.input.podId,
+      refLabel: record.input.refLabel,
+      ...reviewIdentityFor(record.input.target),
+      startedAt: new Date(this.now()).toISOString(),
+    });
+  }
+
+  /**
+   * Task 12.4/9.6: releases the concurrency slot immediately (D12: "a long
+   * backoff moves the run to `waiting`... and releases its global execution
+   * slot") and keeps everything else about the record exactly as it is. Not
+   * a completion: the `InFlightRunStore` marker is deliberately left alone —
+   * a host that stops mid-wait must still be able to sweep this run as
+   * interrupted, and slot release is not the same fact as "no longer in
+   * flight".
+   */
+  private enterPausedState(key: string, target: 'waiting' | 'paused', reason?: string): void {
+    const record = this.records.get(key);
+    if (!record || !isActiveLifecycle(record.lifecycle)) return;
+    const applied = this.transition(record, target, { resumeTo: record.lifecycle, waitReason: reason });
+    if (!applied) return;
+    if (this.slotHolders.delete(key)) this.running = Math.max(0, this.running - 1);
+    this.pump();
+  }
+
+  /**
+   * Re-enters the FIFO queue at its *original* admission position — sorting
+   * the whole queue by `queuedAt` (which never changes across a resume) is
+   * equivalent to a sorted insert, since every other entry's own `queuedAt`
+   * is untouched (D12: "returns through `resuming` without losing target
+   * ownership or queue fairness").
+   */
+  private beginResuming(key: string): void {
+    const record = this.records.get(key);
+    if (!record) return;
+    if (record.lifecycle !== 'waiting' && record.lifecycle !== 'paused') return;
+    const applied = this.transition(record, 'resuming');
+    if (!applied) return;
+    this.queue.push(key);
+    this.queue.sort((a, b) => (this.admissionSequence.get(a) ?? 0) - (this.admissionSequence.get(b) ?? 0));
+    this.pump();
   }
 
   private async executeDemo(key: string): Promise<void> {
     const record = this.records.get(key);
     if (!record) return;
     const result = await this.deps.runners.demo(record.input);
-    if (!this.isRunning(key)) return;
+    if (!this.isSettleable(key)) return;
     this.patch(key, { steps: result.steps, attachmentWarnings: result.attachmentWarnings });
     // The log is walked rather than skipped: the demo agent exists to show what
     // a review looks like, and a result that appears instantly shows nothing.
     // It walks in the manager now, so navigating away mid-walk no longer ends
     // it — the same promise every other run gets.
     for (let step = 0; step <= result.steps.length; step += 1) {
-      if (!this.isRunning(key)) return;
+      if (!this.isSettleable(key)) return;
       this.patch(key, { step });
       await (this.deps.delay?.(DEMO_STEP_MS) ?? new Promise((resolve) => setTimeout(resolve, DEMO_STEP_MS)));
     }
-    if (!this.isRunning(key)) return;
+    if (!this.isSettleable(key)) return;
     await this.finish(key, result.response);
   }
 
@@ -488,22 +844,35 @@ export class ReviewRunManager {
         onProgress: (progress) => this.recordProgress(key, progress),
         onAttachmentWarnings: (warnings) => this.patch(key, { attachmentWarnings: warnings }),
         cancellation: cancellation.token,
+        onEnterWaiting: (info) => this.enterPausedState(key, 'waiting', info?.reason),
+        onResuming: () => this.beginResuming(key),
       });
-      if (!this.isRunning(key)) return;
+      if (!this.isSettleable(key)) return;
       await this.finish(key, response);
     } catch (error) {
-      if (!this.isRunning(key)) return;
+      if (!this.isSettleable(key)) return;
       const failure = asRunFailure(error, record.input.timeouts);
       if (failure === 'cancelled') {
-        this.settle(this.records.get(key)!, { status: 'cancelled' });
+        this.settle(this.records.get(key)!, { lifecycle: 'cancelled' });
         return;
       }
-      this.settle(this.records.get(key)!, { status: 'failed', failure });
+      this.settle(this.records.get(key)!, { lifecycle: 'failed', failure });
     }
   }
 
-  private isRunning(key: string): boolean {
-    return this.records.get(key)?.status === 'running';
+  /**
+   * Whether a result arriving right now for this key still belongs to a live
+   * attempt — the structural late-settlement guard task 12.4 asks for.
+   * `false` once the record is gone (already settled and, for a
+   * succeeded/cancelled run, deleted) or its lifecycle has left the four
+   * active phases: `waiting`/`paused`/`resuming`/`cancelling` are all
+   * legitimate nonterminal states, but none of them is a phase a stray
+   * `lm`/`demo` resolution is allowed to conclude on directly — only
+   * `resumeStart` re-entering an active phase makes one settleable again.
+   */
+  private isSettleable(key: string): boolean {
+    const record = this.records.get(key);
+    return !!record && isActiveLifecycle(record.lifecycle);
   }
 
   private recordProgress(key: string, progress: AgentRunProgress): void {
@@ -569,12 +938,13 @@ export class ReviewRunManager {
     // first, it would read the *previous* run's review, or an empty screen, and
     // nothing would repaint when the write landed a microtask later.
     await this.deps.workspaceState.update(recordKeyFor(input.target), retained);
-    // Cancelled while that write was in flight: the reviewer asked for this run
-    // to stop, and `cancel` has already settled the record and freed its slot.
-    // The retained review is written either way — the work was done and paid
-    // for — but the run must not also report itself as succeeded.
-    if (!this.isRunning(key)) return;
-    this.settle(record, { status: 'succeeded', response });
+    // Cancelled (or otherwise moved off an active phase) while that write was
+    // in flight: the reviewer asked for this run to stop, and `cancel` has
+    // already settled the record and freed its slot. The retained review is
+    // written either way — the work was done and paid for — but the run must
+    // not also report itself as succeeded.
+    if (!this.isSettleable(key)) return;
+    this.settle(record, { lifecycle: 'succeeded', response });
 
     // Read-modify-write with no `await` between the pair, per the contract in
     // `storage.ts` — two runs can finish in the same tick.
@@ -595,36 +965,66 @@ export class ReviewRunManager {
     });
   }
 
-  /** The one place a run leaves the running set: releases its slot, then pumps. */
+  /**
+   * The one place a run reaches a terminal lifecycle: releases its slot (if
+   * it held one), then pumps. A cancellation always crosses the observable
+   * `cancelling` state first (spec `background-review-runs`); a succeeded or
+   * failed outcome transitions directly, since `completing -> succeeded` and
+   * every active phase `-> failed` are both direct edges in the table.
+   *
+   * Routed entirely through `transition` (12.3): if the record is already
+   * terminal, both transition attempts below are refused and this method
+   * does nothing else — the structural guard 12.4 asks for, so a late
+   * `lm`/`demo` resolution racing an earlier cancellation or failure can
+   * never re-settle an already-settled record.
+   */
   private settle(
     record: RunRecord,
-    outcome: { status: 'succeeded'; response: AgentReviewResponse }
-      | { status: 'failed'; failure: RunFailure }
-      | { status: 'cancelled' },
+    outcome:
+      | { readonly lifecycle: 'succeeded'; readonly response: AgentReviewResponse }
+      | { readonly lifecycle: 'failed'; readonly failure: RunFailure }
+      | { readonly lifecycle: 'cancelled' },
   ): void {
-    const wasRunning = record.status === 'running';
-    const settled: RunRecord = {
-      ...record,
-      status: outcome.status,
+    if (outcome.lifecycle === 'cancelled') {
+      this.transition(record, 'cancelling');
+    } else if (outcome.lifecycle === 'succeeded') {
+      // `succeeded` is reachable only from `completing` (the table's own
+      // funnel, mirroring D2's diagram) — this pass's coarse `lm`/`demo` seam
+      // never visits `completing` on its own (file header: it stops advancing
+      // once dispatched, at `investigating`), so `finish` crossing it here,
+      // right before the terminal transition, is this pass's one place that
+      // honestly closes the gap rather than skipping straight to `succeeded`.
+      this.transition(record, 'completing');
+    }
+    const current = this.records.get(record.key) ?? record;
+
+    const patch: Partial<RunRecord> = {
       finishedAt: this.now(),
       progress: undefined,
-      response: outcome.status === 'succeeded' ? outcome.response : undefined,
-      failure: outcome.status === 'failed' ? outcome.failure : undefined,
+      response: outcome.lifecycle === 'succeeded' ? outcome.response : undefined,
+      failure: outcome.lifecycle === 'failed' ? outcome.failure : undefined,
+      // This pass's coarse `lm`/`demo` seam has no partial concept: a
+      // successful result is always `complete`, and anything else is `none`
+      // rather than a fabricated `partial` (task 12.5/12.6 give partial real
+      // content).
+      completeness: outcome.lifecycle === 'succeeded' ? 'complete' : 'none',
+      resumeTo: undefined,
+      waitReason: undefined,
     };
-    this.records.set(record.key, settled);
+    const applied = this.transition(current, outcome.lifecycle, patch);
+    if (!applied) return; // already terminal — a late settlement, structurally refused (12.4)
+
+    if (this.slotHolders.delete(record.key)) this.running = Math.max(0, this.running - 1);
     this.cancellations.get(record.key)?.dispose();
     this.cancellations.delete(record.key);
+    // Terminal: this key can never resume again, so its admission-order
+    // bookkeeping is done.
+    this.admissionSequence.delete(record.key);
     void this.inFlight.remove(record.key);
-    if (wasRunning) this.running = Math.max(0, this.running - 1);
     // A succeeded or cancelled record has nothing left to tell a screen that
     // did not see it: the retained review, or the absence of a change, is the
     // whole message. Only a failure has to survive until someone reads it.
-    if (outcome.status !== 'failed') {
-      this.notify(settled);
-      this.records.delete(record.key);
-    } else {
-      this.notify(settled);
-    }
+    if (outcome.lifecycle !== 'failed') this.records.delete(record.key);
     this.pump();
   }
 
@@ -632,8 +1032,66 @@ export class ReviewRunManager {
     const record = this.records.get(key);
     if (!record) return;
     const next = { ...record, ...patch };
+    next.projection = this.buildProjection(next);
     this.records.set(key, next);
     this.emit(next);
+  }
+
+  /**
+   * The one validated lifecycle-transition path (task 12.3). Refuses
+   * (returns `false`, no-op) rather than throwing: a caller racing a late
+   * settlement against an already-terminal record checks the result rather
+   * than needing a `try`/`catch` around every dispatch continuation.
+   * `status`/`projection` are always rederived here, never passed in
+   * `patch` — the one place either can drift is this one.
+   */
+  private transition(record: RunRecord, to: RunLifecycle, patch: Partial<RunRecord> = {}): boolean {
+    if (!isLegalRunTransition(record.lifecycle, to)) return false;
+    const next: RunRecord = { ...record, ...patch, lifecycle: to, status: legacyStatusFor(to) };
+    next.projection = this.buildProjection(next);
+    this.records.set(record.key, next);
+    this.emit(next);
+    return true;
+  }
+
+  /**
+   * Builds this record's own `RunProjection` directly from its known fields
+   * — not a second projection type (12.2 asks to reuse
+   * `../domain/harnessActivity.ts`'s own shape, which this does), and not a
+   * reduction over a full activity log, which this pass's coarse `lm`/`demo`
+   * seam never produces (file header).
+   */
+  private buildProjection(record: Omit<RunRecord, 'projection'>): RunProjection {
+    const elapsedMs = Math.max(0, this.now() - (record.startedAt ?? record.queuedAt));
+    // While waiting/paused/resuming, the phase shown is the one being
+    // returned to (`resumeTo`), matching `harnessActivityProjection.ts`'s own
+    // reducer: a `waiting`/`paused` activity event is tagged with the phase
+    // it interrupted, not a phase of its own (`RunPhase` has none).
+    const phaseSource =
+      record.lifecycle === 'waiting' || record.lifecycle === 'paused' || record.lifecycle === 'resuming'
+        ? record.resumeTo
+        : record.lifecycle;
+    const isTerminal = isTerminalLifecycle(record.lifecycle);
+    return {
+      runId: record.runId,
+      lineageId: record.lineageId,
+      attempt: record.attempt,
+      lifecycle: record.lifecycle,
+      completeness: record.completeness,
+      phase: phaseSource ? activePhaseFor(phaseSource) : undefined,
+      currentAction: record.lifecycle === 'waiting' || record.lifecycle === 'paused' ? record.waitReason : undefined,
+      elapsedMs,
+      // No real coverage denominator exists behind this pass's coarse
+      // `lm`/`demo` seam (file header) — `indeterminate` is the honest
+      // choice per `review-run-activity`'s truthful-progress rule, never a
+      // fabricated determinate count.
+      progressMode: 'indeterminate',
+      attention: record.lifecycle === 'paused' ? 'attentionRequired' : 'none',
+      limitations: record.limitations,
+      result: isTerminal
+        ? { completeness: record.completeness, limitations: record.limitations, findingCount: record.response?.items.length }
+        : undefined,
+    };
   }
 
   /** A state change: emitted at once, and it resets the progress throttle. */

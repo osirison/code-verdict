@@ -6,6 +6,27 @@ function record(over: Partial<RunRecord> = {}): RunRecord {
   return {
     key: 'repo-1!2841',
     input: {} as RunRecord['input'],
+    // `livenessView` reads only `status`/`progress` (see its own header); the
+    // canonical fields below are filled in with values consistent with
+    // `status: 'running'` purely so this fixture type-checks against the
+    // expanded `RunRecord` (task 12.2).
+    lifecycle: 'investigating',
+    completeness: 'none',
+    runId: 'run-1',
+    lineageId: 'lineage-1',
+    attempt: 1,
+    limitations: [],
+    projection: {
+      runId: 'run-1',
+      lineageId: 'lineage-1',
+      attempt: 1,
+      lifecycle: 'investigating',
+      completeness: 'none',
+      elapsedMs: 0,
+      progressMode: 'indeterminate',
+      attention: 'none',
+      limitations: [],
+    },
     status: 'running',
     queuedAt: 1_000,
     startedAt: 1_000,

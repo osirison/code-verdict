@@ -5,13 +5,17 @@ import { readRetained, type SessionDraft } from './retainedReview';
 import {
   InFlightRunStore,
   ReviewRunManager,
+  isLegalRunTransition,
+  legacyStatusFor,
   sweepInterruptedRuns,
   type DemoRunResult,
   type RunInput,
   type RunRecord,
   type RunnerOptions,
+  type RunStatus,
 } from './reviewRunManager';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { RUN_LIFECYCLES, type RunLifecycle } from '../domain/harnessLifecycle';
 import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { ChangeRequestDiff } from '../platform/types';
@@ -93,18 +97,28 @@ function controllableRunners() {
   const cancelled: string[] = [];
   const progressOf = new Map<string, RunnerOptions['onProgress']>();
   const warningsOf = new Map<string, RunnerOptions['onAttachmentWarnings']>();
+  // Task 12.4/9.6: captures each call's `onEnterWaiting`/`onResuming` hooks so
+  // a test can simulate a harness-attempt-backed `lm` reporting a long
+  // backoff wait and its later resumption, the same way `progressOf`/
+  // `warningsOf` above already let a test simulate progress and warnings.
+  const waitingOf = new Map<string, NonNullable<RunnerOptions['onEnterWaiting']>>();
+  const resumingOf = new Map<string, NonNullable<RunnerOptions['onResuming']>>();
   return {
     started,
     cancelled,
     pending,
     progressOf,
     warningsOf,
+    waitingOf,
+    resumingOf,
     runners: {
       lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse> {
         const key = input.refLabel;
         started.push(key);
         progressOf.set(key, options.onProgress);
         warningsOf.set(key, options.onAttachmentWarnings);
+        if (options.onEnterWaiting) waitingOf.set(key, options.onEnterWaiting);
+        if (options.onResuming) resumingOf.set(key, options.onResuming);
         return new Promise<AgentReviewResponse>((resolve, reject) => {
           pending.set(key, { resolve, reject });
           options.cancellation.onCancellationRequested(() => {
@@ -714,5 +728,295 @@ describe('the in-flight record and the interrupted sweep', () => {
     // An interruption is reported alongside the last completed review, never
     // in place of it.
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toEqual(existing);
+  });
+});
+
+/**
+ * A runner that never settles on its own and, unlike `controllableRunners`,
+ * does not react to cancellation at all — it models the risk design.md names
+ * directly ("cancellation may not stop a provider or model immediately"), so
+ * a test can resolve/reject it *after* the manager already considers the
+ * record terminal and prove the late arrival is ignored, rather than only
+ * exercising the cooperative-cancellation fast path `controllableRunners`
+ * already covers above.
+ */
+function unresponsiveRunner() {
+  const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
+  return {
+    pending,
+    runners: {
+      lm(input: RunInput): Promise<AgentReviewResponse> {
+        return new Promise<AgentReviewResponse>((resolve, reject) => {
+          pending.set(input.refLabel, { resolve, reject });
+        });
+      },
+      demo(): DemoRunResult {
+        return { response: response(0), steps: [] };
+      },
+    },
+  };
+}
+
+describe('task 12.2: every canonical lifecycle maps to a documented legacy status', () => {
+  it('maps all thirteen lifecycles', () => {
+    const expected: Record<RunLifecycle, RunStatus> = {
+      queued: 'queued',
+      planning: 'running',
+      investigating: 'running',
+      verifying: 'running',
+      completing: 'running',
+      waiting: 'running',
+      paused: 'running',
+      resuming: 'running',
+      cancelling: 'running',
+      cancelled: 'cancelled',
+      succeeded: 'succeeded',
+      failed: 'failed',
+      interrupted: 'failed',
+    };
+    expect(RUN_LIFECYCLES).toHaveLength(13);
+    for (const lifecycle of RUN_LIFECYCLES) {
+      expect(legacyStatusFor(lifecycle)).toBe(expected[lifecycle]);
+    }
+  });
+});
+
+describe('task 12.3: the one validated transition path', () => {
+  it('accepts the edges the lifecycle diagram and the spec describe', () => {
+    expect(isLegalRunTransition('queued', 'planning')).toBe(true);
+    expect(isLegalRunTransition('planning', 'investigating')).toBe(true);
+    // A forward skip among active phases is legal: this pass's coarse
+    // lm/demo seam has no per-phase feedback of its own.
+    expect(isLegalRunTransition('investigating', 'completing')).toBe(true);
+    expect(isLegalRunTransition('completing', 'succeeded')).toBe(true);
+    expect(isLegalRunTransition('investigating', 'waiting')).toBe(true);
+    expect(isLegalRunTransition('verifying', 'paused')).toBe(true);
+    expect(isLegalRunTransition('waiting', 'resuming')).toBe(true);
+    expect(isLegalRunTransition('paused', 'resuming')).toBe(true);
+    expect(isLegalRunTransition('resuming', 'verifying')).toBe(true);
+    expect(isLegalRunTransition('investigating', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('queued', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('waiting', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('paused', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('cancelling', 'cancelled')).toBe(true);
+  });
+
+  it('refuses an illegal transition', () => {
+    expect(isLegalRunTransition('queued', 'succeeded')).toBe(false);
+    expect(isLegalRunTransition('queued', 'investigating')).toBe(false);
+    expect(isLegalRunTransition('completing', 'investigating')).toBe(false); // backward
+    expect(isLegalRunTransition('waiting', 'succeeded')).toBe(false);
+    expect(isLegalRunTransition('paused', 'failed')).toBe(false);
+    expect(isLegalRunTransition('cancelling', 'failed')).toBe(false);
+  });
+
+  it('gives every terminal lifecycle zero outgoing edges', () => {
+    for (const terminal of ['succeeded', 'failed', 'cancelled', 'interrupted'] as const) {
+      for (const to of RUN_LIFECYCLES) {
+        expect(isLegalRunTransition(terminal, to)).toBe(false);
+      }
+    }
+  });
+
+  it('refuses to move an already-terminal record through the manager itself', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(Object.assign(new Error('boom'), { requestId: 'r1' }));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const finishedAt = runs.get(record.key)?.finishedAt;
+
+    // The only other public path that could move it: cancelling an
+    // already-failed record is refused, not silently applied.
+    runs.cancel(record.key);
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.lifecycle).toBe('failed');
+    expect(runs.get(record.key)?.finishedAt).toBe(finishedAt);
+  });
+});
+
+describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairness', () => {
+  it('releases the slot on entering waiting, lets the next queued run start, and resumes without losing queue position', async () => {
+    const { started, pending, waitingOf, resumingOf, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const first = runs.trigger(crInput('1'), 1); // limit 1: holds the only slot
+    const second = runs.trigger(crInput('2'), 1); // queued behind it
+    expect(started).toEqual(['!1']);
+    expect(second.status).toBe('queued');
+
+    // '1' enters a long backoff wait — the slot is released at once, so '2'
+    // starts even though '1' has not finished.
+    waitingOf.get('!1')!({ reason: 'A transient provider issue requires a longer wait.' });
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+    await vi.waitFor(() => expect(started).toEqual(['!1', '!2']));
+
+    // '1' still owns its target while waiting: a retrigger returns the same
+    // waiting record rather than starting a second run.
+    const stillOwned = runs.trigger(crInput('1'), 1);
+    expect(stillOwned.key).toBe(first.key);
+    expect(stillOwned.lifecycle).toBe('waiting');
+
+    // A third target, triggered after '1' resumes, must not cut ahead of it.
+    const third = runs.trigger(crInput('3'), 1);
+    expect(third.status).toBe('queued');
+
+    resumingOf.get('!1')!();
+    expect(runs.get(first.key)?.lifecycle).toBe('resuming');
+
+    // '2' finishes, freeing the slot. '1' (resuming, original queuedAt) goes
+    // before '3' (queued after it) — original admission order, not FIFO by
+    // resume time.
+    pending.get('!2')!.resolve(response(0));
+    await vi.waitFor(() => expect(runs.get(first.key)?.lifecycle).toBe('investigating'));
+    // No second dispatch for '1': this pass's coarse lm/demo seam has no
+    // per-turn continuation to re-issue — the original call is still live.
+    expect(started).toEqual(['!1', '!2']);
+    expect(runs.get(third.key)?.status).toBe('queued');
+
+    pending.get('!1')!.resolve(response(0));
+    await vi.waitFor(() => expect(runs.active().some((r) => r.key === third.key && r.status === 'running')).toBe(true));
+  });
+
+  it('cancellation from queued, active, waiting and paused each ends promptly and releases the slot at once', async () => {
+    const { started, cancelled, waitingOf, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    // 'w' takes the only slot, then enters `waiting` (releasing it).
+    const waitingRun = runs.trigger(crInput('w'), 1);
+    waitingOf.get('!w')!();
+    expect(runs.get(waitingRun.key)?.lifecycle).toBe('waiting');
+
+    // 'p' takes the freed slot, then is explicitly paused (releasing it again).
+    const pausedRun = runs.trigger(crInput('p'), 1);
+    runs.pause(pausedRun.key);
+    expect(runs.get(pausedRun.key)?.lifecycle).toBe('paused');
+
+    // 'a' takes the slot and stays active.
+    const activeRun = runs.trigger(crInput('a'), 1);
+    expect(runs.get(activeRun.key)?.lifecycle).toBe('investigating');
+
+    // 'q' finds the slot taken and queues behind it.
+    const queuedRun = runs.trigger(crInput('q'), 1);
+    expect(queuedRun.status).toBe('queued');
+
+    // Cancel 'q' first, while 'a' still holds the slot — otherwise cancelling
+    // 'a' below would free the slot and let 'q' start via the queue pump
+    // before this test gets to assert it was never dispatched.
+    runs.cancel(queuedRun.key);
+    runs.cancel(waitingRun.key);
+    runs.cancel(pausedRun.key);
+    runs.cancel(activeRun.key);
+
+    expect(runs.active()).toHaveLength(0);
+    // Only the three that ever held a live dispatch had a token to stop;
+    // the queued run never made a request at all.
+    expect(cancelled).toEqual(['!w', '!p', '!a']);
+    expect(started).toEqual(['!w', '!p', '!a']);
+
+    // The slot cancelling 'a' released is usable at once.
+    runs.trigger(crInput('fresh'), 1);
+    expect(started).toContain('!fresh');
+  });
+
+  it('does not double-release the slot when a waiting or paused attempt is cancelled', () => {
+    // A slot-accounting bug (releasing the running count a second time for a
+    // key that already released it on entering waiting/paused) would only
+    // show up once *another* run genuinely holds the slot at cancel time —
+    // the test above cancels 'w'/'p' after their slot has already gone to a
+    // later run, but never checks that cancelling them leaves that run's
+    // slot alone. This does, chaining the same relay through both cases:
+    // 'w' (waiting, released) -> 'b' (active) -> 'b' (paused, released) ->
+    // 'c' (active, was queued) -> 'd' (queued).
+    const { started, waitingOf, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const waitingRun = runs.trigger(crInput('w'), 1); // takes the only slot
+    waitingOf.get('!w')!(); // enters `waiting`, releasing it
+    const holder = runs.trigger(crInput('b'), 1); // takes the freed slot
+    expect(runs.get(holder.key)?.lifecycle).toBe('investigating');
+    const queuedBehindHolder = runs.trigger(crInput('c'), 1); // must stay queued
+    expect(queuedBehindHolder.status).toBe('queued');
+
+    // Cancelling a `waiting` attempt must not touch the slot 'b' genuinely
+    // holds: a double release would drop `running` to 0 and let 'c' start
+    // past the limit-1 cap.
+    runs.cancel(waitingRun.key);
+    expect(started).toEqual(['!w', '!b']);
+    expect(runs.get(queuedBehindHolder.key)?.status).toBe('queued');
+
+    // Now pause 'b' itself, releasing its slot the same way. 'c' — already
+    // queued — legitimately takes it.
+    runs.pause(holder.key);
+    expect(runs.get(holder.key)?.lifecycle).toBe('paused');
+    expect(runs.get(queuedBehindHolder.key)?.lifecycle).toBe('investigating');
+    const queuedBehindNextHolder = runs.trigger(crInput('d'), 1); // must stay queued
+    expect(queuedBehindNextHolder.status).toBe('queued');
+
+    // Cancelling the now-`paused` 'b' must not touch the slot 'c' holds.
+    runs.cancel(holder.key);
+    expect(started).toEqual(['!w', '!b', '!c']);
+    expect(runs.get(queuedBehindNextHolder.key)?.status).toBe('queued');
+  });
+});
+
+describe('task 12.4: late model/provider work cannot settle an already-terminal attempt', () => {
+  it('a late success arriving after cancellation does not overwrite the cancelled state or write a retained review', async () => {
+    const { pending, runners } = unresponsiveRunner();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)).toBeUndefined();
+
+    // Arrives late; this fixture, unlike `controllableRunners`, never reacted
+    // to the cancellation token at all.
+    pending.get('!2841')!.resolve(response(3));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    expect(runs.get(record.key)).toBeUndefined();
+  });
+
+  it('a late waiting/resuming signal arriving after failure does not move the failed record', async () => {
+    const { pending, waitingOf, resumingOf, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(Object.assign(new Error('boom'), { requestId: 'r1' }));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+    // A stray hook call racing the rejection — the same seam that could have
+    // reported `onEnterWaiting` calling it (or `onResuming`) after the
+    // promise it belonged to already settled the record.
+    waitingOf.get('!2841')?.();
+    resumingOf.get('!2841')?.();
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.lifecycle).toBe('failed');
+  });
+});
+
+describe('task 12.2/12.4: one active run per target holds through waiting', () => {
+  it('refuses a second trigger for a waiting target while a different target runs independently', async () => {
+    const { started, waitingOf, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const waiting = runs.trigger(crInput('waiter'), 2);
+    waitingOf.get('!waiter')!();
+    expect(runs.get(waiting.key)?.lifecycle).toBe('waiting');
+
+    // Retriggering the same target returns the existing waiting record, not
+    // a second run.
+    const retriggered = runs.trigger(crInput('waiter'), 2);
+    expect(retriggered.key).toBe(waiting.key);
+    expect(retriggered.lifecycle).toBe('waiting');
+
+    // A different target runs completely independently.
+    const other = runs.trigger(crInput('other'), 2);
+    expect(started).toEqual(['!waiter', '!other']);
+    expect(other.status).toBe('running');
   });
 });
