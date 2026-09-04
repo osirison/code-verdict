@@ -756,6 +756,18 @@ export interface HarnessRunStore {
   checkpointsFor(lineageId: LineageId, attempt?: AttemptNumber): readonly PersistedCheckpoint[];
   latestCheckpoint(lineageId: LineageId, attempt?: AttemptNumber): PersistedCheckpoint | undefined;
   lineageIdsForRun(runId: RunId): readonly LineageId[];
+  /**
+   * Every lineage this store currently holds, whichever run or target it belongs to — the one way
+   * to find a target's most recent attempt after it ends, when nothing durable links a target back
+   * to its lineage id (`ReviewRunStore`, `reviewRuns.ts`, records only `repoId`/`crNumber` for an
+   * ordinary terminal outcome; only the activation sweep's `interrupted` entries carry `lineageId`).
+   * Reads back every `codeVerdict.harness.lineage.*` key `store.keys()` reports — the same
+   * enumeration pattern `retainedReview.ts`'s own pruning already uses over this same store's kind
+   * of key-value backing — and re-parses each one exactly as `readLineage` does, so a corrupt or
+   * unrecognized entry is silently dropped, never partially trusted. Empty when the store has no
+   * `keys()` (a minimal test double) or nothing has ever run.
+   */
+  listLineages(): readonly PersistedLineageRecord[];
 }
 
 function readLineageRaw(store: KeyValueStore, lineageId: LineageId): PersistedLineageRecord | undefined {
@@ -941,6 +953,18 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     return latestCheckpoint(built.lineageId as LineageId, built.attempt) ?? built;
   }
 
+  function listLineages(): readonly PersistedLineageRecord[] {
+    const keys = store.keys?.() ?? [];
+    const out: PersistedLineageRecord[] = [];
+    for (const key of keys) {
+      if (!key.startsWith(LINEAGE_KEY_PREFIX)) continue;
+      const lineageId = key.slice(LINEAGE_KEY_PREFIX.length) as LineageId;
+      const record = readLineageRaw(store, lineageId);
+      if (record) out.push(record);
+    }
+    return out;
+  }
+
   return {
     writeSnapshot,
     writeCheckpoint,
@@ -950,5 +974,6 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     checkpointsFor,
     latestCheckpoint,
     lineageIdsForRun: (runId) => readRunIndexRaw(store, runId)?.lineageIds ?? [],
+    listLineages,
   };
 }

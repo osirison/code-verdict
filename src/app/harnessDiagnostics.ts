@@ -27,15 +27,51 @@ import { COMPLETION_CLAUSES, type CompletionBlockerDetail, type CompletionClause
 import type { RunRecord } from './reviewRunManager';
 
 /**
+ * Everything this module reads off one evidence source, whether it comes from a live attempt's
+ * `LedgerEvidenceSource` (`CheckpointInfo.evidenceSources`) or is rebuilt from a persisted
+ * `RetainedEvidenceRecord` (`harnessDiagnosticsSource.ts`, which has no stored `sequence`/
+ * `byteLength` — see that module's own doc comment on why both are recomputed or left unknown
+ * there rather than fabricated). `byteLength` is optional for exactly that reason: the live path
+ * always has it, the persisted path never does.
+ */
+export interface DiagnosticsEvidenceSource {
+  readonly sequence: number;
+  readonly memberId: string;
+  readonly origin: string;
+  readonly path?: string;
+  readonly byteLength?: number;
+}
+
+/**
+ * The slice of a checkpoint this module actually reads — satisfied structurally by a live
+ * `CheckpointInfo` (`harnessAttempt.ts`) as-is, and by a small adapter over a persisted
+ * `PersistedCheckpoint` (`harnessDiagnosticsSource.ts`) once a review has ended and no panel
+ * holds the live record anymore. Never a second copy of either shape — this is the one seam both
+ * feed through.
+ */
+export interface DiagnosticsCheckpointSource {
+  readonly activityLog: { readonly events: readonly ActivityEvent[] };
+  readonly coverage: readonly MemberCoverage[];
+  readonly budget: BudgetConsumption;
+  readonly unresolved: UnresolvedWork;
+  readonly evidenceSources: readonly DiagnosticsEvidenceSource[];
+}
+
+/**
  * Only the fields this module actually reads off a `RunRecord` — narrowed the same way
  * `harnessRunStore.ts`'s own `RetentionPolicy` narrows `HarnessPolicy`, so a test can build one
  * without a full `RunRecord` fixture, and this module's own dependency on the manager stays
- * exactly as wide as what it uses.
+ * exactly as wide as what it uses. `checkpoint` is widened from `RunRecord`'s own
+ * `CheckpointInfo | undefined` to `DiagnosticsCheckpointSource | undefined` (a live `CheckpointInfo`
+ * satisfies it unchanged) so a caller reconstructing a settled attempt from `HarnessRunStore` alone
+ * — no live record anywhere — can still hand this builder something real.
  */
-export type DiagnosticsSourceRecord = Pick<
-  RunRecord,
-  'runId' | 'lineageId' | 'attempt' | 'lifecycle' | 'completeness' | 'checkpoint' | 'completionEvaluation' | 'limitations' | 'failure'
->;
+export type DiagnosticsSourceRecord = Omit<
+  Pick<RunRecord, 'runId' | 'lineageId' | 'attempt' | 'lifecycle' | 'completeness' | 'checkpoint' | 'completionEvaluation' | 'limitations' | 'failure'>,
+  'checkpoint'
+> & {
+  readonly checkpoint?: DiagnosticsCheckpointSource;
+};
 
 export interface DiagnosticsPhaseTransition {
   readonly phase: string;
@@ -55,12 +91,13 @@ export interface DiagnosticsToolCall {
 }
 
 export interface DiagnosticsEvidenceEntry {
-  /** The ledger's own append-order sequence for this source — never recomputed. */
+  /** The ledger's own append-order sequence for this source — never recomputed on the live path; recomputed from array order on the persisted path (see `DiagnosticsEvidenceSource`). */
   readonly sequence: number;
   readonly memberId: string;
   readonly origin: string;
   readonly path?: string;
-  readonly byteLength: number;
+  /** Absent only when rebuilt from a persisted checkpoint, which never retained a byte count — unknown, never fabricated as zero. */
+  readonly byteLength?: number;
 }
 
 export interface DiagnosticsClause {
@@ -77,7 +114,7 @@ export interface AttemptDiagnosticsReport {
   readonly completeness: ResultCompleteness;
   readonly phaseTransitions: readonly DiagnosticsPhaseTransition[];
   readonly coverage: readonly MemberCoverage[];
-  /** Absent only when no `evaluateCompletion` verdict was ever recorded for this attempt (a bootstrap failure ended it first). */
+  /** Absent when no `evaluateCompletion` verdict is available for this attempt — either none was ever recorded (a bootstrap failure ended it first) or one ran but was never persisted (a report rebuilt from `HarnessRunStore` alone, once no live record survives). Never asserts which one happened. */
   readonly completionClauses?: readonly DiagnosticsClause[];
   readonly blockerDetails: readonly CompletionBlockerDetail[];
   readonly limitations: readonly Limitation[];
@@ -174,7 +211,10 @@ export function renderAttemptDiagnosticsText(report: AttemptDiagnosticsReport): 
   if (report.completionClauses) {
     section(lines, 'Completion clauses', report.completionClauses.map((c) => `${c.passed ? 'PASS' : 'FAIL'}  ${c.clause}`));
   } else {
-    section(lines, 'Completion clauses', ['(no completion evaluation was recorded — the attempt ended before host validation ran)']);
+    // True whether the attempt genuinely never reached host validation (a bootstrap failure) or it
+    // did and the clause-by-clause verdict simply was not persisted (a report rebuilt from
+    // `HarnessRunStore` alone, once no live record survives) — never asserts which one happened.
+    section(lines, 'Completion clauses', ['(no completion evaluation is available for this attempt)']);
   }
 
   section(
@@ -203,12 +243,17 @@ export function renderAttemptDiagnosticsText(report: AttemptDiagnosticsReport): 
       `unresolved fetches: ${report.unresolved.unresolvedFetches}`,
       `unresolved candidates: ${report.unresolved.unresolvedCandidates}`,
     ]);
+  } else {
+    // Was missing entirely (no `else`) until this pass — the one section a checkpoint-less record
+    // silently dropped instead of naming, which is exactly the "channel came out blank" failure mode
+    // this module exists to rule out. Every section heading now always writes.
+    section(lines, 'Unresolved work', ['(no checkpoint was recorded for this attempt, so unresolved work is unknown)']);
   }
 
   section(
     lines,
     'Evidence fetched (citable sources only — byte counts, never content)',
-    report.evidenceFetched.map((ev) => `[#${ev.sequence}] member=${ev.memberId} origin=${ev.origin}${ev.path ? ` path=${ev.path}` : ''} bytes=${ev.byteLength}`),
+    report.evidenceFetched.map((ev) => `[#${ev.sequence}] member=${ev.memberId} origin=${ev.origin}${ev.path ? ` path=${ev.path}` : ''} bytes=${ev.byteLength ?? 'unknown'}`),
   );
 
   section(

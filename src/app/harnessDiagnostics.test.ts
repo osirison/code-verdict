@@ -208,6 +208,24 @@ describe('renderAttemptDiagnosticsText', () => {
     expect(text).not.toContain('RAW CONTENT THAT MUST NEVER REACH THE DIAGNOSTICS REPORT');
   });
 
+  it('renders identity, lifecycle, and every section heading for a record with no checkpoint at all — the channel must never come out blank', () => {
+    const text = renderAttemptDiagnosticsText(
+      buildAttemptDiagnosticsReport(record({ checkpoint: undefined, completionEvaluation: undefined, failure: undefined }), () => '2026-09-03T00:01:00.000Z'),
+    );
+    expect(text).toContain('run=run-1 lineage=lineage-1 attempt=1');
+    expect(text).toContain('lifecycle=failed completeness=none');
+    expect(text).toContain('Phase transitions:');
+    expect(text).toContain('Coverage:');
+    expect(text).toContain('Completion clauses:');
+    expect(text).toContain('Blocker details:');
+    expect(text).toContain('Limitations:');
+    expect(text).toContain('Budget consumption:');
+    expect(text).toContain('Unresolved work:');
+    expect(text).toContain('Evidence fetched');
+    expect(text).toContain('Tool call log:');
+    expect(text.trim().length).toBeGreaterThan(0);
+  });
+
   it('never carries raw model text, prompts, or hidden reasoning — only bounded, deterministic host-produced fields exist on the report at all', () => {
     const text = renderAttemptDiagnosticsText(buildAttemptDiagnosticsReport(record(), () => 'now'));
     // The report has no field capable of carrying a prompt or model reply (verified structurally
@@ -219,7 +237,13 @@ describe('renderAttemptDiagnosticsText', () => {
 
   it('says plainly when there is nothing to report in a section, rather than an empty block', () => {
     const text = renderAttemptDiagnosticsText(buildAttemptDiagnosticsReport(record({ checkpoint: undefined, completionEvaluation: undefined, limitations: [] }), () => 'now'));
-    expect(text).toContain('(no completion evaluation was recorded');
+    expect(text).toContain('(no completion evaluation is available');
     expect(text).toContain('(no budget snapshot was recorded');
+    expect(text).toContain('(no checkpoint was recorded for this attempt, so unresolved work is unknown)');
+  });
+
+  it('writes the Unresolved work heading even with no checkpoint, never dropping the section outright', () => {
+    const text = renderAttemptDiagnosticsText(buildAttemptDiagnosticsReport(record({ checkpoint: undefined, completionEvaluation: undefined }), () => 'now'));
+    expect(text).toContain('Unresolved work:');
   });
 });

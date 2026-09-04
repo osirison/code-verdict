@@ -8,19 +8,20 @@ import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
 import { deleteTokenIfUnused } from './app/storage';
 import { repoIdsOf } from './app/podQuery';
-import type { PodSource } from './domain/types';
+import type { Pod, PodSource } from './domain/types';
 import { getProvider, listRealProviders } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
 import { ReviewRunManager } from './app/reviewRunManager';
 import { isTerminalLifecycle } from './domain/harnessLifecycle';
-import { pruneClosedRetained } from './app/retainedReview';
+import { pruneClosedRetained, runKeyForChangeset, runKeyForCr } from './app/retainedReview';
 import { RunStatusGate } from './app/runStatusGate';
 import { revalidateAttachments } from './app/attachments';
 import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
 import { createHarnessRunStore } from './app/harnessRunStore';
-import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText } from './app/harnessDiagnostics';
+import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText, type DiagnosticsSourceRecord } from './app/harnessDiagnostics';
+import { findRecentDiagnosticsCandidates, type DiagnosticsCandidate, type IdentifyDiagnosticsTarget } from './app/harnessDiagnosticsSource';
 import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './app/harnessRuntime';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
@@ -483,6 +484,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (picked) runManager.cancel(picked.key);
   };
 
+  /**
+   * `codeVerdict.showRunDiagnostics`'s disk-fallback scoping: which of `HarnessRunStore`'s
+   * lineages belong to the pod currently active, and what to call each one — the same repo
+   * membership `repoIdsOf` already answers for a live fetch, and the same `vocabulary.formatCrRef`
+   * every other ref label in this file already reuses (`switchPod`, `showActiveRuns`'s own
+   * `record.input.refLabel` was built with it too, upstream in `ui/*.ts`).
+   */
+  const identifyDiagnosticsTargetForPod = (pod: Pod): IdentifyDiagnosticsTarget => {
+    const repoIds = new Set(repoIdsOf(pod));
+    const vocabulary = getProvider(pod.providerId).vocabulary;
+    return (snapshot) => {
+      const members = snapshot.members.filter(
+        (member) => member.providerId === pod.providerId && member.instanceUrl === pod.instanceUrl && repoIds.has(member.ref.repoId),
+      );
+      const first = members[0];
+      if (!first) return undefined; // no member of this snapshot belongs to the active pod
+      if (snapshot.targetKind === 'cr') {
+        return { targetKey: runKeyForCr(first.ref), refLabel: vocabulary.formatCrRef(first.ref.number) };
+      }
+      return {
+        targetKey: runKeyForChangeset(snapshot.changesetId ?? snapshot.lineageId),
+        refLabel: members.map((member) => vocabulary.formatCrRef(member.ref.number)).join(' · '),
+      };
+    };
+  };
+
   const bootstrapFromDebugBypass = async (): Promise<void> => {
     const bypass = getDebugAuthBypass(context.extensionMode);
     if (!bypass) {
@@ -713,16 +740,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
     [COMMANDS.showRunDiagnostics]: async () => {
-      // Whichever review panel is open, single-CR or changeset — mirrors the
-      // "no active review" fallback the palette's other review-tab commands
-      // already use (`ReviewFlowPanel.revealIfOpen() || ChangesetReviewPanel.revealIfOpen()`).
-      const record = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+      // Whichever review panel is open, single-CR or changeset, still holding its own live
+      // `RunRecord` — mirrors the "no active review" fallback the palette's other review-tab
+      // commands already use. This is the freshest source there is (a live `CheckpointInfo`, and
+      // `completionEvaluation`/`failure`, neither of which is ever persisted), but it is gone the
+      // moment a run ends and its panel is closed, dismissed, or the window reloads — exactly when
+      // diagnostics are actually wanted (`harnessDiagnosticsSource.ts`'s own file header).
+      let record: DiagnosticsSourceRecord | undefined = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+
       if (!record) {
-        void vscode.window.showInformationMessage(
-          'Verdict: no active review — open a change request from the dashboard first.',
-        );
-        return;
+        const pod = podStore.activePod;
+        if (!pod) {
+          void vscode.window.showInformationMessage('Verdict: connect first — run "Verdict: Sign in".');
+          return;
+        }
+        const candidates = findRecentDiagnosticsCandidates(harnessRunStore.listLineages(), identifyDiagnosticsTargetForPod(pod));
+        const first = candidates[0];
+        if (!first) {
+          void vscode.window.showInformationMessage('Verdict: no review has run yet for this pod.');
+          return;
+        }
+        let chosen: DiagnosticsCandidate = first;
+        if (candidates.length > 1) {
+          const picked = await vscode.window.showQuickPick(
+            candidates.map((candidate) => ({
+              label: candidate.refLabel,
+              description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
+              candidate,
+            })),
+            { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on?' },
+          );
+          if (!picked) return;
+          chosen = picked.candidate;
+        }
+        // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle` only
+        // ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure, the exact
+        // shape of this bug, so still has the fuller live record in memory even though no panel is
+        // showing it. Preferred only when it is still the *same* attempt the disk resolved, so a
+        // different, newer run in flight for this target is never silently substituted for the one
+        // the reviewer picked.
+        const live = runManager.get(chosen.targetKey);
+        record = live && live.lineageId === chosen.lineageId && live.attempt === chosen.attempt ? live : chosen.record;
       }
+
       const report = buildAttemptDiagnosticsReport(record, () => new Date().toISOString());
       runDiagnosticsChannel.clear();
       runDiagnosticsChannel.appendLine(renderAttemptDiagnosticsText(report));
