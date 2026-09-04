@@ -208,10 +208,13 @@ export class VerdictNotifier implements vscode.Disposable {
    * `otherPodSuffix`).
    *
    * Task 14.7 (spec `review-run-activity`: "the notification distinguishes
-   * complete, partial, failed, and cancelled outcomes"): `succeeded` may
-   * still be `completeness: 'partial'` (D2 — an attempt that validated
-   * findings without satisfying every completion condition), so this never
-   * says "ready" for a result that stopped short of complete.
+   * complete, partial, failed, and cancelled outcomes"). The `'Partial
+   * results'` headline is defensive, not a case reached today:
+   * `classifyOutcome` (`../app/harnessCompletion.ts`) only reports
+   * `succeeded` for a `complete` outcome, and every partial currently
+   * arrives through `runEnded` instead. It stays because D2 keeps lifecycle
+   * and completeness independent — if a `succeeded + partial` outcome ever
+   * becomes reachable, this must not call it "ready".
    */
   reviewReady(info: { ref?: ChangeRequestRef; refLabel: string; itemCount: number; podId?: string; completeness: ResultCompleteness }): void {
     const items =
