@@ -125,6 +125,7 @@ function baseConnectionMethods(): Pick<
     async getChangeRequestDiff(): Promise<ChangeRequestDiff> {
       return {
         ref: CR_REF,
+        baseSha: BASE_SHA,
         headSha: HEAD_SHA,
         files: [{ oldPath: CHANGED_FILE, newPath: CHANGED_FILE, diff: '@@ -1,3 +1,4 @@\n+  // TODO: refine\n' }],
         anchorRefs: {},

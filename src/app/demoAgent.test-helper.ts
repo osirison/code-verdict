@@ -7,11 +7,12 @@ export async function toChangeRequestDiff(fetchImpl: EmulatorFetch): Promise<Cha
     headers: { authorization: 'Bearer glpat-emulator' },
   });
   const body = (await res.json()) as {
-    diff_refs: { head_sha: string };
+    diff_refs: { base_sha: string; head_sha: string };
     changes: Array<{ old_path: string; new_path: string; diff: string }>;
   };
   return {
     ref: { repoId: '9101', number: '2841' },
+    baseSha: body.diff_refs.base_sha,
     headSha: body.diff_refs.head_sha,
     files: body.changes.map((c) => ({ oldPath: c.old_path, newPath: c.new_path, diff: c.diff })),
     anchorRefs: body.diff_refs,

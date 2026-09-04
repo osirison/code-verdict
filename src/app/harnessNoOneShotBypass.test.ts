@@ -58,6 +58,40 @@ function harnessModuleFiles(dir: string): string[] {
   return out;
 }
 
+describe('the shipped runtime wiring itself reaches only the harness (task 10.8, 15.7)', () => {
+  const extensionSource = readFileSync(join('src', 'extension.ts'), 'utf8');
+
+  it('extension.ts constructs ReviewRunManager with the real harness factory, never a bare {lm, demo} runner object', () => {
+    // Source-text assertion, not a runtime import: `extension.ts` imports `vscode`, which is not
+    // resolvable outside the extension host, so this is the same methodology the import-graph
+    // check above already uses — matching actual statements, never a loose keyword search.
+    expect(extensionSource).toMatch(/import\s*\{\s*createReviewHarnessFactory[^}]*\}\s*from\s*['"]\.\/app\/harnessRuntime['"]/);
+    expect(extensionSource).toMatch(/runners:\s*createReviewHarnessFactory\(/);
+  });
+
+  it('extension.ts never imports or constructs the deprecated one-shot runners', () => {
+    // The exact functions `legacyRunnersToHarnessFactory`'s own doc comment names as the shape it
+    // adapts — reachable only as `reviewRunManager.ts`'s own test fixture, never from shipped
+    // wiring, per that module's file header ("no shipped runtime setting exposes a bypass").
+    const oneShotRunnerNames = ['runLmAgent', 'runLmChangesetAgent', 'runDemoAgent', 'runDemoChangesetAgent'];
+    for (const name of oneShotRunnerNames) {
+      const importPattern = new RegExp(`\\bimport\\b[^;]*\\b${name}\\b[^;]*\\bfrom\\b`);
+      expect(extensionSource).not.toMatch(importPattern);
+    }
+    // Never references the legacy `{lm, demo}` shape's own type name, or hand-builds an object
+    // literal carrying both an `lm` and a `demo` key (the shape `isLegacyRunners` detects).
+    expect(extensionSource).not.toMatch(/\bReviewRunnersLegacy\b/);
+    expect(extensionSource).not.toMatch(/runners:\s*\{\s*lm:/);
+  });
+
+  it('every shipped RunInput/RunnerOptions type import into extension.ts is gone — the legacy runner shape has nothing left to type against there', () => {
+    // `RunnerOptions`/`RunInput` were the legacy `{lm, demo}` closures' own parameter types; the
+    // real factory's `create`/`createDemo` are constructed once, inside `harnessRuntime.ts`, and
+    // extension.ts never needs to name either type directly any more.
+    expect(extensionSource).not.toMatch(/\bRunnerOptions\b/);
+  });
+});
+
 describe('no one-shot bypass (task 10.9 item 9)', () => {
   it('no harness module imports the legacy one-shot parser', () => {
     const files = [...harnessModuleFiles('src/app'), ...harnessModuleFiles('src/domain')];

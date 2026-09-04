@@ -104,6 +104,16 @@ export type AnchorRefs = unknown;
 
 export interface ChangeRequestDiff {
   ref: ChangeRequestRef;
+  /**
+   * The merge-base/target commit this diff is against. Neutral and provider-
+   * read (unlike `anchorRefs`): every provider already resolves this SHA
+   * while building the diff (GitLab's `diff_refs.base_sha`, GitHub's
+   * `pull.base.sha`), and the harness's review-investigation tools (design.md
+   * D7, `add-agentic-review-harness`) need it up front to pin every
+   * `InvestigationSnapshotRef` — there is no separate neutral "resolve the
+   * base" operation to call later.
+   */
+  baseSha: string;
   headSha: string;
   files: FileDiff[];
   anchorRefs: AnchorRefs;

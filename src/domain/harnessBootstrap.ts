@@ -114,6 +114,16 @@ export function buildBootstrapSection(input: BuildBootstrapSectionInput): Bootst
  * text. The app layer (`harnessAttempt.ts`) is the only place that both
  * builds this section and registers the matching evidence-ledger source, so
  * the two can never drift; this type alone does not guarantee that.
+ *
+ * `sourceId`/`digest` are the evidence ledger's own minted identifiers for
+ * this attachment (task 15.7 closure of a gap task 15.1-15.3 named
+ * explicitly: an attachment registered as citable evidence but never told to
+ * the model can never actually be cited). Absent until `harnessAttempt.ts`'s
+ * `runBootstrap` registers the attachment with the ledger — which always
+ * succeeds before this section is ever handed to a real model seam, since a
+ * registration failure is reported as a limitation and the attachment's `id`
+ * alone remains, uncitable, exactly like a `pending`-registration gap always
+ * was.
  */
 export interface BootstrapAttachmentSection {
   readonly id: string;
@@ -121,6 +131,8 @@ export interface BootstrapAttachmentSection {
   readonly path: string;
   readonly content: string;
   readonly truncated: boolean;
+  readonly sourceId?: string;
+  readonly digest?: string;
 }
 
 export interface BootstrapMemberSections {

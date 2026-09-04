@@ -336,6 +336,18 @@ export interface ReviewRunnersLegacy {
  */
 export interface HarnessAttemptRunOptions extends RunnerOptions {
   /**
+   * The record's own harness identity (task 15.7 gap closure): `trigger()`
+   * mints `runId`/`lineageId` into `RunRecord` before any factory ever runs,
+   * but neither `RunInput` nor the rest of this options bag carried them
+   * through — so a real factory building a `ReviewRunSnapshot`
+   * (`buildReviewRunSnapshot`) had no way to give it the *same* identity the
+   * manager already stores in `InFlightRun`/uses for `sweepInterrupted`'s
+   * `harnessRunStore.latestCheckpoint(lineageId)` lookup. Without this, a
+   * checkpoint written under a factory-invented id would be unreachable by
+   * the activation sweep and by resume compatibility — dead on arrival.
+   */
+  identity: { readonly runId: RunId; readonly lineageId: LineageId; readonly attempt: AttemptNumber };
+  /**
    * Fires at every phase boundary and tool-call-cadence checkpoint the
    * attempt reaches (`harnessAttempt.ts`'s own `fireCheckpoint`) — this is
    * what actually drives `planning`/`investigating`/`verifying`/`completing`
@@ -1259,6 +1271,7 @@ export class ReviewRunManager {
       progress: { startedAt: this.now(), fragmentsReceived: 0, charsReceived: 0 },
     });
     const options: HarnessAttemptRunOptions = {
+      identity: { runId: record.runId, lineageId: record.lineageId, attempt: record.attempt },
       timeouts: record.input.timeouts,
       onProgress: (progress) => this.recordProgress(key, progress),
       onAttachmentWarnings: (warnings) => this.patch(key, { attachmentWarnings: warnings }),

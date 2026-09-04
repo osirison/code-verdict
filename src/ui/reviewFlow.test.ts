@@ -159,6 +159,7 @@ const RAN_AT = '2026-09-01T10:14:00.000Z';
 
 const DIFF: ChangeRequestDiff = {
   ref: REF,
+  baseSha: 'base-aaaa',
   headSha: 'aaaa',
   files: [
     { oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' },

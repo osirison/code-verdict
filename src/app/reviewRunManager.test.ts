@@ -59,6 +59,7 @@ const TIMEOUTS: AgentRunTimeouts = { inactivityMs: 90_000, ceilingMs: 600_000 };
 
 const diff: ChangeRequestDiff = {
   ref: { repoId: 'repo-1', number: '2841' },
+  baseSha: 'base-1',
   headSha: 'head-1',
   files: [{ oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' }],
   anchorRefs: {},

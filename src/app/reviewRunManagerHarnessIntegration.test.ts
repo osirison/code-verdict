@@ -272,7 +272,7 @@ function crInput(refLabel: string): RunInput {
     target: {
       kind: 'cr',
       ref: { repoId: 'repo-1', number: '42' },
-      diff: { ref: { repoId: 'repo-1', number: '42' }, headSha: 'head1', files: [], anchorRefs: {} },
+      diff: { ref: { repoId: 'repo-1', number: '42' }, baseSha: 'base1', headSha: 'head1', files: [], anchorRefs: {} },
     },
     refLabel,
     podId: 'pod-a',

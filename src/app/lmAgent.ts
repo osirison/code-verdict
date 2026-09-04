@@ -440,6 +440,37 @@ export async function runFollowUpPrompt(
   });
 }
 
+/**
+ * One harness protocol turn (task 15.7 of `add-agentic-review-harness`,
+ * `./harnessModelSeam.ts`'s `createLiveModelSeam`): `prompt` already carries
+ * the full bootstrap envelope, persona, criteria, tool schemas, protocol
+ * contract, prior tool results, and any repair instruction — this function
+ * adds nothing to it and reuses `streamText`'s existing streaming path,
+ * cancellation, timeout windows, and tracing exactly as `runFollowUpPrompt`
+ * does, returning the model's raw reply text for
+ * `../domain/harnessProtocol.ts`'s `parseModelTurn` to parse. `runFollowUpPrompt`/
+ * `runPrompt` are the pre-harness review paths and stay untouched by this
+ * addition (task 10.2's second clause: follow-up questions and the legacy
+ * one-shot contract are not review-harness concerns).
+ *
+ * A missing or refusing model, a timeout, or a cancellation surfaces as the
+ * same `AgentRunError` `streamText` always throws — never swallowed here,
+ * so `harnessAttempt.ts`'s turn loop (and, above it, `ReviewRunManager`'s
+ * `executeAttempt` catch block) sees a genuine rejection and fails the
+ * attempt truthfully rather than falling back to anything.
+ */
+export async function runHarnessModelTurn(
+  modelId: string,
+  prompt: string,
+  options?: RunAgentOptions,
+): Promise<string> {
+  return streamText(modelId, prompt, options, (text, trace) => {
+    trace.response(text, true);
+    trace.success(0);
+    return text;
+  });
+}
+
 export async function runPrompt(
   modelId: string,
   prompt: string,

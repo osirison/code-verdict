@@ -592,6 +592,7 @@ describe('runLmAgent / runLmChangesetAgent forward options to runPrompt', () => 
 
   const diff: ChangeRequestDiff = {
     ref: { repoId: 'repo1', number: '42' },
+    baseSha: 'b1',
     headSha: 'h1',
     files: [{ oldPath: 'a.ts', newPath: 'a.ts', diff: '@@ -1 +1 @@\n-old\n+new' }],
     anchorRefs: undefined,
@@ -800,6 +801,7 @@ describe('the prompt carries what the change is for', () => {
 
   const diff: ChangeRequestDiff = {
     ref: { repoId: 'repo1', number: '42' },
+    baseSha: 'b1',
     headSha: 'h1',
     files: [{ oldPath: 'a.ts', newPath: 'a.ts', diff: '@@ -1 +1 @@\n-old\n+SENTINEL_ADDED_LINE' }],
     anchorRefs: undefined,

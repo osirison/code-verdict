@@ -167,6 +167,7 @@ import {
   buildBootstrapEnvelope,
   buildBootstrapSection,
   type BootstrapAttachmentSection,
+  type BootstrapEnvelope,
   type BootstrapMemberIdentity,
   type BootstrapMemberRootPolicy,
   type BootstrapMemberSections,
@@ -199,10 +200,29 @@ import type {
  * turn's dispatch results (empty on a phase's first turn), so a real caller
  * can quote a `sourceId`/`digest` the ledger actually minted back at the
  * model in its next prompt; this module never inspects the array itself.
+ *
+ * `envelope` is the fitted `BootstrapEnvelope` (`fitBootstrapToModel`'s own
+ * `ok: true` result — already shrunk to the selected model's input limit
+ * when it had to be) that `runBootstrap` below built and confirmed fits,
+ * threaded through on every `planning`/`investigating`/`verifying` call this
+ * module itself makes (`runPhaseLoop`) so a real seam can render it into
+ * literal model-facing prompt text without a second bootstrap fetch of its
+ * own. Optional only so a hand-constructed test call — e.g.
+ * `harnessSynthesisVerification.ts`'s own direct `askModel` call for its
+ * contradiction-check turn, which already has full context from the
+ * surrounding investigation and needs no fresh envelope — is not forced to
+ * fabricate one; a real production seam always receives it on every
+ * `runPhaseLoop`-issued call and fails closed when it does not (see
+ * `harnessModelSeam.ts`).
  */
 export interface HarnessModelSeam {
   readonly modelId: string;
-  askModel(input: { phase: RunPhase; repairInstruction: string | undefined; toolResults: readonly HostToolResult[] }): Promise<string>;
+  askModel(input: {
+    phase: RunPhase;
+    repairInstruction: string | undefined;
+    toolResults: readonly HostToolResult[];
+    envelope?: BootstrapEnvelope;
+  }): Promise<string>;
 }
 
 // ---- Injected synthesis/verification collaborator (task 10.6's seam) --------------
@@ -397,6 +417,11 @@ function mintId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString('hex')}`;
 }
 
+/** Key for `registeredAttachmentSources` below — member id and attachment id joined so neither can collide with the other across members. */
+function attachmentSourceKey(memberId: string, attachmentId: string): string {
+  return `${memberId}:${attachmentId}`;
+}
+
 /**
  * The host-side classification step (D10). `proposed` is always `undefined`
  * from this module today (see the file header's documented protocol gap),
@@ -533,6 +558,8 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   let activityLog: ActivityLog = createActivityLog(runId, lineageId, attemptNumber);
   let currentPhase: RunPhase = 'bootstrap';
+  /** The fitted bootstrap envelope (`runBootstrap`'s own `fit.envelope`) — set once, after `fitBootstrapToModel` confirms it fits, and handed to `options.modelSeam.askModel` on every `planning`/`investigating`/`verifying` call `runPhaseLoop` makes. See `HarnessModelSeam.envelope`'s own doc comment. */
+  let fittedEnvelope: BootstrapEnvelope | undefined;
   let plan: Plan | undefined;
   let lastTurnResults: readonly HostToolResult[] = [];
   let toolCallsSinceCheckpoint = 0;
@@ -1007,7 +1034,8 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       if (!reserved.ok) return reserved.code === 'cancelled' ? 'cancelled' : 'budgetExhausted';
 
       const toolResultsForThisAsk = lastTurnResults;
-      const askModel: PhaseAskModel = (repairInstruction) => options.modelSeam.askModel({ phase, repairInstruction, toolResults: toolResultsForThisAsk });
+      const askModel: PhaseAskModel = (repairInstruction) =>
+        options.modelSeam.askModel({ phase, repairInstruction, toolResults: toolResultsForThisAsk, envelope: fittedEnvelope });
       const outcome = await runHarnessTurn(askModel, { phase, previousPlan: plan, policy, cancellation });
 
       if (!outcome.ok) {
@@ -1213,6 +1241,12 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // Task 15.2's citability boundary: an attachment becomes a citable ledger source only here,
     // after the envelope carrying it is confirmed to actually fit the model — never earlier (an
     // overflowing bootstrap makes no model request, so nothing in it was ever returned).
+    // Task 15.7 closure: the ledger's own minted `sourceId`/`digest` for each successfully
+    // registered attachment is captured here (keyed by member+attachment id, the same identity
+    // `BootstrapAttachmentSection.id` already carries) so the envelope patch below can tell the
+    // model exactly what to cite back — without this, an attachment registered as evidence could
+    // never actually be cited in a live run (the gap task 15.1-15.3 named explicitly).
+    const registeredAttachmentSources = new Map<string, { sourceId: string; digest: string }>();
     for (const entry of pendingAttachments) {
       const outcome = ledger.registerAttachment(entry.memberId, entry.attachment, entry.expectedDigest);
       if (!outcome.ok) {
@@ -1220,8 +1254,32 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
           code: 'attachmentRegistrationFailed',
           message: `Attachment ${entry.attachment.id} for member ${entry.memberId} could not be registered as evidence: ${outcome.code}.`,
         });
+        continue;
       }
+      registeredAttachmentSources.set(attachmentSourceKey(entry.memberId, entry.attachment.id), {
+        sourceId: outcome.source.sourceId,
+        digest: outcome.source.digest,
+      });
     }
+
+    // The *fitted* envelope, never the pre-fit local above: `fitBootstrapToModel`
+    // may have summarized sections or minimized tool descriptions to make it
+    // fit, and the raw envelope built above was never confirmed to fit the
+    // model at all (see `HarnessModelSeam.envelope`'s own doc comment). Patched
+    // with each registered attachment's citable identifiers — the shrink
+    // tactics (`withSectionsSummarized`/`withMinimalToolDescriptions`) never
+    // touch attachment sections, so this patch is safe regardless of whether
+    // the envelope needed to shrink to fit.
+    fittedEnvelope = {
+      ...fit.envelope,
+      untrusted: fit.envelope.untrusted.map((section) => ({
+        ...section,
+        attachments: section.attachments?.map((attachment) => {
+          const registered = registeredAttachmentSources.get(attachmentSourceKey(section.memberId, attachment.id));
+          return registered ? { ...attachment, sourceId: registered.sourceId, digest: registered.digest } : attachment;
+        }),
+      })),
+    };
 
     for (const member of options.members) await pageManifestToExhaustion(member);
     appendActivity(coverageChangedFact(inventory, riskCoverageRules.requireInspection), 'bootstrap');

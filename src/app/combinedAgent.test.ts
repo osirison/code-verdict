@@ -14,7 +14,7 @@ const members: ChangesetAgentMember[] = [
     ref: { repoId: '9103', number: '381' },
     projectPath: 'hve/platform/api-gateway',
     diff: {
-      ref: { repoId: '9103', number: '381' }, headSha: 'gateway-head', anchorRefs: { head: 'gateway' },
+      ref: { repoId: '9103', number: '381' }, baseSha: 'gateway-base', headSha: 'gateway-head', anchorRefs: { head: 'gateway' },
       files: [{ oldPath: 'src/routes/session.ts', newPath: 'src/routes/session.ts', diff: '@@ -87,1 +87,2 @@\n return session\n+return { expires_at: session.expiresAt }\n' }],
     },
   },
@@ -22,7 +22,7 @@ const members: ChangesetAgentMember[] = [
     ref: { repoId: '9210', number: '1509' },
     projectPath: 'hve/web/console',
     diff: {
-      ref: { repoId: '9210', number: '1509' }, headSha: 'console-head', anchorRefs: { head: 'console' },
+      ref: { repoId: '9210', number: '1509' }, baseSha: 'console-base', headSha: 'console-head', anchorRefs: { head: 'console' },
       files: [{ oldPath: 'src/api/session.ts', newPath: 'src/api/session.ts', diff: '@@ -40,1 +40,2 @@\n const data = await load()\n+const expiry = data.expiry\n' }],
     },
   },

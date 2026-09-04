@@ -9,17 +9,17 @@ import { connectionForPod } from './app/connections';
 import { deleteTokenIfUnused } from './app/storage';
 import { repoIdsOf } from './app/podQuery';
 import type { PodSource } from './domain/types';
-import { getProvider, listRealProviders, tryGetProvider } from './platform/registry';
+import { getProvider, listRealProviders } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
-import { ReviewRunManager, sweepInterruptedRuns, type RunInput, type RunnerOptions } from './app/reviewRunManager';
+import { ReviewRunManager } from './app/reviewRunManager';
 import { isTerminalLifecycle } from './domain/harnessLifecycle';
 import { pruneClosedRetained } from './app/retainedReview';
-import { runDemoAgent } from './app/demoAgent';
-import { runDemoChangesetAgent } from './app/combinedAgent';
 import { revalidateAttachments } from './app/attachments';
-import { runLmAgent, runLmChangesetAgent } from './app/lmAgent';
+import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
+import { createHarnessRunStore } from './app/harnessRunStore';
+import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './app/harnessRuntime';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
 import { setApiTraceSink } from './app/apiTrace';
@@ -103,15 +103,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     baseSeconds: () => readPollIntervalSeconds(),
   });
 
-  // Before anything paints. A `vscode.lm` stream cannot be reattached after the
-  // extension host stops, so whatever was running when the last window closed is
-  // gone; recording it as interrupted is how the change request avoids reading
-  // exactly as it would have if no review had ever been started on it. The
-  // promise is captured (task 14.7), not fired-and-forgotten, so the summary
-  // notification below can be raised once `notifier` exists further down —
-  // the sweep itself still starts at this exact point in activation.
-  const interruptedSweep = sweepInterruptedRuns(context.globalState);
-
   /**
    * The last lifecycle seen per run, so a progress emission — four a second
    * on a streaming run — cannot be mistaken for a state change. Task 14.4:
@@ -124,6 +115,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const lastRunStatus = new Map<string, string>();
 
   /**
+   * The harness's own bounded store (task 11.1), built once here over the
+   * same `context.globalState` `ReviewRunManager` already reads its own
+   * internal copy from (see that module's `harnessRunStore` field doc
+   * comment — the two instances share every underlying key, so a checkpoint
+   * written through this one is exactly what the manager's activation sweep
+   * below, and any future resume compatibility check, finds). Nothing on the
+   * live execution path wrote a checkpoint here before this pass (task
+   * 15.7) — the sweep and resume compatibility had no production data.
+   */
+  const harnessRunStore = createHarnessRunStore(context.globalState, { now: () => Date.now() });
+
+  /**
+   * The real `ReviewHarnessFactory` (task 15.7, the runtime cutover):
+   * assembles a live `ReviewRunSnapshot`, a provider-backed tool dispatcher
+   * (through `harnessAttempt.ts`'s own `createHostToolDispatcher` wiring),
+   * the real model seam (`./app/harnessModelSeam.ts`, over
+   * `runHarnessModelTurn`'s existing streaming/cancellation path), and the
+   * real synthesis/verification collaborator — every collaborator built and
+   * tested in sections 1-14, assembled for the first time. Every shipped
+   * entry point (built-in agent, discovered agent, demo agent, individual
+   * review, changeset review, first run, rerun) reaches a review only
+   * through `runManager.trigger`, which drives this one factory — there is
+   * no shipped path left that reaches the deprecated one-shot runners (task
+   * 10.8) — the old `{lm, demo}` compatibility shape `reviewRunManager.ts`
+   * still accepts remains only that module's own test fixture.
+   */
+  const harnessRuntimeDeps: HarnessRuntimeDeps = {
+    podStore,
+    secrets,
+    discoverModel: async (modelId) => (await discoverModels()).find((model) => model.id === modelId),
+    countTokens: (modelId, text) => countPromptTokens(modelId, text),
+    runTurn: (modelId, prompt, options) => runHarnessModelTurn(modelId, prompt, options),
+    revalidateAttachments,
+    harnessRunStore,
+  };
+
+  /**
    * Runs live here, for the window's lifetime — not on the panel that started
    * them. Constructed before any panel so a review triggered from one screen is
    * still running when the reviewer is on another.
@@ -131,53 +159,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const runManager = new ReviewRunManager({
     workspaceState: context.workspaceState,
     globalState: context.globalState,
-    runners: {
-      lm: (input: RunInput, options: RunnerOptions) =>
-        input.target.kind === 'cr'
-          ? runLmAgent(
-              input.agent,
-              input.modelId ?? '',
-              input.target.diff,
-              input.criteria,
-              input.target.reviewContext,
-              {
-                ...options,
-                attachments: input.target.attachments,
-                contextBudgets: input.contextBudgets,
-                effort: input.effort,
-                workspaceRootLabel: input.target.workspaceRootLabel,
-              },
-            )
-          : runLmChangesetAgent(input.agent, input.modelId ?? '', input.target.members, input.criteria, {
-              ...options,
-              contextBudgets: input.contextBudgets,
-              effort: input.effort,
-            }),
-      demo: async (input: RunInput) => {
-        if (input.target.kind === 'cr') {
-          const validated = await revalidateAttachments(input.target.attachments ?? []);
-          return {
-            ...runDemoAgent(input.target.diff, input.criteria, {
-              attachments: validated.attachments,
-              workspaceRootLabel: input.target.workspaceRootLabel,
-            }),
-            attachmentWarnings: validated.warnings,
-          };
-        }
-        const validated = await Promise.all(input.target.members.map(async (member) => {
-          const result = await revalidateAttachments(member.attachments ?? []);
-          return { member: { ...member, attachments: result.attachments }, warnings: result.warnings };
-        }));
-        return {
-          ...runDemoChangesetAgent(
-            validated.map((result) => result.member),
-            input.criteria,
-            tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
-          ),
-          attachmentWarnings: validated.flatMap((result) => result.warnings),
-        };
-      },
-    },
+    runners: createReviewHarnessFactory(harnessRuntimeDeps),
     onChange: (record) => {
       // The run list and the status bar's runs segment both read live run
       // state, so one fan-out keeps them from drifting apart — both are
@@ -209,6 +191,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // `onReviewReady` already covers `succeeded` (complete or partial).
     onRunOutcome: (info) => notifier.runEnded(info),
   });
+
+  // Before anything paints. A `vscode.lm` stream cannot be reattached after the
+  // extension host stops, so whatever was running when the last window closed is
+  // gone; recording it as interrupted is how the change request avoids reading
+  // exactly as it would have if no review had ever been started on it. The
+  // promise is captured (task 14.7), not fired-and-forgotten, so the summary
+  // notification below can be raised once `notifier` exists further down —
+  // the sweep itself still starts at this exact point in activation, now
+  // through the manager's own `sweepInterrupted` (task 15.7) so it consults
+  // the same `harnessRunStore` a live run actually wrote checkpoints into,
+  // not just the crude in-flight marker `sweepInterruptedRuns` always had on
+  // its own (see that function's own doc comment on what an empty store gave
+  // it before this pass).
+  const interruptedSweep = runManager.sweepInterrupted();
 
   const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
 

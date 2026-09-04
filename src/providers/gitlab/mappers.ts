@@ -300,6 +300,7 @@ export function toChangeRequestDiff(
 ): ChangeRequestDiff {
   return {
     ref,
+    baseSha: changes.diff_refs.base_sha,
     headSha: changes.diff_refs.head_sha,
     files: changes.changes.map(toFileDiff),
     anchorRefs: changes.diff_refs,

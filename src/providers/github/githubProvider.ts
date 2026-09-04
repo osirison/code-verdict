@@ -719,6 +719,7 @@ export class GitHubConnection implements Connection {
     const files = await this.http.getAll<GhFile>(`${this.prPath(ref)}/files`);
     return {
       ref,
+      baseSha: pull.base.sha,
       headSha: pull.head.sha,
       files: files.map(toFileDiff),
       // Opaque to the platform layer: GitHub needs one commit id where GitLab

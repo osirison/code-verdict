@@ -20,6 +20,7 @@ export const SMALL_REVIEW_REF: ChangeRequestRef = { repoId: 'harness-small', num
 
 export const SMALL_REVIEW_DIFF: ChangeRequestDiff = {
   ref: SMALL_REVIEW_REF,
+  baseSha: 'small-base-1',
   headSha: 'small-head-1',
   files: [
     {
@@ -53,6 +54,7 @@ export function hugeReviewFiles(count = HUGE_REVIEW_FILE_COUNT): FileDiff[] {
 
 export const HUGE_REVIEW_DIFF: ChangeRequestDiff = {
   ref: HUGE_REVIEW_REF,
+  baseSha: 'huge-base-1',
   headSha: 'huge-head-1',
   files: hugeReviewFiles(),
   anchorRefs: { base_sha: 'huge-base-1', head_sha: 'huge-head-1' },
@@ -78,6 +80,7 @@ export const BINARY_AND_RENAMED_REF: ChangeRequestRef = { repoId: 'harness-mixed
 
 export const BINARY_AND_RENAMED_DIFF: ChangeRequestDiff = {
   ref: BINARY_AND_RENAMED_REF,
+  baseSha: 'mixed-base-1',
   headSha: 'mixed-head-1',
   files: [BINARY_FILE, RENAMED_FILE],
   anchorRefs: { base_sha: 'mixed-base-1', head_sha: 'mixed-head-1' },
@@ -99,6 +102,7 @@ export const OVERSIZED_REVIEW_REF: ChangeRequestRef = { repoId: 'harness-oversiz
 
 export const OVERSIZED_REVIEW_DIFF: ChangeRequestDiff = {
   ref: OVERSIZED_REVIEW_REF,
+  baseSha: 'oversized-base-1',
   headSha: 'oversized-head-1',
   files: [{ oldPath: OVERSIZED_FILE_PATH, newPath: OVERSIZED_FILE_PATH, diff: oversizedDiffBody() }],
   anchorRefs: { base_sha: 'oversized-base-1', head_sha: 'oversized-head-1' },
@@ -123,6 +127,7 @@ export const NESTED_AGENTS_MD: FixtureRepoFile[] = [
 
 export const NESTED_AGENTS_MD_DIFF: ChangeRequestDiff = {
   ref: NESTED_AGENTS_MD_REF,
+  baseSha: 'policy-base-1',
   headSha: 'policy-head-1',
   files: [
     {
@@ -150,6 +155,7 @@ const CHANGED_HEAD_FILE: FileDiff = {
 
 export const CHANGED_HEAD_SNAPSHOT_DIFF: ChangeRequestDiff = {
   ref: CHANGED_HEAD_REF,
+  baseSha: 'stale-base-1',
   headSha: CHANGED_HEAD_SNAPSHOT_SHA,
   files: [CHANGED_HEAD_FILE],
   anchorRefs: { base_sha: 'stale-base-1', head_sha: CHANGED_HEAD_SNAPSHOT_SHA },
@@ -158,6 +164,7 @@ export const CHANGED_HEAD_SNAPSHOT_DIFF: ChangeRequestDiff = {
 /** Same ref, later head — evidence bound to the snapshot must not be reused against this one. */
 export const CHANGED_HEAD_LATER_DIFF: ChangeRequestDiff = {
   ref: CHANGED_HEAD_REF,
+  baseSha: 'stale-base-1',
   headSha: CHANGED_HEAD_LATER_SHA,
   files: [
     CHANGED_HEAD_FILE,
@@ -229,6 +236,7 @@ export const CHANGESET_MEMBERS: FixtureChangesetMember[] = [
     projectPath: 'harness/core',
     diff: {
       ref: { repoId: 'harness-cs-core', number: '11' },
+      baseSha: 'cs-core-base',
       headSha: 'cs-core-head',
       anchorRefs: { head: 'cs-core' },
       files: [{ oldPath: 'src/schema/order.ts', newPath: 'src/schema/order.ts', diff: '@@ -3,1 +3,2 @@\n export interface Order {\n+  taxAmountMinorUnits: number\n' }],
@@ -239,6 +247,7 @@ export const CHANGESET_MEMBERS: FixtureChangesetMember[] = [
     projectPath: 'harness/billing',
     diff: {
       ref: { repoId: 'harness-cs-billing', number: '22' },
+      baseSha: 'cs-billing-base',
       headSha: 'cs-billing-head',
       anchorRefs: { head: 'cs-billing' },
       files: [{ oldPath: 'src/invoice/build.ts', newPath: 'src/invoice/build.ts', diff: '@@ -12,1 +12,2 @@\n const order = await orders.load(id)\n+const tax = order.taxAmountMinorUnits\n' }],
@@ -249,6 +258,7 @@ export const CHANGESET_MEMBERS: FixtureChangesetMember[] = [
     projectPath: 'harness/console',
     diff: {
       ref: { repoId: 'harness-cs-console', number: '33' },
+      baseSha: 'cs-console-base',
       headSha: 'cs-console-head',
       anchorRefs: { head: 'cs-console' },
       files: [{ oldPath: 'src/views/OrderSummary.tsx', newPath: 'src/views/OrderSummary.tsx', diff: '@@ -20,1 +20,2 @@\n const total = order.total\n+const tax = order.taxAmountMinorUnits ?? 0\n' }],
