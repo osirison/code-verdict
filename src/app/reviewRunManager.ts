@@ -67,14 +67,17 @@
  * authoritative result whenever it resolves, `waiting` or not; `isSettleable`
  * therefore treats `waiting`/`paused`/`resuming` as settleable, and `settle`
  * performs the "resuming -> prior active phase" hop itself when it finds one
- * of those three, rather than requiring an external `resume()` first. (2) the
- * *automatic* production trigger for `onResuming` does not exist anywhere in
- * the committed harness engine — `harnessToolDispatcher.ts`'s
- * `DispatchControl.resumedAfterWait` has no writer in `harnessAttempt.ts` —
- * so `onResuming` is exercised here only via the reviewer-initiated `resume()`
- * path (task 14.6's future UI control); see the integration test file's own
- * header for the full finding, and this pass's report for why task 9.6 is
- * not re-ticked on the strength of it alone.
+ * of those three, rather than requiring an external `resume()` first. (2) a
+ * later pass closed task 9.6's remaining gap: `harnessAttempt.ts`'s
+ * `dispatchAndTrack` now marks the model's re-dispatch of a logical operation
+ * that previously entered `waiting` with `DispatchControl.resumedAfterWait:
+ * true`, so `onResuming` now also fires automatically, from a real attempt's
+ * own retry loop, not only via the reviewer-initiated `resume()` path (task
+ * 14.6's future UI control) this module still separately supports; see
+ * `harnessAttempt.ts`'s own file header and `harnessAttempt.test.ts`'s "9.6"
+ * test for the production trigger and its end-to-end proof. Either way, the
+ * one live `HarnessAttempt.run()` promise remains this module's sole source
+ * of truth for when the attempt actually finishes — (1) above still holds.
  */
 import { randomBytes } from 'node:crypto';
 import type { AgentDescriptor } from './agents';
@@ -86,7 +89,9 @@ import type { Attachment, ContextBudgets, ReviewContext } from './reviewContext'
 import { ReviewRunStore } from './reviewRuns';
 import {
   changesetDraftKeyFor,
+  changesetPartialDraftKeyFor,
   draftKeyFor,
+  partialDraftKeyFor,
   retainedFromRun,
   runKeyForChangeset,
   runKeyForCr,
@@ -96,10 +101,13 @@ import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './har
 import { reduceActivity } from './harnessActivityProjection';
 import type { CompletionOutcome } from './harnessCompletion';
 import type { ValidatedFinding } from './harnessCandidateValidation';
+import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
+import { checkCheckpointIntegrity, closeAttemptAsInterrupted } from './harnessResume';
 import { createReview } from '../domain/reviewState';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { EffortLevel } from '../domain/effort';
 import type { Limitation, RunProjection } from '../domain/harnessActivity';
+import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
 import {
   isActiveLifecycle,
   isTerminalLifecycle,
@@ -463,6 +471,15 @@ export function recordKeyFor(target: RunTarget): string {
 }
 
 /**
+ * Where a target's *partial* result is stored (task 12.5) — always a
+ * separate key from `recordKeyFor`, so a partial can never be mistaken for,
+ * or silently merge into, the target's retained complete review.
+ */
+export function partialRecordKeyFor(target: RunTarget): string {
+  return target.kind === 'cr' ? partialDraftKeyFor(target.ref) : changesetPartialDraftKeyFor(target.changesetId);
+}
+
+/**
  * How a changeset identifies itself to `ReviewRunStore` and `createReview`.
  * Not invented here: `changesetReview.ts` already builds its `Review` with
  * `repoId: 'changeset'` and the changeset id as the number, so a changeset run
@@ -784,12 +801,27 @@ export class ReviewRunManager {
   private readonly listeners = new Set<(record: RunRecord) => void>();
   private readonly runs: ReviewRunStore;
   private readonly inFlight: InFlightRunStore;
+  /**
+   * Task 12.7: the same bounded store `HarnessRunStore` (task 11.1) already
+   * defines, built here exactly as `ReviewRunStore`/`InFlightRunStore` above
+   * are — self-contained, no `extension.ts` change needed. Nothing on the
+   * live execution path writes to it yet: durable checkpoint persistence
+   * needs a real `ReviewRunSnapshot` per run (`RunRecord.checkpoint`'s own
+   * doc comment — "once one does"), which is the section 15 runtime cutover,
+   * not this pass. It exists here so the activation sweep
+   * (`sweepInterrupted`) can honestly consult whatever a later pass writes,
+   * without a second store construction path to keep in sync — see
+   * `sweepInterruptedRuns`'s own doc comment for exactly what it does with
+   * an empty store today.
+   */
+  private readonly harnessRunStore: HarnessRunStore;
   /** Always a real `ReviewHarnessFactory` by the time the constructor returns — `deps.runners`'s legacy shape, if that is what was injected, is normalized once here (see `legacyRunnersToHarnessFactory`). Nothing past this point branches on which one was supplied. */
   private readonly harnessFactory: ReviewHarnessFactory;
 
   constructor(private readonly deps: ReviewRunManagerDeps) {
     this.runs = new ReviewRunStore(deps.globalState);
     this.inFlight = new InFlightRunStore(deps.globalState);
+    this.harnessRunStore = createHarnessRunStore(deps.globalState, { now: () => this.now() });
     this.harnessFactory = isLegacyRunners(deps.runners)
       ? legacyRunnersToHarnessFactory(deps.runners, {
           delay: (ms) => this.deps.delay?.(ms) ?? new Promise((resolve) => setTimeout(resolve, ms)),
@@ -931,7 +963,7 @@ export class ReviewRunManager {
 
   /** The interrupted sweep — see `InFlightRunStore`. Run once, on activation. */
   async sweepInterrupted(): Promise<number> {
-    return sweepInterruptedRuns(this.deps.globalState);
+    return sweepInterruptedRuns(this.deps.globalState, { harnessRunStore: this.harnessRunStore, now: () => this.now() });
   }
 
   private pump(): void {
@@ -969,6 +1001,11 @@ export class ReviewRunManager {
       refLabel: record.input.refLabel,
       ...reviewIdentityFor(record.input.target),
       startedAt: new Date(startedAt).toISOString(),
+      // Task 12.7: lets the activation sweep find this run's lineage in
+      // `harnessRunStore`, once something writes one there (see the store
+      // field's own doc comment) — absent costs the sweep nothing today.
+      runId: record.runId,
+      lineageId: record.lineageId,
     });
     void this.executeAttempt(record.key);
   }
@@ -1009,6 +1046,8 @@ export class ReviewRunManager {
       refLabel: record.input.refLabel,
       ...reviewIdentityFor(record.input.target),
       startedAt: new Date(this.now()).toISOString(),
+      runId: record.runId,
+      lineageId: record.lineageId,
     });
   }
 
@@ -1268,6 +1307,13 @@ export class ReviewRunManager {
         // or an empty screen, and nothing would repaint when the write
         // landed a microtask later.
         await this.deps.workspaceState.update(recordKeyFor(input.target), retained);
+        // Task 12.5: a fresh complete success is the one thing that ever
+        // clears a stale partial (mirrors this file's own header: a retained
+        // review "is deleted by exactly one thing — a newer run on the same
+        // target that succeeded"). Still before `settle`'s notify below —
+        // same write-before-notify discipline as the retained-review write
+        // just above.
+        await this.deps.workspaceState.update(partialRecordKeyFor(input.target), undefined);
         // Cancelled (or otherwise moved off an active phase) while that
         // write was in flight: the reviewer asked for this run to stop, and
         // `cancel` has already settled the record and freed its slot. The
@@ -1316,6 +1362,42 @@ export class ReviewRunManager {
     const partial: AgentReviewResponse | undefined = items.length > 0
       ? { schemaVersion: '1', agentId: input.agent.id, agentLabel: input.agentLabel, headSha: headShaFor(input.target), items, candidates: [] }
       : undefined;
+    const identity = reviewIdentityFor(input.target);
+    const ranAt = new Date(this.now()).toISOString();
+    if (partial) {
+      // Task 12.5/12.6: a partial result is durably, separately reachable —
+      // its own key (`partialRecordKeyFor`), never the target's retained
+      // review — not merged into it and never presented as if it were
+      // complete. Written before anything is told the run ended, same
+      // write-before-notify discipline as the succeeded path above.
+      const review = createReview({
+        repoId: identity.repoId,
+        crNumber: identity.crNumber,
+        agentId: input.agent.id,
+        modelId: input.modelId,
+        effort: input.effort,
+        criteria: input.criteria,
+        response: partial,
+      });
+      const partialRecord = retainedFromRun({
+        review,
+        ranAt,
+        agentId: input.agent.id,
+        agentLabel: input.agentLabel,
+        modelId: input.modelId,
+        candidates: partial.candidates,
+        // Not exposed by `HarnessAttemptResult` in this pass (matches the succeeded path above).
+        filesRead: undefined,
+        attachmentWarnings: record.attachmentWarnings,
+        // Explicitly incomplete: never defaults to 'complete' the way a plain `retainedFromRun`
+        // call would (`result.outcome.completeness` here is always `'partial'` under
+        // `runPersisting`'s own invariant — cancellation/failure never reach `complete`).
+        completeness: result.outcome.completeness,
+        limitations: result.outcome.limitations,
+      });
+      await this.deps.workspaceState.update(partialRecordKeyFor(input.target), partialRecord);
+      if (!this.isSettleable(key)) return;
+    }
     if (result.lifecycle === 'cancelled') {
       this.settle(record, {
         lifecycle: 'cancelled',
@@ -1323,6 +1405,7 @@ export class ReviewRunManager {
         limitations: result.outcome.limitations,
         partialResult: partial,
       });
+      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt);
       return;
     }
     // 'failed', or (structurally unreachable from a live `.run()` — see this
@@ -1340,6 +1423,29 @@ export class ReviewRunManager {
       limitations: result.outcome.limitations,
       partialResult: partial,
     });
+    if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt);
+  }
+
+  /**
+   * Task 12.5: the run-history counterpart to a durable partial write
+   * (`completeAttempt`'s failed/cancelled tail) — an explicit `'partial'`
+   * outcome, never folded into `'findings'`. Recorded after `settle`'s
+   * notify, mirroring the succeeded path's own `this.runs.record`/
+   * `onRunRecorded` ordering above (run-history/dashboard metadata, not the
+   * result a panel reads back to render — see `completeAttempt`'s own
+   * write-before-notify comment on the retained-review and durable-partial
+   * writes themselves, which do precede notify).
+   */
+  private async recordPartialHistory(identity: { repoId: string; crNumber: string }, agentLabel: string, findingCount: number, ranAt: string): Promise<void> {
+    await this.runs.record({
+      repoId: identity.repoId,
+      crNumber: identity.crNumber,
+      outcome: 'partial',
+      findingCount,
+      agentLabel,
+      ranAt,
+    });
+    this.deps.onRunRecorded?.();
   }
 
   /**
@@ -1558,6 +1664,16 @@ export interface InFlightRun {
   repoId: string;
   crNumber: string;
   startedAt: string;
+  /**
+   * Task 12.7: this run's harness identity, so the activation sweep can look
+   * up its lineage in `HarnessRunStore` (`sweepInterruptedRuns`). Optional so
+   * every pre-this-change persisted entry (`migrationFixtures.ts`'s
+   * `LEGACY_IN_FLIGHT_RUN`) still parses unchanged, and so a legacy-adapted
+   * run (which reports no checkpoints at all) can still be swept the way it
+   * always was.
+   */
+  runId?: string;
+  lineageId?: string;
 }
 
 const IN_FLIGHT_KEY = 'codeVerdict.inFlightRuns';
@@ -1586,25 +1702,76 @@ export class InFlightRunStore {
   }
 }
 
+/** Task 12.7's optional collaborators — see `sweepInterruptedRuns`'s own doc comment. */
+export interface SweepInterruptedOptions {
+  readonly harnessRunStore?: HarnessRunStore;
+  /** Bound values only (`closeAttemptAsInterrupted`'s activity retention, `HarnessRunStore.writeCheckpoint`'s per-lineage retention) — defaults to `DEFAULT_HARNESS_POLICY`, matching every other module in this change with no live policy to read. */
+  readonly policy?: HarnessPolicy;
+  /** This module's determinism rule ("a checkpoint store must never read a clock of its own") applies to the closed checkpoint's `occurredAt` too — defaults to `() => Date.now()` only for callers with no injected clock (today's tests, legacy call sites); `ReviewRunManager.sweepInterrupted` passes its own. */
+  readonly now?: () => number;
+}
+
+/** `computeInterruptedCompleteness`'s own predicate (`harnessResume.ts`), counted rather than reduced to a boolean — never a second definition of "which candidates count". */
+function acceptedFindingCount(candidates: readonly { readonly state: string; readonly finding?: unknown }[]): number {
+  return candidates.filter((candidate) => candidate.state === 'accepted' && candidate.finding !== undefined).length;
+}
+
 /**
  * Turn whatever survived the last session into recorded `interrupted` runs, and
  * clear the list. Nothing here touches the target's retained review: an
  * interruption is reported *alongside* the last completed review, never in
  * place of it.
+ *
+ * Task 12.7: when `options.harnessRunStore` is given and a leftover entry
+ * carries `runId`/`lineageId` (`InFlightRun`'s own doc comment) with a
+ * nonterminal checkpoint on record there, that attempt is closed as
+ * `interrupted` in the store too — `harnessResume.ts`'s
+ * `closeAttemptAsInterrupted`, the same function task 11.6's own tests
+ * already exercise, never a second close path. The recorded finding count
+ * then reflects whatever validated findings the last checkpoint actually
+ * held, and `ReviewRun.resumable` reports whether the *stored* checkpoint
+ * alone is sound (`harnessResume.ts`'s `checkCheckpointIntegrity` — never
+ * the live head/model/policy comparison `decideResume`'s remaining
+ * dimensions need, which this sweep has no live snapshot to build; offering
+ * an *actual* resume — starting a new attempt — needs that live snapshot too
+ * and stays out of this pass, see `ReviewRunManager`'s own `harnessRunStore`
+ * field doc comment). Every leftover entry with nothing to consult — every
+ * entry today, since nothing on the live execution path writes checkpoints
+ * yet, and every legacy-adapted run always — falls back to exactly the
+ * crude behavior this function always had.
  */
-export async function sweepInterruptedRuns(globalState: KeyValueStore): Promise<number> {
+export async function sweepInterruptedRuns(globalState: KeyValueStore, options: SweepInterruptedOptions = {}): Promise<number> {
   const inFlight = new InFlightRunStore(globalState);
   const leftover = inFlight.list();
   if (leftover.length === 0) return 0;
   const runs = new ReviewRunStore(globalState);
+  const harnessRunStore = options.harnessRunStore;
+  const policy = options.policy ?? DEFAULT_HARNESS_POLICY;
+  const now = options.now ?? (() => Date.now());
   for (const entry of leftover) {
+    let findingCount = 0;
+    let resumable: boolean | undefined;
+    if (harnessRunStore && entry.runId && entry.lineageId) {
+      const lineageId = entry.lineageId as LineageId;
+      const latest = harnessRunStore.latestCheckpoint(lineageId);
+      if (latest && !isTerminalLifecycle(latest.projection.lifecycle)) {
+        const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
+        if (closed) {
+          await harnessRunStore.writeCheckpoint(closed, policy);
+          findingCount = acceptedFindingCount(closed.candidates);
+          const storedSnapshot = harnessRunStore.readSnapshot(lineageId, closed.attempt);
+          resumable = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, closed).length === 0 : false;
+        }
+      }
+    }
     await runs.record({
       repoId: entry.repoId,
       crNumber: entry.crNumber,
       outcome: 'interrupted',
-      findingCount: 0,
+      findingCount,
       agentLabel: '',
       ranAt: entry.startedAt,
+      ...(resumable !== undefined ? { resumable } : {}),
     });
   }
   await inFlight.clear();

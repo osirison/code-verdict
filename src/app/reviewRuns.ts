@@ -24,8 +24,15 @@ import type { KeyValueStore } from './storage';
  * gone; recording it is how the change request avoids silently reading
  * whatever it read before, which is indistinguishable from never having run.
  * It is neither reviewed nor submitted, and counts towards no coverage.
+ *
+ * `partial` (task 12.5, design.md D11) = the run ended (failed or cancelled)
+ * with some validated findings but did not satisfy the host completion gate.
+ * Explicitly its own outcome, never folded into `findings`: a partial result
+ * is not retained as the target's complete review (`retainedReview.ts`'s
+ * `partialDraftKeyFor`, a separate key) and must never be presented as if it
+ * were one.
  */
-export type ReviewRunOutcome = 'clean' | 'findings' | 'interrupted';
+export type ReviewRunOutcome = 'clean' | 'findings' | 'interrupted' | 'partial';
 
 export interface ReviewRun {
   repoId: string;
@@ -35,6 +42,18 @@ export interface ReviewRun {
   findingCount: number;
   agentLabel: string;
   ranAt: string;
+  /**
+   * Task 12.7: for an `interrupted` entry the activation sweep could match
+   * against a stored harness checkpoint, whether `harnessResume.ts`'s stored-
+   * checkpoint integrity check (`checkCheckpointIntegrity`) found the
+   * checkpoint itself sound — the *offer*, not a live compatibility decision
+   * against the current head/model/policy (`decideResume`'s remaining
+   * dimensions), which needs a live snapshot no code path feeding the
+   * activation sweep builds yet. Absent whenever no checkpoint data was
+   * available to check at all (the ordinary case today, and every entry not
+   * produced by the sweep).
+   */
+  resumable?: boolean;
 }
 
 const KEY = 'codeVerdict.reviewRuns';

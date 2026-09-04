@@ -34,12 +34,20 @@ export function readLegacyReview(review: Pick<Review, 'crNumber' | 'repoId'>): L
 
 export interface LegacyRunHistoryRead {
   completeness: ResultCompleteness;
-  /** Absent for `interrupted`: there is no result to attribute a protocol to. */
+  /** Absent for `interrupted`/`partial`: there is no complete result to attribute a legacy protocol to. */
   protocolProvenance?: ProtocolProvenance;
 }
 
-/** Mirrors `ReviewRunOutcome` (`src/app/reviewRuns.ts`) structurally, without importing the app layer. */
-export function readLegacyRunHistory(run: { outcome: 'clean' | 'findings' | 'interrupted' }): LegacyRunHistoryRead {
+/**
+ * Mirrors `ReviewRunOutcome` (`src/app/reviewRuns.ts`) structurally, without
+ * importing the app layer. `'partial'` (task 12.5) can never actually reach
+ * this *legacy* reader in practice — nothing before the harness ever wrote
+ * it — but the branch keeps this mirror accurate rather than narrower than
+ * the type it mirrors, and reports the same completeness `readRetained`'s
+ * own partial-key default would.
+ */
+export function readLegacyRunHistory(run: { outcome: 'clean' | 'findings' | 'interrupted' | 'partial' }): LegacyRunHistoryRead {
   if (run.outcome === 'interrupted') return { completeness: 'none' };
+  if (run.outcome === 'partial') return { completeness: 'partial' };
   return { completeness: 'complete', protocolProvenance: 'legacy-one-shot' };
 }

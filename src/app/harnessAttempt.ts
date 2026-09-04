@@ -516,6 +516,18 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   let passesStale = false;
   /** The contradiction pass's exclusions (task 10.6's collaborator's `output.contradicted`), captured here so `fireCheckpoint`/`runPersisting` can hand them to the checkpoint collaborator and `HarnessAttemptOutcome` instead of dropping them at this closure's boundary. */
   let latestContradicted: readonly ContradictedFindingRecord[] = [];
+  /**
+   * Task 9.6's production trigger for `DispatchControl.resumedAfterWait`/`onResuming`. Keys are
+   * `waitKeyFor(request)` for every logical tool-call operation `retryOptions.onEnterWaiting`
+   * (below) observed entering a 9.6 long-delay `wait`; `dispatchAndTrack` consumes (deletes) a key
+   * the moment the same operation is dispatched again, marking that re-dispatch resumed. Every
+   * dispatch in this module is awaited one at a time (never concurrently), so `inFlightRequest`
+   * safely names "whichever request `dispatcher.dispatch` is currently working on" for
+   * `onEnterWaiting` to key off of — `DispatcherRetryWaitInfo` itself carries only `tool`/
+   * `memberId`, not the operation's own request fields (`path`/`query`/...).
+   */
+  const pendingWaitKeys = new Set<string>();
+  let inFlightRequest: HostToolRequest | undefined;
 
   function isCancelled(): boolean {
     return cancellation?.isCancellationRequested === true;
@@ -613,6 +625,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     },
     onEnterWaiting: (info) => {
       appendActivity({ kind: 'waiting', reason: 'A transient provider issue requires a longer wait before this request can continue.' }, currentPhase);
+      // Closes task 9.6: remember which logical operation just entered `waiting`, so
+      // `dispatchAndTrack`'s next dispatch of that same operation is marked
+      // `resumedAfterWait: true` — the one production trigger for `onResuming` below.
+      if (inFlightRequest) pendingWaitKeys.add(waitKeyFor(inFlightRequest));
       options.retry?.onEnterWaiting?.(info);
     },
     onResuming: (info) => {
@@ -669,6 +685,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         return exhaustive;
       }
     }
+  }
+
+  /** 9.6: a logical operation's identity for `pendingWaitKeys` — coarser than `requestId` (which is
+   * always fresh per dispatch, D12/`DispatchControl`'s own budget note) on purpose: it names "the
+   * same tool call the model/host is redoing," not one specific request envelope. */
+  function waitKeyFor(request: HostToolRequest): string {
+    return [request.tool, request.memberId ?? '', pathOrIdOf(request) ?? ''].join('::');
   }
 
   function recordToolActivity(phase: RunPhase, request: HostToolRequest, result: HostToolResult): void {
@@ -757,7 +780,23 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   }
 
   async function dispatchAndTrack(phase: RunPhase, request: HostToolRequest, control?: DispatchControl): Promise<HostToolResult> {
-    const result = await dispatcher.dispatch(phase, request, control);
+    // Closes task 9.6: consume (delete, unconditionally — never left short-circuited by an
+    // already-true `control.resumedAfterWait`, or it would linger and misattribute a later,
+    // unrelated dispatch of the same operation) any pending wait recorded for this exact
+    // operation. This dispatch IS the re-dispatch a caller-supplied `control.resumedAfterWait`
+    // would have signalled by hand, so mark it resumed even when no caller passed `control` at
+    // all — the model reissuing the identical tool call is the real production path; nothing in
+    // this module hand-constructs `DispatchControl` today.
+    const hadPendingWait = pendingWaitKeys.delete(waitKeyFor(request));
+    const resumedAfterWait = control?.resumedAfterWait === true || hadPendingWait;
+    const effectiveControl: DispatchControl | undefined = resumedAfterWait ? { resumedAfterWait: true } : control;
+    inFlightRequest = request;
+    let result: HostToolResult;
+    try {
+      result = await dispatcher.dispatch(phase, request, effectiveControl);
+    } finally {
+      inFlightRequest = undefined;
+    }
     recordToolActivity(phase, request, result);
     updateInventoryFromResult(request, result);
     if (result.state !== 'refused') {

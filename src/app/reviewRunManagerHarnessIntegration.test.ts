@@ -20,22 +20,22 @@
  * `reviewRunManager.test.ts`'s hand-rolled-fake tests already assert
  * happens when the hook fires.
  *
- * **What this does not prove, and why.** `onResuming`'s real production
- * trigger does not exist in the committed harness engine yet:
- * `harnessToolDispatcher.ts`'s `dispatchToHandler` only calls
- * `executeWithRetry` with `resumedFromWait: true` when a caller passes
- * `DispatchControl.resumedAfterWait: true` into `dispatcher.dispatch`, and
- * nothing in `harnessAttempt.ts` (the only caller of `dispatch`, tasks
- * 10.3-10.9) ever constructs one — `grep -rn resumedAfterWait src/app` finds
- * only the field's own declaration and its one read site, no writer. That is
- * a gap in an already-committed, already-tested earlier task, not something
- * 12.1 can close without editing `harnessAttempt.ts` itself (out of this
- * pass's scope). Task 9.6 is therefore reported, not re-ticked: the
- * manager's own mechanics (slot release on waiting, FIFO re-entry on
- * resuming, target ownership) are built and proven both by hand-rolled fakes
- * and by this real half of the chain; `harnessRetry.ts`'s hooks are proven
- * in isolation (`harnessRetry.test.ts`); but the full real thread through
- * `onResuming` cannot be exercised until that gap is closed elsewhere.
+ * **What this file does not prove, and why.** `onResuming`'s *automatic*
+ * production trigger — the model reissuing an operation that previously
+ * entered `waiting`, now marked `DispatchControl.resumedAfterWait: true` by
+ * `harnessAttempt.ts`'s `dispatchAndTrack` — was a real gap when this file
+ * was first written (task 12.1): nothing in `harnessAttempt.ts` constructed
+ * one, so this fixture's scripted model (a single `READ_DIFF_TURN` per
+ * phase) never needed to reissue the failed call for the test to make its
+ * point. A later pass closed that gap and proved it end to end in
+ * `harnessAttempt.test.ts`'s own "9.6" test (a real `HarnessAttempt.run()`
+ * through a forced wait-then-resume, asserting `onResuming` fires with a
+ * fresh `requestId`) — this file was not the place for that proof, since its
+ * job is the *manager's* side of the chain (slot release on waiting, FIFO
+ * re-entry on resuming, target ownership), not `harnessAttempt.ts`'s own
+ * dispatch bookkeeping. This file's own scripted scenario below still never
+ * exercises `onResuming` automatically for that reason; the second test
+ * below still exercises it only via the reviewer-initiated `resume()` path.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { createHarnessAttempt, type HarnessAttemptMemberInput, type HarnessModelSeam } from './harnessAttempt';
@@ -332,12 +332,14 @@ describe('task 12.1/9.6: a real HarnessAttempt drives waiting and slot release t
     // the "resuming -> prior active phase" hop itself when the result
     // finally arrives, without requiring an external `resume()` first — see
     // `settle`'s own doc comment on why. This is what makes it possible for
-    // the run to conclude naturally at all: nothing in the currently
-    // committed harness engine ever fires the *automatic* `onResuming`
-    // signal (`harnessToolDispatcher.ts`'s `DispatchControl.resumedAfterWait`
-    // has no writer anywhere in `harnessAttempt.ts` — see this file's own
-    // header), so without this fix a real `waiting` attempt would settle its
-    // own work and then sit stuck, unable to report it.
+    // the run to conclude naturally at all: this fixture's scripted model
+    // never reissues the failed `readDiff` call (`investigating` is scripted
+    // as exactly one `READ_DIFF_TURN` followed by `STOP_TURN`), so
+    // `onResuming` never fires automatically for *this* scenario even with
+    // task 9.6's production trigger now wired in `harnessAttempt.ts` (see
+    // this file's own header) — without `settle`'s implicit resume, a real
+    // `waiting` attempt whose model never asks again would settle its own
+    // work and then sit stuck, unable to report it.
     await vi.waitFor(() => expect(runs.active().some((r) => r.key === first.key)).toBe(false), { timeout: 4000 });
     // This minimal script never satisfies the real completion gate (no
     // synthesis/verification collaborator is injected), so the attempt

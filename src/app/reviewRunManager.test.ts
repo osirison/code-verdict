@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from './agents';
 import { ReviewRunStore } from './reviewRuns';
-import { readRetained, type SessionDraft } from './retainedReview';
+import { partialDraftKeyFor, readRetained, type SessionDraft } from './retainedReview';
 import {
   InFlightRunStore,
   ReviewRunManager,
@@ -18,11 +18,18 @@ import {
 } from './reviewRunManager';
 import type { CheckpointInfo, HarnessAttemptResult } from './harnessAttempt';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
-import type { ValidatedFinding } from './harnessCandidateValidation';
+import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
+import { createHarnessRunStore } from './harnessRunStore';
+import type { CitedEvidenceRef, TrackedCandidate, ValidatedFinding } from './harnessCandidateValidation';
+import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
+import { sha256Hex } from './contentDigest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { RUN_LIFECYCLES, type RunLifecycle } from '../domain/harnessLifecycle';
 import type { RunPhase } from '../domain/harnessActivity';
-import type { BudgetConsumption } from '../domain/harnessCoverage';
+import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
+import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
+import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
+import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { ChangeRequestDiff } from '../platform/types';
@@ -228,6 +235,32 @@ function failedResult(message: string, refLabel = 'run', itemCount = 0): Harness
     findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
     activityLog: createActivityLog(refLabel, refLabel, 1),
     cancelled: false,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/** The cancelled counterpart to `failedResult` — `itemCount > 0` produces the same `partial` outcome shape D11 describes for "cancellation follows a validated partial result". */
+function cancelledResult(refLabel = 'run', itemCount = 0): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'cancelled',
+    outcome: {
+      kind: itemCount > 0 ? 'partialFindings' : 'failed',
+      completeness: itemCount > 0 ? 'partial' : 'none',
+      findingCount: itemCount,
+      limitations: itemCount > 0 ? [{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }] : [],
+      replacesRetainedReview: false,
+      clean: false,
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: true,
     small: true,
     turnsUsed: 1,
     toolCallsUsed: 1,
@@ -1233,5 +1266,316 @@ describe('task 12.1/12.2: completeness, limitations, and partial result come fro
     // Never written as the target's retained review — only a `succeeded`
     // result with `outcome.replacesRetainedReview` ever reaches that path.
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+});
+
+// ---- Task 12.8: partial results are durable, separately reachable, and explicitly incomplete --
+
+describe('task 12.5/12.6: a partial result is durable, separately reachable, and explicitly incomplete', () => {
+  const PARTIAL_KEY = partialDraftKeyFor({ repoId: 'repo-1', number: '2841' });
+
+  it('partial after failure: a failed result with validated findings writes a durable partial record, under its own key, before the run is settled', async () => {
+    const { pending, runners } = controllableAttempts();
+    const seenAtNotify: unknown[] = [];
+    const { runs, workspaceState } = manager({
+      runners,
+      onChange: (record) => {
+        if (record.status === 'failed') seenAtNotify.push(workspaceState.get(PARTIAL_KEY));
+      },
+    });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(seenAtNotify).toHaveLength(1));
+
+    // Write-before-notify: the durable partial was already there the moment a
+    // listener reacted to the failed notification, same discipline as the
+    // succeeded path's own retained-review write.
+    expect(seenAtNotify[0]).toBeDefined();
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Never the target's retained review.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('partial after cancellation: a cancelled result with validated findings writes a durable partial record the same way', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 3));
+    // A cancelled record is deleted from `records` once settled (existing
+    // behavior — "nothing left to tell a screen that did not see it"); the
+    // durable partial write is what this test actually proves.
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(3);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('reading a partial record is never indistinguishable from a complete retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    // A reader that forgets `{ partial: true }` still cannot mistake this for
+    // a complete review: the record itself always carries its own explicit
+    // completeness, never relying on the caller's read-side default.
+    const readAsIfMainKey = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY));
+    expect(partial?.completeness).toBe('partial');
+    expect(readAsIfMainKey?.completeness).toBe('partial');
+    expect(partial?.completeness).not.toBe('complete');
+  });
+
+  it('partial non-replacement: a partial result never replaces an existing complete retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    // First run succeeds and writes the retained review.
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeDefined());
+    const before = workspaceState.get('codeVerdict.draft.repo-1!2841');
+
+    // A re-run ends partial.
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed head could not be re-verified.', '!2841', 1));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    // The complete retained review is untouched — the partial went to its own key.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toEqual(before);
+    expect(readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true })?.completeness).toBe('partial');
+  });
+
+  it('a fresh complete success clears a stale partial from an earlier failed run', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed head could not be re-verified.', '!2841', 1));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeDefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  it('a partial result is recorded in run history under its own outcome, never folded into "findings"', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, globalState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list()).toHaveLength(1));
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '2841', outcome: 'partial', findingCount: 2 });
+  });
+});
+
+// ---- Task 12.7: the activation sweep consults stored checkpoints ------------------------
+
+describe('task 12.7: the activation sweep consults stored checkpoints for a richer interrupted close', () => {
+  const SWEEP_RUN_ID = 'run-sweep-1';
+  const SWEEP_LINEAGE_ID = 'lineage-sweep-1';
+
+  function sweepSnapshot(overrides: Partial<ReviewRunSnapshot> = {}): ReviewRunSnapshot {
+    return {
+      schemaVersion: '1',
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+      attempt: 1,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      targetKind: 'cr',
+      members: [
+        {
+          memberId: 'm1',
+          providerId: 'fixture',
+          instanceUrl: 'https://example.test',
+          ref: { repoId: 'repo-1', number: '42' },
+          baseSha: 'base1',
+          headSha: 'head1',
+          providerCapabilitySignature: 'sig-1',
+          rootAgentsPolicy: { present: false },
+          context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+        },
+      ],
+      agentId: 'built-in',
+      agentInstructions: 'Review the change carefully.',
+      agentInstructionsDigest: 'digest-instructions',
+      personaLabel: 'Built-in reviewer',
+      modelId: 'test-model',
+      effort: 'none',
+      effortInstructionDigest: 'digest-effort',
+      criteria: DEFAULT_CRITERIA,
+      extraInstructionsDigest: 'digest-extra',
+      toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+      harnessPolicyVersion: HARNESS_POLICY_VERSION,
+      ...overrides,
+    };
+  }
+
+  const SWEEP_COVERAGE: readonly MemberCoverage[] = [{ memberId: 'm1', manifestComplete: true, totalFiles: 1, files: [] }];
+
+  function fakeSource(sourceId: string, exactContent: string): LedgerEvidenceSource {
+    return {
+      sourceId,
+      digest: sha256Hex(exactContent),
+      kind: 'diff',
+      repositoryId: 'repo-1',
+      baseSha: 'base1',
+      headSha: 'head1',
+      completeness: 'complete',
+      citable: true,
+      exactContent,
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+      attempt: 1,
+      memberId: 'm1',
+      origin: 'diffPage',
+      trust: 'untrusted',
+      sequence: 1,
+      locations: [],
+      byteLength: Buffer.byteLength(exactContent, 'utf8'),
+    };
+  }
+
+  function citedRef(source: LedgerEvidenceSource): CitedEvidenceRef {
+    return { sourceId: source.sourceId, digest: source.digest, origin: source.origin, memberId: source.memberId, repositoryId: source.repositoryId, baseSha: source.baseSha, headSha: source.headSha, path: 'file1.ts', range: { startLine: 1, endLine: 1 } };
+  }
+
+  function acceptedCandidate(candidateId: string, primary: LedgerEvidenceSource): TrackedCandidate {
+    const finding: ValidatedFinding = {
+      candidateId,
+      memberId: 'm1',
+      routing: 'inline',
+      item: { id: candidateId, file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A finding', body: 'Body.', code: '' },
+      provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
+      evidence: { repositoryId: primary.repositoryId, baseSha: primary.baseSha, headSha: primary.headSha, primary: citedRef(primary), supporting: [] },
+    };
+    return { candidateId, state: 'accepted', repairs: 0, reasons: [], finding };
+  }
+
+  /** A genuinely nonterminal checkpoint: one real `investigating`-phase activity event, not an empty log (which would derive lifecycle `queued`). */
+  function nonterminalActivityEvents() {
+    let log = createActivityLog(SWEEP_RUN_ID, SWEEP_LINEAGE_ID, 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+    return log.events;
+  }
+
+  function sweepCheckpointInput(snapshot: ReviewRunSnapshot, overrides: Partial<CheckpointBuildInput> = {}): CheckpointBuildInput {
+    return {
+      checkpointId: 'ckpt-sweep-1',
+      runId: snapshot.runId,
+      lineageId: snapshot.lineageId,
+      attempt: snapshot.attempt,
+      phase: 'investigating',
+      reason: 'phaseBoundary',
+      occurredAt: '2026-01-01T00:10:00.000Z',
+      elapsedMs: 1000,
+      snapshotDigest: computeSnapshotDigest(snapshot),
+      activityEvents: nonterminalActivityEvents(),
+      evidenceSources: [],
+      candidates: [],
+      contradicted: [],
+      budget: ZERO_BUDGET,
+      coverage: SWEEP_COVERAGE,
+      unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+      retry: INITIAL_RETRY_STATE,
+      ...overrides,
+    };
+  }
+
+  async function addInFlightEntry(globalState: KeyValueStore): Promise<void> {
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!42',
+      podId: 'pod-a',
+      refLabel: '!42',
+      repoId: 'repo-1',
+      crNumber: '42',
+      startedAt: '2026-01-01T00:05:00.000Z',
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+    });
+  }
+
+  it('interruption: closes an unattached nonterminal checkpoint as interrupted, and records its validated finding count', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const primary = fakeSource('ev_a00000000000000000000000000000', 'exact diff bytes');
+    const candidate = acceptedCandidate('cand-1', primary);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot, { evidenceSources: [primary], candidates: [candidate] }), DEFAULT_HARNESS_POLICY);
+    expect(built.projection.lifecycle).toBe('investigating'); // sanity: genuinely nonterminal
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'interrupted', findingCount: 1 });
+    // The lineage's own checkpoint is closed as interrupted too, not only the coarse history row.
+    const closed = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
+    expect(closed?.projection.lifecycle).toBe('interrupted');
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
+  });
+
+  it('compatible resume: marks a resumable interrupted run when the stored checkpoint is sound', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ resumable: true });
+  });
+
+  it('incompatible restart: marks a non-resumable interrupted run when the stored checkpoint fails integrity', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    // A digest that no longer verifies against the stored snapshot — the checkpoint itself is
+    // unsound (`checkCheckpointIntegrity`), independent of any live head/model/policy comparison.
+    const corrupted: PersistedCheckpoint = { ...built, snapshotDigest: 'stale-digest' };
+    await harnessRunStore.writeCheckpoint(corrupted, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ resumable: false });
+  });
+
+  it('a leftover entry with no lineage data to consult falls back to the crude interrupted behavior unchanged', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    // No snapshot/checkpoint ever written for this lineage — exactly today's
+    // production reality (nothing on the live execution path writes one yet).
+    await addInFlightEntry(globalState);
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    const entry = new ReviewRunStore(globalState).list()[0];
+    expect(entry).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'interrupted', findingCount: 0 });
+    expect(entry?.resumable).toBeUndefined();
   });
 });

@@ -24,7 +24,9 @@ import type { KeyValueStore } from './storage';
 import type { ChangesetSubmitState } from './changesetSubmit';
 import type { AttachmentWarning } from './attachments';
 import type { CandidateBucket } from '../domain/agentResponse';
+import type { Limitation } from '../domain/harnessActivity';
 import { normalizeEffortLevel } from '../domain/effort';
+import type { ResultCompleteness } from '../domain/harnessLifecycle';
 import { isReviewItemAnchored, type Review } from '../domain/types';
 
 /**
@@ -40,6 +42,27 @@ export function draftKeyFor(ref: { repoId: string; number: string }): string {
 /** The changeset equivalent, under its own prefix. */
 export function changesetDraftKeyFor(changesetId: string): string {
   return `codeVerdict.changesetDraft.${changesetId}`;
+}
+
+/**
+ * Where a single change request's *partial* result lives (task 12.5,
+ * design.md D16, spec `background-review-runs` "A cached review is replaced
+ * only by a review that succeeds": "those findings remain an explicitly
+ * incomplete partial result associated with the new run... they do not
+ * replace the complete retained review").
+ *
+ * A deliberately separate key, never the draft key above: a partial must
+ * stay reachable on its own without ever being mistaken for — or silently
+ * merged into — the target's retained complete review. Same repo!number
+ * addressing as `draftKeyFor`, under its own prefix.
+ */
+export function partialDraftKeyFor(ref: { repoId: string; number: string }): string {
+  return `codeVerdict.partial.${ref.repoId}!${ref.number}`;
+}
+
+/** The changeset equivalent of `partialDraftKeyFor`. */
+export function changesetPartialDraftKeyFor(changesetId: string): string {
+  return `codeVerdict.changesetPartial.${changesetId}`;
 }
 
 const DRAFT_PREFIX = 'codeVerdict.draft.';
@@ -135,6 +158,21 @@ export interface RetainedResult {
   filesRead?: number;
   /** Filesystem-backed context omitted when its run-start revalidation failed. */
   attachmentWarnings?: readonly AttachmentWarning[];
+  /**
+   * Task 12.5 (design.md D11/D16): independent result completeness, exactly
+   * `HarnessAttemptResult.outcome.completeness`. Absent on every record
+   * written before this field existed (the main draft key's whole history, and
+   * `legacy-one-shot` reviews generally) — `readRetained` defaults an absent
+   * value to `'complete'` there, matching D16's "historical successful
+   * reviews... are read as complete". A record written under
+   * `partialDraftKeyFor`/`changesetPartialDraftKeyFor` always sets this
+   * explicitly to `'partial'`; nothing in this module ever defaults *that*
+   * key's absence to `'complete'` (see `readRetained`'s own `options.partial`
+   * parameter) — an unmarked record is never mistaken for a finished review.
+   */
+  completeness?: ResultCompleteness;
+  /** The attempt's own `CompletionOutcome.limitations` — why this result did not reach `complete`. `[]`/absent for an ordinary complete record. */
+  limitations?: readonly Limitation[];
 }
 
 /**
@@ -161,6 +199,8 @@ export function carryRetainedResult(raw: RetainedResult | undefined): RetainedRe
     candidates: raw?.candidates,
     filesRead: raw?.filesRead,
     attachmentWarnings: raw?.attachmentWarnings,
+    completeness: raw?.completeness,
+    limitations: raw?.limitations,
   };
 }
 
@@ -223,6 +263,9 @@ export function retainedFromRun(input: {
   candidates?: CandidateBucket[];
   filesRead?: number;
   attachmentWarnings?: readonly AttachmentWarning[];
+  /** Defaults to `'complete'` — every existing caller (a finished, retained-review-replacing run) is complete by construction; a partial write (task 12.5) passes `'partial'` explicitly. */
+  completeness?: ResultCompleteness;
+  limitations?: readonly Limitation[];
 }): RetainedRecord {
   return {
     review: input.review,
@@ -237,6 +280,8 @@ export function retainedFromRun(input: {
     candidates: input.candidates,
     filesRead: input.filesRead,
     attachmentWarnings: input.attachmentWarnings,
+    completeness: input.completeness ?? 'complete',
+    limitations: input.limitations,
   };
 }
 
@@ -254,6 +299,18 @@ export interface RetainedReview<D extends RetainedRecord> {
   candidates: CandidateBucket[];
   filesRead?: number;
   attachmentWarnings: readonly AttachmentWarning[];
+  /**
+   * Task 12.5: never left ambiguous with a complete review. `readRetained`'s
+   * default (an absent value reads as `'complete'`) matches D16 for the main
+   * draft key, whose entire pre-this-change history is complete reviews by
+   * construction. A caller reading the *partial* key
+   * (`partialDraftKeyFor`/`changesetPartialDraftKeyFor`) passes
+   * `{ partial: true }` so an absent value there instead reads as `'partial'`
+   * — the direction that can never overstate completeness — rather than
+   * silently borrowing the main key's default.
+   */
+  completeness: ResultCompleteness;
+  limitations: readonly Limitation[];
 }
 
 /**
@@ -261,9 +318,18 @@ export interface RetainedReview<D extends RetainedRecord> {
  * it. A record written before the result fields existed carries its agent and
  * model on the `Review` it holds, so nothing about it is actually missing —
  * only differently placed.
+ *
+ * `options.partial` marks the caller as reading the separate partial key
+ * (task 12.5) rather than the main draft key — the only thing this changes
+ * is the default `completeness` for a record that (should never happen, but
+ * fails closed rather than assumed) omits it. Every partial record this
+ * module's own writer produces always sets `completeness` explicitly; this
+ * default exists only so a partial slot can never be misread as a complete
+ * review through a mere absent field.
  */
 export function readRetained<D extends RetainedRecord>(
   raw: D | undefined,
+  options: { partial?: boolean } = {},
 ): RetainedReview<D> | undefined {
   if (!raw?.review) return undefined;
   const draft = {
@@ -286,6 +352,8 @@ export function readRetained<D extends RetainedRecord>(
     candidates: raw.candidates ?? [],
     filesRead: raw.filesRead,
     attachmentWarnings: raw.attachmentWarnings ?? [],
+    completeness: raw.completeness ?? (options.partial ? 'partial' : 'complete'),
+    limitations: raw.limitations ?? [],
   };
 }
 

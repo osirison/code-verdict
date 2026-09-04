@@ -4,6 +4,7 @@ import {
   createHarnessAttempt,
   defaultSynthesisVerification,
   isSmallReview,
+  type CheckpointInfo,
   type HarnessAttemptMemberInput,
   type HarnessAttemptOptions,
   type HarnessModelSeam,
@@ -13,12 +14,13 @@ import { createSynthesisVerification } from './harnessSynthesisVerification';
 import type { AgentCancellationToken } from './lmAgent';
 import { createBudgetTracker } from './harnessBudgets';
 import { DEFAULT_RISK_FLOOR_RULES } from './harnessRiskFloors';
-import type { HostToolResult } from './harnessToolDispatcher';
+import type { DispatcherRetryResumingInfo, DispatcherRetryWaitInfo, HostToolResult } from './harnessToolDispatcher';
 import { normalizeHarnessPolicy, HARNESS_POLICY_VERSION, type HarnessPolicy } from '../domain/harnessPolicy';
 import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { RunPhase } from '../domain/harnessActivity';
 import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
+import { ScmError } from '../platform/errors';
 import type { Connection, InvestigationOperationCapability, ProviderCapabilities } from '../platform/provider';
 import type {
   ChangedFileEntry,
@@ -880,5 +882,117 @@ describe('HarnessAttempt.run (10.5: small-review fast path)', () => {
     expect(result.small).toBe(true);
     expect(result.outcome.completeness).not.toBe('complete');
     expect(result.outcome.limitations.some((l) => l.code === 'verificationPending' || l.code === 'contradictionPending' || l.code === 'deduplicationPending')).toBe(true);
+  });
+});
+
+describe('HarnessAttempt.run (9.6: a long retry delay moves through waiting to resuming — the production trigger for DispatchControl.resumedAfterWait)', () => {
+  it('a real attempt driven through a long backoff fires onEnterWaiting once, then onResuming once when the model reissues the identical call, charging budget for the resumed read exactly once', async () => {
+    const path = 'file1.ts';
+    const expectedDiffResult = diffPageResult(path);
+    if (expectedDiffResult.state !== 'complete') throw new Error('unreachable: diffPageResult always returns state "complete"');
+    const expectedPatch = expectedDiffResult.value.patch;
+    let readDiffCalls = 0;
+    const connection = reviewConnection({
+      files: [path],
+      // First call: a transient, retryable provider error. Classified as a *long* delay below
+      // (longDelayThresholdMs: 0), so the dispatcher never sleeps through it — it returns an
+      // "unavailable ... will resume later" result instead. Second call (the model's re-dispatch
+      // of the identical readDiff): succeeds.
+      readDiff: async (request) => {
+        readDiffCalls += 1;
+        if (readDiffCalls === 1) throw new ScmError('network', 'a transient network blip');
+        return diffPageResult(request.path);
+      },
+    });
+
+    const waitEvents: DispatcherRetryWaitInfo[] = [];
+    const resumingEvents: DispatcherRetryResumingInfo[] = [];
+    const checkpoints: CheckpointInfo[] = [];
+
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      // The model sees the first readDiff result was unavailable and simply asks again — the real
+      // production path (nothing hand-constructs `DispatchControl` today; see harnessAttempt.ts).
+      investigating: [messages(readDiffMessage(path)), messages(readDiffMessage(path)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        checkpoints.push(info);
+      },
+      retry: {
+        longDelayThresholdMs: 0,
+        sleep: async () => {},
+        onEnterWaiting: (info) => waitEvents.push(info),
+        onResuming: (info) => resumingEvents.push(info),
+      },
+    });
+
+    const result = await attempt.run();
+
+    expect(readDiffCalls).toBe(2);
+
+    // onEnterWaiting fired exactly once, for the waited readDiff call...
+    expect(waitEvents).toHaveLength(1);
+    expect(waitEvents[0]).toMatchObject({ tool: 'readDiff', memberId: 'm1' });
+    // ...and onResuming fired exactly once, for the model's re-dispatch of that same operation.
+    // Before the 9.6 fix, nothing in harnessAttempt.ts ever set `DispatchControl.resumedAfterWait`,
+    // so this never fired in production — this assertion is the regression guard for that gap.
+    expect(resumingEvents).toHaveLength(1);
+    expect(resumingEvents[0]).toMatchObject({ tool: 'readDiff', memberId: 'm1' });
+    // The resumed dispatch used a fresh requestId, never the waited call's own (the budget note on
+    // DispatchControl.resumedAfterWait) — the two requestIds actually observed differ.
+    expect(resumingEvents[0]?.requestId).not.toBe(waitEvents[0]?.requestId);
+
+    // Public activity shows the same causal order: waiting, then resuming.
+    const kinds = result.activityLog.events.map((event) => event.kind);
+    const waitingIndex = kinds.indexOf('waiting');
+    const resumingIndex = kinds.indexOf('resuming');
+    expect(waitingIndex).toBeGreaterThanOrEqual(0);
+    expect(resumingIndex).toBeGreaterThan(waitingIndex);
+
+    // Budget: the resumed read's real evidence bytes were charged exactly once — never left at
+    // zero (the ledger-vs-budget mismatch a reused requestId would silently cause) and never
+    // double-counted for retrying the same logical operation. Proved by comparison against a
+    // control attempt that reads the identical file without ever needing to wait: total evidence
+    // bytes charged must be identical either way.
+    let controlReadDiffCalls = 0;
+    const controlConnection = reviewConnection({
+      files: [path],
+      readDiff: async (request) => {
+        controlReadDiffCalls += 1;
+        return diffPageResult(request.path);
+      },
+    });
+    const controlCheckpoints: CheckpointInfo[] = [];
+    const controlSeam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(path)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const controlAttempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(controlConnection)],
+      modelSeam: controlSeam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        controlCheckpoints.push(info);
+      },
+    });
+    await controlAttempt.run();
+
+    expect(controlReadDiffCalls).toBe(1);
+    const finalBudget = checkpoints[checkpoints.length - 1]?.budget;
+    const controlFinalBudget = controlCheckpoints[controlCheckpoints.length - 1]?.budget;
+    expect(finalBudget?.evidenceBytesUsed).toBeGreaterThan(0);
+    expect(finalBudget?.evidenceBytesUsed).toBe(controlFinalBudget?.evidenceBytesUsed);
+    expect(expectedPatch.length).toBeGreaterThan(0); // sanity: the fixture patch is non-empty
   });
 });
