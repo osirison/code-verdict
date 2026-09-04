@@ -23,15 +23,19 @@
  *
  * **The risk-coverage rule is the one non-numeric setting.** The shipped
  * default (`DEFAULT_RISK_COVERAGE_RULES.requireInspection`, `harnessRiskFloors.ts`)
- * requires every risk level to be actually read before a review can complete
- * — the fail-closed default this change does not relax. `requireInspectionMinRisk`
- * exposes *which* levels that applies to, through the already-existing
- * `risksAtLeast` helper, rather than accepting an arbitrary array: the
- * setting can only ever describe "this level and every level above it",
- * which is the one shape `configuredRiskCoverageSatisfied` (`harnessCompletion.ts`)
- * was designed to accept, so a reviewer can never configure an incoherent
- * rule (say, "high" without "medium"). Its own fallback is the fail-closed
- * default, same discipline as every numeric field.
+ * requires medium and above to be actually read before a review can complete
+ * — `low` is deliberately left to the model, because `harnessRiskFloors.ts`'s
+ * `sourceCodeFloor` already keeps real source code out of `low` regardless of
+ * what the model proposes, so relaxing the requirement below "every level"
+ * does not reopen the fail-closed guarantee it used to provide.
+ * `requireInspectionMinRisk` exposes *which* levels that applies to, through
+ * the already-existing `risksAtLeast` helper, rather than accepting an
+ * arbitrary array: the setting can only ever describe "this level and every
+ * level above it", which is the one shape `configuredRiskCoverageSatisfied`
+ * (`harnessCompletion.ts`) was designed to accept, so a reviewer can never
+ * configure an incoherent rule (say, "high" without "medium"). Its own
+ * fallback is the shipped default, same discipline as every numeric field —
+ * a reviewer remains free to choose `low` explicitly for full coverage.
  */
 import * as vscode from 'vscode';
 import { isRiskLevel, RISK_LEVELS, type RiskLevel } from '../domain/harnessCoverage';
@@ -125,9 +129,9 @@ export function harnessPolicyToSettingValues(policy: HarnessPolicy): Record<Harn
 export const DEFAULT_HARNESS_SETTING_VALUES: Record<HarnessNumberSettingKey, number> =
   harnessPolicyToSettingValues(DEFAULT_HARNESS_POLICY);
 
-/** `'low'` reproduces the shipped fail-closed default: every risk level requires inspection. An unusable value falls back to it, never to a weaker level. */
+/** `'medium'` reproduces the shipped default (`DEFAULT_RISK_COVERAGE_RULES.requireInspection`): medium and above require inspection, with `harnessRiskFloors.ts`'s source-code floor keeping real source code out of `low` in the first place. An unusable value falls back to it, never to a weaker level. */
 export function normalizeRequireInspectionMinRisk(value: unknown): RiskLevel {
-  return isRiskLevel(value) ? value : 'low';
+  return isRiskLevel(value) ? value : 'medium';
 }
 
 export const DEFAULT_REQUIRE_INSPECTION_MIN_RISK: RiskLevel = normalizeRequireInspectionMinRisk(undefined);

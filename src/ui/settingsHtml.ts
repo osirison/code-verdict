@@ -347,7 +347,7 @@ function harnessRegion(state: SettingsViewState): string {
       <p class="subnote">Limits for how much work one review attempt does, and how much of its history is kept afterward.</p>
       ${rows}
       <div class="context-setting">
-        <label class="notification-copy"><span class="notification-name">Inspection required from</span><span class="hint">The lowest risk level that must actually be read, not just classified, before a review can be marked complete. Low (the default) requires every changed file, regardless of risk, to be read.</span></label>
+        <label class="notification-copy"><span class="notification-name">Inspection required from</span><span class="hint">The lowest risk level that must actually be read, not just classified, before a review can be marked complete. Medium (the default) requires every file classified medium or high risk to be read; low-risk files — documentation, specifications, generated output — can be skipped, and real source code is never classified low. Low requires every changed file, regardless of risk, to be read.</span></label>
         <div class="segments">${MIN_RISK_LEVELS.map((level) => `<button class="${state.harness.requireInspectionMinRisk === level.value ? 'active' : ''}" data-min-risk="${level.value}">${level.label}</button>`).join('')}</div>
       </div>
     </section>`;

@@ -334,8 +334,15 @@ describe('classifyFile (10.3 risk classification)', () => {
     expect(result.risk).toBe('high');
   });
 
-  it('with no proposal at all, the floor alone decides (the committed protocol carries no risk-proposal message)', () => {
+  it('with no proposal at all, the floor alone decides — an ordinary source file floors to medium via the source-code floor', () => {
     const entry: ChangedFileEntry = { path: 'src/plain.ts', kind: 'modified', binary: false };
+    const result = classifyFile(entry, undefined, DEFAULT_RISK_FLOOR_RULES);
+    expect(result.risk).toBe('medium');
+    expect(result.floorReasons.some((reason) => reason.ruleId === 'category.sourceCode')).toBe(true);
+  });
+
+  it('with no proposal at all, a non-source (documentation) file floors to low', () => {
+    const entry: ChangedFileEntry = { path: 'docs/readme.md', kind: 'modified', binary: false };
     const result = classifyFile(entry, undefined, DEFAULT_RISK_FLOOR_RULES);
     expect(result.risk).toBe('low');
   });

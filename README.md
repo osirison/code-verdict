@@ -81,10 +81,18 @@ an open-ended search. A finding can anchor to a changed line or an attachment; a
 model reads can support a finding about changed code but cannot become an unrelated one by itself.
 
 What is visible while a review runs is the model's plan, plan revisions with a short reason, which
-file or tool it is working on, and how much of the change has been covered. What is never visible,
+file or tool it is working on, a live list of every tool call it has made — the tool, the file or
+query, and how it came back, including a failed one, bounded so a long-running review does not turn
+the screen into a wall of text — and how much of the change has been covered. What is never visible,
 never logged, and never stored is the prompts sent to the model, its raw output, or any hidden
 reasoning. A separate diagnostic channel, "Code Verdict: Agent Trace", records only the size and a
 digest of what was sent and received — never the text itself.
+
+Every changed file is classified by risk; at medium risk or above, it must actually be read before
+the review can finish, not just classified. A file classified low can be skipped — but real source
+code is never allowed to carry a low classification, regardless of what the reviewing model proposes,
+so what can actually be skipped is documentation, specifications, and similar plain-text content.
+`codeVerdict.harness.requireInspectionMinRisk` (default `medium`) raises or lowers that threshold.
 
 Finding nothing is only reported as a clean review once the review has actually finished; stopping
 early is never shown as clean. A review that stops before finishing keeps only what it already

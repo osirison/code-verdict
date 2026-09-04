@@ -570,6 +570,7 @@ ${WIDTH_CSS}
 .activity-log { text-align: left; max-height: 220px; overflow-y: auto; border: 1px solid var(--line2); border-radius: 6px; display: flex; flex-direction: column; }
 .activity-row { padding: 5px 10px; font-size: 11px; color: var(--fg-dim); border-bottom: 1px solid var(--line2); }
 .activity-row:last-child { border-bottom: none; }
+.activity-row-more { color: var(--fg-dimmer); font-style: italic; }
 .legacy-notice { text-align: left; border: 1px dashed var(--line2); border-radius: 6px; padding: 10px 12px; font-size: 11.5px; color: var(--fg-dimmer); }
 .lineage-line { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
 .fail-card { text-align: left; border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
@@ -1197,14 +1198,29 @@ function activityEventLine(event: ActivityEvent): string {
   }
 }
 
+/**
+ * Bounded the same way `failDetailsList` bounds the blocker list: a long-
+ * running review can dispatch thousands of tool calls, and rendering every
+ * one would bloat the webview payload without helping a reviewer, who cares
+ * most about what just happened. Unlike the blocker list — where order
+ * carries no meaning — the feed is chronological, so the elided count is a
+ * leading "and N earlier" row rather than a trailing one: the newest work is
+ * what stays visible.
+ */
+const MAX_ACTIVITY_ROWS_SHOWN = 50;
+
 function activityFeed(activity: readonly ActivityEvent[]): string {
   if (activity.length === 0) return '';
   // Ordered by protocol sequence, not arrival order (spec
   // `review-run-activity`) — the same normalization `reduceActivity` and
   // `planHistory` apply, so a redelivered or reordered event cannot appear
   // twice or out of order in the one place a reviewer reads the full feed.
-  const rows = orderActivity(activity).map((event) => `<div class="activity-row">${e(activityEventLine(event))}</div>`).join('');
-  return `<div class="activity-log">${rows}</div>`;
+  const ordered = orderActivity(activity);
+  const shown = ordered.slice(-MAX_ACTIVITY_ROWS_SHOWN);
+  const remaining = ordered.length - shown.length;
+  const more = remaining > 0 ? `<div class="activity-row activity-row-more">and ${remaining} earlier</div>` : '';
+  const rows = shown.map((event) => `<div class="activity-row">${e(activityEventLine(event))}</div>`).join('');
+  return `<div class="activity-log">${more}${rows}</div>`;
 }
 
 function renderRunning(s: FlowViewState): string {

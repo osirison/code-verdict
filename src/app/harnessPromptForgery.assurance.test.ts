@@ -693,9 +693,10 @@ describe('16.1 behavioral: a fake tool name lifted from hostile change-request b
     const result = await attempt.run();
 
     // Never granted a fake tool: no `HostToolResult` for it exists anywhere the model could have
-    // used, the required file was never actually inspected (`DEFAULT_RISK_COVERAGE_RULES` requires
-    // inspection at every risk level), so the run cannot claim a clean complete result off the
-    // back of it.
+    // used, the required file was never actually inspected (`FILE_PATH`'s `.ts` extension floors it
+    // to 'medium' via `harnessRiskFloors.ts`'s source-code floor, and `DEFAULT_RISK_COVERAGE_RULES`
+    // requires inspection at 'medium' and above), so the run cannot claim a clean complete result
+    // off the back of it.
     expect(result.outcome.completeness).not.toBe('complete');
     const modelTurnFailures = result.activityLog.events.flatMap((e) => (e.kind === 'toolFailed' && e.tool === 'modelTurn' ? [e.reason] : []));
     expect(modelTurnFailures.some((reason) => reason.includes('not a recognized host tool name'))).toBe(true);

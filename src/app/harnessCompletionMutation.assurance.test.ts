@@ -743,8 +743,9 @@ describe('16.7: contradictionPassComplete, deduplicationComplete, and finalVerif
     const collaborator: SynthesisVerificationRunner = async (input) =>
       Object.freeze({ findings: input.findings, contradictionPassComplete: false, deduplicationComplete: true, finalVerificationComplete: true });
     // The file is genuinely read (inspected) during investigating, so `everyFileClassified` and
-    // `configuredRiskCoverageSatisfied` both genuinely hold — DEFAULT_RISK_COVERAGE_RULES requires
-    // inspection at every risk level, including 'low'.
+    // `configuredRiskCoverageSatisfied` both genuinely hold — `LOW_FILE`'s `.ts` extension floors it
+    // to 'medium' (`harnessRiskFloors.ts`'s source-code floor), and DEFAULT_RISK_COVERAGE_RULES
+    // requires inspection at 'medium' and above.
     const seam = scriptedModelSeam2({ planning: [PLAN_TURN2], investigating: [messages2(readDiffMessage2(LOW_FILE)), STOP_TURN2], verifying: [COMPLETION_TURN2, STOP_TURN2] });
     const attempt = createHarnessAttempt({ ...attemptOptions2({ synthesisVerification: collaborator }), snapshot: testSnapshot2(), members: [member2(connection)], modelSeam: seam });
 
@@ -759,8 +760,9 @@ describe('16.7: contradictionPassComplete, deduplicationComplete, and finalVerif
     const collaborator: SynthesisVerificationRunner = async (input) =>
       Object.freeze({ findings: input.findings, contradictionPassComplete: true, deduplicationComplete: false, finalVerificationComplete: true });
     // The file is genuinely read (inspected) during investigating, so `everyFileClassified` and
-    // `configuredRiskCoverageSatisfied` both genuinely hold — DEFAULT_RISK_COVERAGE_RULES requires
-    // inspection at every risk level, including 'low'.
+    // `configuredRiskCoverageSatisfied` both genuinely hold — `LOW_FILE`'s `.ts` extension floors it
+    // to 'medium' (`harnessRiskFloors.ts`'s source-code floor), and DEFAULT_RISK_COVERAGE_RULES
+    // requires inspection at 'medium' and above.
     const seam = scriptedModelSeam2({ planning: [PLAN_TURN2], investigating: [messages2(readDiffMessage2(LOW_FILE)), STOP_TURN2], verifying: [COMPLETION_TURN2, STOP_TURN2] });
     const attempt = createHarnessAttempt({ ...attemptOptions2({ synthesisVerification: collaborator }), snapshot: testSnapshot2(), members: [member2(connection)], modelSeam: seam });
 
@@ -775,8 +777,9 @@ describe('16.7: contradictionPassComplete, deduplicationComplete, and finalVerif
     const collaborator: SynthesisVerificationRunner = async (input) =>
       Object.freeze({ findings: input.findings, contradictionPassComplete: true, deduplicationComplete: true, finalVerificationComplete: false });
     // The file is genuinely read (inspected) during investigating, so `everyFileClassified` and
-    // `configuredRiskCoverageSatisfied` both genuinely hold — DEFAULT_RISK_COVERAGE_RULES requires
-    // inspection at every risk level, including 'low'.
+    // `configuredRiskCoverageSatisfied` both genuinely hold — `LOW_FILE`'s `.ts` extension floors it
+    // to 'medium' (`harnessRiskFloors.ts`'s source-code floor), and DEFAULT_RISK_COVERAGE_RULES
+    // requires inspection at 'medium' and above.
     const seam = scriptedModelSeam2({ planning: [PLAN_TURN2], investigating: [messages2(readDiffMessage2(LOW_FILE)), STOP_TURN2], verifying: [COMPLETION_TURN2, STOP_TURN2] });
     const attempt = createHarnessAttempt({ ...attemptOptions2({ synthesisVerification: collaborator }), snapshot: testSnapshot2(), members: [member2(connection)], modelSeam: seam });
 

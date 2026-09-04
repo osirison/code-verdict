@@ -248,6 +248,18 @@ One attempt moves through six phases: `bootstrap`, `planning`, `investigating`, 
 `completing`, `persisting`. Risk classification runs at the start of `investigating`; synthesis and
 model contradiction-checking run inside `verifying`; host validation runs in `completing`.
 
+Risk classification is a model proposal maximized against a deterministic host floor
+(`harnessRiskFloors.ts`): sensitive paths (auth, authorization, security, secrets, key material, CI
+and infra definitions, payments), binary/deleted/large-changed files, policy-governed paths, and
+cross-member contracts each raise the floor independently, and the model's own proposal can raise a
+file's risk further but never lower it below the floor. A dedicated floor keyed on file extension —
+not path — holds any changed file whose extension names a general-purpose or scripting language at
+`medium` regardless of what the model proposes, with generated/built output explicitly exempted; this
+is what makes it safe for `DEFAULT_RISK_COVERAGE_RULES.requireInspection` (and the reviewer-facing
+`codeVerdict.harness.requireInspectionMinRisk`, default `medium`) to require actual inspection only at
+medium risk and above instead of every level — a model can decline to read a low-risk documentation or
+specification file without that ever letting real source code go uninspected under a low label.
+
 The lifecycle a reviewer sees has more states than that, because it also covers being queued and
 being interrupted:
 

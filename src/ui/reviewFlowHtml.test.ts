@@ -890,6 +890,47 @@ describe('the running screen renders from the shared projection alone (task 14.1
     expect(html.match(/Reading src\/b\.ts/g)?.length).toBe(1);
   });
 
+  it('shows a completed tool call — tool, target, and outcome/size, live in the running review', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'toolCompleted', tool: 'readDiff', target: 'src/auth/token.ts', summary: '40 unit(s) returned.',
+      },
+    ];
+    const html = running({ runActivity: activity });
+    expect(html).toContain('readDiff');
+    expect(html).toContain('src/auth/token.ts');
+    expect(html).toContain('40 unit(s) returned.');
+  });
+
+  it('shows a failed tool call — including the sanitized reason — so a run that stopped early still shows the last thing it tried', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'toolFailed', tool: 'readFile', target: 'src/big.bin', reason: 'The content is binary.',
+      },
+    ];
+    const html = running({ runActivity: activity });
+    expect(html).toContain('readFile');
+    expect(html).toContain('src/big.bin');
+    expect(html).toContain('The content is binary.');
+  });
+
+  it('bounds a long activity list — newest work stays visible and the rest is a count, not a wall of rows (task: long lists must not break the layout)', () => {
+    const activity: FlowViewState['runActivity'] = Array.from({ length: 65 }, (_unused, index) => ({
+      runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: index + 1,
+      occurredAt: `2026-08-28T09:${String(index).padStart(2, '0')}:00.000Z`, phase: 'investigating' as const, elapsedMs: index * 1_000,
+      kind: 'toolCompleted' as const, tool: 'readDiff', target: `src/file${index}.ts`, summary: '1 unit(s) returned.',
+    }));
+    const html = running({ runActivity: activity });
+    // The oldest entries are elided, named only by count...
+    expect(html).not.toContain('src/file0.ts');
+    expect(html).not.toContain('src/file14.ts');
+    expect(html).toContain('and 15 earlier');
+    // ...while the newest is always rendered.
+    expect(html).toContain('src/file64.ts');
+  });
+
   it('shows limitations from the projection', () => {
     const html = running({
       runProjection: baseProjection({ limitations: [{ code: 'incompleteInventory', message: 'The provider could not return the full changed-file manifest.' }] }),

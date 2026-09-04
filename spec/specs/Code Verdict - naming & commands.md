@@ -98,8 +98,11 @@ tool calls it may use, how much evidence it may hold, how much of that is held b
 files and final verification, how many times a failed step retries, how often it checkpoints, and
 how much history is kept. A missing or unusable value falls back to its own documented default, never
 to zero. `requireInspectionMinRisk` is the one non-numeric setting — `low / medium / high` — and its
-default, `low`, requires every changed file to actually be read, not just classified, before a review
-can complete.
+default, `medium`, requires every changed file classified medium or high risk to actually be read, not
+just classified, before a review can complete. A file classified low can be skipped — but a host risk
+floor keeps real source code out of `low` regardless of what the reviewing model proposes, so only
+documentation, specification, and similar plain-text files are ever skipped at the default setting.
+Setting this to `low` requires every changed file, including those, to actually be read.
 
 The access token is never a setting — it lives in the VS Code secret store.
 

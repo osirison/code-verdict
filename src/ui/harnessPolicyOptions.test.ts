@@ -94,13 +94,13 @@ describe('the risk-coverage setting — reuses risksAtLeast, cannot express an i
     settings.values = {};
   });
 
-  it('falls back to the shipped fail-closed default (every level requires inspection) for any unusable value', () => {
+  it('falls back to the shipped default (medium and above require inspection) for any unusable value', () => {
     for (const bad of [undefined, null, 42, 'nonsense', ['high'], {}, '']) {
       const rules = normalizeHarnessCoverageRules(bad);
       expect(rules.requireInspection).toEqual(DEFAULT_RISK_COVERAGE_RULES.requireInspection);
-      expect(rules.requireInspection).toEqual(FULL_RISK_COVERAGE);
+      expect(rules.requireInspection).toEqual(['medium', 'high']);
     }
-    expect(DEFAULT_REQUIRE_INSPECTION_MIN_RISK).toBe('low');
+    expect(DEFAULT_REQUIRE_INSPECTION_MIN_RISK).toBe('medium');
   });
 
   it('never changes reserveEligible or contradictionCheck — only requireInspection is configurable', () => {
@@ -110,7 +110,7 @@ describe('the risk-coverage setting — reuses risksAtLeast, cannot express an i
   });
 
   it('an explicit reviewer choice narrows which levels require inspection, monotonically', () => {
-    expect(normalizeHarnessCoverageRules('low').requireInspection).toEqual(['low', 'medium', 'high']);
+    expect(normalizeHarnessCoverageRules('low').requireInspection).toEqual(FULL_RISK_COVERAGE);
     expect(normalizeHarnessCoverageRules('medium').requireInspection).toEqual(['medium', 'high']);
     expect(normalizeHarnessCoverageRules('high').requireInspection).toEqual(['high']);
   });
@@ -144,15 +144,19 @@ describe('a settings-driven hostile configuration never weakens the completion g
     settings.values = {};
   });
 
-  it('a garbage requireInspectionMinRisk setting still requires a low-risk file to be inspected before completion', () => {
+  it('a garbage requireInspectionMinRisk setting still requires a medium-risk file to be inspected before completion', () => {
     settings.values['harness.requireInspectionMinRisk'] = 'not-a-real-risk-level';
     const rules = readHarnessCoverageRules();
     expect(rules.requireInspection).toEqual(DEFAULT_RISK_COVERAGE_RULES.requireInspection);
 
     const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
     inventory.acceptManifestPage('m1', { snapshot: SNAPSHOT, state: 'complete', value: [entry('a')] });
-    inventory.classify('m1', 'a', { risk: 'low' });
-    // Deliberately never `markInspected` — this is the fail-closed default's whole point.
+    // `inventory.classify` records whatever risk it is given directly, bypassing
+    // `harnessRiskFloors.ts` entirely — so the risk that matters here is chosen
+    // explicitly (`medium`, what the source-code floor would have produced for
+    // a real `.ts` file), not left to a garbage setting to weaken.
+    inventory.classify('m1', 'a', { risk: 'medium' });
+    // Deliberately never `markInspected` — this is the shipped default's whole point.
     const evaluation = evaluateCompletion({ ...passingExcept(inventory), coverageRules: rules });
     expect(evaluation.eligible).toBe(false);
     expect(evaluation.blockers).toEqual(['insufficientRiskCoverage']);

@@ -20,10 +20,21 @@
  * but keeping it non-Turing-complete removes the catastrophic-backtracking
  * class of bug from the surface entirely.
  *
- * `DEFAULT_RISK_COVERAGE_RULES` requires inspection at every risk level. That
- * is the fail-closed initial default: a review whose low-risk files were
- * classified but never read is not "complete" until a deployment explicitly
- * relaxes `requireInspection`.
+ * `DEFAULT_RISK_COVERAGE_RULES` requires inspection at medium and above, not
+ * every level. Requiring literally every level (including `low`) forced a
+ * model to either read purely informational content (docs, specs, changelogs)
+ * it had already correctly judged low-stakes, or refuse to — and a refusal
+ * failed the whole review with zero findings (real runs hit this against
+ * `*.md`/`*.yaml` proposal files). Relaxing the requirement to `low` is only
+ * safe because `sourceCodeFloor` below makes `low` mean something narrower
+ * than "whatever the model felt like proposing": a changed file whose
+ * extension names a general-purpose or scripting language is floored to
+ * `medium` by the host, regardless of the model's proposal, unless it also
+ * matches an explicit generated/build-output exemption. So a model cannot
+ * launder real source code through a low-risk label to skip inspecting it —
+ * the fail-closed guarantee moves from "every level requires inspection" to
+ * "every level a model could plausibly mis-rate requires inspection," with
+ * the floor closing the gap the coverage relaxation opens.
  */
 import type { RiskLevel } from '../domain/harnessCoverage';
 import { isRiskLevel, RISK_LEVELS } from '../domain/harnessCoverage';
@@ -54,9 +65,31 @@ export interface CategoryFloors {
   readonly crossMemberContract?: RiskLevel;
 }
 
+/**
+ * A host floor keyed on file extension rather than path: "is this file
+ * source code" is a question about what a file *is*, not where it lives.
+ * Deliberately a small, documented list rather than an attempt to enumerate
+ * every language a changeset could contain — an unlisted extension simply
+ * falls through to whatever the model or another rule decides, the same as
+ * today. `exemptPatterns` (same glob dialect as `PathRiskRule.pattern`) lets
+ * a path that matches an extension still opt out — generated or built
+ * output (`dist/`, `*.min.js`, ...) is still literally source-shaped text,
+ * but nothing a reviewer authored, so it is exempted here exactly as
+ * `DEFAULT_RISK_FLOOR_RULES.pathRules`' own `path.generated`/
+ * `path.generatedName` entries already tag it.
+ */
+export interface SourceCodeFloor {
+  /** Case-insensitive, dot-prefixed extensions, e.g. `.ts`. */
+  readonly extensions: readonly string[];
+  readonly risk: RiskLevel;
+  readonly exemptPatterns?: readonly string[];
+}
+
 export interface RiskFloorRules {
   readonly pathRules: readonly PathRiskRule[];
   readonly categoryFloors: CategoryFloors;
+  /** Absent means no extension-based source-code floor at all (used by tests exercising only path/category rules). */
+  readonly sourceCodeFloor?: SourceCodeFloor;
 }
 
 /** Which risk levels demand which coverage (D10 "Configured coverage rules define which risk levels require ..."). */
@@ -105,6 +138,34 @@ export function maxRisk(first: RiskLevel, ...rest: readonly RiskLevel[]): RiskLe
   return rest.reduce<RiskLevel>((best, risk) => (compareRisk(risk, best) > 0 ? risk : best), first);
 }
 
+/**
+ * Shared verbatim between `path.generated`/`path.generatedName` below and
+ * `DEFAULT_SOURCE_CODE_FLOOR.exemptPatterns` — one place naming "this is
+ * generated or built output," so the two can never quietly drift apart.
+ */
+const GENERATED_OUTPUT_PATTERNS: readonly string[] = ['**/{generated,gen,dist,build}/**', '**/*.{generated,min}.*'];
+
+/**
+ * A small, explicit list of general-purpose and scripting-language
+ * extensions — the languages where risk hides in logic rather than markup.
+ * Deliberately excludes documentation/specification/plain-text formats
+ * (`.md`, `.txt`, `.yml`/`.yaml`, licences, changelogs) and data/markup
+ * formats (`.json`, `.html`, `.css`) — those stay at whatever risk the model
+ * or another floor rule assigns, per design. Not exhaustive by construction;
+ * an unlisted language falls through unfloored exactly as before this rule
+ * existed.
+ */
+export const DEFAULT_SOURCE_CODE_FLOOR: SourceCodeFloor = Object.freeze({
+  extensions: Object.freeze([
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+    '.py', '.go', '.rb', '.java', '.kt', '.kts',
+    '.c', '.cc', '.cpp', '.h', '.hpp', '.cs', '.rs',
+    '.php', '.swift', '.scala', '.sh', '.bash', '.ps1',
+  ]),
+  risk: 'medium',
+  exemptPatterns: Object.freeze([...GENERATED_OUTPUT_PATTERNS]),
+} satisfies SourceCodeFloor);
+
 export const DEFAULT_RISK_FLOOR_RULES: RiskFloorRules = Object.freeze({
   pathRules: Object.freeze([
     { id: 'path.auth', pattern: '**/auth/**', risk: 'high', reason: 'authentication code' },
@@ -122,8 +183,8 @@ export const DEFAULT_RISK_FLOOR_RULES: RiskFloorRules = Object.freeze({
     { id: 'path.dependencyManifest', pattern: '**/{package.json,package-lock.json,yarn.lock,pnpm-lock.yaml,go.mod,go.sum,Cargo.toml,Cargo.lock,pyproject.toml,requirements*.txt,Gemfile,Gemfile.lock,*.csproj,pom.xml,build.gradle,build.gradle.kts}', risk: 'medium', reason: 'dependency manifest' },
     { id: 'path.migration', pattern: '**/{migrations,migrate}/**', risk: 'medium', reason: 'database migration' },
     { id: 'path.sql', pattern: '**/*.sql', risk: 'medium', reason: 'SQL' },
-    { id: 'path.generated', pattern: '**/{generated,gen,dist,build}/**', risk: 'low', reason: 'generated or built output' },
-    { id: 'path.generatedName', pattern: '**/*.{generated,min}.*', risk: 'low', reason: 'generated or minified file' },
+    { id: 'path.generated', pattern: GENERATED_OUTPUT_PATTERNS[0]!, risk: 'low', reason: 'generated or built output' },
+    { id: 'path.generatedName', pattern: GENERATED_OUTPUT_PATTERNS[1]!, risk: 'low', reason: 'generated or minified file' },
   ] satisfies readonly PathRiskRule[]),
   categoryFloors: Object.freeze({
     binary: 'medium',
@@ -133,10 +194,17 @@ export const DEFAULT_RISK_FLOOR_RULES: RiskFloorRules = Object.freeze({
     policyGoverned: 'medium',
     crossMemberContract: 'high',
   } satisfies CategoryFloors),
+  sourceCodeFloor: DEFAULT_SOURCE_CODE_FLOOR,
 });
 
+/**
+ * Requires inspection at `medium` and above, not every level. `low` is safe
+ * to leave to the model's own judgement only because `DEFAULT_RISK_FLOOR_RULES.
+ * sourceCodeFloor` above already keeps real source code out of `low` — see
+ * this file's header for the full reasoning.
+ */
 export const DEFAULT_RISK_COVERAGE_RULES: RiskCoverageRules = Object.freeze({
-  requireInspection: RISK_LEVELS,
+  requireInspection: Object.freeze(risksAtLeast('medium')),
   reserveEligible: Object.freeze(['high'] as const),
   contradictionCheck: Object.freeze(['high'] as const),
 });
@@ -204,6 +272,27 @@ function stripLeadingSlash(path: string): string {
   return path.replace(/^\/+/, '');
 }
 
+const compiledExemptPatterns = new WeakMap<SourceCodeFloor, readonly RegExp[]>();
+
+function compileExemptPatterns(floor: SourceCodeFloor): readonly RegExp[] {
+  const cached = compiledExemptPatterns.get(floor);
+  if (cached) return cached;
+  const compiled = (floor.exemptPatterns ?? []).map((pattern) => globToRegExp(pattern));
+  compiledExemptPatterns.set(floor, compiled);
+  return compiled;
+}
+
+function hasSourceCodeExtension(path: string, extensions: readonly string[]): boolean {
+  const lower = path.toLowerCase();
+  return extensions.some((extension) => lower.endsWith(extension.toLowerCase()));
+}
+
+/** True when at least one of `paths` both names a listed extension and matches no exemption. */
+function isFlooredAsSourceCode(paths: readonly string[], floor: SourceCodeFloor): boolean {
+  const exemptions = compileExemptPatterns(floor);
+  return paths.some((path) => hasSourceCodeExtension(path, floor.extensions) && !exemptions.some((regExp) => regExp.test(path)));
+}
+
 /**
  * Deterministic floor: `low` unless a matched rule or category raises it.
  * Path rules are evaluated against the new path and, for a rename, the old
@@ -226,6 +315,9 @@ export function computeRiskFloor(input: RiskFloorInput, rules: RiskFloorRules = 
     if (changedLines >= floors.largeChange.minChangedLines) {
       reasons.push({ ruleId: 'category.largeChange', risk: floors.largeChange.risk, reason: `${changedLines} changed lines` });
     }
+  }
+  if (rules.sourceCodeFloor !== undefined && isFlooredAsSourceCode(paths, rules.sourceCodeFloor)) {
+    reasons.push({ ruleId: 'category.sourceCode', risk: rules.sourceCodeFloor.risk, reason: 'source code' });
   }
   if (input.policy !== undefined) {
     if (input.policy.policyIds.length > 0 && floors.policyGoverned !== undefined) {
