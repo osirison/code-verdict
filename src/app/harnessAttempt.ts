@@ -151,6 +151,7 @@ import {
   computeRiskFloor,
   DEFAULT_RISK_COVERAGE_RULES,
   DEFAULT_RISK_FLOOR_RULES,
+  isReserveEligible,
   type RiskCoverageRules,
   type RiskFloorRules,
 } from './harnessRiskFloors';
@@ -975,8 +976,55 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return result;
   }
 
+  /**
+   * D12/D15's "unvisited and high-risk reserve" is capacity carved out of `ordinary`, meant for
+   * exactly one thing: finishing REQUIRED, RESERVE-ELIGIBLE coverage once the ordinary pool runs
+   * dry (spec `agentic-review-harness` "High-risk files remain unvisited": "the host uses reserved
+   * investigation budget for those files"). `RiskCoverageRules` deliberately separates
+   * `requireInspection` (which risk levels must be inspected at all — the default requires every
+   * level) from `reserveEligible` (which of THOSE may draw the reserve — the default is `high`
+   * alone, `harnessRiskFloors.ts`'s own `DEFAULT_RISK_COVERAGE_RULES`); using `requireInspection`
+   * here would let low-risk exploration spend the reserve too, defeating the reserve's entire
+   * purpose (protecting *high-risk* coverage specifically once ordinary work has exhausted the
+   * shared pool). Before task 16.2's assurance pass, nothing in this module ever reserved with
+   * purpose `'highRiskCoverage'` at all — `choosePurpose` returned only `'exploration'`/
+   * `'verification'`, so `LANE_ORDER.highRiskCoverage`'s `['ordinary', 'highRiskReserve']` draw
+   * order was dead code and the reserve sat unreachable while a required high-risk file starved.
+   * This is the real defect the assurance pass found and fixes; see
+   * `harnessLargeReview.assurance.test.ts` for the end-to-end proof (16.2) that breaks without it.
+   */
+  function reserveEligibleCoverageRemains(): boolean {
+    for (const member of inventory.members()) {
+      for (const file of member.files) {
+        if (file.state === 'classified' && file.risk !== undefined && isReserveEligible(file.risk, riskCoverageRules)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Turn-level purpose: coarse by necessity (the model has not yet said which tool it will call), so any reserve-eligible file still needing inspection is enough to let this turn's own reservation draw the reserve if ordinary is spent. Draining still prefers `ordinary` first (`LANE_ORDER.highRiskCoverage`), so this changes nothing while ordinary capacity remains. */
   function choosePurpose(phase: RunPhase): ReservationPurpose {
-    return phase === 'verifying' ? 'verification' : 'exploration';
+    if (phase === 'verifying') return 'verification';
+    if (phase === 'investigating' && reserveEligibleCoverageRemains()) return 'highRiskCoverage';
+    return 'exploration';
+  }
+
+  /**
+   * Tool-call-level purpose: precise, unlike `choosePurpose` above. Only a `readDiff` naming the
+   * exact reserve-eligible file still awaiting inspection draws the reserve; every other tool call
+   * (search, an already-inspected or low/medium-risk file, an unrelated read) stays `'exploration'`
+   * even while some other file in the run still needs the reserve — otherwise ordinary exploration
+   * could spend down capacity meant only for the files it actually protects.
+   */
+  function purposeForToolCall(phase: RunPhase, call: ParsedToolCall): ReservationPurpose {
+    if (phase === 'verifying') return 'verification';
+    if (phase === 'investigating' && call.tool === 'readDiff') {
+      const file = inventory.file(call.memberId, call.request.path);
+      if (file && file.state !== 'inspected' && file.risk !== undefined && isReserveEligible(file.risk, riskCoverageRules)) {
+        return 'highRiskCoverage';
+      }
+    }
+    return 'exploration';
   }
 
   /** The pre-completion head check (D3), refreshed on entry to `verifying` and again in `completing`. Never routed through the dispatcher/model-facing tool catalog — `Connection.getCurrentHead`'s own doc comment: "Used only for the pre-completion head check." */
@@ -1063,16 +1111,27 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
           appendActivity({ kind: 'actionStarted', action: message.rationale, target: message.itemId }, phase);
           break;
         case 'toolRequest': {
-          const request = toHostToolRequest(message.call, nextRequestId(), clock(), choosePurpose(phase), false);
+          const request = toHostToolRequest(message.call, nextRequestId(), clock(), purposeForToolCall(phase, message.call), false);
           sink.push(await dispatchAndTrack(phase, request));
           break;
         }
         case 'candidateSubmission': {
+          // Precise, like `purposeForToolCall`: a finding for a reserve-eligible file draws the
+          // reserve regardless of whether that file's *own* read already flipped
+          // `reserveEligibleCoverageRemains()` back to false — the submission is still budget work
+          // belonging to that file's coverage, not unrelated ordinary exploration. `risk` persists
+          // on the file record after inspection (it is never cleared), so this reads correctly
+          // however much later the submission turn lands.
+          const targetFile = inventory.file(message.candidate.memberId, message.candidate.file);
+          const purpose: ReservationPurpose =
+            phase === 'investigating' && targetFile?.risk !== undefined && isReserveEligible(targetFile.risk, riskCoverageRules)
+              ? 'highRiskCoverage'
+              : choosePurpose(phase);
           const request: HostToolRequest = {
             tool: 'submitCandidateFinding',
             requestId: nextRequestId(),
             elapsedMs: clock(),
-            purpose: choosePurpose(phase),
+            purpose,
             hostInitiated: false,
             memberId: message.candidate.memberId,
             candidate: message.candidate,
