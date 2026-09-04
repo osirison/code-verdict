@@ -17,14 +17,17 @@
  *    the new typed protocol with the legacy parser it succeeds).
  * 2. `harnessAttempt.ts`'s runtime (value) export surface is pinned to an
  *    allowlist. `createHarnessAttempt(...).run()` is the *only* value export
- *    capable of producing a `HarnessAttemptResult`; the other three
- *    (`classifyFile`, `isSmallReview`, `defaultSynthesisVerification`) are
- *    pure helpers/an honest no-op collaborator, none of which can construct
- *    findings or a lifecycle/outcome on their own. If a future change added
- *    a second exported function that could return findings without going
- *    through `run()`'s bootstrap -> planning -> investigating -> verifying
- *    -> completing -> persisting sequence (and its `evaluateCompletion`
- *    call in `completing`), this allowlist would catch it immediately.
+ *    capable of producing a `HarnessAttemptResult`; every other export
+ *    (`classifyFile`, `isSmallReview`, `defaultSynthesisVerification`,
+ *    `CHECKPOINT_REASONS`, `isCheckpointReason`, `parseCheckpointReason` —
+ *    the last three added by task 11.2's `CheckpointInfo` widening) is a
+ *    pure helper, a plain data array, or an honest no-op collaborator, none
+ *    of which can construct findings or a lifecycle/outcome on their own. If
+ *    a future change added a second exported function that could return
+ *    findings without going through `run()`'s bootstrap -> planning ->
+ *    investigating -> verifying -> completing -> persisting sequence (and
+ *    its `evaluateCompletion` call in `completing`), this allowlist would
+ *    catch it immediately.
  *
  * `demoAgent.ts`/`combinedAgent.ts` are explicitly excluded from check 1:
  * task 10.7's brief keeps them in place unmodified in this pass (their call
@@ -69,10 +72,21 @@ describe('no one-shot bypass (task 10.9 item 9)', () => {
 
   it("harnessAttempt.ts's runtime export surface is exactly the pinned allowlist — no escape hatch that returns findings without an evaluated completion decision", () => {
     const exportedNames = Object.keys(harnessAttemptModule).sort();
-    // Every one of these is a pure helper or an honest no-op; only `createHarnessAttempt(...).run()`
-    // can ever produce a `HarnessAttemptResult`, and `run()` always executes the full phase
-    // sequence ending in `runCompleting`'s `evaluateCompletion` call before `runPersisting`.
-    expect(exportedNames).toEqual(['classifyFile', 'createHarnessAttempt', 'defaultSynthesisVerification', 'isSmallReview'].sort());
+    // Every one of these is a pure helper, a plain data array, or an honest no-op; only
+    // `createHarnessAttempt(...).run()` can ever produce a `HarnessAttemptResult`, and `run()`
+    // always executes the full phase sequence ending in `runCompleting`'s `evaluateCompletion`
+    // call before `runPersisting`.
+    expect(exportedNames).toEqual(
+      [
+        'classifyFile',
+        'createHarnessAttempt',
+        'defaultSynthesisVerification',
+        'isSmallReview',
+        'CHECKPOINT_REASONS',
+        'isCheckpointReason',
+        'parseCheckpointReason',
+      ].sort(),
+    );
   });
 
   it('createHarnessAttempt is the only exported value shaped like a result-producing entry point (no bare parse-and-return-findings function alongside it)', () => {
@@ -81,10 +95,10 @@ describe('no one-shot bypass (task 10.9 item 9)', () => {
         expect(typeof value).toBe('function');
         continue;
       }
-      // The other three exports are plain helpers: none returns anything
-      // shaped like `{lifecycle, outcome, findings}` — none even takes an
-      // evidence ledger or a model seam, so none could construct a result.
-      expect(typeof value === 'function' || typeof value === 'object').toBe(true);
+      // Every other export is a plain helper, predicate, or data array: none returns anything
+      // shaped like `{lifecycle, outcome, findings}` — none even takes an evidence ledger or a
+      // model seam, so none could construct a result.
+      expect(['function', 'object']).toContain(typeof value);
     }
   });
 });

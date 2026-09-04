@@ -104,10 +104,10 @@
 
 ## 11. Checkpoint Persistence And Resume
 
-- [ ] 11.1 Create a bounded `HarnessRunStore` over workspace storage for snapshots, projected plans/status, sanitized activity, checkpoints, evidence metadata/digests, required exact excerpts, candidates/findings, budgets, coverage, retries, and lineage.
-- [ ] 11.2 Implement checkpoint writes at every phase boundary and configured tool cadence without serializing clients, streams, cancellation handles, prompts, model fragments, secrets, full arguments, full outputs, or hidden reasoning.
-- [ ] 11.3 Implement activity compaction that preserves plan revisions, lifecycle and terminal events, failures, checkpoints, coverage changes, and results while coalescing only routine repeated progress.
-- [ ] 11.4 Enforce per-attempt activity, per-lineage checkpoint data, checkpoint count, terminal-attempt count, and retention-age bounds from `HarnessPolicy`.
+- [x] 11.1 Create a bounded `HarnessRunStore` over workspace storage for snapshots, projected plans/status, sanitized activity, checkpoints, evidence metadata/digests, required exact excerpts, candidates/findings, budgets, coverage, retries, and lineage.
+- [x] 11.2 Implement checkpoint writes at every phase boundary and configured tool cadence without serializing clients, streams, cancellation handles, prompts, model fragments, secrets, full arguments, full outputs, or hidden reasoning.
+- [x] 11.3 Implement activity compaction that preserves plan revisions, lifecycle and terminal events, failures, checkpoints, coverage changes, and results while coalescing only routine repeated progress.
+- [x] 11.4 Enforce per-attempt activity, per-lineage checkpoint data, checkpoint count, terminal-attempt count, and retention-age bounds from `HarnessPolicy`.
 - [ ] 11.5 Implement checkpoint integrity and resume compatibility checks for versions, digests, repository/head, model, resolved agent instructions, criteria, effort, context controls, policy, provider capabilities, and required exact evidence.
 - [ ] 11.6 Resume compatible work as a new attempt in the same lineage, explicitly interrupt the lost attempt, and refetch rather than claim unavailable exact evidence remains model-visible.
 - [ ] 11.7 Reject incompatible resume with all reasons and offer a fresh restart without mixing revisions, attempts, or evidence.

@@ -101,6 +101,7 @@ import {
   createCandidateTracker,
   revalidateFindings,
   type CandidateTracker,
+  type TrackedCandidate,
   type ValidatedFinding,
 } from './harnessCandidateValidation';
 import {
@@ -119,6 +120,7 @@ import {
   ledgerMembersFromSnapshot,
   normalizeEvidencePath,
   type EvidenceLedger,
+  type LedgerEvidenceSource,
 } from './harnessEvidenceLedger';
 import {
   coverageChangedFact,
@@ -153,7 +155,7 @@ import {
 } from '../domain/harnessBootstrap';
 import { fitBootstrapToModel } from './harnessBootstrapBudget';
 import type { Limitation, Plan, RunPhase } from '../domain/harnessActivity';
-import type { RiskLevel } from '../domain/harnessCoverage';
+import type { BudgetConsumption, MemberCoverage, RiskLevel, UnresolvedWork } from '../domain/harnessCoverage';
 import { effortPrompt } from '../domain/effort';
 import { isTerminalLifecycle, type RunLifecycle } from '../domain/harnessLifecycle';
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
@@ -236,13 +238,51 @@ export const defaultSynthesisVerification: SynthesisVerificationRunner = async (
 
 // ---- Injected checkpoint/persistence collaborators (section 11's seams) -----------
 
-export type CheckpointReason = 'phaseBoundary' | 'toolCadence' | 'modelSuggested';
+export const CHECKPOINT_REASONS = ['phaseBoundary', 'toolCadence', 'modelSuggested'] as const;
 
+export type CheckpointReason = (typeof CHECKPOINT_REASONS)[number];
+
+export function isCheckpointReason(value: unknown): value is CheckpointReason {
+  return (CHECKPOINT_REASONS as readonly unknown[]).includes(value);
+}
+
+export function parseCheckpointReason(value: unknown): CheckpointReason | undefined {
+  return isCheckpointReason(value) ? value : undefined;
+}
+
+/**
+ * What a checkpoint collaborator (task 11.2's real implementation) receives:
+ * `checkpointId`/`phase`/`reason`/`elapsedMs` name the event itself; every
+ * other field is a **value snapshot** (a frozen array or plain object
+ * already returned by its owning module's own read API — `ledger.sources()`,
+ * `budget.consumption()`, `candidateTracker.all()`, `inventory.coverage()`)
+ * taken at the moment of the checkpoint, never a live handle back into this
+ * closure. `activityLog` is the attempt's own sanitized log (every field on
+ * it already passed `appendActivityEvent`'s sanitizer) — a collaborator that
+ * derives a checkpoint's public plan from it, rather than from the mutable
+ * `plan` variable this module tracks internally, never risks persisting
+ * unsanitized model-supplied plan text (`plan` above is set directly from
+ * `message.plan`, before sanitization). `occurredAt` is `now()`, matching
+ * every other activity timestamp — a checkpoint store must never read a
+ * clock of its own (this module's own determinism rule, matching
+ * `harnessBudgets.ts`/`harnessRetry.ts`).
+ */
 export interface CheckpointInfo {
   readonly checkpointId: string;
+  readonly runId: string;
+  readonly lineageId: string;
+  readonly attempt: number;
   readonly phase: RunPhase;
   readonly reason: CheckpointReason;
+  readonly occurredAt: string;
   readonly elapsedMs: number;
+  readonly activityLog: ActivityLog;
+  readonly evidenceSources: readonly LedgerEvidenceSource[];
+  readonly candidates: readonly TrackedCandidate[];
+  readonly contradicted: readonly ContradictedFindingRecord[];
+  readonly budget: BudgetConsumption;
+  readonly coverage: readonly MemberCoverage[];
+  readonly unresolved: UnresolvedWork;
 }
 
 export type OnCheckpoint = (info: CheckpointInfo) => void | Promise<void>;
@@ -253,6 +293,8 @@ export interface HarnessAttemptOutcome {
   readonly findings: readonly ValidatedFinding[];
   readonly plan?: Plan;
   readonly cancelled: boolean;
+  /** The contradiction pass's exclusions (task 10.6's collaborator), wired through in task 11.2 so persistence and activity can both see them instead of silently dropping them at this boundary. Empty when no contradiction pass ran (the honest default collaborator, or a bootstrap failure before verification). */
+  readonly contradicted: readonly ContradictedFindingRecord[];
 }
 
 export type OnPersist = (outcome: HarnessAttemptOutcome, log: ActivityLog) => void | Promise<void>;
@@ -304,6 +346,7 @@ export interface HarnessAttemptResult {
   readonly small: boolean;
   readonly turnsUsed: number;
   readonly toolCallsUsed: number;
+  readonly contradicted: readonly ContradictedFindingRecord[];
 }
 
 export interface HarnessAttempt {
@@ -463,6 +506,8 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   let survivingFindings: readonly ValidatedFinding[] = [];
   let verificationRan = false;
   let passesStale = false;
+  /** The contradiction pass's exclusions (task 10.6's collaborator's `output.contradicted`), captured here so `fireCheckpoint`/`runPersisting` can hand them to the checkpoint collaborator and `HarnessAttemptOutcome` instead of dropping them at this closure's boundary. */
+  let latestContradicted: readonly ContradictedFindingRecord[] = [];
 
   function isCancelled(): boolean {
     return cancellation?.isCancellationRequested === true;
@@ -475,8 +520,34 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   async function fireCheckpoint(phase: RunPhase, reason: CheckpointReason): Promise<void> {
     const checkpointId = mintId('ckpt');
+    // The checkpoint's own activity event is appended first (unconditionally — it is public
+    // progress, independent of whether a persistence collaborator is injected), so a collaborator
+    // reading `activityLog` below sees its own checkpoint marker as the log's latest event.
     appendActivity({ kind: 'checkpoint', checkpointId }, phase);
-    await onCheckpoint?.({ checkpointId, phase, reason, elapsedMs: clock() });
+    if (!onCheckpoint) return; // nothing to gather a state snapshot for
+    const coverage: MemberCoverage[] = [];
+    for (const member of inventory.members()) {
+      const memberCoverage = inventory.coverage(member.memberId);
+      if (memberCoverage) coverage.push(memberCoverage);
+    }
+    const info: CheckpointInfo = {
+      checkpointId,
+      runId,
+      lineageId,
+      attempt: attemptNumber,
+      phase,
+      reason,
+      occurredAt: now(),
+      elapsedMs: clock(),
+      activityLog,
+      evidenceSources: ledger.sources(),
+      candidates: candidateTracker.all(),
+      contradicted: latestContradicted,
+      budget: budget.consumption(),
+      coverage,
+      unresolved: { unresolvedFetches: 0, unresolvedCandidates: candidateTracker.unresolvedCount() },
+    };
+    await onCheckpoint(info);
   }
 
   // ---- Collaborators (ledger, budget, inventory, candidates, dispatcher) ----
@@ -741,6 +812,15 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       deduplicationComplete: output.deduplicationComplete,
       finalVerificationComplete: output.finalVerificationComplete,
     };
+    // Known-gap closure (task 11.2): `output.contradicted` used to end here, never reaching
+    // activity or persistence. It is now recorded for `fireCheckpoint`/`runPersisting` below, and
+    // each exclusion becomes its own public `toolFailed` event — `appendActivity`'s existing
+    // sanitizer is still the one boundary that redacts/bounds `entry.reason`, whether or not the
+    // injected `synthesisVerification` collaborator already sanitized it itself.
+    latestContradicted = output.contradicted ?? [];
+    for (const entry of latestContradicted) {
+      appendActivity({ kind: 'toolFailed', tool: 'contradictionCheck', target: entry.candidateId, reason: entry.reason }, 'verifying');
+    }
     verificationRan = true;
     passesStale = false;
   }
@@ -1037,7 +1117,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       throw new Error(`HarnessAttempt computed a non-terminal lifecycle at persistence: ${lifecycle}`);
     }
     appendActivity({ kind: 'terminalResult', lifecycle, completeness: outcome.completeness, limitations: outcome.limitations }, 'persisting');
-    const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, cancelled: cancelledNow };
+    const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, cancelled: cancelledNow, contradicted: latestContradicted };
     await onPersist?.(attemptOutcome, activityLog);
     const consumption = budget.consumption();
     return {
@@ -1053,6 +1133,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       small: smallFlag,
       turnsUsed: consumption.modelTurnsUsed,
       toolCallsUsed: consumption.toolCallsUsed,
+      contradicted: latestContradicted,
     };
   }
 
@@ -1079,7 +1160,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       replacesRetainedReview: false,
       clean: false,
     };
-    const attemptOutcome: HarnessAttemptOutcome = { lifecycle: 'failed', outcome, findings: [], plan: undefined, cancelled: false };
+    const attemptOutcome: HarnessAttemptOutcome = { lifecycle: 'failed', outcome, findings: [], plan: undefined, cancelled: false, contradicted: [] };
     await onPersist?.(attemptOutcome, activityLog);
     const consumption = budget.consumption();
     return {
@@ -1095,6 +1176,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       small: false,
       turnsUsed: consumption.modelTurnsUsed,
       toolCallsUsed: consumption.toolCallsUsed,
+      contradicted: [],
     };
   }
 

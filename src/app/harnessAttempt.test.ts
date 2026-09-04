@@ -622,6 +622,67 @@ describe('HarnessAttempt.run (10.9: candidate flow — invalid citation blocks c
   });
 });
 
+describe('HarnessAttempt.run (11.2: a contradicted finding reaches activity, onCheckpoint, and onPersist — the gap the previous pass left dropped)', () => {
+  it('wires output.contradicted through to a public toolFailed event, the checkpoint collaborator, and the persisted outcome', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const contradictingVerification: SynthesisVerificationRunner = async () => ({
+      findings: [],
+      contradicted: [{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }],
+      contradictionPassComplete: true,
+      deduplicationComplete: true,
+      finalVerificationComplete: true,
+    });
+    const checkpoints: Array<{ phase: RunPhase; contradicted: readonly { candidateId: string; reason: string }[] }> = [];
+    let persistedOutcome: { contradicted: readonly { candidateId: string; reason: string }[] } | undefined;
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: contradictingVerification }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        checkpoints.push({ phase: info.phase, contradicted: info.contradicted });
+      },
+      onPersist: (outcome) => {
+        persistedOutcome = outcome;
+      },
+    });
+
+    const result = await attempt.run();
+
+    // The activity record: a public event names the excluded candidate and why, using the
+    // existing `toolFailed` kind rather than a new one.
+    const contradictionEvent = result.activityLog.events.find(
+      (e) => e.kind === 'toolFailed' && e.tool === 'contradictionCheck' && e.target === 'cand-1',
+    );
+    expect(contradictionEvent).toBeDefined();
+    if (contradictionEvent?.kind === 'toolFailed') {
+      expect(contradictionEvent.reason).toBe('The model found the cited evidence does not support this claim.');
+    }
+
+    // The checkpoint collaborator: every checkpoint fired after verification ran carries the
+    // exclusion (the ones before verification ran are legitimately empty).
+    const afterVerification = checkpoints.filter((c) => c.phase === 'completing' || c.phase === 'persisting');
+    expect(afterVerification.length).toBeGreaterThan(0);
+    for (const checkpoint of afterVerification) {
+      expect(checkpoint.contradicted).toEqual([{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }]);
+    }
+
+    // The persisted outcome (`onPersist`) and the returned result both carry it too.
+    expect(persistedOutcome?.contradicted).toEqual([{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }]);
+    expect(result.contradicted).toEqual([{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }]);
+  });
+});
+
 describe('HarnessAttempt.run (10.9: the real 10.6 collaborator, end to end — a skipped stage refuses the gate, a genuinely completed one does not)', () => {
   it('a contradiction stage that never gets a parseable verdict leaves contradictionPassComplete false end to end, and the gate refuses a complete verdict', async () => {
     const connection = reviewConnection({ files: ['file1.ts'] });
