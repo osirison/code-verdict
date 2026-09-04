@@ -258,6 +258,35 @@ describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, dige
     expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1);
   });
 
+  it('a member-scoped plan item\'s memberId survives a real JSON checkpoint round-trip, and a shared item stays without one (task 13.3)', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      {
+        kind: 'planCreated',
+        plan: {
+          revision: 1,
+          items: [
+            { id: 'core-1', description: 'Inspect authorization changes.', state: 'active', memberId: 'core' },
+            { id: 'shared-1', description: 'Confirm the billing schema matches core.', state: 'pending' },
+          ],
+        },
+      },
+      { occurredAt: '2026-01-01T00:00:00.000Z', phase: 'planning', elapsedMs: 0 },
+    );
+
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeSnapshot(testSnapshot());
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    expect(readBack?.plan?.items[0]).toEqual({ id: 'core-1', description: 'Inspect authorization changes.', state: 'active', memberId: 'core' });
+    expect(readBack?.plan?.items[1]).not.toHaveProperty('memberId');
+  });
+
   it('writeCheckpoint is idempotent by checkpointId: writing the same checkpoint twice does not duplicate it', async () => {
     const backing = jsonMemoryStore();
     const runStore = createHarnessRunStore(backing, { now: () => 0 });

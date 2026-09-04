@@ -295,6 +295,19 @@ export function validateCandidate(raw: unknown, context: CandidateValidationCont
   const primary = resolved.primary as ResolvedCitation;
   const supporting = resolved.supporting.filter((resolution): resolution is ResolvedCitation => resolution.ok).map(citedRef);
   const primaryRef = citedRef(primary);
+  // 13.5/D15: a finding whose supporting evidence reaches into another member is exactly what
+  // the pre-harness changeset UI already calls a "cross" finding (`combinedAgent.ts`,
+  // `changesetFindings.ts`'s `collectCrossFindings` filter on `cross && spans.length >= 2`). A
+  // same-member supporting citation does not qualify — only evidence that actually crosses a
+  // repository boundary does.
+  const crossMemberSupporting = supporting.filter((ref) => ref.memberId !== candidate.memberId);
+  const spans =
+    crossMemberSupporting.length > 0
+      ? [
+          { repoId: member.repositoryId, location: `${candidate.file}:${candidate.line}`, role: 'primary evidence' },
+          ...crossMemberSupporting.map((ref) => ({ repoId: ref.repositoryId, location: `${ref.path}:${ref.range.startLine}`, role: 'supporting evidence' })),
+        ]
+      : undefined;
   const item: ReviewItem = {
     id: candidate.candidateId,
     file: candidate.file,
@@ -312,6 +325,7 @@ export function validateCandidate(raw: unknown, context: CandidateValidationCont
     repoId: member.repositoryId,
     crNumber: member.changeRequestNumber,
     suggestion: candidate.suggestion ? { ...candidate.suggestion } : undefined,
+    ...(spans ? { cross: true, spans } : {}),
   };
   return {
     state: 'accepted',

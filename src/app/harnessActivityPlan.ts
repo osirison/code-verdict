@@ -14,6 +14,8 @@ export interface PlanItemInput {
   id: string;
   description: string;
   state?: PlanItemState;
+  /** Scopes this item to one changeset member; omit for shared cross-member work (task 13.3). */
+  memberId?: string;
 }
 
 function buildItems(items: readonly PlanItemInput[]): readonly PlanItem[] | undefined {
@@ -24,8 +26,9 @@ function buildItems(items: readonly PlanItemInput[]): readonly PlanItem[] | unde
     if (item.id.trim() === '' || ids.has(item.id)) return undefined; // fail closed: empty or duplicate id
     const description = sanitizePublicText(item.description);
     if (description === undefined) return undefined;
+    if (item.memberId !== undefined && item.memberId.trim() === '') return undefined; // fail closed: present-but-blank member id
     ids.add(item.id);
-    built.push({ id: item.id, description, state: item.state ?? 'pending' });
+    built.push({ id: item.id, description, state: item.state ?? 'pending', ...(item.memberId !== undefined ? { memberId: item.memberId } : {}) });
   }
   return built;
 }

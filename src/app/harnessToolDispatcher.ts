@@ -207,7 +207,19 @@ export type HostToolResult =
   | (HostToolResultContentBase & { readonly state: 'complete' })
   | (HostToolResultContentBase & { readonly state: 'paginated'; readonly cursor: InvestigationCursor })
   | (HostToolResultContentBase & { readonly state: 'truncated'; readonly unitsKnownRemaining?: number })
-  | (HostToolResultBase & { readonly state: 'unavailable'; readonly reason: string })
+  | (HostToolResultBase & {
+      readonly state: 'unavailable';
+      readonly reason: string;
+      /**
+       * Set only when this dispatch stopped to wait out a long retry delay (9.6),
+       * not because the provider cannot supply the content. The distinction is
+       * load-bearing: `harnessInventory`'s terminal states are immutable, so a
+       * caller that marked a deferred read terminally `unavailable` would make the
+       * file permanently uninspectable and the run permanently unable to reach
+       * complete, even after the very next retry of the same read succeeds.
+       */
+      readonly deferred?: true;
+    })
   | (HostToolResultBase & { readonly state: 'binary'; readonly byteSize?: number })
   | (HostToolResultBase & { readonly state: 'tooLarge'; readonly byteSize?: number })
   | (HostToolResultBase & { readonly state: 'notFound'; readonly reason: string })
@@ -573,6 +585,23 @@ export function createHostToolDispatcher(options: HostToolDispatcherOptions): Ho
     });
   }
 
+  /**
+   * A read this dispatch stopped short of, to wait out a long retry delay (9.6).
+   * Distinct from a provider-reported `unavailable` so coverage never marks the
+   * file terminally uninspectable — see `HostToolResult`'s `deferred` field.
+   */
+  function deferredForWait(request: HostToolRequest, reason: string): HostToolResult {
+    return emit({
+      toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+      requestId: request.requestId,
+      tool: request.tool,
+      memberId: request.memberId,
+      state: 'unavailable',
+      reason: sanitizedReason(reason),
+      deferred: true,
+    });
+  }
+
   function nonContent(request: HostToolRequest, state: 'unavailable' | 'binary' | 'tooLarge' | 'notFound' | 'unknown', reason?: string, byteSize?: number): HostToolResult {
     const base = { toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION, requestId: request.requestId, tool: request.tool, memberId: request.memberId };
     if (state === 'binary' || state === 'tooLarge') return emit({ ...base, state, byteSize });
@@ -697,7 +726,7 @@ export function createHostToolDispatcher(options: HostToolDispatcherOptions): Ho
     } catch (error) {
       if (error instanceof RetryWaitSignal) {
         outcome = {
-          result: nonContent(request, 'unavailable', `This request needs a longer retry wait (about ${Math.max(1, Math.round(error.delayMs / 1000))}s) and will resume later.`),
+          result: deferredForWait(request, `This request needs a longer retry wait (about ${Math.max(1, Math.round(error.delayMs / 1000))}s) and will resume later.`),
           evidenceBytes: 0,
         };
       } else {

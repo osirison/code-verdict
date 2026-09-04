@@ -90,6 +90,36 @@ describe('buildReviewRunSnapshot (task 6.1)', () => {
     expect(new Set(snapshot.members.map((m) => m.ref.repoId)).size).toBe(2);
   });
 
+  it('keeps each changeset member\'s explicit attachments to itself: one member\'s attachment never appears in another member\'s context (task 13.1)', () => {
+    const coreAttachment: Attachment = { id: 'att-core', kind: 'file', label: 'schema.ts', path: 'schema.ts', content: 'export const coreSchema = 1;', truncated: false };
+    const billingAttachment: Attachment = { id: 'att-billing', kind: 'file', label: 'invoice.ts', path: 'invoice.ts', content: 'export const invoiceSchema = 2;', truncated: false };
+    const snapshot = buildReviewRunSnapshot(baseInput({
+      targetKind: 'changeset',
+      changesetId: 'harness-changeset-2',
+      members: [
+        member({ memberId: 'core', ref: { repoId: 'harness-cs-core', number: '11' }, attachments: [coreAttachment] }),
+        member({ memberId: 'billing', ref: { repoId: 'harness-cs-billing', number: '22' }, attachments: [billingAttachment] }),
+      ],
+    }));
+    const core = snapshot.members.find((m) => m.memberId === 'core')!;
+    const billing = snapshot.members.find((m) => m.memberId === 'billing')!;
+    expect(core.context.attachments.map((a) => a.attachmentId)).toEqual(['att-core']);
+    expect(billing.context.attachments.map((a) => a.attachmentId)).toEqual(['att-billing']);
+  });
+
+  it('leaves a member with no attachments empty, even when a sibling member carries one (task 13.1)', () => {
+    const attachment: Attachment = { id: 'att-core', kind: 'file', label: 'schema.ts', path: 'schema.ts', content: 'export const coreSchema = 1;', truncated: false };
+    const snapshot = buildReviewRunSnapshot(baseInput({
+      targetKind: 'changeset',
+      changesetId: 'harness-changeset-3',
+      members: [
+        member({ memberId: 'core', ref: { repoId: 'harness-cs-core', number: '11' }, attachments: [attachment] }),
+        member({ memberId: 'billing', ref: { repoId: 'harness-cs-billing', number: '22' } }),
+      ],
+    }));
+    expect(snapshot.members.find((m) => m.memberId === 'billing')!.context.attachments).toEqual([]);
+  });
+
   it('rejects an empty member list', () => {
     expect(() => buildReviewRunSnapshot(baseInput({ members: [] }))).toThrow();
   });

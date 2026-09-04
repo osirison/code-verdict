@@ -89,8 +89,9 @@ function sanitizePlanItems(items: readonly PlanItem[]): readonly PlanItem[] | un
     if (!isPlanItemState(item.state)) return undefined;
     const description = sanitizePublicText(item.description);
     if (description === undefined) return undefined;
+    if (item.memberId !== undefined && item.memberId.trim() === '') return undefined; // fail closed: present-but-blank member id
     ids.add(item.id);
-    cleaned.push({ id: item.id, description, state: item.state });
+    cleaned.push({ id: item.id, description, state: item.state, ...(item.memberId !== undefined ? { memberId: item.memberId } : {}) });
   }
   return cleaned;
 }

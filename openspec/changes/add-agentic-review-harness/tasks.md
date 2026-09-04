@@ -126,12 +126,12 @@
 
 ## 13. Changeset Harness
 
-- [ ] 13.1 Build one changeset snapshot with immutable member identities and base/head SHAs, member-owned context/attachments, and a shared lineage.
-- [ ] 13.2 Scope manifest, diff, file, search, policy, detail, evidence, and candidate operations to an explicit member while preserving common host authorization.
-- [ ] 13.3 Build member-scoped plan items and shared cross-member plan items, retaining stable identifiers when evidence adds or revises shared work.
-- [ ] 13.4 Enforce per-member inventory exhaustion, risk coverage, minimum budgets, head stability, and limitations before evaluating shared completion.
-- [ ] 13.5 Validate cross-member findings with one changed or explicit-attachment primary target and revision-bound supporting spans from other members.
-- [ ] 13.6 Test a dominant large member, a rate-limited member, an incomplete member, cross-member API/schema evidence, mixed head changes, member attachment routing, and a complete clean changeset.
+- [x] 13.1 Build one changeset snapshot with immutable member identities and base/head SHAs, member-owned context/attachments, and a shared lineage.
+- [x] 13.2 Scope manifest, diff, file, search, policy, detail, evidence, and candidate operations to an explicit member while preserving common host authorization.
+- [x] 13.3 Build member-scoped plan items and shared cross-member plan items, retaining stable identifiers when evidence adds or revises shared work.
+- [x] 13.4 Enforce per-member inventory exhaustion, risk coverage, minimum budgets, head stability, and limitations before evaluating shared completion.
+- [x] 13.5 Validate cross-member findings with one changed or explicit-attachment primary target and revision-bound supporting spans from other members.
+- [x] 13.6 Test a dominant large member, a rate-limited member, an incomplete member, cross-member API/schema evidence, mixed head changes, member attachment routing, and a complete clean changeset.
 
 ## 14. UI Projections And Controls
 

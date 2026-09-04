@@ -266,6 +266,18 @@ export interface CompletionOutcome {
   readonly replacesRetainedReview: boolean;
   /** True only for `completeClean`; a partial or failed run with no findings is never clean. */
   readonly clean: boolean;
+  /**
+   * `evaluation.details` verbatim (task 13.4): one member's incompleteness must not be hidden
+   * inside `limitations`' deduplicated, member-anonymous blocker codes — a changeset with one
+   * incomplete member among several complete ones needs the aggregate result to name which
+   * member and why. Empty whenever `eligible` is true, since `evaluateCompletion` only ever
+   * pushes a detail alongside a failing clause. Additive and optional so every existing
+   * `CompletionOutcome` construction site and assertion (`.limitations`, `toMatchObject`)
+   * keeps working unchanged. Present only from `classifyOutcome` itself; other
+   * `CompletionOutcome` construction sites (bootstrap failure, the legacy one-shot adapter)
+   * predate any per-member evaluation and correctly leave it absent.
+   */
+  readonly blockerDetails?: readonly CompletionBlockerDetail[];
 }
 
 export interface ClassifyOutcomeOptions {
@@ -304,6 +316,10 @@ export function classifyOutcome(evaluation: CompletionEvaluation, findingCount: 
     for (const blocker of evaluation.blockers) limitations.push(blockerLimitation(blocker));
     if (options.cancelled === true) limitations.push({ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' });
   }
+  // `evaluation.details` is always empty when `eligible` (no clause ever failed to push one), so this
+  // key is omitted whenever there is nothing to report — every existing exact-equality assertion on a
+  // complete outcome keeps matching a literal with no `blockerDetails` field at all.
+  const blockerDetails = evaluation.details.length > 0 ? { blockerDetails: evaluation.details } : {};
   if (complete) {
     return Object.freeze({
       kind: count > 0 ? 'completeFindings' : 'completeClean',
@@ -312,12 +328,13 @@ export function classifyOutcome(evaluation: CompletionEvaluation, findingCount: 
       limitations: Object.freeze(limitations),
       replacesRetainedReview: true,
       clean: count === 0,
+      ...blockerDetails,
     });
   }
   if (count > 0) {
-    return Object.freeze({ kind: 'partialFindings', completeness: 'partial', findingCount: count, limitations: Object.freeze(limitations), replacesRetainedReview: false, clean: false });
+    return Object.freeze({ kind: 'partialFindings', completeness: 'partial', findingCount: count, limitations: Object.freeze(limitations), replacesRetainedReview: false, clean: false, ...blockerDetails });
   }
-  return Object.freeze({ kind: 'failed', completeness: 'none', findingCount: 0, limitations: Object.freeze(limitations), replacesRetainedReview: false, clean: false });
+  return Object.freeze({ kind: 'failed', completeness: 'none', findingCount: 0, limitations: Object.freeze(limitations), replacesRetainedReview: false, clean: false, ...blockerDetails });
 }
 
 // ---- Advisory completion request (D11 "repairable early completion") ----------

@@ -219,6 +219,40 @@ describe('deterministic completion gate (task 8.7)', () => {
     expect(evaluation.blockers).toEqual(['headChanged', 'incompleteInventory', 'unclassifiedFiles']);
     expect(evaluation.details.every((detail) => detail.memberId === 'm2')).toBe(true);
   });
+
+  it('names the incomplete member in the aggregate outcome without hiding it behind the other member\'s success (task 13.4)', () => {
+    // A dedicated changeset scenario: m1 (e.g. "core") is fully inspected and its head is
+    // unchanged; m2 (e.g. "billing") has a still-paginating manifest. The aggregate result must
+    // say which member blocked completion and why, not just that *something* is incomplete —
+    // `.limitations` alone (deduplicated, member-anonymous blocker codes) cannot do that; this
+    // is what `blockerDetails` (task 13.4) exists to carry through `classifyOutcome`.
+    const m2Snapshot: InvestigationSnapshotRef = { repoId: 'harness-cs-billing', baseSha: 'b2', headSha: 'h2' };
+    const inventory = createChangedFileInventory([
+      { memberId: 'core', snapshot: SNAPSHOT },
+      { memberId: 'billing', snapshot: m2Snapshot },
+    ]);
+    inventory.acceptManifestPage('core', { snapshot: SNAPSHOT, state: 'complete', value: [entry('a')] });
+    inventory.classify('core', 'a', { risk: 'low' });
+    inventory.markInspected('core', 'a');
+    inventory.acceptManifestPage('billing', { snapshot: m2Snapshot, state: 'paginated', value: [entry('x')], cursor: 'c' });
+    const evaluation = evaluateCompletion(
+      passing({
+        inventory,
+        heads: [
+          { memberId: 'core', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'resolved', headSha: 'head-1' } },
+          { memberId: 'billing', snapshotHeadSha: 'h2', currentHead: { repoId: 'harness-cs-billing', state: 'resolved', headSha: 'h2' } },
+        ],
+      }),
+    );
+    const outcome = classifyOutcome(evaluation, 0);
+    expect(outcome.completeness).not.toBe('complete');
+    expect(outcome.blockerDetails?.length).toBeGreaterThan(0);
+    expect(outcome.blockerDetails?.every((detail) => detail.memberId === 'billing')).toBe(true);
+    expect(outcome.blockerDetails?.some((detail) => detail.message.includes('billing'))).toBe(true);
+    // The generic, member-anonymous limitations stay exactly as every other caller already
+    // relies on — `blockerDetails` is additive, not a replacement.
+    expect(outcome.limitations).toEqual([blockerLimitation('incompleteInventory'), blockerLimitation('unclassifiedFiles')]);
+  });
 });
 
 describe('outcome classification (task 8.8)', () => {

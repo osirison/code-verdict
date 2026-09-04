@@ -658,3 +658,103 @@ describe('search and detail tools echo the exact ledger content (D8)', () => {
     expect(result.content.detailJson).toBe(source!.exactContent);
   });
 });
+
+// ---- Cross-member confusion (task 13.2) ----------------------------------------
+//
+// Every test above builds a single-member dispatcher through `setup()`. That proves
+// each operation carries an explicit `memberId` and is refused when that member does
+// not exist, but it cannot prove the *cross-member* confusion case D15 and task 13.2
+// actually care about: a request that names a real member of a real multi-member
+// changeset, while its revision or continuation actually belongs to a *different* real
+// member. `harnessEvidenceLedger.test.ts` already proves this at the ledger layer
+// ("cross-member aliasing"); this proves it holds at the dispatcher's own pre-ledger
+// `validate()` step too, and that a cursor minted for one member cannot be replayed by
+// another.
+
+const SNAPSHOT_2 = { repoId: 'repo-2', baseSha: 'base2', headSha: 'head2' };
+
+function twoMemberSetup(
+  connections: { m1: Connection; m2: Connection },
+  overrides: Partial<HostToolDispatcherOptions> = {},
+): DispatcherHarness {
+  const m1: DispatcherMember = { memberId: 'm1', repositoryId: SNAPSHOT.repoId, baseSha: SNAPSHOT.baseSha, headSha: SNAPSHOT.headSha, changeRequestNumber: '42', connection: connections.m1, capabilities: fullCapabilities() };
+  const m2: DispatcherMember = { memberId: 'm2', repositoryId: SNAPSHOT_2.repoId, baseSha: SNAPSHOT_2.baseSha, headSha: SNAPSHOT_2.headSha, changeRequestNumber: '77', connection: connections.m2, capabilities: fullCapabilities() };
+  const ledger = createEvidenceLedger(
+    { runId: 'r1', lineageId: 'l1', attempt: 1 },
+    [
+      { memberId: m1.memberId, repositoryId: m1.repositoryId, baseSha: m1.baseSha, headSha: m1.headSha, changeRequestNumber: m1.changeRequestNumber },
+      { memberId: m2.memberId, repositoryId: m2.repositoryId, baseSha: m2.baseSha, headSha: m2.headSha, changeRequestNumber: m2.changeRequestNumber },
+    ],
+    { policy: TEST_POLICY },
+  );
+  const budget = createBudgetTracker(TEST_POLICY, { members: ['m1', 'm2'] });
+  const candidateTracker = createCandidateTracker();
+  const dispatcher = createHostToolDispatcher({
+    members: [m1, m2],
+    ledger,
+    budget,
+    candidateTracker,
+    criteria: DEFAULT_CRITERIA,
+    agentsPolicyResolver: stubAgentsPolicyResolver(),
+    evaluateCompletion: () => NEVER_GRANTED_EVALUATION,
+    policy: TEST_POLICY,
+    now: () => '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+  return { ledger, dispatcher, budget };
+}
+
+describe('cross-member confusion in a real multi-member changeset (task 13.2)', () => {
+  it('refuses a request naming a real member but pinned to a different real member\'s revision (revisionMismatch)', async () => {
+    const { dispatcher } = twoMemberSetup({ m1: diffConnection({ snapshot: SNAPSHOT, state: 'complete', value: DIFF_PAGE }), m2: fakeConnection({}) });
+    // Names m2 (a real member of this changeset) but the request is pinned to m1's snapshot.
+    const result = await dispatcher.dispatch('investigating', readDiffRequest({ memberId: 'm2', request: { snapshot: SNAPSHOT, path: 'src/foo.ts' } }));
+    expect(result).toMatchObject({ state: 'refused', code: 'revisionMismatch' });
+  });
+
+  it('refuses an id naming neither real member as unknownMember, not revisionMismatch', async () => {
+    const { dispatcher } = twoMemberSetup({ m1: fakeConnection({}), m2: fakeConnection({}) });
+    const result = await dispatcher.dispatch('investigating', readDiffRequest({ memberId: 'm3', request: { snapshot: SNAPSHOT, path: 'src/foo.ts' } }));
+    expect(result).toMatchObject({ state: 'refused', code: 'unknownMember' });
+  });
+
+  it('dispatches each member\'s own request against its own connection and revision, never the other member\'s', async () => {
+    const { dispatcher, ledger } = twoMemberSetup({
+      m1: diffConnection({ snapshot: SNAPSHOT, state: 'complete', value: DIFF_PAGE }),
+      m2: diffConnection({ snapshot: SNAPSHOT_2, state: 'complete', value: { ...DIFF_PAGE, path: 'src/bar.ts' } }),
+    });
+    const r1 = await dispatcher.dispatch('investigating', readDiffRequest({ memberId: 'm1', request: { snapshot: SNAPSHOT, path: 'src/foo.ts' } }));
+    const r2 = await dispatcher.dispatch('investigating', readDiffRequest({ memberId: 'm2', request: { snapshot: SNAPSHOT_2, path: 'src/bar.ts' } }));
+    expect(r1.state).toBe('complete');
+    expect(r2.state).toBe('complete');
+    expect(ledger.sources().map((source) => ({ memberId: source.memberId, repositoryId: source.repositoryId }))).toEqual([
+      { memberId: 'm1', repositoryId: 'repo-1' },
+      { memberId: 'm2', repositoryId: 'repo-2' },
+    ]);
+  });
+
+  it('refuses a cursor minted for one member when replayed by another member as forgedCursor', async () => {
+    const paginatedResult: RepositorySearchResult = { snapshot: SNAPSHOT, state: 'paginated', value: [{ path: 'src/foo.ts', line: 1, excerpt: 'x' }], cursor: 'cursor-1' };
+    const { dispatcher } = twoMemberSetup({
+      m1: fakeConnection({ searchRepository: async () => paginatedResult }),
+      m2: fakeConnection({ searchRepository: async () => paginatedResult }),
+    });
+    const first = await dispatcher.dispatch('investigating', {
+      tool: 'searchRepository',
+      requestId: nextRequestId(),
+      memberId: 'm1',
+      elapsedMs: 0,
+      request: { snapshot: SNAPSHOT, revision: 'head', query: 'x' },
+    });
+    expect(first).toMatchObject({ state: 'paginated', cursor: 'cursor-1' });
+    // Same tool, same query, but a different member than the cursor was issued to.
+    const replayedByOtherMember = await dispatcher.dispatch('investigating', {
+      tool: 'searchRepository',
+      requestId: nextRequestId(),
+      memberId: 'm2',
+      elapsedMs: 0,
+      request: { snapshot: SNAPSHOT_2, revision: 'head', query: 'x', cursor: 'cursor-1' },
+    });
+    expect(replayedByOtherMember).toMatchObject({ state: 'refused', code: 'forgedCursor' });
+  });
+});

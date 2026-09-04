@@ -569,7 +569,15 @@ function parsePlanItemInputs(rawItems: unknown): { readonly ok: true; readonly i
       if (!isPlanItemState(rawItem.state)) return { ok: false };
       state = rawItem.state;
     }
-    items.push(state !== undefined ? { id, description, state } : { id, description });
+    // Absent memberId means shared cross-member work (task 13.3); present-but-malformed fails closed.
+    const memberId = boundedOptionalString(rawItem.memberId, MAX_ID_LENGTH);
+    if (!memberId.ok) return { ok: false };
+    items.push({
+      id,
+      description,
+      ...(state !== undefined ? { state } : {}),
+      ...(memberId.value !== undefined ? { memberId: memberId.value } : {}),
+    });
   }
   return { ok: true, items };
 }

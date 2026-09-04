@@ -637,16 +637,29 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     },
   };
 
+  /**
+   * D8/13.5's attachment-inline-routing rule ("inline only when its path is also a changed file
+   * of that member") needs each member's changed-file set as manifest pages arrive — this Map is
+   * mutated in place by `onManifestPage` below and read live by every later
+   * `submitCandidateFinding` dispatch, never rebuilt or snapshotted once passed to the dispatcher.
+   */
+  const changedPathsByMember = new Map<string, Set<string>>(memberIds.map((memberId) => [memberId, new Set<string>()]));
+
   const dispatcher: HostToolDispatcher = createHostToolDispatcher({
     members: dispatcherMembers,
     ledger,
     budget,
     candidateTracker,
     criteria: snapshot.criteria,
+    changedPathsByMember,
     agentsPolicyResolver,
     evaluateCompletion: () => currentCompletionEvaluation(),
     onManifestPage: (memberId, result) => {
       inventory.acceptManifestPage(memberId, result);
+      if (result.state === 'complete' || result.state === 'paginated' || result.state === 'truncated') {
+        const paths = changedPathsByMember.get(memberId);
+        for (const entry of result.value) paths?.add(entry.path);
+      }
     },
     policy,
     cancellation,
@@ -770,6 +783,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         inventory.markTerminal(memberId, path, 'oversized', 'The diff for this file exceeded what the provider could return.');
         break;
       case 'unavailable':
+        // A read deferred to wait out a long retry (9.6) has not failed — the very next
+        // retry may return the diff. `markTerminal` is irreversible, so marking it here
+        // would leave the file permanently uninspectable and the run permanently unable
+        // to reach complete. Leave it classified-but-uninspected: the completion gate
+        // then correctly reports the run incomplete until the read actually lands.
+        if (result.deferred) break;
+        inventory.markTerminal(memberId, path, 'unavailable', result.reason);
+        break;
       case 'notFound':
         inventory.markTerminal(memberId, path, 'unavailable', result.reason);
         break;

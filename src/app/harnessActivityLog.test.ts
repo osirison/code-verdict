@@ -97,6 +97,28 @@ describe('appendActivityEvent (tasks 5.1/5.2)', () => {
     expect(accepted.events).toHaveLength(2);
   });
 
+  it('carries a member-scoped plan item\'s memberId through sanitization, and leaves a shared item without one (task 13.3)', () => {
+    const plan = {
+      revision: 1,
+      items: [
+        { id: 'core-1', description: 'Inspect authorization changes', state: 'pending' as const, memberId: 'core' },
+        { id: 'shared-1', description: 'Confirm the billing schema matches core', state: 'pending' as const },
+      ],
+    };
+    const log = appendActivityEvent(createActivityLog('run-1', 'lineage-1', 1), planCreatedFact(plan), context(0, '2026-09-01T00:00:00.000Z'));
+    const event = log.events[0];
+    if (event?.kind !== 'planCreated') throw new Error('expected planCreated');
+    expect(event.plan.items[0]).toEqual({ id: 'core-1', description: 'Inspect authorization changes', state: 'pending', memberId: 'core' });
+    expect(event.plan.items[1]).not.toHaveProperty('memberId');
+  });
+
+  it('fails closed on a plan item with a blank memberId', () => {
+    const plan = { revision: 1, items: [{ id: 'p1', description: 'x', state: 'pending' as const, memberId: '  ' }] };
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const rejected = appendActivityEvent(log, planCreatedFact(plan), context(0, '2026-09-01T00:00:00.000Z'));
+    expect(rejected).toBe(log);
+  });
+
   it('rejects a fact whose required text sanitizes to nothing', () => {
     const log = createActivityLog('run-1', 'lineage-1', 1);
     const rejected = appendActivityEvent(

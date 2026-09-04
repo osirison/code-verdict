@@ -155,6 +155,31 @@ describe('validateCandidate (task 7.6)', () => {
     expect(finding.provenance.citations).toHaveLength(2);
   });
 
+  it('marks a cross-member finding cross/spans, matching the changeset UI\'s collectCrossFindings filter (task 13.5)', () => {
+    const fixture = setup();
+    const finding = accepted(fixture, {
+      line: 11,
+      citations: { primary: cite(fixture.diff, 'src/auth/token.ts', 11), supporting: [cite(fixture.file, 'src/api/session.ts', 41)] },
+      code: undefined,
+    });
+    expect(finding.item.cross).toBe(true);
+    expect(finding.item.spans).toEqual([
+      { repoId: 'repo-1', location: 'src/auth/token.ts:11', role: 'primary evidence' },
+      { repoId: 'repo-2', location: 'src/api/session.ts:41', role: 'supporting evidence' },
+    ]);
+  });
+
+  it('never marks a same-member-only finding cross, even with a supporting citation from its own member', () => {
+    const fixture = setup();
+    const secondDiff = fixture.ledger.registerFileRange('m1', fileRange(SNAP1, 'src/auth/util.ts'));
+    if (!secondDiff.ok) throw new Error('setup failed');
+    const finding = accepted(fixture, {
+      citations: { primary: cite(fixture.diff, 'src/auth/token.ts', 12), supporting: [{ sourceId: secondDiff.source.sourceId, digest: secondDiff.source.digest, path: 'src/auth/util.ts', range: { startLine: 40, endLine: 45 } }] },
+    });
+    expect(finding.item.cross).toBeUndefined();
+    expect(finding.item.spans).toBeUndefined();
+  });
+
   it('rejects schema failures fail-closed and reports each of them', () => {
     const fixture = setup();
     const outcome = validateCandidate(candidate(fixture, { line: 0, severity: 'urgent', category: 'vibes', confidence: Number.NaN, title: '' }), fixture.context);
@@ -276,6 +301,40 @@ describe('primary-target eligibility (task 7.7)', () => {
     const context = { ...fixture.context, changedPathsByMember: undefined };
     const outcome = validateCandidate(candidate(fixture, { file: 'config/schema.ts', line: 1, code: undefined, citations: { primary: cite(fixture.attachment, 'config/schema.ts', 1) } }), context);
     expect(outcome).toMatchObject({ state: 'accepted', finding: { routing: 'summary' } });
+  });
+
+  it('rejects a candidate declaring another member as primary target when it cites this member\'s attachment (member attachment routing, task 13.5)', () => {
+    // fixture.attachment was registered to member m1; a candidate declaring member m2 must not
+    // be able to use it as a primary target, even though the attachment origin is otherwise eligible.
+    const fixture = setup();
+    const outcome = validateCandidate(candidate(fixture, {
+      memberId: 'm2',
+      file: 'config/schema.ts',
+      line: 2,
+      code: undefined,
+      citations: { primary: cite(fixture.attachment, 'config/schema.ts', 2) },
+    }), fixture.context);
+    expect(outcome).toMatchObject({ state: 'rejected', reasons: [{ code: 'primary:memberMismatch' }] });
+  });
+
+  it('routes strictly per member: a path changed in m1 does not make the same-named path inline for m2 (task 13.5/13.6)', () => {
+    // m1's changed-path set includes config/schema.ts (via setup's override below); m2 gets its
+    // own attachment at the identical literal path but no matching entry in its own changed-path
+    // set. Routing must consult each member's own set — a path being "changed" in one member must
+    // never leak into another member's inline/summary decision for the same-named attachment.
+    const fixture = setup({ changedPaths: ['src/auth/token.ts', 'config/schema.ts'] });
+    const m2Attachment = attachment('config/schema.ts');
+    const registered = fixture.ledger.registerAttachment('m2', m2Attachment, sha256Hex(m2Attachment.content));
+    if (!registered.ok) throw new Error('setup failed');
+    const finding = accepted(fixture, {
+      memberId: 'm2',
+      file: 'config/schema.ts',
+      line: 2,
+      code: undefined,
+      citations: { primary: cite(registered.source, 'config/schema.ts', 2) },
+    });
+    expect(finding.routing).toBe('summary');
+    expect(finding.item.anchored).toBe(false);
   });
 });
 

@@ -43,6 +43,34 @@ describe('parseModelTurn: every message kind round-trips', () => {
     }
   });
 
+  it('planCreated parses a member-scoped item and leaves a shared item without memberId (task 13.3)', () => {
+    const outcome = parseModelTurn(
+      turnText([
+        {
+          kind: 'planCreated',
+          items: [
+            { id: 'core-1', description: 'Inspect authorization changes', memberId: 'core' },
+            { id: 'shared-1', description: 'Confirm the billing schema matches core' },
+          ],
+        },
+      ]),
+      { phase: 'planning' },
+    );
+    const [msg] = okMessages(outcome);
+    if (msg?.kind !== 'planCreated') throw new Error('expected planCreated');
+    expect(msg.plan.items[0]).toEqual({ id: 'core-1', description: 'Inspect authorization changes', state: 'pending', memberId: 'core' });
+    expect(msg.plan.items[1]).not.toHaveProperty('memberId');
+  });
+
+  it('rejects a plan item whose memberId is not a well-formed string', () => {
+    const outcome = parseModelTurn(
+      turnText([{ kind: 'planCreated', items: [{ id: 'p1', description: 'Inspect auth', memberId: 42 }] }]),
+      { phase: 'planning' },
+    );
+    expect(outcome.ok).toBe(false);
+    expect(failReasons(outcome)).toEqual([{ code: 'schema', message: expect.any(String) }]);
+  });
+
   it('planRevised preserves prior item ids via the existing revisePlan and appends a new one', () => {
     const previousPlan = createPlan([{ id: 'p1', description: 'Inspect auth' }]) as Plan;
     const outcome = parseModelTurn(

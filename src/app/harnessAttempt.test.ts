@@ -995,4 +995,47 @@ describe('HarnessAttempt.run (9.6: a long retry delay moves through waiting to r
     expect(finalBudget?.evidenceBytesUsed).toBe(controlFinalBudget?.evidenceBytesUsed);
     expect(expectedPatch.length).toBeGreaterThan(0); // sanity: the fixture patch is non-empty
   });
+
+  it('a read deferred to wait out a long retry does not mark the file terminally unavailable, so the successful retry can still inspect it and the run can reach complete', async () => {
+    const path = 'file1.ts';
+    let readDiffCalls = 0;
+    const connection = reviewConnection({
+      files: [path],
+      readDiff: async (request) => {
+        readDiffCalls += 1;
+        if (readDiffCalls === 1) throw new ScmError('rateLimited', 'slow down', { retryAfterSeconds: 600 });
+        return diffPageResult(request.path);
+      },
+    });
+
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(path)), messages(readDiffMessage(path)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      retry: { longDelayThresholdMs: 0, sleep: async () => {} },
+    });
+
+    const result = await attempt.run();
+
+    expect(readDiffCalls).toBe(2);
+    // The regression this guards: `markTerminal` is irreversible, so treating the
+    // wait-deferred result as a provider `unavailable` left the file permanently
+    // uninspectable and the run permanently unable to reach complete, even though
+    // the very next read succeeded.
+    expect(result.outcome.completeness).toBe('complete');
+    const coverage = result.activityLog.events.filter((e) => e.kind === 'coverageChanged');
+    const last = coverage[coverage.length - 1];
+    if (last?.kind !== 'coverageChanged') throw new Error('expected a coverageChanged event');
+    expect(last.coverage.inspected).toBe(1);
+    expect(last.coverage.classified).toBe(1);
+    expect(last.coverage.total).toBe(1);
+  });
 });

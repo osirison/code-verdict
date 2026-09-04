@@ -189,7 +189,8 @@ function parsePlanItem(raw: unknown): PlanItem | undefined {
   if (!isRecord(raw)) return undefined;
   const state = parsePlanItemState(raw.state);
   if (typeof raw.id !== 'string' || typeof raw.description !== 'string' || !state) return undefined;
-  return { id: raw.id, description: raw.description, state };
+  if (raw.memberId !== undefined && typeof raw.memberId !== 'string') return undefined;
+  return { id: raw.id, description: raw.description, state, ...(raw.memberId !== undefined ? { memberId: raw.memberId } : {}) };
 }
 
 /** Reused by `parseActivityEvent`'s `planCreated`/`planRevised` branches — the only place a `Plan` is ever persisted. */

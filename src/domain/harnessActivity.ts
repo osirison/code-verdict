@@ -14,11 +14,18 @@ export const PLAN_ITEM_STATES = ['pending', 'active', 'completed', 'skipped', 'b
 
 export type PlanItemState = (typeof PLAN_ITEM_STATES)[number];
 
-/** Stable across plan revisions within a lineage (D5, review-run-activity). */
+/**
+ * Stable across plan revisions within a lineage (D5, review-run-activity).
+ * `memberId` scopes an item to one changeset member; absent means the item
+ * is shared cross-member work (D15, task 13.3) — an individual (non-
+ * changeset) review's items are always shared, since there is only one
+ * member to begin with.
+ */
 export interface PlanItem {
   id: string;
   description: string;
   state: PlanItemState;
+  memberId?: string;
 }
 
 /** A revision appends history; it never silently overwrites the prior plan. */

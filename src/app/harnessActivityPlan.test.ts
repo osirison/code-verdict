@@ -76,3 +76,50 @@ describe('createPlan / revisePlan (task 5.3)', () => {
     });
   });
 });
+
+describe('member-scoped and shared plan items (task 13.3)', () => {
+  it('creates a plan mixing member-scoped items and a shared cross-member item', () => {
+    const plan = createPlan([
+      { id: 'core-1', description: 'Inspect authorization changes', memberId: 'core' },
+      { id: 'billing-1', description: 'Inspect billing webhook changes', memberId: 'billing' },
+      { id: 'shared-1', description: 'Confirm the billing schema matches core' },
+    ]);
+    expect(plan?.items).toEqual([
+      { id: 'core-1', description: 'Inspect authorization changes', state: 'pending', memberId: 'core' },
+      { id: 'billing-1', description: 'Inspect billing webhook changes', state: 'pending', memberId: 'billing' },
+      { id: 'shared-1', description: 'Confirm the billing schema matches core', state: 'pending' },
+    ]);
+    expect(plan?.items[2]).not.toHaveProperty('memberId');
+  });
+
+  it('fails closed on a present-but-blank member id', () => {
+    expect(createPlan([{ id: 'p1', description: 'Inspect auth', memberId: '  ' }])).toBeUndefined();
+  });
+
+  it('keeps a member-scoped item\'s stable id when a revision adds new shared work', () => {
+    const first = createPlan([{ id: 'core-1', description: 'Inspect authorization changes', memberId: 'core' }])!;
+    const revised = revisePlan(
+      first,
+      [
+        { id: 'core-1', description: 'Inspect authorization changes', state: 'active', memberId: 'core' },
+        { id: 'shared-1', description: 'Confirm the billing schema matches core' },
+      ],
+      'A schema consumer was found in another member',
+    );
+    expect(revised?.items.map((item) => item.id)).toEqual(['core-1', 'shared-1']);
+    expect(revised?.items[0]).toMatchObject({ id: 'core-1', memberId: 'core' });
+    expect(revised?.items[1]).not.toHaveProperty('memberId');
+  });
+
+  it('keeps a shared item\'s stable id when a revision narrows its description', () => {
+    const first = createPlan([{ id: 'shared-1', description: 'Check the API contract' }])!;
+    const revised = revisePlan(
+      first,
+      [{ id: 'shared-1', description: 'Check the API contract: response shape only', state: 'active' }],
+      'Narrowed after the first pass found no request-shape drift',
+    );
+    expect(revised?.items).toEqual([
+      { id: 'shared-1', description: 'Check the API contract: response shape only', state: 'active' },
+    ]);
+  });
+});
