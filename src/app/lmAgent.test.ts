@@ -840,8 +840,6 @@ describe('the prompt carries what the change is for', () => {
         { id: 'auto:linked:0:1180', kind: 'linkedItem', label: '#1180 · Key rotation, end to end', enabled: true },
       ],
       unresolvedContextReferences: [],
-      runSteps: [],
-      runStep: 0,
       mode: 'split',
       items: [],
       counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 0 },

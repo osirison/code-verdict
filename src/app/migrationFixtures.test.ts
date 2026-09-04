@@ -72,4 +72,26 @@ describe('legacy migration fixtures (task 1.4) read back under today\'s code', (
     expect(retained?.draft.submitState?.postedCommentKeys).toEqual(['i0']);
     expect(retained?.draft.review.repoId).toBe('changeset');
   });
+
+  /**
+   * Task 14.2, design.md D16: "The UI does not invent plan, evidence, or
+   * coverage data for [legacy reviews]." Every pre-harness fixture above
+   * predates `protocolProvenance`/`activity`/`lineageId`/`attempt` entirely —
+   * this asserts `readRetained` reads every one of them as `legacy-one-shot`
+   * with no fabricated plan or activity, not only the triage/clean ones
+   * already covered above.
+   */
+  it.each([
+    ['an unsubmitted triage draft', LEGACY_RETAINED_TRIAGE_DRAFT],
+    ['a submitted draft', LEGACY_RETAINED_SUBMITTED],
+    ['a clean run', LEGACY_RETAINED_CLEAN],
+    ['a pre-result-fields record', LEGACY_RETAINED_PRE_RESULT_FIELDS],
+    ['a changeset draft', LEGACY_CHANGESET_DRAFT],
+  ] as const)('reads %s as legacy provenance with no fabricated plan or activity', (_label, fixture) => {
+    const retained = readRetained(fixture);
+    expect(retained?.protocolProvenance).toBe('legacy-one-shot');
+    expect(retained?.activity).toEqual([]);
+    expect(retained?.lineageId).toBeUndefined();
+    expect(retained?.attempt).toBeUndefined();
+  });
 });

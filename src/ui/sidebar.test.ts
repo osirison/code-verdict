@@ -224,7 +224,7 @@ describe('the sidebar stops fetching on every triage action', () => {
     sidebar.setPendingReview({ headline: '#7', context: 'feat/x', agent: 'agent', added: 1, removed: 0 });
     sidebar.setThreads({ headline: '#7', context: 'feat/x', summary: [], threads: [] });
     sidebar.setActiveRoute('dashboard');
-    sidebar.setActiveRuns([{ key: 'k', label: '#7', state: 'running', elapsedMs: 0 }]);
+    sidebar.setActiveRuns([{ key: 'k', label: '#7', lifecycle: 'investigating', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none' }]);
 
     expect(world.calls).toEqual({ changeRequests: 1, workItems: 1, ciRuns: 1 });
     expect(view.postMessage).toHaveBeenCalledTimes(4);

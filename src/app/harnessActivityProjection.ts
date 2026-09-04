@@ -45,6 +45,22 @@ function dedupeBySequence(events: readonly ActivityEvent[]): ActivityEvent[] {
 }
 
 /**
+ * Sorted and deduped by protocol sequence (spec `review-run-activity`:
+ * "Consumers SHALL order events by protocol sequence rather than arrival
+ * time... a duplicate event does not create duplicate activity"). Exported
+ * so every other reader of a raw activity array — `planHistory`
+ * (`./harnessActivityPlan.ts`) and the retained/live activity feed
+ * (`../ui/reviewFlowHtml.ts`, tasks 14.1/14.2) — normalizes exactly the way
+ * `reduceActivity` below does, rather than each trusting arrival order on
+ * its own. This matters most for *persisted* activity (task 14.2's retained
+ * details read a deserialized array back from storage), which carries no
+ * transport-order guarantee at all.
+ */
+export function orderActivity(events: readonly ActivityEvent[]): ActivityEvent[] {
+  return dedupeBySequence(sortBySequence(events));
+}
+
+/**
  * Phases with no lifecycle value of their own collapse to the nearest one:
  * `bootstrap` precedes planning, and `persisting` is still `completing` from
  * the reviewer's point of view (D2's lifecycle diagram names neither).
@@ -189,7 +205,7 @@ function deriveProgress(coverage: CoverageProgress | undefined): {
  * or otherwise delays a terminal event behind routine activity volume.
  */
 export function reduceActivity(log: ActivityLog): RunProjection {
-  const events = dedupeBySequence(sortBySequence(log.events));
+  const events = orderActivity(log.events);
   const last = events[events.length - 1];
   const lifecycle = deriveLifecycle(events);
   const coverage = deriveCoverage(events);

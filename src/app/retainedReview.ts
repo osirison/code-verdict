@@ -24,9 +24,10 @@ import type { KeyValueStore } from './storage';
 import type { ChangesetSubmitState } from './changesetSubmit';
 import type { AttachmentWarning } from './attachments';
 import type { CandidateBucket } from '../domain/agentResponse';
-import type { Limitation } from '../domain/harnessActivity';
+import type { ActivityEvent, Limitation } from '../domain/harnessActivity';
 import { normalizeEffortLevel } from '../domain/effort';
-import type { ResultCompleteness } from '../domain/harnessLifecycle';
+import type { AttemptNumber, LineageId, ResultCompleteness } from '../domain/harnessLifecycle';
+import type { ProtocolProvenance } from '../domain/harnessEvidence';
 import { isReviewItemAnchored, type Review } from '../domain/types';
 
 /**
@@ -173,6 +174,30 @@ export interface RetainedResult {
   completeness?: ResultCompleteness;
   /** The attempt's own `CompletionOutcome.limitations` — why this result did not reach `complete`. `[]`/absent for an ordinary complete record. */
   limitations?: readonly Limitation[];
+  /**
+   * Task 14.2 (design.md D16): set only when the writer actually knows this
+   * result came from a real harness attempt (`HarnessAttemptResult.plan`
+   * present — see `reviewRunManager.ts`'s two `retainedFromRun` call sites).
+   * Left absent otherwise, never written as `'legacy-one-shot'` from an
+   * inference: `readRetained` below is the one place an absent value is
+   * read as legacy, so a fact and a guess can never be confused in storage.
+   */
+  protocolProvenance?: ProtocolProvenance;
+  /** Stable across a checkpoint-based resume of the run that produced this result (D2). Absent for a legacy record, which predates the concept. */
+  lineageId?: LineageId;
+  /** Monotonic within `lineageId`. Greater than 1 only once a prior attempt in this lineage closed as `interrupted` (D2/D13). */
+  attempt?: AttemptNumber;
+  /**
+   * The full ordered sanitized activity from the attempt that produced this
+   * result (task 14.2, design.md D14) — the same typed union every other
+   * surface reads, never a second retained-details shape. `planHistory`
+   * (`./harnessActivityPlan`) and `reduceActivity` (`./harnessActivityProjection`)
+   * both read straight off this array, so retained details cannot derive a
+   * plan or a coverage figure that disagrees with what the live screen showed
+   * while the run was still in progress. Absent (never `[]` written as if it
+   * were a real empty activity) for a legacy record, which has none.
+   */
+  activity?: readonly ActivityEvent[];
 }
 
 /**
@@ -201,6 +226,10 @@ export function carryRetainedResult(raw: RetainedResult | undefined): RetainedRe
     attachmentWarnings: raw?.attachmentWarnings,
     completeness: raw?.completeness,
     limitations: raw?.limitations,
+    protocolProvenance: raw?.protocolProvenance,
+    lineageId: raw?.lineageId,
+    attempt: raw?.attempt,
+    activity: raw?.activity,
   };
 }
 
@@ -266,6 +295,11 @@ export function retainedFromRun(input: {
   /** Defaults to `'complete'` — every existing caller (a finished, retained-review-replacing run) is complete by construction; a partial write (task 12.5) passes `'partial'` explicitly. */
   completeness?: ResultCompleteness;
   limitations?: readonly Limitation[];
+  /** Task 14.2: set only when the caller knows this came from a real harness attempt — see `RetainedResult.protocolProvenance`'s own doc comment. */
+  protocolProvenance?: ProtocolProvenance;
+  lineageId?: LineageId;
+  attempt?: AttemptNumber;
+  activity?: readonly ActivityEvent[];
 }): RetainedRecord {
   return {
     review: input.review,
@@ -282,6 +316,10 @@ export function retainedFromRun(input: {
     attachmentWarnings: input.attachmentWarnings,
     completeness: input.completeness ?? 'complete',
     limitations: input.limitations,
+    protocolProvenance: input.protocolProvenance,
+    lineageId: input.lineageId,
+    attempt: input.attempt,
+    activity: input.activity,
   };
 }
 
@@ -311,6 +349,19 @@ export interface RetainedReview<D extends RetainedRecord> {
    */
   completeness: ResultCompleteness;
   limitations: readonly Limitation[];
+  /**
+   * Task 14.2 (design.md D16): defaults to `'legacy-one-shot'` when the raw
+   * record carries no value — every record written before this field
+   * existed predates the harness protocol, and this is the one place that
+   * inference is allowed to happen (never in storage; see
+   * `RetainedResult.protocolProvenance`).
+   */
+  protocolProvenance: ProtocolProvenance;
+  /** Absent exactly when `protocolProvenance` is `'legacy-one-shot'` — a legacy record has no lineage to report. */
+  lineageId?: LineageId;
+  attempt?: AttemptNumber;
+  /** `[]` for a legacy record — never fabricated activity for a review the harness never produced. */
+  activity: readonly ActivityEvent[];
 }
 
 /**
@@ -354,6 +405,10 @@ export function readRetained<D extends RetainedRecord>(
     attachmentWarnings: raw.attachmentWarnings ?? [],
     completeness: raw.completeness ?? (options.partial ? 'partial' : 'complete'),
     limitations: raw.limitations ?? [],
+    protocolProvenance: raw.protocolProvenance ?? 'legacy-one-shot',
+    lineageId: raw.lineageId,
+    attempt: raw.attempt,
+    activity: raw.activity ?? [],
   };
 }
 

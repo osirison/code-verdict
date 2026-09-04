@@ -34,6 +34,7 @@ import { ReviewFlowPanel } from './ui/reviewFlow';
 import { SettingsPanel } from './ui/settings';
 import { VerdictSidebarProvider, VerdictStatusBar } from './ui/sidebar';
 import type { SidebarActiveReview, SidebarPendingReview, SidebarThreads } from './ui/sidebarHtml';
+import { toSidebarActiveRuns } from './ui/sidebarState';
 import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
@@ -173,14 +174,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // fan-out keeps them from drifting apart. Both are cheap: local state,
       // rendered into a webview.
       const active = runManager.active();
-      sidebar.setActiveRuns(
-        active.map((run) => ({
-          key: run.key,
-          label: run.input.refLabel,
-          state: run.status === 'queued' ? ('queued' as const) : ('running' as const),
-          elapsedMs: Date.now() - (run.startedAt ?? run.queuedAt),
-        })),
-      );
+      // Task 14.3 (design.md D14): the sidebar's compact list is the same
+      // `RunProjection` the active review screen reads, mapped by
+      // `toSidebarActiveRuns` — not a second, call-site-local read of
+      // `RunRecord`.
+      sidebar.setActiveRuns(toSidebarActiveRuns(active));
       statusBar.setActiveRuns(active.filter((run) => run.status === 'running').length);
 
       // The dashboard is NOT cheap: `refreshIfOpen` refetches the whole pod.

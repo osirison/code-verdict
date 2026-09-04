@@ -1,5 +1,7 @@
 import { renderPage, escapeHtml, type CodiconAssets } from './theme';
-import { cap, type Vocabulary } from './vocab';
+import { cap, elapsedClock, runLifecycleLabel, type Vocabulary } from './vocab';
+import type { AttentionState, ProgressMode } from '../domain/harnessActivity';
+import { isActiveLifecycle, type RunLifecycle } from '../domain/harnessLifecycle';
 
 /**
  * Chrome icons are codicons (issue #6). Glyphs the spec names in prose —
@@ -87,13 +89,25 @@ export interface SidebarPendingReview {
  * One review in flight. Shown outside the run screen because that is the whole
  * point of a background run: the reviewer is somewhere else, and still needs to
  * know something is happening and be able to stop it.
+ *
+ * Task 14.3 (design.md D14): every field here is the same compact projection
+ * data the active review screen itself reads — `lifecycle`/`currentAction`/
+ * `progressMode`/`progressUnits`/`attention` mirror `RunProjection`
+ * verbatim (`../domain/harnessActivity.ts`) rather than a second,
+ * sidebar-only notion of run state. `toSidebarActiveRuns`
+ * (`./sidebarState.ts`) is the one place a `RunRecord` becomes this shape.
  */
 export interface SidebarActiveRun {
   key: string;
   label: string;
-  state: 'running' | 'queued';
+  lifecycle: RunLifecycle;
+  /** The public current action, when the projection has one — absent while queued, or before the first checkpoint. */
+  currentAction?: string;
   /** Milliseconds since it was triggered, formatted by the renderer. */
   elapsedMs: number;
+  progressMode: ProgressMode;
+  progressUnits?: { completed: number; total?: number };
+  attention: AttentionState;
 }
 
 /** Spec §9: the posted-reviews thread list. */
@@ -170,12 +184,19 @@ body { min-height: 100vh; background: var(--bg2); color: var(--fg); font-size: 1
 .divider { border-top: 1px solid var(--line); margin-top: 4px; }
 .section { padding: 11px 12px 8px; color: var(--fg-dimmer); font-size: 10px; font-weight: 500; letter-spacing: .09em; text-transform: uppercase; }
 .pod-list, .list, .run-list { display: flex; flex-direction: column; padding-bottom: 8px; }
-/* One review in flight. The dot pulses only while a run is actually streaming;
-   a queued one is still, because nothing is happening on it yet. */
+/* One review in flight. The dot pulses only during an active phase
+   (planning/investigating/verifying/completing); a queued run is still,
+   because nothing is happening on it yet, and a run needing attention
+   (paused) turns the dot a warning color instead of pulsing. Label and
+   current action each truncate on their own line rather than wrapping or
+   pushing the cancel button out of this fixed-width row (task 14.3). */
 .run-row { display: flex; align-items: center; gap: 8px; padding: 5px 12px; }
-.run-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: run-pulse 1.4s ease-in-out infinite; }
-.run-dot.queued { background: var(--fg-dimmer); animation: none; }
-.run-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.run-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--fg-dimmer); }
+.run-dot.active { background: var(--accent); animation: run-pulse 1.4s ease-in-out infinite; }
+.run-row-attention .run-dot { background: var(--sev-major); animation: none; }
+.run-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.run-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.run-action { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9.5px; color: var(--fg-dimmer); }
 .run-meta { flex: none; color: var(--fg-dimmer); font-family: var(--font-mono); font-size: 10.5px; }
 .run-cancel { flex: none; background: none; border: 0; color: var(--fg-dimmer); cursor: pointer; padding: 0 2px; font-size: 11px; }
 .run-cancel:hover { color: var(--fg); }
@@ -377,33 +398,55 @@ function renderPending(pending: SidebarPendingReview): string {
 }
 
 /**
+ * "queued" while waiting for a slot; a real "N/total" once a denominator
+ * exists; the shared `elapsedClock` (./vocab.ts — the same formatter the
+ * active review screen ticks its own clock with) otherwise. Never a
+ * percentage estimated from no denominator (task 14.3, design.md D10).
+ */
+function runMetaText(run: SidebarActiveRun): string {
+  if (run.lifecycle === 'queued') return 'queued';
+  if (run.progressMode === 'determinate' && run.progressUnits?.total !== undefined) {
+    return `${run.progressUnits.completed}/${run.progressUnits.total}`;
+  }
+  return elapsedClock(run.elapsedMs);
+}
+
+/**
  * Reviews in flight, above whatever screen the sidebar is showing.
  *
  * Nothing at all when nothing is running: an empty section is a claim that
- * there is something to see. Elapsed rather than a percentage, because a run
- * that has parked on the same step for two minutes is exactly the case the
- * reviewer needs to notice.
+ * there is something to see. Task 14.3 (design.md D14): every field this
+ * reads is the compact projection data `toSidebarActiveRuns`
+ * (./sidebarState.ts) copied straight off the same `RunProjection` the
+ * active review screen renders from — the lifecycle label
+ * (`runLifecycleLabel`, ./vocab.ts) and the elapsed clock are the identical
+ * shared formatters, so this narrow surface cannot describe a run
+ * differently than the full screen does.
+ *
+ * A long label or a long current action truncates with an ellipsis
+ * (`.run-label`/`.run-action`) rather than wrapping or pushing the cancel
+ * button out of the row — this list sits in a fixed-width sidebar.
  */
 function renderActiveRuns(runs: readonly SidebarActiveRun[]): string {
   if (runs.length === 0) return '';
   const rows = runs
-    .map(
-      (run) => `<div class="run-row">
-      <span class="run-dot ${run.state === 'queued' ? 'queued' : ''}"></span>
-      <span class="run-label">${escapeHtml(run.label)}</span>
-      <span class="run-meta">${run.state === 'queued' ? 'queued' : escapeHtml(formatElapsed(run.elapsedMs))}</span>
+    .map((run) => {
+      const dotClass = run.lifecycle === 'queued' ? 'queued' : isActiveLifecycle(run.lifecycle) ? 'active' : '';
+      const phase = runLifecycleLabel(run.lifecycle);
+      const action = run.currentAction ? `${phase} — ${run.currentAction}` : phase;
+      return `<div class="run-row ${run.attention === 'attentionRequired' ? 'run-row-attention' : ''}">
+      <span class="run-dot ${dotClass}"></span>
+      <span class="run-main">
+        <span class="run-label">${escapeHtml(run.label)}</span>
+        <span class="run-action">${escapeHtml(action)}</span>
+      </span>
+      <span class="run-meta">${escapeHtml(runMetaText(run))}</span>
       <button class="run-cancel" data-cancel-run="${escapeHtml(run.key)}" title="Cancel this review">✕</button>
-    </div>`,
-    )
+    </div>`;
+    })
     .join('');
-  const running = runs.filter((run) => run.state === 'running').length;
+  const running = runs.filter((run) => isActiveLifecycle(run.lifecycle)).length;
   return `<div class="divider"></div><div class="section">Running · ${running} of ${runs.length}</div><div class="run-list">${rows}</div>`;
-}
-
-/** `0:42`, `12:07` — a stopwatch, not a duration phrase. */
-function formatElapsed(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000));
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 
 /** Spec §9: status summary over the thread list. No counters, no filter pills. */

@@ -86,7 +86,6 @@ import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
-import { livenessView } from './runLiveness';
 import { escapeHtml } from './theme';
 import { AppSurface, type AppRoute } from './appSurface';
 import { locateInWorkspace } from './inDiffEditor';
@@ -1341,9 +1340,11 @@ export class ChangesetReviewPanel {
       contextUsage: this.contextUsage,
       unresolvedContextReferences: this.unresolvedContextReferences,
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
-      runSteps: this.runRecord?.steps ?? [],
-      runStep: this.runRecord?.step ?? 0,
-      runLive: livenessView(this.runRecord),
+      // Task 14.1 (design.md D14): the shared reducer's own projection and
+      // ordered activity — never a fixed step list or a fragment count.
+      runProjection: this.runRecord?.projection,
+      runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      runStartedAt: this.runRecord?.startedAt,
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
         ? { ...this.runRecord.failure, partialCount: 0 }
         : undefined,
@@ -1351,6 +1352,18 @@ export class ChangesetReviewPanel {
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
         ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
+        : undefined,
+      // Task 14.2 (design.md D14/D16): the same retained record's own
+      // lineage/activity fields, never re-derived.
+      retainedDetails: this.retained
+        ? {
+            completeness: this.retained.completeness,
+            protocolProvenance: this.retained.protocolProvenance,
+            lineageId: this.retained.lineageId,
+            attempt: this.retained.attempt,
+            limitations: this.retained.limitations,
+            activity: this.retained.activity,
+          }
         : undefined,
       mode: this.mode,
       items,

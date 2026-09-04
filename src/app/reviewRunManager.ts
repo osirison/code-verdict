@@ -1434,6 +1434,16 @@ export class ReviewRunManager {
           // Not exposed by `HarnessAttemptResult` in this pass.
           filesRead: undefined,
           attachmentWarnings: record.attachmentWarnings,
+          // Task 14.2 (design.md D16): `result.plan` is set only by a real
+          // harness attempt (D5: planning always produces one) — never set
+          // by the temporary `legacyRunnersToHarnessFactory` adapter, which
+          // fabricates no plan for the shape it wraps. Absent here, never
+          // guessed as `'legacy-one-shot'`: that inference belongs to
+          // `readRetained` alone, over an absent stored value.
+          protocolProvenance: result.plan ? 'harness' : undefined,
+          lineageId: result.lineageId,
+          attempt: result.attempt,
+          activity: result.activityLog.events,
         });
         // The write comes FIRST, before anything is told the run succeeded.
         // `settle` notifies synchronously, and a panel watching this target
@@ -1529,6 +1539,12 @@ export class ReviewRunManager {
         // `runPersisting`'s own invariant — cancellation/failure never reach `complete`).
         completeness: result.outcome.completeness,
         limitations: result.outcome.limitations,
+        // Task 14.2: same rule as the succeeded path above — set only from
+        // `result.plan`'s actual presence, never guessed.
+        protocolProvenance: result.plan ? 'harness' : undefined,
+        lineageId: result.lineageId,
+        attempt: result.attempt,
+        activity: result.activityLog.events,
       });
       await this.deps.workspaceState.update(partialRecordKeyFor(input.target), partialRecord);
       if (!this.isSettleable(key)) return;

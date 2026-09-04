@@ -135,9 +135,9 @@
 
 ## 14. UI Projections And Controls
 
-- [ ] 14.1 Replace fixed running steps and fragment-count user progress in the active review with the shared `RunProjection`, public plan, plan revisions, current action, elapsed time, coverage, limitations, checkpoint, and completeness.
-- [ ] 14.2 Add full ordered sanitized activity and attempt lineage to retained/completed run details, including legacy provenance without fabricated activity or coverage.
-- [ ] 14.3 Update `src/ui/sidebarState.ts`, `sidebar.ts`, and `sidebarHtml.ts` to show the same lifecycle/current action, truthful progress mode, elapsed time, attention state, and cancel navigation from compact projection data.
+- [x] 14.1 Replace fixed running steps and fragment-count user progress in the active review with the shared `RunProjection`, public plan, plan revisions, current action, elapsed time, coverage, limitations, checkpoint, and completeness.
+- [x] 14.2 Add full ordered sanitized activity and attempt lineage to retained/completed run details, including legacy provenance without fabricated activity or coverage.
+- [x] 14.3 Update `src/ui/sidebarState.ts`, `sidebar.ts`, and `sidebarHtml.ts` to show the same lifecycle/current action, truthful progress mode, elapsed time, attention state, and cancel navigation from compact projection data.
 - [ ] 14.4 Update `src/ui/dashboardState.ts`, `dashboard.ts`, and `dashboardHtml.ts` to show target-level phase, completeness, real coverage, partial limitations, and retained complete review separately from an active or partial rerun.
 - [ ] 14.5 Update status-bar state and rendering to show active-run count plus concise current action and determinate units only when a denominator exists; show indeterminate elapsed waits otherwise.
 - [ ] 14.6 Add pause, resume-from-checkpoint, restart, and cancel controls only in lifecycle states where the manager accepts them, with incompatible resume reasons visible.

@@ -6,9 +6,10 @@
  * again regardless — a caller that constructs a `Plan` some other way still
  * cannot smuggle unsanitized text into the log.
  */
-import type { Plan, PlanItem, PlanItemState } from '../domain/harnessActivity';
+import type { ActivityEvent, Plan, PlanItem, PlanItemState } from '../domain/harnessActivity';
 import type { ActivityFact } from './harnessActivityLog';
 import { sanitizePublicText } from './harnessActivitySanitizer';
+import { orderActivity } from './harnessActivityProjection';
 
 export interface PlanItemInput {
   id: string;
@@ -75,4 +76,30 @@ export function planItemStateChangedFact(
   state: PlanItemState,
 ): Extract<ActivityFact, { kind: 'planItemStateChanged' }> {
   return { kind: 'planItemStateChanged', itemId, state };
+}
+
+/**
+ * Every plan revision an attempt's ordered activity recorded, oldest first
+ * (task 14.1/14.2, design.md D5: "a revision appends history rather than
+ * silently overwriting the prior plan"). `RunProjection` (`../domain/
+ * harnessActivity.ts`) carries only `activePlanItemId` — the full plan and
+ * its revision history are not projected fields, they are this direct,
+ * ordered read of `planCreated`/`planRevised` events, which is why every
+ * screen that shows the plan reads the same ordered activity `RunRecord`
+ * already carries (`checkpoint.activityLog.events` while a run is live,
+ * the retained record's own `activity` once it has settled) rather than a
+ * second plan-tracking structure of its own.
+ */
+export function planHistory(events: readonly ActivityEvent[]): readonly Plan[] {
+  const revisions: Plan[] = [];
+  // Defensive, like `reduceActivity` (`./harnessActivityProjection.ts`)
+  // itself: a caller may hand this a raw persisted or replayed array, not
+  // only one built in protocol-sequence order (spec `review-run-activity`:
+  // "Consumers SHALL order events by protocol sequence rather than arrival
+  // time"). Retained/completed run details (task 14.2) read exactly such a
+  // deserialized array back from storage.
+  for (const event of orderActivity(events)) {
+    if (event.kind === 'planCreated' || event.kind === 'planRevised') revisions.push(event.plan);
+  }
+  return revisions;
 }
