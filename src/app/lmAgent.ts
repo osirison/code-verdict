@@ -434,7 +434,7 @@ export async function runFollowUpPrompt(
     .filter((part) => part !== '')
     .join('\n\n');
   return streamText(modelId, withPersona, options, (text, trace) => {
-    trace.rawText(text, true);
+    trace.response(text, true);
     trace.success(0);
     return text.trim();
   });
@@ -450,17 +450,26 @@ export async function runPrompt(
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start < 0 || end <= start) {
-      trace.rawText(text, false, 'no JSON object found');
+      trace.response(text, false, 'no JSON object found');
       throw new AgentResponseError('agent returned no JSON object');
     }
     let parsed: AgentReviewResponse;
     try {
       parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1)), responsePaths).response;
     } catch (parseError) {
-      trace.rawText(text, false, parseError instanceof Error ? parseError.message : String(parseError));
+      // `JSON.parse`'s own `SyntaxError` quotes a fragment of the input it failed on (e.g. `Unexpected
+      // token 'M', "MARKER_RAW"... is not valid JSON`) — a raw fragment of the model's own output, not
+      // a host-authored description. Trace diagnostics get a fixed, safe classification instead; a
+      // structured `AgentResponseError` from `parseAgentReviewResponse` is host-authored (at most it
+      // echoes one small field, e.g. `schemaVersion`) and is safe to forward through the shared
+      // sanitizer, same as any other error detail.
+      const traceDetail = parseError instanceof SyntaxError
+        ? 'malformed JSON'
+        : parseError instanceof Error ? parseError.message : String(parseError);
+      trace.response(text, false, traceDetail);
       throw parseError;
     }
-    trace.rawText(text, true);
+    trace.response(text, true);
     trace.success(parsed.items.length);
     return parsed;
   });
@@ -569,7 +578,11 @@ async function streamText<T>(
     }
     if (e instanceof AgentResponseError || e instanceof SyntaxError) {
       const message = `agent response did not match the contract: ${e.message}`;
-      trace.failure(message);
+      // The thrown `AgentRunError` keeps `e.message` verbatim (existing, tested behaviour: the
+      // reviewer-facing failure card). The trace sink does not: a `SyntaxError` from `JSON.parse`
+      // quotes a fragment of the model's own output in its own message (the same reason `runPrompt`
+      // above never forwards it raw), so the sink gets a fixed classification instead.
+      trace.failure(e instanceof SyntaxError ? 'agent response did not match the contract: malformed JSON' : message);
       throw new AgentRunError(message, requestId, false);
     }
     const message = e instanceof Error ? e.message : String(e);

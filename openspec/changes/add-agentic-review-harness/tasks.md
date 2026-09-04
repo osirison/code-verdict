@@ -149,9 +149,9 @@
 - [x] 15.1 Snapshot every context-control and thinking-effort input from `add-context-controls-and-thinking-effort` for both individual and changeset runs, including explicit attachment content digests and member ownership.
 - [x] 15.2 Register explicit attachments as citable ledger sources only when returned to the model; keep auto-derived title, body, issue, and discussion content as non-citable intent.
 - [x] 15.3 Preserve out-of-diff attachment findings in summary routing and changed-file attachment findings in inline anchor routing after citation validation.
-- [ ] 15.4 Update agent-definition parsing and tests so arbitrary tool frontmatter grants nothing while existing name, description, preferred model, and instruction behavior remains.
-- [ ] 15.5 Replace the `review-agents` byte-identical one-shot prompt test with harness-authority, common-tool-contract, evidence, phase, and completion parity tests across personas.
-- [ ] 15.6 Convert `src/app/agentTrace.ts` and `lmAgent.ts` diagnostics to metadata-only request identifiers, model/phase, timings, sizes, digests, and redacted errors; remove raw prompt and raw model-fragment output.
+- [x] 15.4 Update agent-definition parsing and tests so arbitrary tool frontmatter grants nothing while existing name, description, preferred model, and instruction behavior remains.
+- [x] 15.5 Replace the `review-agents` byte-identical one-shot prompt test with harness-authority, common-tool-contract, evidence, phase, and completion parity tests across personas.
+- [x] 15.6 Convert `src/app/agentTrace.ts` and `lmAgent.ts` diagnostics to metadata-only request identifiers, model/phase, timings, sizes, digests, and redacted errors; remove raw prompt and raw model-fragment output.
 - [ ] 15.7 Update `src/extension.ts` wiring to construct the provider-backed tool dispatcher, harness factory, bounded store, activity fan-out, resume compatibility services, and notifier while preserving existing dependency direction.
 - [ ] 15.8 Remove whole-diff capture from `RunInput`, remove shipped one-shot review execution, and retain `getChangeRequestDiff` only for non-harness callers until all callers are migrated.
 
