@@ -440,7 +440,7 @@ describe('HarnessRunStore (11.4): each HarnessPolicy bound triggers eviction at 
   });
 });
 
-describe('HarnessRunStore (11.1): malformed or unknown persisted enum values fail closed on read', () => {
+describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and unknown-enum persisted blobs all fail closed on read', () => {
   const validLineage = () => ({
     schemaVersion: '1',
     runId: RUN_ID,
@@ -475,10 +475,21 @@ describe('HarnessRunStore (11.1): malformed or unknown persisted enum values fai
   });
 
   it.each([
+    // unknown-enum: a recognized-shape field carrying a value outside its own enum.
     ['unknown checkpoint phase', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { phase: string }).phase = 'reasoning'; }],
     ['unknown checkpoint reason', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { reason: string }).reason = 'becauseISaidSo'; }],
     ['unknown projection lifecycle', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { lifecycle: string } }).projection.lifecycle = 'executing'; }],
     ['unknown projection completeness', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { completeness: string } }).projection.completeness = 'done'; }],
+    // wrong-typed: a required field present, but as the wrong primitive type.
+    ['wrong-typed: checkpointId is a number', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).checkpointId = 42; }],
+    ['wrong-typed: elapsedMs is a string', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = '1000'; }],
+    ['wrong-typed: compatible is a string, not a boolean', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).compatible = 'true'; }],
+    // truncated: a required field missing entirely, as a byte-cut-short blob would produce.
+    ['truncated: checkpoint missing its budget field', (r: ReturnType<typeof validLineage>) => { delete (r.checkpoints[0] as unknown as Record<string, unknown>).budget; }],
+    ['truncated: checkpoint missing its retry field', (r: ReturnType<typeof validLineage>) => { delete (r.checkpoints[0] as unknown as Record<string, unknown>).retry; }],
+    ['truncated: lineage record missing its terminalAttempts field', (r: ReturnType<typeof validLineage>) => { delete (r as unknown as Record<string, unknown>).terminalAttempts; }],
+    // malformed: a field present with a value of the wrong overall shape (not an array where one is required).
+    ['malformed: checkpoints is not an array', (r: ReturnType<typeof validLineage>) => { (r as unknown as Record<string, unknown>).checkpoints = 'not-an-array'; }],
   ])('%s makes the whole lineage record fail closed (undefined), not partially trusted', async (_label, corrupt) => {
     const backing = jsonMemoryStore();
     const record = validLineage();

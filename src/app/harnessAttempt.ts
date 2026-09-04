@@ -238,7 +238,15 @@ export const defaultSynthesisVerification: SynthesisVerificationRunner = async (
 
 // ---- Injected checkpoint/persistence collaborators (section 11's seams) -----------
 
-export const CHECKPOINT_REASONS = ['phaseBoundary', 'toolCadence', 'modelSuggested'] as const;
+/**
+ * `attemptInterrupted` is never produced by this module's own `fireCheckpoint`
+ * (an attempt always runs live when it calls that) — it is task 11.6's reason
+ * for the one other way a `PersistedCheckpoint` can change,
+ * `harnessCheckpoint.ts`'s `closeCheckpointAsTerminal`, used by
+ * `harnessResume.ts` to close a lost attempt as `interrupted` from its last
+ * persisted checkpoint after an extension restart.
+ */
+export const CHECKPOINT_REASONS = ['phaseBoundary', 'toolCadence', 'modelSuggested', 'attemptInterrupted'] as const;
 
 export type CheckpointReason = (typeof CHECKPOINT_REASONS)[number];
 

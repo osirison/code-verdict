@@ -18,14 +18,31 @@
  * `toRetainedEvidenceRecord`'s existing `includeExactContent` flag, computed
  * here from the checkpoint's own candidates rather than left to a caller.
  *
- * `buildCheckpoint` is the one funnel: it is the only function in this
- * change that produces a `PersistedCheckpoint`, and it accepts only
- * `CheckpointBuildInput` — value snapshots from the already-tested
- * collaborators (`EvidenceLedger.sources()`, `CandidateTracker.all()`,
- * `BudgetTracker.consumption()`, `ChangedFileInventory.coverage()`, an
- * attempt's own `ActivityEvent[]`), never a client, stream, or cancellation
- * token. `HarnessRunStore.writeCheckpoint` (task 11.1) accepts only the
- * *output* `PersistedCheckpoint`, so every write path funnels through here.
+ * `buildCheckpoint` is the one funnel that produces a `PersistedCheckpoint`
+ * from scratch: it accepts only `CheckpointBuildInput` — value snapshots from
+ * the already-tested collaborators (`EvidenceLedger.sources()`,
+ * `CandidateTracker.all()`, `BudgetTracker.consumption()`,
+ * `ChangedFileInventory.coverage()`, an attempt's own `ActivityEvent[]`),
+ * never a client, stream, or cancellation token. `HarnessRunStore.writeCheckpoint`
+ * (task 11.1) accepts only the *output* `PersistedCheckpoint`, so every fresh
+ * write path funnels through here. Two further functions transform an
+ * *already-built* `PersistedCheckpoint` rather than building a new one from
+ * raw input, and both live here for the same reason `buildCheckpoint` does —
+ * one module owns every way a `PersistedCheckpoint` value can come into
+ * being or change: `markIncompatible` (11.4, a per-lineage bound only
+ * `HarnessRunStore` can see) and `closeCheckpointAsTerminal` (11.6, closing a
+ * lost attempt as `interrupted` from its last persisted checkpoint alone,
+ * with no live collaborators to re-snapshot from).
+ *
+ * `computeSnapshotDigest` is the one formula behind `snapshotDigest`
+ * (`sha256Hex(canonicalStringify(snapshot))`, see the field's own doc
+ * comment below) — exported so a checkpoint writer and a resume-compatibility
+ * reader (`harnessResume.ts`, tasks 11.5-11.7) always agree on how it is
+ * computed, rather than each inlining the formula and risking drift.
+ * `requiredSourceIds` is exported for the same reason: `harnessResume.ts`
+ * needs the identical "which sources does a currently-accepted finding cite"
+ * set this module already computes, to know which retained evidence a resume
+ * must eagerly refetch rather than lazily.
  *
  * Two fields the raw input could otherwise carry unsanitized are
  * deliberately re-derived rather than trusted as given:
@@ -43,9 +60,11 @@
  *   module in this change).
  */
 import { compactActivity, jsonByteLength } from './harnessActivityCompaction';
+import { appendActivityEvent, type ActivityContext, type ActivityFact, type ActivityLog } from './harnessActivityLog';
 import { reduceActivity } from './harnessActivityProjection';
 import { sanitizePublicText } from './harnessActivitySanitizer';
 import type { CheckpointReason, ContradictedFindingRecord } from './harnessAttempt';
+import { canonicalStringify, sha256Hex } from './contentDigest';
 import type { TrackedCandidate } from './harnessCandidateValidation';
 import {
   toRetainedEvidenceRecord,
@@ -54,8 +73,9 @@ import {
 } from './harnessEvidenceLedger';
 import type { ActivityEvent, Plan, RunPhase, RunProjection } from '../domain/harnessActivity';
 import type { BudgetConsumption, MemberCoverage, UnresolvedWork } from '../domain/harnessCoverage';
-import type { AttemptNumber, LineageId, RunId } from '../domain/harnessLifecycle';
+import { isTerminalLifecycle, type AttemptNumber, type LineageId, type RunId } from '../domain/harnessLifecycle';
 import type { HarnessPolicy } from '../domain/harnessPolicy';
+import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 
 // ---- Retry state (D13 "retries"; shape only — not yet fed by a live counter) -------
 
@@ -161,8 +181,15 @@ function latestPlanFrom(events: readonly ActivityEvent[]): Plan | undefined {
   return undefined;
 }
 
-/** Source identifiers a currently-retained (accepted) finding actually cites — the only ones D8/D13 allow `exactContent` for. */
-function requiredSourceIds(candidates: readonly TrackedCandidate[]): ReadonlySet<string> {
+/**
+ * Source identifiers a currently-retained (accepted) finding actually cites
+ * — the only ones D8/D13 allow `exactContent` for. Exported (task 11.5/11.6)
+ * so `harnessResume.ts` can tell, for each retained evidence record on a
+ * resume, whether it is one a validated finding actually needs (and so must
+ * be eagerly refetched if it fails to reimport) or merely supporting
+ * material a resumed attempt can fetch again lazily if the model asks for it.
+ */
+export function requiredSourceIds(candidates: readonly TrackedCandidate[]): ReadonlySet<string> {
   const ids = new Set<string>();
   for (const candidate of candidates) {
     const finding = candidate.finding;
@@ -250,4 +277,76 @@ export function buildCheckpoint(
 export function markIncompatible(checkpoint: PersistedCheckpoint, reason: string): PersistedCheckpoint {
   if (checkpoint.incompatibilityReasons.includes(reason)) return checkpoint;
   return { ...checkpoint, compatible: false, incompatibilityReasons: [...checkpoint.incompatibilityReasons, reason] };
+}
+
+// ---- Snapshot digest (shared by the writer and 11.5's resume-compatibility reader) --
+
+/** `snapshotDigest`'s one formula (see the field's own doc comment on `PersistedCheckpoint`) — every producer and every checker calls this rather than inlining `sha256Hex(canonicalStringify(...))` a second time. */
+export function computeSnapshotDigest(snapshot: ReviewRunSnapshot): string {
+  return sha256Hex(canonicalStringify(snapshot));
+}
+
+// ---- Closing a lost attempt as interrupted (task 11.6, D13) -------------------------
+
+/**
+ * Transforms a lineage's *latest* checkpoint for one attempt into a closed,
+ * terminal one by appending exactly one more activity fact to its own
+ * already-persisted activity — never re-snapshotting from live collaborators
+ * (there are none: this runs after the process that held them is gone).
+ *
+ * `undefined` when `latest`'s own projection is already terminal ("A
+ * completed run leaves no interrupted marker", spec `background-review-runs`)
+ * or when `context.occurredAt`/the fact itself fails
+ * `appendActivityEvent`'s own validation (fail closed: the checkpoint the
+ * caller already has is returned as-is by that caller, not silently
+ * fabricated here as "closed").
+ *
+ * `context.occurredAt` is clamped up to `latest`'s own last event time (never
+ * down): `appendActivityEvent`'s `validContext` refuses a context whose
+ * `occurredAt` moves wall-clock time backwards, and a caller's injected
+ * `now()` racing a checkpoint's own last-recorded timestamp must never
+ * silently drop the interruption event as a result. `elapsedMs` is `latest`'s
+ * own — an attempt that is no longer running has no further live elapsed
+ * time to report.
+ */
+export function closeCheckpointAsTerminal(
+  latest: PersistedCheckpoint,
+  context: { checkpointId: string; occurredAt: string; reason: CheckpointReason; terminalFact: Extract<ActivityFact, { kind: 'terminalResult' }> },
+  policy: Pick<HarnessPolicy, 'maxActivityEventsPerAttempt' | 'maxActivityBytesPerAttempt'>,
+): PersistedCheckpoint | undefined {
+  if (isTerminalLifecycle(latest.projection.lifecycle)) return undefined;
+
+  const priorLog: ActivityLog = { runId: latest.runId, lineageId: latest.lineageId, attempt: latest.attempt, events: latest.activity };
+  const lastEvent = latest.activity[latest.activity.length - 1];
+  const clampedOccurredAt = lastEvent && Date.parse(context.occurredAt) < Date.parse(lastEvent.occurredAt) ? lastEvent.occurredAt : context.occurredAt;
+  const activityContext: ActivityContext = { occurredAt: clampedOccurredAt, phase: latest.phase, elapsedMs: latest.elapsedMs };
+  const nextLog = appendActivityEvent(priorLog, context.terminalFact, activityContext);
+  if (nextLog.events.length === priorLog.events.length) return undefined; // the fact or context failed validation; fail closed
+
+  const compaction = compactActivity(nextLog.events, policy);
+  const projection = reduceActivity({ runId: latest.runId, lineageId: latest.lineageId, attempt: latest.attempt, events: compaction.events });
+
+  const incompatibilityReasons = [...latest.incompatibilityReasons];
+  if (!compaction.withinEventBound) {
+    incompatibilityReasons.push(
+      `Activity has ${compaction.eventCount} protected/unfoldable events, exceeding the ${policy.maxActivityEventsPerAttempt}-event bound even after coalescing every routine tool-progress run.`,
+    );
+  }
+  if (!compaction.withinByteBound) {
+    incompatibilityReasons.push(
+      `Activity is ${compaction.byteLength} bytes, exceeding the ${policy.maxActivityBytesPerAttempt}-byte bound even after coalescing every routine tool-progress run.`,
+    );
+  }
+
+  const draft: Omit<PersistedCheckpoint, 'bytes'> = {
+    ...latest,
+    checkpointId: context.checkpointId,
+    reason: context.reason,
+    occurredAt: clampedOccurredAt,
+    projection,
+    activity: compaction.events,
+    compatible: latest.compatible && incompatibilityReasons.length === latest.incompatibilityReasons.length,
+    incompatibilityReasons,
+  };
+  return { ...draft, bytes: jsonByteLength(draft) };
 }
