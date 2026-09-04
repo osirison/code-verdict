@@ -170,9 +170,9 @@
 
 - [x] 17.1 Add reviewer-relevant harness budget, elapsed-time, retry, reserve, checkpoint, activity, and retention settings to `package.json`, with the design defaults and validation that unusable values fall back safely.
 - [x] 17.2 Add settings UI for reviewer-relevant policy values without exposing provider-specific page sizes or allowing settings to weaken citation, revision, or completion invariants.
-- [ ] 17.3 Update `README.md` with the universal harness, public activity versus private reasoning boundary, complete/partial semantics, cancellation, checkpoint resume, attachment evidence, and legacy review provenance.
-- [ ] 17.4 Update `docs/ARCHITECTURE.md` with the harness attempt layer, host tool dispatcher, evidence ledger, provider investigation contracts, one shared run projection, and metadata-only trace.
-- [ ] 17.5 Update provider documentation and `spec/specs/Code Verdict - naming & commands.md` for new settings, lifecycle labels, progress language, partial outcomes, and resume/restart controls.
+- [x] 17.3 Update `README.md` with the universal harness, public activity versus private reasoning boundary, complete/partial semantics, cancellation, checkpoint resume, attachment evidence, and legacy review provenance.
+- [x] 17.4 Update `docs/ARCHITECTURE.md` with the harness attempt layer, host tool dispatcher, evidence ledger, provider investigation contracts, one shared run projection, and metadata-only trace.
+- [x] 17.5 Update provider documentation and `spec/specs/Code Verdict - naming & commands.md` for new settings, lifecycle labels, progress language, partial outcomes, and resume/restart controls. ("Provider documentation" is the Provider contract section of `docs/ARCHITECTURE.md` — no separate per-provider doc file exists in this repo; a new "Review-investigation capabilities" subsection there covers the new `reviewInvestigation` declaration, the honest GitHub `repositorySearch` gap, and the common result-completeness states.)
 - [ ] 17.6 Run the expanded provider conformance suites and all focused harness, evidence, coverage, persistence, lifecycle, changeset, activity, and UI tests.
 - [ ] 17.7 Run `npm run lint`, the complete Vitest suite, `npm run build`, and the repository's Markdown validation; resolve only failures caused by this change.
 - [ ] 17.8 Run `openspec validate add-agentic-review-harness --json` and confirm every artifact and delta is valid before implementation is marked complete.

@@ -37,7 +37,9 @@ linked work items. Configure those limits with `codeVerdict.context.sectionBudge
 title, description, and linked work items by default; use `codeVerdict.context.includeTitle`,
 `codeVerdict.context.includeDescription`, and `codeVerdict.context.includeLinkedItems` to change
 those starting choices. `codeVerdict.contextUsage.enabled` controls the usage indicator and defaults
-to `true`; context and attachment budgets continue to apply when it is off.
+to `true`; context and attachment budgets continue to apply when it is off. The indicator estimates
+the size of the old single-prompt request, not the bounded pages the harness actually sends (see
+"How a review runs" below) — treat it as an approximation, not an exact count.
 
 ### Writing an agent
 
@@ -66,6 +68,44 @@ selected context, attachments, and diffs are assembled by Code Verdict after the
 instructions. An agent file cannot change the response shape, drop the criteria, or alter which
 attachments or diffs are sent. A body that tries is text the model reads before the contract it
 must still satisfy.
+
+## How a review runs
+
+Every review — a first run, a rerun, one change request, or a changeset — goes through the same
+harness: the same plan, the same bounded tools, the same completion checks. A small review needs
+fewer steps to satisfy them; it never skips one.
+
+The model works from a list of every changed file, then reads diffs, file ranges, and repository
+content in bounded pages, each pinned to the exact commit under review — never an unbounded diff or
+an open-ended search. A finding can anchor to a changed line or an attachment; anything else the
+model reads can support a finding about changed code but cannot become an unrelated one by itself.
+
+What is visible while a review runs is the model's plan, plan revisions with a short reason, which
+file or tool it is working on, and how much of the change has been covered. What is never visible,
+never logged, and never stored is the prompts sent to the model, its raw output, or any hidden
+reasoning. A separate diagnostic channel, "Code Verdict: Agent Trace", records only the size and a
+digest of what was sent and received — never the text itself.
+
+Finding nothing is only reported as a clean review once the review has actually finished; stopping
+early is never shown as clean. A review that stops before finishing keeps only what it already
+validated: with findings, that is a partial result, shown as such and naming the files it did not
+reach; with none, there is nothing to keep. A partial result never replaces a complete review already
+held for the same change request — both stay visible. Cancelling produces the same outcome as any
+other early stop: whatever was already validated is kept, and nothing further is attempted.
+
+An interrupted review — one still running when the editor closed or crashed — is not picked back up.
+What is offered instead is a new attempt from the last checkpoint: the plan, findings, and coverage
+recorded before the interruption carry forward, but nothing about the model's earlier connection
+does. If the change request, model, agent, or criteria changed underneath it, that new attempt is
+refused with its reasons, and a plain restart — a fresh run with no history to carry forward — is
+offered in its place.
+
+A review completed before this feature shipped is shown as before, but carries no plan, activity, or
+coverage detail, because none was ever recorded for it — it is labeled a legacy review rather than
+presented as though the harness had produced it.
+
+Investigation limits — attempt length, tool-call and turn ceilings, evidence held at once, checkpoint
+frequency, and how much history is kept — are configurable under `codeVerdict.harness.*` in Settings.
 
 **Status: under construction.** The build is tracked in
 [issues](https://github.com/osirison/code-verdict/issues) across three milestones
