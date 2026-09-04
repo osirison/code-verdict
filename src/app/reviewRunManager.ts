@@ -92,6 +92,7 @@ import {
 } from './retainedReview';
 import type { KeyValueStore } from './storage';
 import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './harnessAttempt';
+import type { CompletionBlockerDetail, CompletionEvaluation } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { checkCheckpointIntegrity, closeAttemptAsInterrupted, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
@@ -209,6 +210,16 @@ export interface RunFailure {
   message: string;
   requestId: string;
   code: string;
+  /**
+   * `CompletionOutcome.blockerDetails` verbatim (`classifyOutcome`, `harnessCompletion.ts`) — the
+   * per-file reasons behind `message`'s generic sentence, already bounded per clause and already
+   * public-safe (`evaluateCompletion`'s own deterministic host text, never model output). `message`
+   * stays the deduplicated, path-less summary every existing caller already reads; this is the
+   * detail underneath it, never a replacement for it. Absent whenever the outcome carried none
+   * (a clean complete result, or a failure this manager built without a `CompletionOutcome` at
+   * all — a genuine crash, never a harness completion decision).
+   */
+  blockerDetails?: readonly CompletionBlockerDetail[];
 }
 
 /**
@@ -272,6 +283,14 @@ export interface RunRecord {
   checkpoint?: CheckpointInfo;
   /** From the attempt's own `CompletionOutcome.limitations` (`completeAttempt`). */
   limitations: readonly Limitation[];
+  /**
+   * `HarnessAttemptResult.completionEvaluation` verbatim (`completeAttempt`) — every D11
+   * completion clause's own pass/fail, for a diagnostics view of the attempt
+   * (`codeVerdict.showRunDiagnostics`); nothing here derives a second verdict from it. Absent
+   * before the manager has admitted the run at all, same as `checkpoint`, and absent for an
+   * attempt whose own `HarnessAttemptResult` carried none (a bootstrap failure).
+   */
+  completionEvaluation?: CompletionEvaluation;
   /** Findings the attempt validated before ending without reaching `complete` (D11) — from `HarnessAttemptResult.findings` when `outcome.completeness !== 'complete'`. Held only in memory; task 12.5/12.6 make it durably, separately reachable. */
   partialResult?: AgentReviewResponse;
   /** When it was triggered — queue order, and what the sidebar counts elapsed from. */
@@ -1489,6 +1508,7 @@ export class ReviewRunManager {
           response,
           completeness: result.outcome.completeness,
           limitations: result.outcome.limitations,
+          completionEvaluation: result.completionEvaluation,
         });
 
         // Read-modify-write with no `await` between the pair, per the
@@ -1519,6 +1539,7 @@ export class ReviewRunManager {
         response,
         completeness: result.outcome.completeness,
         limitations: result.outcome.limitations,
+        completionEvaluation: result.completionEvaluation,
       });
       return;
     }
@@ -1575,6 +1596,7 @@ export class ReviewRunManager {
         completeness: result.outcome.completeness,
         limitations: result.outcome.limitations,
         partialResult: partial,
+        completionEvaluation: result.completionEvaluation,
       });
       if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
       return;
@@ -1586,6 +1608,7 @@ export class ReviewRunManager {
       message: result.outcome.limitations.map((limitation) => limitation.message).join(' ') || 'The review could not be completed.',
       requestId: '------',
       code: result.outcome.limitations[0]?.code ?? 'harness.incomplete',
+      blockerDetails: result.outcome.blockerDetails,
     };
     this.settle(record, {
       lifecycle: 'failed',
@@ -1593,6 +1616,7 @@ export class ReviewRunManager {
       completeness: result.outcome.completeness,
       limitations: result.outcome.limitations,
       partialResult: partial,
+      completionEvaluation: result.completionEvaluation,
     });
     if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
   }
@@ -1665,9 +1689,9 @@ export class ReviewRunManager {
   private settle(
     record: RunRecord,
     outcome:
-      | { readonly lifecycle: 'succeeded'; readonly response: AgentReviewResponse; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[] }
-      | { readonly lifecycle: 'failed'; readonly failure: RunFailure; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[]; readonly partialResult?: AgentReviewResponse }
-      | { readonly lifecycle: 'cancelled'; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[]; readonly partialResult?: AgentReviewResponse },
+      | { readonly lifecycle: 'succeeded'; readonly response: AgentReviewResponse; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[]; readonly completionEvaluation?: CompletionEvaluation }
+      | { readonly lifecycle: 'failed'; readonly failure: RunFailure; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[]; readonly partialResult?: AgentReviewResponse; readonly completionEvaluation?: CompletionEvaluation }
+      | { readonly lifecycle: 'cancelled'; readonly completeness?: ResultCompleteness; readonly limitations?: readonly Limitation[]; readonly partialResult?: AgentReviewResponse; readonly completionEvaluation?: CompletionEvaluation },
   ): void {
     let current = this.records.get(record.key) ?? record;
     // Skipped entirely for `cancelled`: `waiting`/`paused`/`resuming` already
@@ -1705,6 +1729,7 @@ export class ReviewRunManager {
       completeness: outcome.completeness ?? (outcome.lifecycle === 'succeeded' ? 'complete' : 'none'),
       limitations: outcome.limitations ?? [],
       partialResult: outcome.lifecycle !== 'succeeded' ? outcome.partialResult : undefined,
+      completionEvaluation: outcome.completionEvaluation,
       resumeTo: undefined,
       waitReason: undefined,
     };

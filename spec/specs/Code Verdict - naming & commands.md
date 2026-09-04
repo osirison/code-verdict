@@ -51,6 +51,7 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
 | Verdict: Sign in | `codeVerdict.signIn` | |
 | Verdict: Show API trace | `codeVerdict.showApiTrace` | Reveals the API log; says which setting turns tracing on when it is off |
+| Verdict: Show run diagnostics | `codeVerdict.showRunDiagnostics` | Reveals a metadata-only report of the active review's most recent attempt — phases, coverage, completion clauses, budget, and tool calls; offers to save it as JSON. No prompts, model output, or secrets. |
 
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.

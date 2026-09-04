@@ -173,6 +173,12 @@ export class ReviewFlowPanel {
     return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
   }
 
+  /** `codeVerdict.showRunDiagnostics`'s own read: this panel's mirrored `RunRecord` (the same one `render()` builds `runError`/`runProjection` from), if this panel is open at all — no focus requirement, unlike `handleCommand`'s keyboard-command routing. */
+  static activeRunRecord(): RunRecord | undefined {
+    const panel = ReviewFlowPanel.current;
+    return panel && !panel.disposed ? panel.runRecord : undefined;
+  }
+
   static selectItem(itemId: string): void {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;

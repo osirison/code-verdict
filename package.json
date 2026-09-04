@@ -101,6 +101,10 @@
       {
         "command": "codeVerdict.showApiTrace",
         "title": "Verdict: Show API trace"
+      },
+      {
+        "command": "codeVerdict.showRunDiagnostics",
+        "title": "Verdict: Show run diagnostics"
       }
     ],
     "viewsContainers": {

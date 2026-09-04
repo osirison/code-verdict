@@ -924,6 +924,64 @@ describe('the running screen renders from the shared projection alone (task 14.1
   });
 });
 
+describe('the failure card names specific files, not just that some files (task: say which files)', () => {
+  function running(overrides: Partial<FlowViewState> = {}): string {
+    return renderReviewFlowBody({ ...state, screen: 'running', ...overrides }, 'HVE Core');
+  }
+
+  it('keeps the existing generic summary line and adds the per-file detail underneath it', () => {
+    const html = running({
+      runError: {
+        message: 'Files at a risk level that requires inspection were not inspected.',
+        requestId: 'r1',
+        partialCount: 0,
+        code: 'insufficientRiskCoverage',
+        blockerDetails: [
+          { blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', memberId: 'm1', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true },
+        ],
+      },
+    });
+    expect(html).toContain('Files at a risk level that requires inspection were not inspected.');
+    expect(html).toContain('src/auth/token.ts (high risk) was classified but never inspected.');
+  });
+
+  it('bounds the list and names how many more, rather than rendering every file', () => {
+    const detail = (path: string) => ({
+      blocker: 'insufficientRiskCoverage' as const,
+      clause: 'configuredRiskCoverageSatisfied' as const,
+      memberId: 'm1',
+      path,
+      message: `${path} was classified but never inspected.`,
+      repairable: true,
+    });
+    const blockerDetails = Array.from({ length: 14 }, (_, i) => detail(`src/file${i}.ts`));
+    const html = running({
+      runError: { message: 'Files at a risk level that requires inspection were not inspected.', requestId: 'r1', partialCount: 0, code: 'insufficientRiskCoverage', blockerDetails },
+    });
+    expect(html).toContain('src/file0.ts was classified but never inspected.');
+    expect(html).toContain('and 6 more');
+    expect(html).not.toContain('src/file13.ts was classified but never inspected.');
+  });
+
+  it('renders nothing extra when there is no per-file detail to add', () => {
+    const html = running({ runError: { message: 'The review could not be completed.', requestId: 'r1', partialCount: 0, code: 'harness.incomplete' } });
+    expect(html).not.toContain('fail-detail-row');
+  });
+
+  it('carries no inline style attribute in the failure detail list', () => {
+    const html = running({
+      runError: {
+        message: 'Files at a risk level that requires inspection were not inspected.',
+        requestId: 'r1',
+        partialCount: 0,
+        code: 'insufficientRiskCoverage',
+        blockerDetails: [{ blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true }],
+      },
+    });
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+});
+
 /**
  * Task 14.6: pause/resume/cancel render only where `runControls` (computed
  * in `reviewFlow.ts` from `isLegalRunTransition`) says the manager actually

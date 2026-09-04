@@ -123,9 +123,12 @@ import {
 import {
   classifyOutcome,
   evaluateCompletion,
+  respondToCompletionRequest,
+  type CompletionClause,
   type CompletionEvaluation,
   type CompletionEvaluationInput,
   type CompletionOutcome,
+  type CompletionRequestResponse,
   type CitationRevalidationSummary,
   type MemberHeadCheck,
   type VerificationPasses,
@@ -165,6 +168,7 @@ import {
   type HostToolRetryOptions,
 } from './harnessToolDispatcher';
 import { runHarnessTurn, type AskModel as PhaseAskModel } from './harnessTurn';
+import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
 import { renderAttachmentsForModel, type Attachment } from './reviewContext';
 import {
   buildBootstrapEnvelope,
@@ -447,6 +451,14 @@ export interface HarnessAttemptResult {
   readonly turnsUsed: number;
   readonly toolCallsUsed: number;
   readonly contradicted: readonly ContradictedFindingRecord[];
+  /**
+   * `runCompleting`'s own `evaluateCompletion` verdict, verbatim — every D11 clause's pass/fail,
+   * not just `outcome.blockerDetails`' bounded failures (task: a diagnostics command needs "every
+   * completion clause with pass/fail", which `CompletionOutcome` alone never carried). `undefined`
+   * only when a bootstrap failure ended the attempt before `runCompleting` ever ran
+   * (`finalizeBootstrapFailure`) — there is no evaluation to report, not an empty one.
+   */
+  readonly completionEvaluation?: CompletionEvaluation;
 }
 
 export interface HarnessAttempt {
@@ -545,6 +557,73 @@ type StopReason = 'condition' | 'noActionableWork' | 'budgetExhausted' | 'cancel
 interface ProcessMessagesOutcome {
   readonly hadActionableWork: boolean;
   readonly completionGranted: boolean;
+}
+
+/**
+ * `investigating`/`verifying` only (see `runPhaseLoop`'s own doc comment): the two phases whose
+ * loop a model can end early by simply sending a turn with nothing actionable in it, and whose
+ * D11 completion clauses can still be unmet at that moment. `planning`'s own `shouldStop` already
+ * gates on a plan existing — a model that stops there with none is reported as `noPlan` (`run()`
+ * below), never nudged into inventory/coverage work `evaluateCompletion` was never asked to judge
+ * before a plan exists.
+ */
+const EARLY_STOP_NUDGE_PHASES: ReadonlySet<RunPhase> = new Set<RunPhase>(['investigating', 'verifying']);
+
+/**
+ * Bounds the fix below: a model that keeps stopping without doing anything must not turn one
+ * phase into an unbounded loop. Deliberately its own documented constant, not a reuse of
+ * `HarnessPolicy.protocolRepairsPerPhase` — that field bounds retries after a *malformed* turn
+ * (`harnessTurn.ts`), a different failure mode from a well-formed turn that simply asks for
+ * nothing. Every nudge still costs at least one real model turn (`budget.beginTurn` at the top of
+ * every loop iteration runs regardless), so this is a bound on top of budget exhaustion, not a
+ * replacement for it.
+ */
+const MAX_EARLY_STOP_NUDGES_PER_PHASE = 3;
+
+/**
+ * Clauses `investigating` can still act on when a turn stops early. `headUnchanged` and the four
+ * `verifying`-only clauses (`everyRetainedCitationValid`, `contradictionPassComplete`,
+ * `deduplicationComplete`, `finalVerificationComplete`) have not run yet at this point in the
+ * attempt — `refreshHeads`/`runSynthesisVerification` are only ever called from `runVerifying`
+ * (this module's own header: "the head check... refreshed on entry to verifying"; "synthesis and
+ * verification... both run inside verifying") — so a raw `evaluateCompletion()` reports every one
+ * of them failing during `investigating` regardless of how much coverage is actually done. Worse,
+ * an unverified head check fails with blocker `providerLimit`, which is not in
+ * `REPAIRABLE_BLOCKERS` (`harnessCompletion.ts`) — so left unscoped, that one always-present
+ * failure would mark the *whole* evaluation unrepairable and silence the nudge below on every
+ * single `investigating` phase, healthy or not, defeating the fix it exists to make. Restricting
+ * to the clauses `investigating` actually owns leaves every clause's own pass/fail verdict exactly
+ * as `evaluateCompletion` computed it — this only decides which of those verdicts this phase
+ * should act on, not a second predicate for any of them. `verifying` needs no equivalent
+ * restriction: by the time its own loop can reach this branch, `runVerifying` has already
+ * refreshed heads once and reconciled any stale verification pass
+ * (`runPhaseLoop`'s own call below, mirroring `processMessages`'s `completionRequest` case), so
+ * every clause reflects real, current state there.
+ */
+const INVESTIGATING_RELEVANT_CLAUSES: ReadonlySet<CompletionClause> = new Set<CompletionClause>([
+  'inventoryCompleteForEveryMember',
+  'everyFileClassified',
+  'configuredRiskCoverageSatisfied',
+  'noUnresolvedFetches',
+  'noUnresolvedCandidates',
+]);
+
+/**
+ * A view of `evaluation` restricted to `clauses` — the same fields `respondToCompletionRequest`
+ * reads (`eligible`/`details`/`blockers`/`repairable`), recomputed from the restricted detail set
+ * rather than the whole-attempt one. Every detail kept is `evaluateCompletion`'s own, byte for
+ * byte; none of its pass/fail reasoning is redone here.
+ */
+function scopedForNudge(evaluation: CompletionEvaluation, clauses: ReadonlySet<CompletionClause>): CompletionEvaluation {
+  const details = evaluation.details.filter((detail) => detail.clause !== undefined && clauses.has(detail.clause));
+  const eligible = details.length === 0;
+  return {
+    ...evaluation,
+    eligible,
+    details,
+    blockers: [...new Set(details.map((detail) => detail.blocker))],
+    repairable: !eligible && details.every((detail) => detail.repairable),
+  };
 }
 
 // ---- The orchestrator ---------------------------------------------------------------
@@ -1171,8 +1250,51 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return { hadActionableWork: turnHasActionableWork(messages), completionGranted };
   }
 
-  /** One phase's model-turn loop: reserve a turn, run it (bounded protocol repair is `runHarnessTurn`'s own job), process the batch, repeat until `shouldStop()`, a turn carries no actionable work, budget/cancellation stops it, or repairs are exhausted. Every exit proceeds onward to host validation (D11) rather than failing silently. */
+  /**
+   * A host-synthesized `requestCompletion` result, byte-for-byte the same shape
+   * `handleRequestCompletion` (`harnessToolDispatcher.ts`) builds for the model's own explicit
+   * ask — reused here, not reinvented, because the model-seam's prompt renderer
+   * (`harnessModelSeam.ts`'s `renderToolResult`) already knows how to show this shape and does so
+   * with no phase awareness at all. Built directly rather than through `dispatcher.dispatch`
+   * because `requestCompletion`'s tool-catalog `allowedPhases` is `['verifying', 'completing']`
+   * (`harnessTools.ts`) — a restriction on what the *model* may ask for, not on what the *host*
+   * may tell it, and D11's completion gate is a whole-attempt check the host is always entitled to
+   * run. Costs no extra tool call (`evidenceBytes`/`toolCalls` are never reserved for it) — the
+   * real cost of the extra turn it buys is the ordinary `budget.beginTurn` reservation at the top
+   * of the next loop iteration, same as every other turn.
+   */
+  function earlyStopNudgeResult(response: CompletionRequestResponse): HostToolResult {
+    return {
+      toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+      requestId: nextRequestId(),
+      tool: 'requestCompletion',
+      unitsReturned: 1,
+      state: 'complete',
+      content: { tool: 'requestCompletion', response },
+    };
+  }
+
+  /**
+   * One phase's model-turn loop: reserve a turn, run it (bounded protocol repair is
+   * `runHarnessTurn`'s own job), process the batch, repeat until `shouldStop()`, budget/
+   * cancellation stops it, repairs are exhausted, or a turn carries no actionable work AND (for
+   * `investigating`/`verifying`) either nothing is missing or nudging is exhausted/not repairable.
+   * Every exit proceeds onward to host validation (D11) rather than failing silently.
+   *
+   * **The early-stop fix.** `turnHasActionableWork`'s stall signal only says the model sent
+   * nothing this host need act on — it is the model's own belief that it is finished, or a bare
+   * `publicRationale`/malformed drift off protocol, never a host confirmation that D11's clauses
+   * are actually satisfied. Ending the phase on that signal alone was the bug: a model that
+   * stopped early left required coverage (or, in `verifying`, unresolved candidates/citations/
+   * verification passes) outstanding while budget sat unspent, and the run then failed with zero
+   * findings even though nothing was blocking further work. An explicit `completionRequest`
+   * already gets exactly this courtesy from `respondToCompletionRequest` (D11's "repairable early
+   * completion request"); a model that simply stops asking must get the same one, not a lesser
+   * one — bounded (`MAX_EARLY_STOP_NUDGES_PER_PHASE`) so a model that keeps stopping without doing
+   * anything cannot spin the phase forever.
+   */
   async function runPhaseLoop(phase: RunPhase, shouldStop: () => boolean): Promise<StopReason> {
+    let earlyStopNudges = 0;
     for (;;) {
       if (isCancelled()) return 'cancelled';
       if (shouldStop()) return 'condition';
@@ -1195,7 +1317,42 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       const processed = await processMessages(phase, outcome.messages, sink);
       lastTurnResults = sink;
       if (phase === 'verifying' && processed.completionGranted) return 'condition';
-      if (!processed.hadActionableWork) return 'noActionableWork';
+      if (processed.hadActionableWork) continue;
+      if (!EARLY_STOP_NUDGE_PHASES.has(phase)) return 'noActionableWork';
+
+      // Mirrors `processMessages`'s own `completionRequest` case: a candidate accepted since the
+      // last verification pass must be reconciled before this evaluation can trust `latestPasses`,
+      // or a merely-stale-not-yet-rerun pass would look identical to a genuinely missing one.
+      if (phase === 'verifying' && passesStale) await runSynthesisVerification();
+
+      const evaluation = currentCompletionEvaluation();
+      const forNudge = phase === 'investigating' ? scopedForNudge(evaluation, INVESTIGATING_RELEVANT_CLAUSES) : evaluation;
+      if (forNudge.eligible) return 'noActionableWork'; // Nothing this phase owns is missing — the model was right to stop.
+      if (earlyStopNudges >= MAX_EARLY_STOP_NUDGES_PER_PHASE) {
+        appendActivity(
+          {
+            kind: 'actionStarted',
+            action: `The model stopped without finishing ${MAX_EARLY_STOP_NUDGES_PER_PHASE} time(s) in this phase; ending it truthfully with its current coverage rather than asking again.`,
+          },
+          phase,
+        );
+        return 'noActionableWork';
+      }
+      // Same budget purpose and check `handleRequestCompletion` uses for the model's own explicit
+      // ask — no member scope, since D11 completion is a whole-attempt gate, not one member's.
+      const response = respondToCompletionRequest(forNudge, { canContinue: budget.canContinue('verification', clock()) });
+      if (response.granted) return 'noActionableWork'; // Unreachable given `evaluation.eligible` was false above; narrows the union for the branch below.
+      if (!response.repairable) return 'noActionableWork'; // An unrepairable blocker, or budget cannot afford another turn.
+
+      earlyStopNudges += 1;
+      appendActivity(
+        {
+          kind: 'actionStarted',
+          action: `The model stopped without finishing; asking it to continue — ${response.missingConditions.length} condition(s) still outstanding.`,
+        },
+        phase,
+      );
+      lastTurnResults = [earlyStopNudgeResult(response)];
     }
   }
 
@@ -1538,6 +1695,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       turnsUsed: consumption.modelTurnsUsed,
       toolCallsUsed: consumption.toolCallsUsed,
       contradicted: latestContradicted,
+      completionEvaluation: evaluation,
     };
   }
 

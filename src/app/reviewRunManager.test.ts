@@ -17,6 +17,7 @@ import {
   type RunStatus,
 } from './reviewRunManager';
 import type { CheckpointInfo, HarnessAttemptResult } from './harnessAttempt';
+import type { CompletionBlockerDetail } from './harnessCompletion';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
@@ -168,8 +169,8 @@ function succeededResult(itemCount: number, refLabel = 'run'): HarnessAttemptRes
   };
 }
 
-/** `itemCount > 0` produces a `partial` outcome with real findings (D11: "the run persists a partial result plus... limitation report") rather than a plain `none`-completeness failure. */
-function failedResult(message: string, refLabel = 'run', itemCount = 0): HarnessAttemptResult {
+/** `itemCount > 0` produces a `partial` outcome with real findings (D11: "the run persists a partial result plus... limitation report") rather than a plain `none`-completeness failure. `blockerDetails` mirrors `CompletionOutcome.blockerDetails` (task: "say which files, not just that some files") — absent by default, matching every existing caller that never set it. */
+function failedResult(message: string, refLabel = 'run', itemCount = 0, blockerDetails?: readonly CompletionBlockerDetail[]): HarnessAttemptResult {
   const items = response(itemCount).items;
   return {
     runId: refLabel,
@@ -183,6 +184,7 @@ function failedResult(message: string, refLabel = 'run', itemCount = 0): Harness
       limitations: [{ code: 'harness.test', message }],
       replacesRetainedReview: false,
       clean: false,
+      ...(blockerDetails ? { blockerDetails } : {}),
     },
     findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
     activityLog: createActivityLog(refLabel, refLabel, 1),
@@ -1570,6 +1572,24 @@ describe('task 12.1/12.2: completeness, limitations, and partial result come fro
     expect(failed.limitations).toEqual([{ code: 'harness.test', message: 'The changed-file inventory is incomplete.' }]);
     expect(failed.failure?.message).toContain('The changed-file inventory is incomplete.');
     expect(failed.partialResult).toBeUndefined();
+  });
+
+  it('a failed result\'s blockerDetails reach the settled record\'s failure, naming the specific files behind the generic message (task: say which files)', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+    const blockerDetails: readonly CompletionBlockerDetail[] = [
+      { blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', memberId: 'm1', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true },
+    ];
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Files at a risk level that requires inspection were not inspected.', '!2841', 0, blockerDetails));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    // The generic summary line survives unchanged.
+    expect(failed.failure?.message).toContain('Files at a risk level that requires inspection were not inspected.');
+    // The per-file detail underneath it is the outcome's own, verbatim.
+    expect(failed.failure?.blockerDetails).toEqual(blockerDetails);
   });
 
   it('a failed result with validated findings is retained only as an in-memory partial result, never as the retained review', async () => {

@@ -653,9 +653,16 @@ describe('HarnessAttempt.run over a real multi-member changeset (tasks 15.1-15.3
           return messages(candidateSubmissionMessage('cand-cross-attach', 'billing', 'core/secret.ts', coreAttachmentRef));
         },
         (call) => {
+          // Captures the candidate submission's own outcome (from the turn just above), then reads
+          // both members' one real changed file so coverage is genuinely complete before the model
+          // stops next turn — this test is about member-scoped attachment citation, not coverage,
+          // and a file left uninspected would otherwise have the host ask the model to keep going
+          // (the fix this change makes) instead of letting the phase end on the next bare-rationale
+          // turn.
           submissionResults = call.toolResults;
-          return STOP_TURN;
+          return messages(readDiffMessage('core', CORE, 'src/core/main.ts'), readDiffMessage('billing', BILLING, 'src/billing/webhook.ts'));
         },
+        STOP_TURN,
       ],
       verifying: [COMPLETION_TURN],
     });
@@ -704,9 +711,15 @@ describe('HarnessAttempt.run over a real multi-member changeset (tasks 15.1-15.3
           return messages(candidateSubmissionMessage('cand-marker', 'core', 'src/core/main.ts', detailRef));
         },
         (call) => {
+          // Captures the candidate submission's own outcome (from the turn just above), then reads
+          // both members' one real changed file so coverage is genuinely complete before the model
+          // stops next turn — this test is about intent never being citable, not coverage, and a
+          // file left uninspected would otherwise have the host ask the model to keep going (the
+          // fix this change makes) instead of letting the phase end on the next bare-rationale turn.
           submissionResults = call.toolResults;
-          return STOP_TURN;
+          return messages(readDiffMessage('core', CORE, 'src/core/main.ts'), readDiffMessage('billing', BILLING, 'src/billing/webhook.ts'));
         },
+        STOP_TURN,
       ],
       verifying: [COMPLETION_TURN],
     });

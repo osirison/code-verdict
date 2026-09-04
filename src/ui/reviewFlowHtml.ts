@@ -14,6 +14,7 @@ import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { ActivityEvent, CoverageProgress, Limitation, PlanItem, RunProjection } from '../domain/harnessActivity';
 import type { AttemptNumber, LineageId, ResultCompleteness } from '../domain/harnessLifecycle';
 import type { ProtocolProvenance } from '../domain/harnessEvidence';
+import type { CompletionBlockerDetail } from '../app/harnessCompletion';
 import { planHistory } from '../app/harnessActivityPlan';
 import { orderActivity, reduceActivity } from '../app/harnessActivityProjection';
 import type { Vocabulary } from './vocab';
@@ -187,7 +188,14 @@ export interface FlowViewState {
   runActivity?: readonly ActivityEvent[];
   /** Epoch ms the request actually started, so the page can tick its own elapsed clock between repaints — `RunRecord.startedAt`, independent of anything fragment-related. */
   runStartedAt?: number;
-  runError?: { message: string; requestId: string; partialCount: number; code: string };
+  /**
+   * `blockerDetails` is `RunFailure.blockerDetails` verbatim (task: "say which files, not just
+   * that some files") — the per-file reasons behind `message`'s generic sentence, already bounded
+   * per clause by `evaluateCompletion` and already public-safe deterministic host text. Absent for
+   * a clean complete result or a genuine crash the manager never ran a completion decision for;
+   * `message` alone still renders in either case, unchanged.
+   */
+  runError?: { message: string; requestId: string; partialCount: number; code: string; blockerDetails?: readonly CompletionBlockerDetail[] };
   /** Waiting for a concurrency slot: accepted and held, not failed. */
   runQueued?: boolean;
   /**
@@ -567,6 +575,9 @@ ${WIDTH_CSS}
 .fail-card { text-align: left; border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
 .fail-title { font-size: 13.5px; font-weight: 600; color: var(--fg-hi); }
 .fail-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+.fail-detail { display: flex; flex-direction: column; gap: 3px; }
+.fail-detail-row { font-size: 11px; color: var(--fg-dim); }
+.fail-detail-more { color: var(--fg-dimmer); font-style: italic; }
 /* Loading-page skeleton bars (issue #39), sized by a class rather than a
    style attribute — this page's CSP authorises nonce'd style elements
    only, and a nonce never covers a style attribute, so the bars rendered at
@@ -1087,6 +1098,25 @@ function limitationsList(limitations: readonly Limitation[]): string {
   return `<div class="limitations">${limitations.map((l) => `<div class="limitation-chip">${e(l.message)}</div>`).join('')}</div>`;
 }
 
+/** Bounded so one changeset with hundreds of uninspected files cannot turn the fail card into a wall of text. */
+const MAX_FAIL_DETAILS_SHOWN = 8;
+
+/**
+ * The specific files behind `runError.message`'s generic summary sentence ("say which files, not
+ * just that some files"). Each `detail.message` is already a complete, deterministic host sentence
+ * (`evaluateCompletion`, `harnessCompletion.ts`) naming its own file and reason — rendered
+ * verbatim, never re-derived here. Absent entirely (returns `''`) rather than an empty block when
+ * there is nothing to add under the summary line.
+ */
+function failDetailsList(details: readonly CompletionBlockerDetail[] | undefined): string {
+  if (!details || details.length === 0) return '';
+  const shown = details.slice(0, MAX_FAIL_DETAILS_SHOWN);
+  const remaining = details.length - shown.length;
+  const rows = shown.map((detail) => `<div class="fail-detail-row">${e(detail.message)}</div>`).join('');
+  const more = remaining > 0 ? `<div class="fail-detail-row fail-detail-more">and ${remaining} more</div>` : '';
+  return `<div class="fail-detail">${rows}${more}</div>`;
+}
+
 /**
  * Task 14.6: the `'agent'` picker screen's own banner for a target whose
  * last attempt was `interrupted` — the plain-English fact of what
@@ -1184,6 +1214,7 @@ function renderRunning(s: FlowViewState): string {
       <div class="fail-card">
         <div class="fail-title">Agent stopped · ${e(s.runError.message)}</div>
         <div>The run did not complete. ${s.runError.partialCount > 0 ? `${s.runError.partialCount} findings arrived before it stopped.` : 'No findings arrived before it stopped.'}</div>
+        ${failDetailsList(s.runError.blockerDetails)}
         <div class="actions-row">
           ${s.runError.partialCount > 0 ? `<button class="btn btn-accent" id="use-partial">Use ${s.runError.partialCount} partial findings</button>` : ''}
           <button class="btn" id="retry-run">Retry</button>

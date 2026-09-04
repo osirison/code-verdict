@@ -584,6 +584,106 @@ describe('HarnessAttempt.run (10.3 phase transitions)', () => {
   });
 });
 
+describe('HarnessAttempt.run (the early-stop fix: a bare-rationale stop is treated like an explicit, repairable completionRequest)', () => {
+  it('a model that stops before inspecting every file is told what is missing, as public activity, and reaches a complete review once it finishes the work', async () => {
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    let nudgeToolResults: readonly HostToolResult[] = [];
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [
+        messages(readDiffMessage('file1.ts')),
+        // file2.ts is still unvisited and budget is untouched — a bare rationale here is exactly
+        // the bug: nothing tells the model file2.ts still needs a look, so it would otherwise end
+        // investigation right here.
+        STOP_TURN,
+        (call) => {
+          // The nudge's own `requestCompletion` result, fed back exactly like the model's own
+          // explicit ask would see it (task's step 3: "reuse respondToCompletionRequest's
+          // missingConditions, which already carry the member, the path and the reason").
+          nudgeToolResults = call.toolResults;
+          return messages(readDiffMessage('file2.ts'));
+        },
+        STOP_TURN,
+      ],
+      verifying: [COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.outcome.kind).toBe('completeClean');
+
+    // The model was asked to continue exactly once (turn 2's readDiff('file2.ts') closed the only
+    // real gap), never spun past it: 4 investigating turns total, not the 3-nudge bound.
+    expect(seam.calls.filter((c) => c.phase === 'investigating')).toHaveLength(4);
+
+    // Step 3's reuse, proven structurally: the fed-back result is the same shape
+    // `handleRequestCompletion` builds for an explicit ask, naming file2.ts by path.
+    expect(nudgeToolResults).toHaveLength(1);
+    const nudge = nudgeToolResults[0] as HostToolResult;
+    expect(nudge.tool).toBe('requestCompletion');
+    expect(nudge.state).toBe('complete');
+    if (nudge.state === 'complete' && nudge.content.tool === 'requestCompletion' && nudge.content.response.granted === false) {
+      expect(nudge.content.response.repairable).toBe(true);
+      expect(nudge.content.response.missingConditions.some((detail) => detail.path === 'file2.ts')).toBe(true);
+    } else {
+      throw new Error('Expected a non-granted requestCompletion response naming file2.ts.');
+    }
+
+    // Step 5: the nudge is recorded as public activity, so the reviewer can see the run asked the
+    // model to keep going and why.
+    expect(
+      result.activityLog.events.some(
+        (e) => e.kind === 'actionStarted' && e.action.includes('asking it to continue') && e.action.includes('condition'),
+      ),
+    ).toBe(true);
+  });
+
+  it('a model that keeps stopping without doing anything ends the phase truthfully, bounded, rather than spinning forever', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      // A single scripted entry: `scriptedModelSeam` replays it for every further call, so this
+      // model stops with a bare rationale on every investigating turn, forever, never touching
+      // file1.ts.
+      investigating: [STOP_TURN],
+      verifying: [STOP_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy({ maxModelTurnsPerAttempt: 200 }),
+    });
+
+    const result = await attempt.run();
+
+    // Truthful, not complete: file1.ts was never inspected.
+    expect(result.lifecycle).not.toBe('succeeded');
+    expect(result.outcome.completeness).not.toBe('complete');
+    expect(result.outcome.limitations.some((l) => l.code === 'insufficientRiskCoverage')).toBe(true);
+
+    // Bounded: 1 initial stop + 3 nudges, never more — the bound this fix adds, not the far larger
+    // per-attempt turn budget, is what ends investigation.
+    expect(seam.calls.filter((c) => c.phase === 'investigating')).toHaveLength(4);
+    expect(result.turnsUsed).toBeLessThan(20);
+    expect(
+      result.activityLog.events.some(
+        (e) => e.kind === 'actionStarted' && e.action.includes('ending it truthfully with its current coverage'),
+      ),
+    ).toBe(true);
+  });
+});
+
 describe('HarnessAttempt.run (10.9: candidate flow — invalid citation blocks completion)', () => {
   it('a finding whose cited evidence fails post-verification revalidation is dropped, not counted as retained, and blocks a complete verdict', async () => {
     const connection = reviewConnection({ files: ['file1.ts'] });
@@ -1227,9 +1327,15 @@ describe('HarnessAttempt.run (15.1/15.2: an explicit attachment becomes citable 
           );
         },
         (call) => {
+          // Captures the two candidate submissions' own outcomes (from the turn just above), then
+          // reads the one real changed file so coverage is genuinely complete before the model
+          // stops next turn — this test is about attachment truncation, not coverage, and a file
+          // left uninspected would otherwise have the host ask the model to keep going (the fix
+          // this change makes) instead of letting the phase end on the next bare-rationale turn.
           submissionResults = call.toolResults;
-          return STOP_TURN;
+          return messages(readDiffMessage('file1.ts'));
         },
+        STOP_TURN,
       ],
       verifying: [COMPLETION_TURN],
     });

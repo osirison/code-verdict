@@ -20,6 +20,7 @@ import { RunStatusGate } from './app/runStatusGate';
 import { revalidateAttachments } from './app/attachments';
 import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
 import { createHarnessRunStore } from './app/harnessRunStore';
+import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText } from './app/harnessDiagnostics';
 import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './app/harnessRuntime';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
@@ -65,6 +66,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // points at; drop it with the channel rather than leave a disposed one wired.
     new vscode.Disposable(() => setApiTraceSink(undefined)),
   );
+
+  // House style of the API trace channel above: created whether or not there is
+  // anything to show yet, so "Verdict: Show run diagnostics" always has a place
+  // to reveal its output.
+  const runDiagnosticsChannel = vscode.window.createOutputChannel('Verdict: Run diagnostics');
+  context.subscriptions.push(runDiagnosticsChannel);
 
   // The session bridge: `connections.ts` stays vscode-free, so the editor's
   // account API is injected here. A provider that declares the 'session' mode
@@ -704,6 +711,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           'Verdict: API tracing is off — switch on "codeVerdict.trace.api" and the next request appears here.',
         );
       }
+    },
+    [COMMANDS.showRunDiagnostics]: async () => {
+      // Whichever review panel is open, single-CR or changeset — mirrors the
+      // "no active review" fallback the palette's other review-tab commands
+      // already use (`ReviewFlowPanel.revealIfOpen() || ChangesetReviewPanel.revealIfOpen()`).
+      const record = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+      if (!record) {
+        void vscode.window.showInformationMessage(
+          'Verdict: no active review — open a change request from the dashboard first.',
+        );
+        return;
+      }
+      const report = buildAttemptDiagnosticsReport(record, () => new Date().toISOString());
+      runDiagnosticsChannel.clear();
+      runDiagnosticsChannel.appendLine(renderAttemptDiagnosticsText(report));
+      runDiagnosticsChannel.show(true);
+      // The interesting cases are long — offered, never forced, so a quick
+      // glance at the channel above never waits on this prompt.
+      const choice = await vscode.window.showInformationMessage('Verdict: run diagnostics ready.', 'Save as JSON…');
+      if (choice !== 'Save as JSON…') return;
+      const uri = await vscode.window.showSaveDialog({
+        filters: { JSON: ['json'] },
+        defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
+      });
+      if (!uri) return;
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
     },
   };
 
