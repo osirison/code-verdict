@@ -951,6 +951,150 @@ describe('changeset runs', () => {
   });
 });
 
+// ---- Task 16.6: the same concurrency/queueing/target-isolation/retained-review guarantees
+// proven for individual (cr) targets above, extended to changeset targets, and to a mix of both --
+
+/** The same inline changeset-target shape `describe('changeset runs')` above already builds, factored out once this file needs it repeatedly. */
+function changesetInput(changesetId: string, refLabel: string, over: Partial<RunInput> = {}): RunInput {
+  return crInput('ignored', { target: { kind: 'changeset', changesetId, members: [] }, refLabel, ...over });
+}
+
+describe('task 16.6: global concurrency, one-run-per-target, waiting-slot release, queue fairness, and target isolation hold for changeset runs exactly as for individual reviews', () => {
+  it('a shared global slot count and trigger-order queue fairness span both target kinds at once — a changeset does not get its own separate pool', async () => {
+    const { started, pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    // Interleaved cr/changeset admission, limit 2: exactly the two earliest-triggered targets run,
+    // regardless of kind, and the rest queue in the order they were triggered.
+    runs.trigger(crInput('1'), 2);
+    runs.trigger(changesetInput('cs-a', 'Changeset A'), 2);
+    const third = runs.trigger(crInput('2'), 2);
+    const fourth = runs.trigger(changesetInput('cs-b', 'Changeset B'), 2);
+
+    expect(started).toEqual(['!1', 'Changeset A']);
+    expect(third.status).toBe('queued');
+    expect(fourth.status).toBe('queued');
+
+    // Finishing order does not decide start order — original admission (trigger) order does: '2'
+    // was queued before 'Changeset B', so it starts first once a slot frees, however the two
+    // running slots happen to finish.
+    pending.get('Changeset A')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!1', 'Changeset A', '!2']));
+    pending.get('!1')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!1', 'Changeset A', '!2', 'Changeset B']));
+  });
+
+  it('one active run per changeset target: retriggering the same changeset while it runs returns the same record, never a second dispatch', async () => {
+    const { started, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const first = runs.trigger(changesetInput('cs-1', 'Changeset one'), 3);
+    const retrigger = runs.trigger(changesetInput('cs-1', 'Changeset one'), 3);
+
+    expect(started).toEqual(['Changeset one']);
+    expect(retrigger.key).toBe(first.key);
+    expect(runs.active()).toHaveLength(1);
+  });
+
+  it('a changeset entering waiting releases its slot for the next queued target, exactly like a cr run', async () => {
+    const { started, pending, optionsOf, runners } = controllableAttempts();
+    const { runs, changes } = manager({ runners });
+
+    const first = runs.trigger(changesetInput('cs-w', 'Waiting changeset'), 1); // limit 1: holds the only slot
+    const second = runs.trigger(crInput('2'), 1); // queued behind it
+    expect(started).toEqual(['Waiting changeset']);
+    expect(second.status).toBe('queued');
+
+    optionsOf.get('Waiting changeset')!.onEnterWaiting!({ reason: 'A transient provider issue requires a longer wait.' });
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+    await vi.waitFor(() => expect(started).toEqual(['Waiting changeset', '!2']));
+
+    // The waiting changeset still owns its target: a retrigger returns the same waiting record.
+    const stillOwned = runs.trigger(changesetInput('cs-w', 'Waiting changeset'), 1);
+    expect(stillOwned.key).toBe(first.key);
+    expect(stillOwned.lifecycle).toBe('waiting');
+
+    pending.get('!2')!.resolve(succeededResult(0, '!2'));
+    // A succeeded record is removed from the live map once settled (`settle`'s own doc comment).
+    await vi.waitFor(() => expect(runs.get(second.key)).toBeUndefined());
+    expect([...changes].reverse().find((record) => record.key === second.key)?.status).toBe('succeeded');
+    // The waiting changeset itself is untouched by '!2' finishing: it still owns its slotless
+    // 'waiting' lifecycle until it either resumes or its own attempt settles — neither happened
+    // here, so it correctly has not moved.
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+
+    // Explicitly resuming (task 12.4/9.6's own mechanism) moves it back to its prior active phase,
+    // and its own eventual result settles it normally — exactly as for a cr run.
+    optionsOf.get('Waiting changeset')!.onResuming!();
+    expect(runs.get(first.key)?.lifecycle).not.toBe('waiting');
+    pending.get('Waiting changeset')!.resolve(succeededResult(0, 'Waiting changeset'));
+    await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
+  });
+
+  it('a changeset run and an individual review proceed independently — cancelling one never touches the other\'s slot, lifecycle, or record', async () => {
+    const { started, cancelled, pending, runners } = controllableAttempts();
+    const { runs, changes } = manager({ runners });
+
+    const csRecord = runs.trigger(changesetInput('cs-iso', 'Isolated changeset'), 5);
+    const crRecord = runs.trigger(crInput('iso'), 5);
+    expect(started).toEqual(['Isolated changeset', '!iso']);
+    expect(runs.active()).toHaveLength(2);
+
+    runs.cancel(csRecord.key);
+    expect(cancelled).toEqual(['Isolated changeset']);
+    // The unrelated cr run is completely untouched: still an active, running record, its own slot
+    // still held.
+    expect(runs.get(crRecord.key)?.status).toBe('running');
+    expect(runs.active().some((r) => r.key === crRecord.key)).toBe(true);
+    // The cancelled changeset's slot is released at once regardless of its attempt ever answering
+    // (task 12.4's own guarantee) — the cr run's slot count is unaffected either way.
+    expect(runs.get(csRecord.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!iso')!.resolve(succeededResult(1, '!iso'));
+    await vi.waitFor(() => expect(runs.get(crRecord.key)).toBeUndefined());
+    // The cr run's own successful completion is likewise untouched by the changeset's cancellation
+    // — a genuine success, not silently reclassified as cancelled or failed. A succeeded record is
+    // removed from the live map once settled (`settle`'s own doc comment), so its terminal outcome
+    // is read off the last `onChange` notification for its key instead.
+    const lastForCr = [...changes].reverse().find((record) => record.key === crRecord.key);
+    expect(lastForCr?.status).toBe('succeeded');
+
+    // The changeset's own cancellation is likewise untouched by the cr run's success — still
+    // cancelling (this fixture's attempt never itself answers the cancellation token, so it is
+    // bounded only by `armCancelGrace`, which `manager()`'s default deliberately never resolves).
+    expect(runs.get(csRecord.key)?.lifecycle).toBe('cancelling');
+  });
+
+  it('retained-review behaviour is unchanged for a changeset run that had to wait its turn in the queue: it writes under its own changeset key alone, never under any member\'s cr key', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs, workspaceState } = manager({ runners });
+
+    // Queue the changeset behind a cr run occupying the only slot. The cr's own review is clean
+    // (0 items) and the changeset's is not (2 items) — a mix-up between the two keys would show up
+    // as the wrong item count under the wrong key, not merely a missing write.
+    runs.trigger(crInput('blocker'), 1);
+    const csRecord = runs.trigger(changesetInput('cs-queued', 'Queued changeset'), 1);
+    expect(csRecord.status).toBe('queued');
+
+    pending.get('!blocker')!.resolve(response(0));
+    await vi.waitFor(() => expect(runs.get(csRecord.key)?.status).toBe('running'));
+
+    pending.get('Queued changeset')!.resolve(response(2));
+    // A succeeded record is removed from the live map once settled (`settle`'s own doc comment) —
+    // the durable write is what this test cares about anyway.
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.changesetDraft.cs-queued')).toBeDefined());
+
+    // The changeset's own key carries exactly its own 2-item review — never a per-member cr draft
+    // key (this fixture's changeset has no members, so a leak would be unambiguous).
+    const changesetWritten = workspaceState.get('codeVerdict.changesetDraft.cs-queued') as { review?: { items: readonly unknown[] } } | undefined;
+    expect(changesetWritten?.review?.items).toHaveLength(2);
+    // The blocking cr run's own key carries exactly its own clean (0-item) review, untouched by
+    // the changeset's write — no cross-contamination in either direction.
+    const crWritten = workspaceState.get('codeVerdict.draft.repo-1!blocker') as { review?: { items: readonly unknown[] } } | undefined;
+    expect(crWritten?.review?.items).toHaveLength(0);
+  });
+});
+
 describe('stored effort attribution', () => {
   it('records the immutable run effort on the review', async () => {
     const { runs, workspaceState } = manager({

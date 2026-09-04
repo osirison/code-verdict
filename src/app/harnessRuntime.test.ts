@@ -416,6 +416,174 @@ describe('resuming an interrupted attempt (task 14.6)', () => {
     expect(stillThere.checkpointId).toBe(lostCheckpoint.checkpointId);
     expect(stillThere.attempt).toBe(1);
   });
+
+  // ---- Task 16.8 -----------------------------------------------------------------------
+
+  it('task 16.8: a changed head forces a restart, not a resume — decideResume rejects it, and a genuinely fresh restart (new lineage, attempt 1) still succeeds once the provider agrees on the new head', async () => {
+    const lostDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurnInterruptedAtVerifying() };
+    const factory = createReviewHarnessFactory(lostDeps);
+    const identity1 = { runId: 'run-resume-head', lineageId: 'lineage-resume-head', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    await expect(attempt1.run()).rejects.toThrow(/simulated extension host restart/);
+
+    const lostCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    const identity2 = { runId: lostCheckpoint.runId, lineageId: lostCheckpoint.lineageId, attempt: nextAttemptNumber(lostCheckpoint.attempt) };
+    const NEW_HEAD_SHA = 'head-e2e-1-moved';
+
+    // More commits landed on the target between the interruption and the resume attempt — the
+    // reviewer's *current* configuration (what `resume` always builds the candidate snapshot from)
+    // now names a different head than the lost attempt's own stored snapshot.
+    const movedHeadInput = runInput({ target: { kind: 'cr', ref: { repoId: REPO_ID, number: CR_NUMBER }, baseSha: BASE_SHA, headSha: NEW_HEAD_SHA } });
+    const resumeFactory = createReviewHarnessFactory({ ...deps, runTurn: scriptedRunTurn() });
+    const attempt2 = resumeFactory.resume(movedHeadInput, noopRunOptions(identity2));
+
+    const outcome = await attempt2.run().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error).toBeInstanceOf(ResumeIncompatibleError);
+    expect((outcome.error as ResumeIncompatibleError).reasons.some((reason) => reason.code === 'headRevision')).toBe(true);
+    // Restart, never resume: the lost lineage's own stored checkpoint is completely untouched by
+    // the rejected attempt — still attempt 1, still nonterminal.
+    const stillThere = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    expect(stillThere.checkpointId).toBe(lostCheckpoint.checkpointId);
+    expect(stillThere.attempt).toBe(1);
+
+    // The fresh restart itself: a genuinely new lineage, attempt 1, through the ordinary `create`
+    // path — never `resume` — against a provider that now agrees the head really did move (the
+    // one piece a hand-picked new head alone cannot prove: the *attempt* actually re-verifies the
+    // provider's current head at completion, not merely at snapshot construction).
+    clearProviders();
+    registerFakeProvider(fakeConnection({
+      getChangeRequestDetails: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: { title: 'A small end-to-end change', labels: [], commits: [], discussion: [], checkSummaries: [], relationships: [], unavailableSections: [] } }),
+      listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [{ path: FILE_PATH, kind: 'modified', binary: false, addedLines: 3, removedLines: 1, byteSize: 120 }] }),
+      readDiff: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: { path: request.path, patch: '@@ -1,1 +1,1 @@\n-old\n+new\n', positions: [{ path: request.path, side: 'new', line: 1, endLine: 1 }] } }),
+      readFile: async (request) => ({ snapshot: request.snapshot, state: 'notFound', reason: 'no such file in this fixture' }),
+      getCurrentHead: async () => ({ repoId: REPO_ID, state: 'resolved', headSha: NEW_HEAD_SHA }),
+    }));
+    // `scriptedRunTurn()` hardcodes the *original* `HEAD_SHA` in its own investigating-phase tool
+    // requests — unsuitable here, since this attempt's real snapshot (built from `movedHeadInput`)
+    // is pinned to `NEW_HEAD_SHA`; a mismatched snapshot in the request would simply be refused.
+    // Otherwise identical: read the one file, submit one real, validly cited finding.
+    let restartInvestigatingCalls = 0;
+    const restartRunTurn = async (_modelId: string, prompt: string) => {
+      if (prompt.startsWith(CONTRADICTION_CHECK_MARKER)) {
+        const match = /candidateId: (\S+)/.exec(prompt);
+        return JSON.stringify({ candidateId: match?.[1] ?? 'unknown', contradicted: false });
+      }
+      const phase = /You are in the "(\w+)" phase/.exec(prompt)?.[1];
+      if (phase === 'planning') return JSON.stringify({ messages: [{ kind: 'planCreated', items: [{ id: 'p1', description: 'Investigate the changed file.' }] }] });
+      if (phase === 'investigating') {
+        restartInvestigatingCalls += 1;
+        if (restartInvestigatingCalls === 1) {
+          return JSON.stringify({
+            messages: [{ kind: 'toolRequest', tool: 'readDiff', memberId: MEMBER_ID, request: { snapshot: { repoId: REPO_ID, baseSha: BASE_SHA, headSha: NEW_HEAD_SHA }, path: FILE_PATH } }],
+          });
+        }
+        if (restartInvestigatingCalls === 2) {
+          const citation = /sourceId=(\S+) digest=(\S+)/.exec(prompt);
+          if (!citation) throw new Error('test model: expected a citable prior tool result in the rendered prompt');
+          return JSON.stringify({
+            messages: [
+              {
+                kind: 'candidateSubmission',
+                candidate: {
+                  candidateId: 'cand-restart',
+                  memberId: MEMBER_ID,
+                  file: FILE_PATH,
+                  line: 1,
+                  endLine: 1,
+                  severity: 'major',
+                  category: 'errorHandling',
+                  confidence: 90,
+                  title: 'Issue found during the restarted investigation',
+                  body: 'A real issue found in the changed file, on the new head.',
+                  citations: { primary: { sourceId: citation[1], digest: citation[2], path: FILE_PATH, range: { startLine: 1, endLine: 1 } } },
+                },
+              },
+            ],
+          });
+        }
+        return JSON.stringify({ messages: [{ kind: 'publicRationale', rationale: 'Investigation is complete.' }] });
+      }
+      if (phase === 'verifying') return JSON.stringify({ messages: [{ kind: 'completionRequest', rationale: 'Coverage looks complete.' }] });
+      throw new Error(`test model: unexpected turn — phase "${phase ?? 'unknown'}"`);
+    };
+    const restartIdentity = { runId: 'run-restart-head', lineageId: 'lineage-restart-head', attempt: 1 };
+    const restartFactory = createReviewHarnessFactory({ ...deps, runTurn: restartRunTurn });
+    const restartResult = await restartFactory.create(movedHeadInput, noopRunOptions(restartIdentity)).run();
+
+    expect(restartResult.lifecycle).toBe('succeeded');
+    expect(restartResult.attempt).toBe(1);
+    expect(restartResult.lineageId).toBe(restartIdentity.lineageId);
+    expect(restartResult.lineageId).not.toBe(identity1.lineageId);
+    // Nothing carried across: this is a brand-new lineage's own attempt 1, not attempt 2 of the
+    // interrupted one — the restart's own finding is real, freshly investigated, not replayed.
+    expect(restartResult.findings).toHaveLength(1);
+  });
+
+  it('task 16.8: a compatible resume carries plan, coverage, and findings forward — the resumed attempt reaches a truthful complete outcome without repeating investigation the interrupted attempt already did, and its activity log never claims a reconnection', async () => {
+    const lostDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurnInterruptedAtVerifying() };
+    const factory = createReviewHarnessFactory(lostDeps);
+    const identity1 = { runId: 'run-carry-1', lineageId: 'lineage-carry-1', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    await expect(attempt1.run()).rejects.toThrow(/simulated extension host restart/);
+
+    const lostCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    // What the interrupted attempt actually carries: a plan, one already-inspected file's
+    // coverage, and one already-accepted, validly cited candidate — all real, from the live turn
+    // loop, never hand-built.
+    expect(lostCheckpoint.plan?.items).toHaveLength(1);
+    expect(lostCheckpoint.coverage.flatMap((c) => c.files).some((f) => f.path === FILE_PATH && f.state === 'inspected')).toBe(true);
+    expect(lostCheckpoint.candidates.some((c) => c.state === 'accepted')).toBe(true);
+
+    const identity2 = { runId: lostCheckpoint.runId, lineageId: lostCheckpoint.lineageId, attempt: nextAttemptNumber(lostCheckpoint.attempt) };
+
+    // The resumed attempt's own script never issues a single investigating-phase tool call — if
+    // coverage genuinely carried forward, the one file is already 'inspected' and there is nothing
+    // left to investigate; if the candidate genuinely carried forward, it survives into this
+    // attempt's own findings without ever being resubmitted.
+    let investigatingCalls = 0;
+    const resumedNoWorkRunTurn = async (_modelId: string, prompt: string) => {
+      if (prompt.startsWith(CONTRADICTION_CHECK_MARKER)) {
+        const match = /candidateId: (\S+)/.exec(prompt);
+        return JSON.stringify({ candidateId: match?.[1] ?? 'unknown', contradicted: false });
+      }
+      const phase = /You are in the "(\w+)" phase/.exec(prompt)?.[1];
+      // 'planning' is never expected here: the seeded plan already satisfies `runPlanning`'s own
+      // stop condition before the phase loop ever asks the model anything.
+      if (phase === 'investigating') {
+        investigatingCalls += 1;
+        return JSON.stringify({ messages: [{ kind: 'publicRationale', rationale: 'Nothing left uninvestigated.' }] });
+      }
+      if (phase === 'verifying') return JSON.stringify({ messages: [{ kind: 'completionRequest', rationale: 'Coverage looks complete.' }] });
+      throw new Error(`test model: unexpected turn — phase "${phase ?? 'unknown'}", prompt starts: ${prompt.slice(0, 120)}`);
+    };
+    const resumeFactory = createReviewHarnessFactory({ ...deps, runTurn: resumedNoWorkRunTurn });
+    const attempt2 = resumeFactory.resume(runInput(), noopRunOptions(identity2));
+    const result = await attempt2.run();
+
+    expect(investigatingCalls).toBe(1); // asked once (the loop always asks at least once), given nothing to do
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    // The plan carried forward (present without this attempt's own planning turn ever running).
+    expect(result.plan?.items.map((item) => item.id)).toEqual(['p1']);
+    // The finding carried forward: never resubmitted by this attempt's script, yet present.
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.item.file).toBe(FILE_PATH);
+
+    // Task 16.8/11.8: the real, production activity log a reviewer would actually see for this
+    // resumed attempt never claims a reconnection — extends `harnessResume.test.ts`'s own
+    // "no-reconnect wording" check (which only scans the pure `describeResumeStart`/
+    // `interruptedLimitation` string functions in isolation) to the genuine end-to-end log a live
+    // `HarnessAttempt` produced, `kind` identifiers (e.g. the literal activity kind `resuming`,
+    // task 9.6's unrelated retry-wait mechanism) excluded — this checks prose, not enum tags.
+    const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
+    const prose = JSON.stringify(result.activityLog.events).replace(/"kind":"[a-zA-Z]+"/g, '');
+    for (const pattern of FORBIDDEN) expect(prose).not.toMatch(pattern);
+  });
 });
 
 describe('ReviewRunManager driven by the real harness factory (task 10.2/10.8)', () => {

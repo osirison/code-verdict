@@ -161,10 +161,10 @@
 - [x] 16.2 Add a large-review integration test whose manifest and evidence exceed model input limits, proving paginated investigation, reopenable bootstrap, real coverage, reserved verification, and complete or explicit partial outcome.
 - [x] 16.3 Add provider-limit tests proving incomplete inventory, truncated search, unavailable oversized diff, binary content, and unknown completeness cannot yield a clean result.
 - [x] 16.4 Add persistence inspection tests proving no raw prompt, model fragment, secret, hidden reasoning, full tool argument, or full tool-output blob enters activity, trace, checkpoints, retained details, or workspace storage.
-- [ ] 16.5 Add lifecycle race tests for cancellation during model streaming, provider reads, retry waits, checkpoint writes, and final persistence, including providers that ignore cancellation and late responses.
-- [ ] 16.6 Add multi-run integration tests proving global concurrency, one run per target, waiting-slot release, queue fairness, target isolation, and unchanged retained-review behavior across individual and changeset runs.
-- [ ] 16.7 Add completion mutation tests that independently remove each required predicate and prove complete/clean status is rejected.
-- [ ] 16.8 Add restart tests proving interrupted attempts never claim reconnection, compatible resume increments attempt in the same lineage, and a changed head or input forces restart.
+- [x] 16.5 Add lifecycle race tests for cancellation during model streaming, provider reads, retry waits, checkpoint writes, and final persistence, including providers that ignore cancellation and late responses.
+- [x] 16.6 Add multi-run integration tests proving global concurrency, one run per target, waiting-slot release, queue fairness, target isolation, and unchanged retained-review behavior across individual and changeset runs.
+- [x] 16.7 Add completion mutation tests that independently remove each required predicate and prove complete/clean status is rejected.
+- [x] 16.8 Add restart tests proving interrupted attempts never claim reconnection, compatible resume increments attempt in the same lineage, and a changed head or input forces restart.
 
 ## 17. Settings, Documentation, And Validation
 

@@ -1480,6 +1480,21 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     await refreshHeads();
     await runSynthesisVerification();
     await runPhaseLoop('verifying', () => false);
+    // Task 16.7's own mutation pass found this gap: a candidate accepted *after* synthesis/
+    // verification already ran once on this attempt sets `passesStale = true`
+    // (`processMessages`'s `candidateSubmission` case), but the only place that used to consult it
+    // was a later `completionRequest`. A model that stops the phase loop without ever sending one —
+    // a `publicRationale`, or simply no more actionable work — left `latestPasses`/
+    // `survivingFindings` at their *first* run's stale snapshot: every clause could still read
+    // satisfied, and the newly accepted, validly cited candidate was silently absent from the
+    // result — `runCompleting()`/`runPersisting()` could report `completeClean` over a genuinely
+    // accepted finding. Reconciling here, unconditionally whenever synthesis went stale and the
+    // attempt was not cancelled, closes that gap the same way an explicit `completionRequest`
+    // already did — `runSynthesisVerification()` is idempotent-safe to call again (it always resets
+    // `passesStale` to `false`), so this is a no-op whenever the model itself already triggered the
+    // mid-loop reconciliation. See `harnessCompletionMutation.assurance.test.ts`'s "headline
+    // finding" test, which fails against the pre-fix behaviour and passes against this.
+    if (passesStale && !isCancelled()) await runSynthesisVerification();
   }
 
   async function runCompleting(): Promise<CompletionEvaluation> {
