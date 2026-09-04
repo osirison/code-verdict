@@ -42,6 +42,7 @@ import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
 import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
+import { readHarnessCoverageRules, readHarnessPolicy } from './ui/harnessPolicyOptions';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
@@ -149,6 +150,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     runTurn: (modelId, prompt, options) => runHarnessModelTurn(modelId, prompt, options),
     revalidateAttachments,
     harnessRunStore,
+    // Getters, not values read once at activation: `harnessRuntime.ts`'s own
+    // `HarnessRuntimeDeps.policy`/`riskCoverageRules` doc comment says these
+    // are read fresh per attempt built, so a setting changed in the settings
+    // panel applies to the reviewer's next run without a window reload.
+    get policy() {
+      return readHarnessPolicy();
+    },
+    get riskCoverageRules() {
+      return readHarnessCoverageRules();
+    },
   };
 
   /**

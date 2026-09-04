@@ -5,6 +5,8 @@ import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { CONTRADICTION_CHECK_MARKER } from './harnessSynthesisVerification';
 import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './harnessRuntime';
+import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
+import { DEFAULT_RISK_COVERAGE_RULES, type RiskCoverageRules } from './harnessRiskFloors';
 import { BUILTIN_AGENT_DESCRIPTOR } from './agents';
 import { DEFAULT_CONTEXT_BUDGETS } from './reviewContext';
 import { ReviewRunManager, type CrRunTarget, type RunInput, type RunRecord } from './reviewRunManager';
@@ -610,5 +612,49 @@ describe('ReviewRunManager driven by the real harness factory (task 10.2/10.8)',
     expect(settled.completeness).toBe('complete');
     expect(settled.response?.items).toHaveLength(1);
     expect(settled.response?.items[0]?.file).toBe(FILE_PATH);
+  });
+});
+
+describe('policy and risk-coverage rules reach the harness fresh per attempt (task 17.1/17.2)', () => {
+  it('reads deps.policy and deps.riskCoverageRules exactly once per attempt built, never caching a value from an earlier attempt', async () => {
+    // Mirrors `extension.ts`'s production wiring: a getter, not a value captured once — a settings
+    // panel edit must reach the *next* attempt a factory builds without a window reload
+    // (`HarnessRuntimeDeps.policy`'s own doc comment in `harnessRuntime.ts`).
+    let policyReads = 0;
+    let coverageReads = 0;
+    const secondPolicy: HarnessPolicy = { ...DEFAULT_HARNESS_POLICY, maxModelTurnsPerAttempt: 5 };
+    const secondCoverage: RiskCoverageRules = { ...DEFAULT_RISK_COVERAGE_RULES, requireInspection: ['high'] };
+
+    function dynamicDeps(): HarnessRuntimeDeps {
+      return {
+        ...deps,
+        // Fresh per attempt: the scripted model turn is stateful (it counts its own calls), so
+        // reusing one instance across two attempts would desync it — the same reason the existing
+        // resume tests above build a fresh `scriptedRunTurn()` per attempt rather than reusing `deps`.
+        runTurn: scriptedRunTurn(),
+        get policy() {
+          policyReads += 1;
+          return policyReads === 1 ? DEFAULT_HARNESS_POLICY : secondPolicy;
+        },
+        get riskCoverageRules() {
+          coverageReads += 1;
+          return coverageReads === 1 ? DEFAULT_RISK_COVERAGE_RULES : secondCoverage;
+        },
+      };
+    }
+
+    const factory = createReviewHarnessFactory(dynamicDeps());
+    const attempt1 = factory.create(runInput(), noopRunOptions({ runId: 'run-policy-1', lineageId: 'lineage-policy-1', attempt: 1 }));
+    await attempt1.run();
+    expect(policyReads).toBe(1);
+    expect(coverageReads).toBe(1);
+
+    // A second attempt, built by a factory over deps whose getters return the second (changed)
+    // value — the settings-panel-edit-then-run-again scenario.
+    const secondFactory = createReviewHarnessFactory(dynamicDeps());
+    const attempt2 = secondFactory.create(runInput(), noopRunOptions({ runId: 'run-policy-2', lineageId: 'lineage-policy-2', attempt: 1 }));
+    await attempt2.run();
+    expect(policyReads).toBe(2);
+    expect(coverageReads).toBe(2);
   });
 });

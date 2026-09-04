@@ -168,8 +168,8 @@
 
 ## 17. Settings, Documentation, And Validation
 
-- [ ] 17.1 Add reviewer-relevant harness budget, elapsed-time, retry, reserve, checkpoint, activity, and retention settings to `package.json`, with the design defaults and validation that unusable values fall back safely.
-- [ ] 17.2 Add settings UI for reviewer-relevant policy values without exposing provider-specific page sizes or allowing settings to weaken citation, revision, or completion invariants.
+- [x] 17.1 Add reviewer-relevant harness budget, elapsed-time, retry, reserve, checkpoint, activity, and retention settings to `package.json`, with the design defaults and validation that unusable values fall back safely.
+- [x] 17.2 Add settings UI for reviewer-relevant policy values without exposing provider-specific page sizes or allowing settings to weaken citation, revision, or completion invariants.
 - [ ] 17.3 Update `README.md` with the universal harness, public activity versus private reasoning boundary, complete/partial semantics, cancellation, checkpoint resume, attachment evidence, and legacy review provenance.
 - [ ] 17.4 Update `docs/ARCHITECTURE.md` with the harness attempt layer, host tool dispatcher, evidence ledger, provider investigation contracts, one shared run projection, and metadata-only trace.
 - [ ] 17.5 Update provider documentation and `spec/specs/Code Verdict - naming & commands.md` for new settings, lifecycle labels, progress language, partial outcomes, and resume/restart controls.

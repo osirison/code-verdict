@@ -48,6 +48,7 @@
  * had any production data before this pass.
  */
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
+import { DEFAULT_RISK_COVERAGE_RULES, type RiskCoverageRules } from './harnessRiskFloors';
 import type { ChangeRequestRef } from '../platform/types';
 import type { Connection, ProviderCapabilities } from '../platform/provider';
 import { getProvider } from '../platform/registry';
@@ -98,7 +99,19 @@ export interface HarnessRuntimeDeps {
    */
   readonly revalidateAttachments: (attachments: readonly Attachment[]) => Promise<RevalidatedAttachments>;
   readonly harnessRunStore: HarnessRunStore;
+  /**
+   * Read fresh for every attempt this factory builds (`buildHarnessAttempt`
+   * reads it once per call, never caches it) — task 17.1/17.2's settings
+   * reach a running extension without a reload: production wiring
+   * (`extension.ts`) passes a getter over `readHarnessPolicy()`
+   * (`../ui/harnessPolicyOptions.ts`), so a setting a reviewer changes
+   * applies to the next attempt it builds, while an attempt already running
+   * keeps the policy snapshotted into it when it started (`HARNESS_POLICY_VERSION`'s
+   * own doc comment).
+   */
   readonly policy?: HarnessPolicy;
+  /** Same freshness contract as `policy` above; production wiring passes a getter over `readHarnessCoverageRules()`. */
+  readonly riskCoverageRules?: RiskCoverageRules;
   /** Epoch milliseconds; defaults to `Date.now`. Injected for deterministic tests, matching every other clock in this change. */
   readonly now?: () => number;
 }
@@ -255,6 +268,7 @@ function buildHarnessAttempt(
   const now = deps.now ?? (() => Date.now());
   const startedAt = now();
   const policy = deps.policy ?? DEFAULT_HARNESS_POLICY;
+  const riskCoverageRules = deps.riskCoverageRules ?? DEFAULT_RISK_COVERAGE_RULES;
   const { pod, revalidatedMembers, snapshot } = assembly;
 
   const modelSeam = demo
@@ -304,6 +318,7 @@ function buildHarnessAttempt(
     members: attemptMembers,
     modelSeam,
     policy,
+    riskCoverageRules,
     cancellation: options.cancellation,
     clock: () => now() - startedAt,
     now: () => new Date(now()).toISOString(),

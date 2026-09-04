@@ -20,6 +20,21 @@ const state: SettingsViewState = {
     includeLinkedItems: true,
     usageEnabled: true,
   },
+  harness: {
+    maxElapsedSecondsPerAttempt: 1_800,
+    maxModelTurnsPerAttempt: 64,
+    maxToolRequestsPerAttempt: 256,
+    maxEvidenceMegabytesPerAttempt: 8,
+    highRiskReservePercent: 20,
+    verificationReservePercent: 15,
+    transientRetriesPerOperation: 3,
+    checkpointCadenceToolCalls: 10,
+    retainedCheckpointsPerLineage: 3,
+    maxActivityEventsPerAttempt: 1_000,
+    terminalAttemptHistoryCount: 5,
+    terminalAttemptHistoryMaxAgeDays: 30,
+    requireInspectionMinRisk: 'low',
+  },
   agentLocations: [{ label: '.github/agents', configured: false, status: 'ok', agentCount: 2 }],
   notifications: [
     { key: 'agentFinished', label: 'Agent finished a review', hint: 'Review results are ready to triage.', mode: 'Interrupt' },
@@ -39,6 +54,7 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('Connection');
     expect(html).toContain('Notifications');
     expect(html).toContain('Context');
+    expect(html).toContain('Harness');
     expect(html).toContain('Data &amp; privacy');
     expect(html).toContain('settings.json');
     expect(html).toContain('Agent finished a review');
@@ -79,6 +95,55 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain("type: 'setContextBudget'");
     expect(html).toContain("type: 'setContextToggle'");
     expect(html).toContain('Number.isInteger(value) && value > 0');
+  });
+
+  it('renders every harness setting this change exposes, and only those', () => {
+    const html = renderSettingsHtml(state, 'nonce123');
+    expect(html).toContain('data-harness-number="maxElapsedSecondsPerAttempt" type="number" min="1" step="1" value="1800"');
+    expect(html).toContain('data-harness-number="maxModelTurnsPerAttempt" type="number" min="1" step="1" value="64"');
+    expect(html).toContain('data-harness-number="maxToolRequestsPerAttempt" type="number" min="1" step="1" value="256"');
+    expect(html).toContain('data-harness-number="maxEvidenceMegabytesPerAttempt" type="number" min="1" step="1" value="8"');
+    // The two reserve percents allow 0 and cap at 100 — not the `min="1"` every count-like field uses.
+    expect(html).toContain('data-harness-number="highRiskReservePercent" type="number" min="0" max="100" step="1" value="20"');
+    expect(html).toContain('data-harness-number="verificationReservePercent" type="number" min="0" max="100" step="1" value="15"');
+    // Retries allow 0 (no retries), unlike the count-like fields above.
+    expect(html).toContain('data-harness-number="transientRetriesPerOperation" type="number" min="0" step="1" value="3"');
+    expect(html).toContain('data-harness-number="checkpointCadenceToolCalls" type="number" min="1" step="1" value="10"');
+    expect(html).toContain('data-harness-number="retainedCheckpointsPerLineage" type="number" min="1" step="1" value="3"');
+    expect(html).toContain('data-harness-number="maxActivityEventsPerAttempt" type="number" min="1" step="1" value="1000"');
+    expect(html).toContain('data-harness-number="terminalAttemptHistoryCount" type="number" min="1" step="1" value="5"');
+    expect(html).toContain('data-harness-number="terminalAttemptHistoryMaxAgeDays" type="number" min="1" step="1" value="30"');
+    // Never a provider page-size setting: internal pagination mechanics, out of both package.json and this panel.
+    for (const pageSizeKey of [
+      'manifestPageSize',
+      'diffOrFileReadPageLines',
+      'diffOrFileReadPageBytes',
+      'searchResultPageMatches',
+      'searchResultPageBytes',
+    ]) {
+      expect(html).not.toContain(`data-harness-number="${pageSizeKey}"`);
+    }
+  });
+
+  it('renders the risk-coverage control with the fail-closed default selected, and wires typed messages', () => {
+    const html = renderSettingsHtml(state, 'nonce123');
+    expect(html).toContain('Inspection required from');
+    expect(html).toContain('data-min-risk="low"');
+    expect(html).toContain('data-min-risk="medium"');
+    expect(html).toContain('data-min-risk="high"');
+    expect(html).toMatch(/class="active" data-min-risk="low"/);
+    expect(html).toContain("type: 'setHarnessNumber'");
+    expect(html).toContain("type: 'setHarnessMinRisk'");
+  });
+
+  it('the risk-coverage control moves with the configured value, never defaulting silently back to low', () => {
+    const html = renderSettingsHtml({ ...state, harness: { ...state.harness, requireInspectionMinRisk: 'high' } }, 'n');
+    expect(html).toMatch(/class="active" data-min-risk="high"/);
+    expect(html).not.toMatch(/class="active" data-min-risk="low"/);
+  });
+
+  it('never writes an inline style attribute anywhere on the page', () => {
+    expect(renderSettingsHtml(state, 'nonce123')).not.toContain('style="');
   });
 });
 

@@ -247,6 +247,90 @@
           "scope": "window",
           "description": "Show the selected model's estimated context-window usage before a review. Context and attachment budgets still apply when this indicator is hidden."
         },
+        "codeVerdict.harness.maxElapsedSecondsPerAttempt": {
+          "type": "number",
+          "minimum": 1,
+          "default": 1800,
+          "description": "Maximum time one review attempt may spend investigating before it must stop and report what it has. Raise it for a large changeset that needs more time; lower it to fail fast on a slow or unresponsive model. Missing or unusable values fall back to 1,800 seconds (30 minutes)."
+        },
+        "codeVerdict.harness.maxModelTurnsPerAttempt": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 64,
+          "description": "Maximum back-and-forth turns with the model one review attempt may use. Raise it for a large or unusually complex changeset that needs more investigation before the model can finish. Missing or unusable values fall back to 64 turns."
+        },
+        "codeVerdict.harness.maxToolRequestsPerAttempt": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 256,
+          "description": "Maximum tool calls — reads, diffs, searches — one review attempt may issue in total. Raise it for a large changeset with many files to inspect. Missing or unusable values fall back to 256 requests."
+        },
+        "codeVerdict.harness.maxEvidenceMegabytesPerAttempt": {
+          "type": "number",
+          "minimum": 1,
+          "default": 8,
+          "description": "Maximum cited evidence content — diff hunks, file excerpts, search results — one review attempt holds at once, in megabytes. Raise it if a large changeset's review is losing citations to evidence it read earlier in the attempt. Missing or unusable values fall back to 8 MB."
+        },
+        "codeVerdict.harness.highRiskReservePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 20,
+          "description": "Percent of the attempt's turns, tool calls, and evidence held back for files the model did not pick to investigate but the host judged high-risk. Raise it if high-risk files are being skipped for lack of remaining budget. Missing or unusable values fall back to 20 percent."
+        },
+        "codeVerdict.harness.verificationReservePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 15,
+          "description": "Percent of the attempt's turns, tool calls, and evidence held back for final verification before completion. Raise it if verification is running out of budget on large reviews. Missing or unusable values fall back to 15 percent."
+        },
+        "codeVerdict.harness.transientRetriesPerOperation": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "How many times the harness retries one tool call or model turn after a transient error (a network blip, a rate limit) before giving up. Raise it if reviews are failing on errors that would have succeeded a moment later. Missing or unusable values fall back to 3 retries."
+        },
+        "codeVerdict.harness.checkpointCadenceToolCalls": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "How many completed tool calls pass between checkpoints inside a phase, in addition to the checkpoint always taken at every phase boundary. Lower it to resume closer to where a long review was interrupted, at the cost of more frequent checkpoint writes. Missing or unusable values fall back to 10 tool calls."
+        },
+        "codeVerdict.harness.retainedCheckpointsPerLineage": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "How many checkpoints are kept for one review's resume history. Raise it to be able to resume further back after a long or repeatedly retried review, at the cost of more stored data. Missing or unusable values fall back to 3 checkpoints."
+        },
+        "codeVerdict.harness.maxActivityEventsPerAttempt": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "How many activity-log entries (plan updates, coverage progress, checkpoints) one review attempt keeps before the oldest are dropped. Raise it to see the full narrative of a long-running review instead of a truncated one. Missing or unusable values fall back to 1,000 events."
+        },
+        "codeVerdict.harness.terminalAttemptHistoryCount": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "How many finished review attempts are kept in history for one change request or changeset target before the oldest is pruned. Raise it to look back further after a review has been retried or resumed several times. Missing or unusable values fall back to 5 attempts."
+        },
+        "codeVerdict.harness.terminalAttemptHistoryMaxAgeDays": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "How many days a finished review attempt's history is kept before it is pruned regardless of count. Raise it to keep history around longer for change requests you revisit infrequently. Missing or unusable values fall back to 30 days."
+        },
+        "codeVerdict.harness.requireInspectionMinRisk": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "low",
+          "description": "The lowest risk level that must actually be read, not just classified, before a review can be marked complete. The default (low) requires every changed file, regardless of risk, to be read. Raising this to medium or high lets lower-risk files — for example, generated output — count as covered without being opened. Missing or unusable values fall back to low."
+        },
         "codeVerdict.agentVoice": {
           "type": "string",
           "enum": [
