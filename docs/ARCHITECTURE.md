@@ -423,6 +423,24 @@ inline style, custom property or not. A value that genuinely varies per element 
 fixed set of classes, or a rule emitted into the same nonce'd `<style>` block and matched on a
 data attribute.
 
+## A stateful element needs a stable id to survive a patch
+
+A region patch replaces a container's `innerHTML`, which rebuilds every element inside it in its
+default state. `REGIONS_SCRIPT` (`src/ui/theme.ts`) puts back what the reviewer was standing in —
+focus and caret, `<details>` open/closed state, and per-container `scrollTop`/`scrollLeft` — but
+it can only match an element to its rebuilt self **by id**. A stateful element without a stable id
+is silently not restored: no error, the section just closes or the pane jumps to the top on the
+next patch. So when a renderer adds an element that holds DOM-side state, give it an id that is
+stable across renders (not derived from list position). Expansion state the panel already holds
+and re-renders (the codebase norm — `expandedThreadId`, `agentOpen`, …) needs nothing; the rule is
+for state that lives only in the DOM, where disclosure must be a `<details id="…">`.
+
+Two deliberate limits. `value` is never restored: the host holds every editable's in-progress
+text and re-renders it current (design D8, task 9.3), so a restored value could only ever be a
+stale one clobbering a regenerated summary. And view state is per route: the page keeps a bounded,
+route-keyed snapshot (saved when a navigation patch leaves a route, reapplied on return), so one
+screen's scroll and open sections never land on another's.
+
 ## The status bar shows only what is Verdict's
 
 Spec §14 is drawn from a prototype that mocks the whole VS Code window, so its `⎇ branch` and
@@ -527,7 +545,10 @@ scoped one, so existing pods are not silently signed out.
   environment hands back a document whose scripts never ran, and switching the global `environment`
   in `vitest.config.ts` drags every other test file into a DOM it does not need. And pass a
   `VirtualConsole` that drops `jsdomError`: `REGIONS_SCRIPT` ends by restoring scroll, and jsdom
-  does not implement `window.scrollTo`. Issue #43 tracks generalising this into a harness.
+  does not implement `window.scrollTo`. A test that needs to *observe* scroll instead installs its
+  own `window.scrollTo` double in `beforeParse` and redefines `scrollX`/`scrollY` over it
+  (`dashboardScript.test.ts`), asserting on what was set and read back — never on layout, which
+  jsdom does not do. Issue #43 tracks generalising this into a harness.
 - **Adversarial and limits** (the review harness): tests feed forged tool names, fabricated source
   ids, changed digests, another head's evidence, and oversized/unavailable provider content into a
   real attempt, and assert it cannot forge host instructions, complete without inspecting a file, or

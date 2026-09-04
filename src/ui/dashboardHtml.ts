@@ -8,7 +8,7 @@
  */
 import type { CiStatus } from '../platform/types';
 import { isScmError } from '../platform/errors';
-import { escapeHtml, renderPage } from './theme';
+import { escapeHtml, renderPage, type RouteAssets } from './theme';
 import { approxDelay, cap, repoCountOf, type Vocabulary } from './vocab';
 
 export { escapeHtml };
@@ -559,8 +559,13 @@ const SCRIPT = `
     const row = ev.target.closest('.mr-row');
     if (row) openMrRow(row);
   });
+  // Narrowed to the card class (task 8.1): the review flow's "open the
+  // changeset" link also carries data-changeset, and once every screen's
+  // script lives in one resident shell a bare [data-changeset] here would
+  // fire alongside the flow's own handler — two openChangeset messages, one
+  // click.
   document.addEventListener('click', (ev) => {
-    const card = ev.target.closest('[data-changeset]');
+    const card = ev.target.closest('.changeset-card[data-changeset]');
     if (card) post({ type: 'openChangeset', changesetId: card.dataset.changeset });
   });
   document.addEventListener('click', (ev) => { if (ev.target.closest('#new-changeset')) post({ type: 'newChangeset' }); });
@@ -578,18 +583,25 @@ const SCRIPT = `
   // which are private to this page's own script. Deleting this block as
   // redundant with REGIONS_SCRIPT would leave a stale filter silently
   // applied to freshly-patched rows it never touched.
+  // 'app-route' too (task 8.4): a navigation back to the dashboard patches
+  // the shell's route container rather than db-body, but it rebuilds this
+  // screen's rows and chips just the same — the filters must reset with it.
   window.addEventListener('message', (ev) => {
     const data = ev.data;
-    if (data && data.type === 'verdict:regions' && data.regions && 'db-body' in data.regions) {
+    if (data && data.type === 'verdict:regions' && data.regions
+      && ('db-body' in data.regions || 'app-route' in data.regions)) {
       scopeSel = 'all';
       repoSel = '*';
     }
   });
 `;
 
+/** This screen's contribution to the resident shell (design D7, task 8.3). */
+export const DASHBOARD_ROUTE: RouteAssets = { className: 'route-dashboard', css: CSS, script: SCRIPT };
+
 export function renderDashboardHtml(state: DashboardViewState, nonce: string): string {
   const body = `<div id="db-body">${renderDashboardBody(state)}</div>`;
-  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT });
+  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT, routeClass: DASHBOARD_ROUTE.className });
 }
 
 /**
@@ -644,5 +656,5 @@ export function renderDashboardLoadingHtml(podName: string, meta: string, nonce:
       <div class="col-right"></div>
     </div>
   </div>`;
-  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT });
+  return renderPage({ title: 'Verdict: Dashboard', nonce, css: CSS, body, script: SCRIPT, routeClass: DASHBOARD_ROUTE.className });
 }

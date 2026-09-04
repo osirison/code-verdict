@@ -1,9 +1,12 @@
+import { JSDOM, VirtualConsole } from 'jsdom';
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
-import type { FlowViewState, ReviewContextView } from './reviewFlowHtml';
+import { parseHunks } from '../domain/diffHunks';
+import type { FlowScreen, FlowViewState, ReviewContextView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
 import type { Limitation, RunProjection } from '../domain/harnessActivity';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: FlowViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -309,7 +312,10 @@ describe('the submitting screen (#42)', () => {
   it('counts comments as they post', () => {
     const html = submitting({ stage: 'comments', posted: 3, total: 12 });
     expect(html).toContain('Posting 3 of 12 inline comments…');
-    expect(html).toContain('width:25%');
+    // A class, not a style="width:…" attribute the page CSP drops silently
+    // (issue #45) — 3/12 is exactly 25%, which is also an exact 5%-step
+    // bucket, so this also confirms the quantisation leaves a round value alone.
+    expect(html).toContain('<div class="w-25"></div>');
   });
 
   it('names the summary and verdict stages, which have nothing to count', () => {
@@ -556,7 +562,7 @@ describe('loading skeleton and region patching (issue #39)', () => {
     // Every value comes from a class in this page's own nonce'd CSS (issue
     // #45) — a nonce authorises style elements, never a style attribute, so
     // anything set that way is dropped before layout.
-    expect(html.slice(html.indexOf('<body>'))).not.toContain('style="');
+    expect(html.slice(html.indexOf('<body>'))).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     // this.cr is not yet assigned at this point, so nothing item-specific renders.
     expect(html).not.toContain('data-item=');
   });
@@ -627,9 +633,9 @@ describe('the context the agent was given, on the screen where the human decides
       webUrl: 'https://gitlab.example/issues/1180',
     }],
   };
-  /** Split mode throughout: the fixture's diff mode is the one screen that still
-   *  carries a pre-existing style attribute (--item-sev), which the last case here
-   *  would trip over for a reason that has nothing to do with this box (#45). */
+  /** Split mode throughout: `reviewContextPanel` is part of the shared triage
+   *  header, rendered identically whichever mode is active — split is simply
+   *  the one this block has always used. */
   const render = (context: Partial<ReviewContextView>, over: Partial<FlowViewState> = {}): string =>
     renderReviewFlowBody(
       { ...state, mode: 'split', context: { open: true, truncated: false, entries: [{ context: reviewContext }], ...context }, ...over },
@@ -715,7 +721,7 @@ describe('the context the agent was given, on the screen where the human decides
   });
 
   it('carries no style attribute — a nonce authorises style elements only (#45)', () => {
-    expect(render({})).not.toContain('style="');
+    expect(render({})).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('labels one block per member in changeset scope', () => {
@@ -806,6 +812,25 @@ describe('the running screen renders from the shared projection alone (task 14.1
     expect(html).toContain('progress-indeterminate');
     expect(html).toContain('5 changed files classified so far');
     expect(html).not.toMatch(/\d+%/);
+  });
+
+  // The `startedAt`/`fragmentsReceived`/`charsReceived` fields this test
+  // (#45, task 8.5) originally exercised belonged to the fragment-count
+  // progress view task 14.1 deleted; `running()` now builds its state from
+  // `runProjection` instead. The assertion itself — no screen ever emits a
+  // `style="…"` attribute, since the CSP drops it silently — still holds and
+  // is re-run here against the current determinate-progress shape (it is
+  // also covered, along with every other screen, by the "no screen writes an
+  // inline style attribute" suite below).
+  it('carries no style attribute — a nonce authorises style elements only (#45, task 8.5)', () => {
+    const html = running({
+      runProjection: baseProjection({
+        progressMode: 'determinate',
+        progressUnits: { completed: 5, total: 20 },
+        coverage: { classified: 5, total: 20, inspected: 0 },
+      }),
+    });
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
   it('shows both coverage denominators when both exist', () => {
@@ -1261,14 +1286,14 @@ describe('the agent and model pickers (spec: review-agents)', () => {
     expect(html).toContain('2 agent files were skipped');
   });
 
-  it('the picker markup writes no inline style attribute — the webview CSP drops them silently', () => {
+  it('writes no inline style attribute anywhere on the screen, pickers or category chips — the webview CSP drops them silently (#45, task 8.5)', () => {
     const html = run({ agentOpen: true, modelOpen: true });
     const pickers = html.slice(html.indexOf('<div class="picker-stack">'), html.indexOf('<div class="crit-grid">'));
     expect(pickers).toContain('agent-select');
-    expect(pickers).not.toMatch(/<[^>]+\sstyle="/);
-    // NOTE: the category buttons further down this screen DO carry inline
-    // `style=` and are therefore uncoloured under the CSP. That predates this
-    // change and is left alone here rather than fixed in passing.
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    // The fixture's one active category ('security') gets a coloured class
+    // in place of the style="…" this used to carry directly.
+    expect(html).toContain('class="cat cat-on-security"');
   });
 });
 
@@ -1489,7 +1514,7 @@ describe('a retained review, and the way back to it', () => {
       runQueued: true,
       retainedAvailable: true,
     });
-    expect(html).not.toMatch(/<[^>]+\sstyle="/);
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 });
 
@@ -1660,5 +1685,216 @@ describe('in-progress text is committed to the host (task 9.3)', () => {
     const script = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html)?.[1];
     expect(script).toBeTruthy();
     expect(() => new Function(script!)).not.toThrow();
+  });
+});
+
+/**
+ * Task 8.5 (issue #45): the page CSP is `style-src 'nonce-…'` — a nonce
+ * authorises the `<style>` element only, so a `style="…"` attribute is
+ * dropped before layout with no error anywhere. One state per `FlowScreen`,
+ * keyed by a `Record<FlowScreen, …>` rather than a hand-picked list: adding a
+ * member to that union without adding a state here fails typecheck, so a new
+ * screen cannot silently skip this check the way the category chips and the
+ * running screen's progress bar did before this task.
+ */
+describe('no screen writes an inline style attribute (issue #45, task 8.5)', () => {
+  const SCREEN_STATES: Record<FlowScreen, FlowViewState> = {
+    agent: { ...state, screen: 'agent' },
+    running: {
+      ...state,
+      screen: 'running',
+      runProjection: {
+        runId: 'run-1',
+        lineageId: 'lineage-1',
+        attempt: 1,
+        lifecycle: 'investigating',
+        completeness: 'none',
+        elapsedMs: 5_000,
+        progressMode: 'determinate',
+        progressUnits: { completed: 1, total: 2 },
+        attention: 'none',
+        limitations: [],
+      },
+    },
+    triage: { ...state, screen: 'triage', mode: 'diff' },
+    clean: { ...state, screen: 'clean', items: [], selectedId: undefined, diffLines: undefined },
+    summary: {
+      ...state,
+      screen: 'summary',
+      items: state.items.map((v) => ({ ...v, verdict: 'accepted' as const })),
+      counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 },
+    },
+    submitting: { ...state, screen: 'submitting', submitProgress: { stage: 'comments', posted: 3, total: 12 } },
+    done: { ...state, screen: 'done' },
+  };
+
+  it('renders none of the seven screens with a style attribute', () => {
+    for (const screen of Object.keys(SCREEN_STATES) as FlowScreen[]) {
+      const html = renderReviewFlowBody(SCREEN_STATES[screen], 'HVE Core / PR Review');
+      expect(html, `screen: ${screen}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    }
+  });
+
+  it('covers the variants FlowScreen alone does not reach: every triage mode, a failed or queued run, and the pre-load pages', () => {
+    for (const mode of ['split', 'queue', 'diff'] as const) {
+      const html = renderReviewFlowBody({ ...state, screen: 'triage', mode }, 'HVE Core / PR Review');
+      expect(html, `triage mode: ${mode}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    }
+    const runError = renderReviewFlowBody(
+      { ...state, screen: 'running', runError: { message: 'boom', requestId: 'r1', partialCount: 2, code: 'E_TIMEOUT' } },
+      'HVE Core / PR Review',
+    );
+    expect(runError).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    const runQueued = renderReviewFlowBody(
+      { ...state, screen: 'running', runQueued: true },
+      'HVE Core / PR Review',
+    );
+    expect(runQueued).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    expect(renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    expect(renderReviewFlowErrorHtml({ refLabel: '!2841', projectPath: 'hve/platform/core' }, 'boom', 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+});
+
+// ---- a patch preserves scroll on the real diff screen (ui-responsiveness:
+// "Scrolled partway through a long diff") -------------------------------------
+//
+// The rejected test (dashboardScript.test.ts) patched a synthetic
+// `statefulRegion()` string the test itself injected — no diff, no review
+// screen. This drives the real `renderReviewFlowHtml`/`renderReviewFlowBody`
+// in `mode: 'diff'`, in jsdom, the same way dashboardScript.test.ts drives the
+// dashboard's page script (that file's own comment explains why: jsdom has no
+// layout, so its `window.scrollTo` is unimplemented, and vitest's jsdom
+// environment never runs page scripts at all — hence a hand-built `JSDOM`
+// under the node environment, and a scroll double duplicated here rather than
+// imported from that file).
+
+interface ScrollDouble { x: number; y: number; max: number }
+
+function loadFlowPage(html: string): { dom: JSDOM; scroll: ScrollDouble } {
+  const scroll: ScrollDouble = { x: 0, y: 0, max: Number.MAX_SAFE_INTEGER };
+  const virtualConsole = new VirtualConsole();
+  const dom = new JSDOM(html, {
+    runScripts: 'dangerously',
+    virtualConsole,
+    beforeParse(window) {
+      (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+        postMessage: (): void => undefined,
+      });
+      window.scrollTo = ((x: number, y: number) => {
+        scroll.x = Math.min(x, scroll.max);
+        scroll.y = Math.min(y, scroll.max);
+      }) as typeof window.scrollTo;
+      Object.defineProperty(window, 'scrollX', { get: () => scroll.x });
+      Object.defineProperty(window, 'scrollY', { get: () => scroll.y });
+    },
+  });
+  return { dom, scroll };
+}
+
+function patchFlow(dom: JSDOM, regions: Record<string, string>): void {
+  dom.window.dispatchEvent(new dom.window.MessageEvent('message', {
+    data: { type: 'verdict:regions', regions },
+  }));
+}
+
+describe('a patch preserves scroll position on the real in-diff triage screen', () => {
+  /** A second, unrelated finding — a real diff screen only ever shows the
+   * SELECTED finding's file, so a second one is what makes the redraw below
+   * genuinely unrelated to the diff on screen rather than a no-op. */
+  const otherFinding = {
+    item: {
+      id: 'finding-2', anchored: true, file: 'src/auth/session.ts', line: 10, severity: 'minor' as const,
+      category: 'style' as const, confidence: 80, title: 'Unrelated finding',
+      body: 'Not the one being read.', code: 'x',
+    },
+    thread: [],
+  };
+  function diffState(overrides: Partial<FlowViewState> = {}): FlowViewState {
+    return {
+      ...state,
+      mode: 'diff',
+      items: [state.items[0]!, otherFinding],
+      counts: { accepted: 0, rejected: 0, skipped: 0, undecided: 2 },
+      ...overrides,
+    };
+  }
+
+  it('the diff stays at the same window scroll position after a patch caused by an unrelated finding', () => {
+    const { dom, scroll } = loadFlowPage(renderReviewFlowHtml(diffState(), 'HVE Core / PR Review', 'testnonce'));
+    const document = dom.window.document;
+    // The real renderer, not injected markup: the diff lines and the flagged
+    // widget this file's own fixture (`state.diffLines`) describes.
+    expect(document.querySelector('.diff-code')).not.toBeNull();
+    expect(document.querySelector('.diff-line')).not.toBeNull();
+
+    dom.window.scrollTo(0, 640);
+
+    // The redraw: the OTHER finding gets decided in the background. The
+    // selected finding, its diff and its body are untouched.
+    patchFlow(dom, {
+      'flow-body': renderReviewFlowBody(
+        diffState({
+          items: [diffState().items[0]!, { ...otherFinding, verdict: 'accepted' }],
+          counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 1 },
+        }),
+        'HVE Core / PR Review',
+      ),
+    });
+
+    expect(scroll.y).toBe(640);
+    // Still the real diff markup after the patch, not a blank or reset region.
+    expect(document.querySelector('.diff-code')).not.toBeNull();
+  });
+});
+
+// ---- an unchanged diff is not re-derived (ui-responsiveness) ---------------
+//
+// `parseHunks` (domain/diffHunks.ts) memoizes on the diff string and — its own
+// doc comment says so — "returns the SAME Hunk[] on a cache hit rather than a
+// copy". `diffHunks.test.ts`'s "memoization (D10)" block already proves that
+// at the pure-function level. What is missing is the render-level half the
+// audit asked for: proof that the exact derivation `reviewFlow.ts` performs
+// for the triage-diff screen (reviewFlowHtml.ts's `diffLines`: `parseHunks(
+// file.diff).flatMap(hunk => hunk.lines)`), called twice the way two renders
+// across an unrelated redraw would call it, yields the identical `HunkLine`
+// objects — not merely equal ones — so nothing downstream re-parsed anything.
+//
+// The finding's body (markdown) is the other half named in the scenario's
+// THEN. `renderMarkdown` (ui/markdown.ts) wraps the same `memoize` and its own
+// `markdown.test.ts` ("memoization (D10)") already covers it — but only via an
+// independently-constructed `memoize(vi.fn(renderMarkdownUncached))`, never
+// the real exported `renderMarkdown`'s own cache: that cache closes over
+// `renderMarkdownUncached` at module load, so a spy placed on the export
+// afterwards cannot observe it, and `renderMarkdown`'s return value is a
+// plain string — two calls with identical input are `===` by value whether or
+// not a re-parse happened, so reference identity proves nothing for it the
+// way it does for `parseHunks`'s array return. No render-level test is added
+// for the body half; this is a limit of what is externally observable, not an
+// uncovered scenario.
+describe('an unchanged diff is not re-derived across an unrelated redraw', () => {
+  it('the diffLines a render actually consumes are the identical HunkLine objects on a second render', () => {
+    const diffText = '@@ -62,3 +62,3 @@\n if (cachedToken) {\n-  return staleToken;\n+  return cachedToken;\n }\n';
+    // Exactly how reviewFlowHtml.ts's `diffLines` is derived — the same
+    // production function, called the same way a real render would.
+    const linesA = parseHunks(diffText).flatMap((hunk) => hunk.lines);
+    // A second render, for a reason unrelated to this diff (another finding
+    // decided, the tallies changed) — the diff text itself is unchanged.
+    const linesB = parseHunks(diffText).flatMap((hunk) => hunk.lines);
+
+    expect(linesA).toHaveLength(4);
+    expect(linesA.map((l) => l.text)).toEqual(['if (cachedToken) {', '  return staleToken;', '  return cachedToken;', '}']);
+    // Reference identity, not deep equality: `parseHunksUncached` builds a
+    // fresh array of fresh objects on every real parse, so the same object at
+    // the same index across two calls is only possible if the second call
+    // served the memoized Hunk rather than re-parsing.
+    for (let i = 0; i < linesA.length; i += 1) expect(linesB[i]).toBe(linesA[i]);
+
+    // What the render actually emits from each is identical too — nothing
+    // about the finding changed between the two.
+    const stateA: FlowViewState = { ...state, mode: 'diff', diffLines: linesA };
+    const stateB: FlowViewState = { ...state, mode: 'diff', diffLines: linesB, counts: { accepted: 1, rejected: 0, skipped: 0, undecided: 0 } };
+    const diffMarkupOf = (html: string): string => html.slice(html.indexOf('<div class="diff-code">'));
+    expect(diffMarkupOf(renderReviewFlowBody(stateB, 'HVE Core / PR Review')))
+      .toBe(diffMarkupOf(renderReviewFlowBody(stateA, 'HVE Core / PR Review')));
   });
 });

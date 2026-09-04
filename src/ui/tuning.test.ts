@@ -6,6 +6,7 @@ import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Pod } from '../domain/types';
 import { deriveTuningState } from './tuningState';
 import { renderTuningHtml } from './tuningHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const handlers = vi.hoisted(() => ({
   message: undefined as ((message: unknown) => void) | undefined,
@@ -205,6 +206,39 @@ describe('agent tuning fidelity (spec §10)', () => {
     expect(html).toContain('class="btn applied" disabled');
     expect(html).not.toContain('data-suggestion="confidence:80"');
     expect(html).toContain('data-suggestion="category:tests"');
+  });
+});
+
+/**
+ * Task 8.5 (issue #45): the page CSP is `style-src 'nonce-…'` — a nonce
+ * authorises the `<style>` element only, so the `style="width:…"` this bar
+ * used to carry was dropped before layout with no error anywhere.
+ */
+describe('no style attribute anywhere on the tuning screen (issue #45, task 8.5)', () => {
+  it('writes no inline style attribute in the empty scorecard', () => {
+    const state = deriveTuningState([], DEFAULT_CRITERIA, 'No review agent selected');
+    expect(renderTuningHtml(state, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+
+  it('writes no inline style attribute with charts and suggestions populated', () => {
+    const state = deriveTuningState(history, DEFAULT_CRITERIA, 'HVE Core · PR Review');
+    expect(renderTuningHtml(state, 'n')).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+
+  it('quantises the accept-rate bar to the nearest 5% class rather than a style="width:…" attribute', () => {
+    // 1 of 3 is 33% exactly (Math.round), which buckets up to the 35% class.
+    const oneOfThree: SubmittedReview[] = [{
+      ...history[0]!,
+      observations: [
+        { category: 'security', confidence: 90, verdict: 'accepted', severity: 'major' },
+        { category: 'security', confidence: 90, verdict: 'rejected', severity: 'major' },
+        { category: 'security', confidence: 90, verdict: 'rejected', severity: 'major' },
+      ],
+    }];
+    const state = deriveTuningState(oneOfThree, DEFAULT_CRITERIA, 'agent');
+    expect(state.categories.find((c) => c.key === 'security')?.rate).toBe(33);
+    const html = renderTuningHtml(state, 'n');
+    expect(html).toContain('class="bar  w-35"');
   });
 });
 

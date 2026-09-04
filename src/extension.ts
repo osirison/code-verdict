@@ -16,6 +16,7 @@ import { ReviewRunStore } from './app/reviewRuns';
 import { ReviewRunManager } from './app/reviewRunManager';
 import { isTerminalLifecycle } from './domain/harnessLifecycle';
 import { pruneClosedRetained } from './app/retainedReview';
+import { RunStatusGate } from './app/runStatusGate';
 import { revalidateAttachments } from './app/attachments';
 import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
 import { createHarnessRunStore } from './app/harnessRunStore';
@@ -111,9 +112,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * (`planning`/`investigating`/`verifying`/`completing` all collapse to
    * one `'running'` status) — the dashboard row's pill now names the live
    * phase, so a phase advance that used to repaint nothing now refreshes
-   * the row that phase actually belongs to.
+   * the row that phase actually belongs to. `RunStatusGate` (task 10.1)
+   * extracted the guard so it is unit-testable on its own; it is generic so
+   * this lifecycle-keyed use and its own `RunStatus`-keyed test share one
+   * implementation.
    */
-  const lastRunStatus = new Map<string, string>();
+  const runStatusGate = new RunStatusGate(isTerminalLifecycle);
 
   /**
    * The harness's own bounded store (task 11.1), built once here over the
@@ -190,10 +194,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // a lifecycle change moves a row's pill, so only a lifecycle change
       // refreshes (task 14.4: the dashboard now names the live phase, not
       // only queued-vs-running, so a phase advance must refresh too).
-      const previous = lastRunStatus.get(record.key);
-      if (previous === record.lifecycle) return;
-      lastRunStatus.set(record.key, record.lifecycle);
-      if (isTerminalLifecycle(record.lifecycle)) lastRunStatus.delete(record.key);
+      if (!runStatusGate.changed(record.key, record.lifecycle)) return;
       void DashboardPanel.refreshIfOpen();
     },
     onRunRecorded: () => repaintReviewSurfaces(),

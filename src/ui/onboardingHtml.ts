@@ -1,6 +1,6 @@
 import type { HostDescriptor } from '../platform/provider';
 import type { Vocabulary } from './vocab';
-import { escapeHtml, renderPage } from './theme';
+import { escapeHtml, renderPage, type RouteAssets } from './theme';
 
 export interface OnboardingSourceView {
   key: string;
@@ -121,8 +121,12 @@ document.addEventListener('click', (ev) => {
   const button = ev.target.closest('[data-remove]');
   if (button) post({ type: 'removeSource', key: button.dataset.remove });
 });
+// Narrowed to this screen's picker-row class (task 8.1): every screen's
+// delegated listeners share one resident shell document, and a bare
+// [data-repo] also matches the dashboard's rows and chips and the changeset
+// screen's member rows.
 document.addEventListener('click', (ev) => {
-  const row = ev.target.closest('[data-repo]');
+  const row = ev.target.closest('.repo[data-repo]');
   if (row) post({ type: 'toggleProject', key: row.dataset.source, repoId: row.dataset.repo });
 });
 document.addEventListener('click', (ev) => {
@@ -168,7 +172,10 @@ export function renderOnboardingBody(state: OnboardingViewState): string {
   return `<div class="steps">${steps}</div>${content}<footer class="footer"><button class="btn" id="back" data-current-step="${state.step}" ${state.step === 1 ? 'disabled' : ''}>Back</button><button class="btn ${state.step === 3 ? 'btn-brand' : 'btn-accent'}" id="next" data-current-step="${state.step}">${state.step === 3 ? `Create pod · ${state.selectedProjects} ${e(v.repoNounPlural)}` : 'Continue'}</button><span class="footer-note">${state.step === 3 ? `${state.selectedProjects} selected across ${state.sources.length} sources` : ''}</span></footer>`;
 }
 
+/** This screen's contribution to the resident shell (design D7, task 8.3). */
+export const ONBOARDING_ROUTE: RouteAssets = { className: 'route-onboarding', css: CSS, script: SCRIPT };
+
 export function renderOnboardingHtml(state: OnboardingViewState, nonce: string): string {
   const body = `<main class="wrap"><div id="onb-body">${renderOnboardingBody(state)}</div></main>`;
-  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: `Connect ${state.vocabulary.platformName}` } });
+  return renderPage({ title: 'Verdict: Setup', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: `Connect ${state.vocabulary.platformName}` }, routeClass: ONBOARDING_ROUTE.className });
 }

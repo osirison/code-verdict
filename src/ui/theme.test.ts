@@ -62,3 +62,25 @@ describe('keyboard overlay (spec §12)', () => {
     expect(html).toContain('<script nonce="nonce123">');
   });
 });
+
+describe('an embedded page that opts into regions can actually arm', () => {
+  it('acquires the vscode API even with no script of its own', () => {
+    // REGIONS_SCRIPT's first statement posts `verdictReady` through
+    // window.verdictVscode. Emitting it without acquiring the API throws on
+    // load, so the page never arms — and because "not ready" falls back to a
+    // full assignment by design, the screen would quietly rebuild itself on
+    // every change with nothing reporting why. The sidebar only escapes this
+    // today because it happens to pass a script too.
+    const html = renderPage({ title: 'T', nonce: 'n', css: '', body: '<p>x</p>', embedded: true, regions: true });
+
+    expect(html).toContain('acquireVsCodeApi()');
+    expect(html.indexOf('acquireVsCodeApi()')).toBeLessThan(html.indexOf('verdictReady'));
+  });
+
+  it('still emits no bootstrap for an embedded page that wants neither', () => {
+    const html = renderPage({ title: 'T', nonce: 'n', css: '', body: '<p>x</p>', embedded: true });
+
+    expect(html).not.toContain('acquireVsCodeApi()');
+    expect(html).not.toContain('verdictReady');
+  });
+});

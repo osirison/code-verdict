@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
-import { renderSidebarHtml, type SidebarViewState } from './sidebarHtml';
+import { renderSidebarHtml, type SidebarScreen, type SidebarViewState } from './sidebarHtml';
+import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: SidebarViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -551,5 +552,123 @@ describe('the active-run list', () => {
       }],
     }, 'nonce123');
     expect(html).not.toContain('style="');
+  });
+});
+
+/**
+ * Task 8.5 (issue #45): this webview's CSP is `style-src 'nonce-…'` — a
+ * nonce authorises the `<style>` element only, so a `style="…"` attribute
+ * is dropped before layout with no error anywhere. One state per
+ * `SidebarScreen`, keyed by a `Record<SidebarScreen, …>` rather than a
+ * hand-picked list: adding a member to that union without adding a state
+ * here fails typecheck, so a new screen cannot silently skip this check.
+ */
+describe('no sidebar screen writes an inline style attribute (issue #45, task 8.5)', () => {
+  const SCREEN_STATES: Record<SidebarScreen, SidebarViewState> = {
+    lists: state,
+    setup: { ...state, setup: { steps: [{ label: 'Connect GitLab', done: false }] } },
+    threads: {
+      ...state,
+      threads: {
+        headline: '!2833 · Session store',
+        context: 'core · HVE Core / PR Review',
+        summary: [{ status: 'awaiting', label: '3 waiting on you' }],
+        threads: [{ id: 't1', title: 'Token cache is unlocked', meta: 'src/auth.ts:63', status: 'awaiting', selected: true }],
+      },
+    },
+    triage: {
+      ...state,
+      activeReview: {
+        headline: '!2841 · Refactor token refresh',
+        context: 'feat/token-refresh',
+        agent: 'Copilot review',
+        added: 42,
+        removed: 9,
+        counts: { accepted: 1, rejected: 1, skipped: 0, undecided: 1 },
+        items: [
+          { id: 'one', title: 'Refresh token can race', file: 'src/auth.ts', severity: 'major', verdict: 'accepted', selected: false },
+          { id: 'two', title: 'Missing expiry guard', file: 'src/session.ts', severity: 'blocker', verdict: 'rejected', selected: true },
+          { id: 'three', title: 'Session never expires', file: 'src/session.ts', severity: 'minor', selected: false },
+        ],
+      },
+    },
+    pending: {
+      ...state,
+      pendingReview: {
+        headline: '!2841 · Refactor token refresh',
+        context: 'feat/token-refresh',
+        agent: 'HVE Core / PR Review',
+        added: 284,
+        removed: 91,
+      },
+    },
+  };
+
+  it('renders none of the five screens with a style attribute', () => {
+    // The regex, not a bare toContain: a fix for this same issue elsewhere in
+    // the page's CSS can legitimately leave a comment quoting the old
+    // style="…" text (as this task's own reviewFlow and tuning fixes do), and
+    // that text is not a style attribute — only a `<tag …style="` match is.
+    for (const screen of Object.keys(SCREEN_STATES) as SidebarScreen[]) {
+      const html = renderSidebarHtml(SCREEN_STATES[screen], 'n');
+      expect(html, `screen: ${screen}`).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    }
+  });
+
+  it('quantises the triage progress bar to width classes rather than a style="width:…" attribute', () => {
+    // 1 accepted, 1 rejected, 0 skipped of 3. Boundaries are rounded, not
+    // widths: 33.3% -> 35, 66.7% -> 65, 66.7% -> 65, so the widths are the
+    // differences 35, 30, 0. Rounding each width on its own would have given
+    // 35, 35, 0 — a bar 3.3 points longer than the work actually decided.
+    const html = renderSidebarHtml(SCREEN_STATES.triage, 'n');
+    expect(html).toContain('class="progress-accepted w-35"');
+    expect(html).toContain('class="progress-rejected w-30"');
+    expect(html).toContain('class="progress-skipped w-0"');
+  });
+
+  const WIDTH_STEP = 5;
+
+  it('never lets the stacked segments add up to more than the work decided', () => {
+    // The failure this guards is visual and silent: three independently
+    // rounded segments can overrun the decided share by up to 7.5 points,
+    // which on a stacked bar reads as progress that is not there.
+    const widthsOf = (html: string): number[] =>
+      [...html.matchAll(/class="progress-(?:accepted|rejected|skipped) w-(\d+)"/g)]
+        .map((match) => Number(match[1]));
+
+    for (const [accepted, rejected, skipped, items] of [
+      [2, 2, 1, 7],
+      [1, 1, 1, 3],
+      [1, 0, 0, 3],
+      [3, 3, 3, 9],
+      [0, 0, 0, 4],
+      [5, 0, 0, 5],
+    ]) {
+      const state = {
+        ...SCREEN_STATES.triage,
+        activeReview: {
+          ...SCREEN_STATES.triage.activeReview!,
+          items: Array.from({ length: items! }, (_, i) => ({
+            ...SCREEN_STATES.triage.activeReview!.items[0]!,
+            id: `i${i}`,
+          })),
+          counts: {
+            accepted: accepted!,
+            rejected: rejected!,
+            skipped: skipped!,
+            undecided: items! - accepted! - rejected! - skipped!,
+          },
+        },
+      };
+      const widths = widthsOf(renderSidebarHtml(state, 'n'));
+      const decided = ((accepted! + rejected! + skipped!) / items!) * 100;
+      const sum = widths.reduce((a, b) => a + b, 0);
+      expect(widths.every((w) => w >= 0)).toBe(true);
+      // Half a step is exactly what rounding the running boundary guarantees:
+      // the total is one rounding of one number. Rounding three widths
+      // separately allows three roundings to stack — 1/1/1 of 3 gives 105
+      // against a true 100 — so this bound is what separates the two.
+      expect(Math.abs(sum - decided)).toBeLessThanOrEqual(WIDTH_STEP / 2);
+    }
   });
 });

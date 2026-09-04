@@ -7,7 +7,7 @@ import { formatAge } from './dashboardState';
 import { replyDraftKey, selectedPostedRow } from './postedReviewsState';
 import type { ThreadStatus } from '../domain/threadStatus';
 
-import { escapeHtml as e, renderPage } from './theme';
+import { escapeHtml as e, renderPage, type RouteAssets } from './theme';
 import { MARKDOWN_CSS, renderMarkdown } from './markdown';
 import { cap, type Vocabulary } from './vocab';
 
@@ -230,7 +230,7 @@ function threadRow(t: PostedThreadView, expanded: boolean, opinion: string | und
  * truncation in `buildPostedRows` survivable.
  */
 function headTools(state: PostedViewState): string {
-  return `<div class="head-right"><button class="tool ${state.showArchived ? 'active' : ''}" data-archived-filter aria-pressed="${state.showArchived}">Archived · ${state.archivedCount}</button> <button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>`;
+  return `<div class="head-right"><button class="tool ${state.showArchived ? 'active' : ''}" data-archived-filter aria-pressed="${state.showArchived}">Archived · ${state.archivedCount}</button> <button class="tool" id="pr-refresh">⟳ Refresh</button> <button class="tool" id="pr-back-dash">Dashboard</button></div>`;
 }
 
 /**
@@ -261,7 +261,7 @@ function postedRowsRegion(state: PostedViewState): string {
     return `<header>
       <h1>Reviews you contributed to · ${e(state.podName)}</h1>
       <span class="on-you skel skel-count"></span>
-      <div class="head-right"><button class="tool" id="refresh">⟳ Refresh</button> <button class="tool" id="back-dash">Dashboard</button></div>
+      <div class="head-right"><button class="tool" id="pr-refresh">⟳ Refresh</button> <button class="tool" id="pr-back-dash">Dashboard</button></div>
     </header>
     <div class="thead"><div>${e(cap(state.vocabulary.changeRequestNoun))}</div><div>Threads</div><div>${e(cap(state.vocabulary.repoNoun))}</div><div>Age</div></div>
     ${rows}`;
@@ -273,7 +273,7 @@ function postedRowsRegion(state: PostedViewState): string {
     // filter is doing and hand back the way to see them.
     const head = state.showArchived || state.archivedCount > 0
       ? headTools(state)
-      : `<div class="head-right"><button class="tool" id="back-dash">Dashboard</button></div>`;
+      : `<div class="head-right"><button class="tool" id="pr-back-dash">Dashboard</button></div>`;
     const body = state.archivedCount > 0
       ? `Every review you submitted here is archived — each ${e(state.vocabulary.changeRequestNoun)} has since been merged or closed.<div><button class="btn" data-archived-filter>Show ${state.archivedCount} archived</button></div>`
       : state.showArchived
@@ -327,7 +327,7 @@ function postedDetailRegion(state: PostedViewState): string {
       <div class="sel-count you"><b>${selected.view.counts.you}</b>waiting on you</div>
       <div class="sel-count author"><b>${selected.view.counts.author}</b>waiting on the author</div>
       <div class="sel-count closed"><b>${selected.view.counts.closed}</b>closed</div>
-      <button class="btn" id="rerun">Re-run agent on the fix</button>
+      <button class="btn" id="pr-rerun">Re-run agent on the fix</button>
     </div>
     <div class="threads">
       ${selected.view.threads
@@ -357,9 +357,14 @@ export function renderPostedReviewsRegions(state: PostedViewState): Record<strin
 const SCRIPT = `
   const vscode = window.verdictVscode;
   const post = (m) => vscode.postMessage(m);
-  document.addEventListener('click', (ev) => { if (ev.target.closest('#refresh')) post({ type: 'refresh' }); });
-  document.addEventListener('click', (ev) => { if (ev.target.closest('#back-dash')) post({ type: 'backToDashboard' }); });
-  document.addEventListener('click', (ev) => { if (ev.target.closest('#rerun')) post({ type: 'rerun' }); });
+  // pr- prefixed ids (task 8.1): this screen and others coexist in one
+  // resident shell document, where a bare #refresh / #back-dash / #rerun
+  // would collide with the dashboard's and the review flow's controls — two
+  // delegated listeners on one id means two messages per click, and both
+  // panels understand 'refresh'/'rerun', so the action would run twice.
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#pr-refresh')) post({ type: 'refresh' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#pr-back-dash')) post({ type: 'backToDashboard' }); });
+  document.addEventListener('click', (ev) => { if (ev.target.closest('#pr-rerun')) post({ type: 'rerun' }); });
   // An attribute, not an id like #refresh: the header tool and the
   // all-archived empty state's button are the same control rendered twice,
   // and two elements sharing one id is invalid. The extension owns the state
@@ -430,8 +435,34 @@ const SCRIPT = `
     const threadId = el.dataset.reply;
     clearTimeout(replyDraftTimers.get(threadId));
     const text = el.value;
-    replyDraftTimers.set(threadId, setTimeout(() => post({ type: 'replyDraft', threadId, text }), 300));
+    replyDraftTimers.set(threadId, setTimeout(() => {
+      replyDraftTimers.delete(threadId);
+      post({ type: 'replyDraft', threadId, text });
+    }, 300));
   });
+  // Land every pending draft before anything that can repaint this region.
+  //
+  // A debounce timer outliving the action that consumes it is how typed text
+  // gets lost, and this screen's own local actions — expanding another
+  // thread, toggling archived, selecting a different review — all patch
+  // #pr-detail from the panel's held drafts without touching the platform.
+  // Inside the 300ms window that patch re-renders the reply field from the
+  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT never
+  // restores the value, so those keystrokes are gone. Capture phase, so this
+  // runs before the delegated handlers below; blur as well, because a
+  // palette command or a click outside the webview never produces one here.
+  const flushReplyDrafts = () => {
+    for (const field of document.querySelectorAll('[data-reply]')) {
+      const threadId = field.dataset.reply;
+      if (!replyDraftTimers.has(threadId)) continue;
+      clearTimeout(replyDraftTimers.get(threadId));
+      replyDraftTimers.delete(threadId);
+      post({ type: 'replyDraft', threadId, text: field.value });
+    }
+  };
+  document.addEventListener('click', flushReplyDrafts, true);
+  document.addEventListener('blur', flushReplyDrafts, true);
+  window.addEventListener('blur', flushReplyDrafts);
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
@@ -450,6 +481,7 @@ const SCRIPT = `
     // already-sent text back in — the next unrelated patch of this region
     // would then replay it as though it were never sent.
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
+    replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
   }
   document.addEventListener('keydown', (ev) => {
@@ -465,7 +497,10 @@ const SCRIPT = `
   });
 `;
 
+/** This screen's contribution to the resident shell (design D7, task 8.3). */
+export const POSTED_REVIEWS_ROUTE: RouteAssets = { className: 'route-posted', css: CSS, script: SCRIPT };
+
 export function renderPostedReviewsHtml(state: PostedViewState, nonce: string): string {
   const body = `<div id="pr-rows">${postedRowsRegion(state)}</div><div id="pr-detail">${postedDetailRegion(state)}</div>`;
-  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Posted reviews' } });
+  return renderPage({ title: 'Verdict: Posted reviews', nonce, css: CSS, body, script: SCRIPT, breadcrumb: { current: 'Posted reviews' }, routeClass: POSTED_REVIEWS_ROUTE.className });
 }

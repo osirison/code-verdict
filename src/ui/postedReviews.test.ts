@@ -19,6 +19,7 @@ import type { KeyValueStore, SecretStore } from '../app/storage';
 import type { SubmittedReview } from '../app/reviewHistory';
 import type { ChangeRequest, ReviewThread } from '../platform/types';
 import type { PostedReviewsDeps } from './postedReviews';
+import { AppSurface } from './appSurface';
 
 const handlers = vi.hoisted(() => ({
   message: undefined as ((message: unknown) => void) | undefined,
@@ -64,9 +65,15 @@ vi.mock('../app/connections', () => ({
         world.calls.listOpenChangeRequests += 1;
         return Promise.resolve(world.crs);
       },
-      listThreads: () => {
+      listThreads: (ref: { repoId: string; number: string }) => {
         world.calls.listThreads += 1;
-        return Promise.resolve(world.threads);
+        // Filtered by ref (as the real platform call is scoped): every
+        // existing test seeds `world.threads` for REF alone, so this is a
+        // no-op there — filtering only matters once a second submitted
+        // review with its own crNumber is in play (the archived-filter
+        // test), where an unfiltered return would show REF's threads under
+        // the wrong review.
+        return Promise.resolve(world.threads.filter((t) => t.crRef.repoId === ref.repoId && t.crRef.number === ref.number));
       },
       resolveThread: () => {
         world.calls.resolveThread += 1;
@@ -287,6 +294,37 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     spy.mockRestore();
   });
 
+  it('a failed reply keeps the held draft — the next repaint still offers the typed text for a retry (task 9.7)', async () => {
+    const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
+    const { PostedReviewsPanel } = await import('./postedReviews.js');
+    const deps = makeDeps(globalState);
+    await PostedReviewsPanel.show(deps);
+    await flush();
+    handlers.message?.({ type: 'verdictReady' });
+
+    const connections = await import('../app/connections.js');
+    const spy = vi.spyOn(connections, 'connectionForPod').mockResolvedValueOnce({
+      listOpenChangeRequests: () => Promise.resolve(world.crs),
+      listThreads: () => Promise.resolve(world.threads),
+      resolveThread: () => Promise.resolve(undefined),
+      replyToThread: () => Promise.reject(new Error('network down')),
+    } as never);
+
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'Still not convinced.' });
+    handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+    await flush();
+
+    // Collapse and re-expand the thread: the re-render reads the held draft,
+    // and the failed send must not have deleted it — only a send that reached
+    // the platform makes the draft stale (task 7.4b).
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+    const posted = lastPosted();
+    expect(posted.regions['pr-detail']).toContain('value="Still not convinced."');
+    spy.mockRestore();
+  });
+
   it('a resolve on one thread does not disturb an unrelated thread\'s in-progress reply draft', async () => {
     world.threads = [
       reviewThread({ id: 'thread-1' }),
@@ -348,5 +386,88 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     await flush();
     const rePosted = lastPosted();
     expect(rePosted.regions['pr-detail']).toContain('id="reply-input" data-reply="thread-1" value=""');
+  });
+});
+
+// ---- filtering updates the list from state already held (ui-responsiveness: "Filtering or changing severity floor") ----
+
+describe('the archived filter reveals its own rows from state already held', () => {
+  it('toggling "Archived" shows the archived review\'s own row, not merely an unchanged fetch count', async () => {
+    // review-7's CR is still open (world.crs, seeded in beforeEach); review-99's
+    // is not — buildPostedRows marks a row archived exactly when its CR is
+    // absent from that same open-CR list, so review-99 is archived with no
+    // separate flag to set.
+    const archived: SubmittedReview = {
+      ...submittedReview(),
+      crNumber: '99',
+      submittedAt: '2026-08-19T10:00:00.000Z',
+      threads: {},
+    };
+    const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview(), archived] });
+    await openPanel(globalState);
+
+    // Hidden by default — the THEN this test exists to strengthen is that the
+    // toggle changes what the list actually shows, not just that no fetch runs.
+    expect(panel.webview.html).not.toContain('#99');
+
+    handlers.message?.({ type: 'toggleArchived' });
+    await flush();
+
+    expect(world.calls.listOpenChangeRequests).toBe(1);
+    expect(world.calls.listThreads).toBe(2);
+    const posted = lastPosted();
+    expect(posted.type).toBe('verdict:regions');
+    // The filtered set itself changed — review-99's row is now in the list,
+    // from the fetch already held, with zero further platform calls.
+    expect(posted.regions['pr-rows']).toContain('#99');
+    expect(world.calls.listOpenChangeRequests).toBe(1);
+    expect(world.calls.listThreads).toBe(2);
+
+    // And toggling back off removes it again — this is a filter, not a permanent reveal.
+    panel.webview.postMessage.mockClear();
+    handlers.message?.({ type: 'toggleArchived' });
+    await flush();
+    expect(lastPosted().regions['pr-rows']).not.toContain('#99');
+  });
+});
+
+// ---- a hidden screen's data changes (ui-responsiveness: "A hidden screen's data changes") ----
+
+describe('posted reviews while the reviewer is looking at another screen', () => {
+  it('data changing while posted reviews is hidden reaches neither the platform nor the webview, and shows on return', async () => {
+    const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
+    const { deps } = await openPanel(globalState);
+    const { PostedReviewsPanel } = await import('./postedReviews.js');
+
+    // The reviewer navigates to another real screen — AppSurface itself, the
+    // shared surface every screen shows through, stands in for it: showing a
+    // different route id disposes the panel's route exactly as a real
+    // navigation to the dashboard, settings, or anywhere else would.
+    AppSurface.show('elsewhere', 'Verdict: Elsewhere');
+
+    // Background activity changes posted reviews' own data while it is not
+    // the visible screen: new commits moved the anchor out from under
+    // thread-1 (the platform's own "line moved" signal), something only this
+    // screen depends on.
+    world.threads = [reviewThread({ anchorPresent: false })];
+    panel.webview.postMessage.mockClear();
+    const callsBefore = { ...world.calls };
+
+    // The panel's own "something changed" path, called the way a background
+    // poll or another screen's fetch would call it.
+    await PostedReviewsPanel.refreshIfOpen();
+
+    // The visible screen (the other route) is unaffected: disposed on
+    // leaving, this panel does not even attempt a refetch or a repaint.
+    expect(world.calls).toEqual(callsBefore);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+
+    // The reviewer returns: a fresh open re-fetches (no mockClear() until the
+    // shared helper's own — read the patch it produces first) and shows the
+    // change that happened while the screen was hidden.
+    await PostedReviewsPanel.show(deps);
+    await flush();
+    expect(world.calls.listThreads).toBe(callsBefore.listThreads + 1);
+    expect(lastPosted().regions['pr-detail']).toContain('thread stale');
   });
 });
