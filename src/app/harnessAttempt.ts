@@ -139,11 +139,13 @@ import {
   type LedgerEvidenceSource,
 } from './harnessEvidenceLedger';
 import {
+  applyCoverageSeed,
   coverageChangedFact,
   createChangedFileInventory,
   type ChangedFileInventory,
   type InventoryFileRecord,
 } from './harnessInventory';
+import { importRetainedEvidence, type EvidenceReuseOutcome, type ResumePayload } from './harnessResume';
 import {
   applyRiskFloor,
   computeRiskFloor,
@@ -389,6 +391,45 @@ export interface HarnessAttemptOptions {
   readonly onCheckpoint?: OnCheckpoint;
   readonly onPersist?: OnPersist;
   readonly retry?: HostToolRetryOptions;
+  /**
+   * Task 14.6: what this attempt carries forward from a compatible prior attempt in the same
+   * lineage (`harnessResume.ts`'s `decideResume`) — the caller's job is only to decide *whether*
+   * to resume and to build this attempt's `snapshot` at the next attempt number; every seed below
+   * is applied here, the one place that owns the collaborators it seeds:
+   *
+   * - `payload.plan`: becomes this attempt's starting plan, exactly as revised so far, AND is
+   *   appended to this fresh attempt's own activity log as its first `planCreated` fact at
+   *   bootstrap — never left as a value only this closure holds. Without that append, this
+   *   attempt's own earliest checkpoints (`buildCheckpoint`'s `plan` derives from the log, by
+   *   scanning it, not from a value passed alongside it) would report no plan at all until the
+   *   model's own first planning turn — losing "preserve the plan" a second time if *this* attempt
+   *   is itself interrupted before planning runs. Design.md's own resume note ("the model starts
+   *   over... resume language says 'new attempt from checkpoint', never 'reconnected'") is why this
+   *   seed is host-state preservation only: the plan is NOT threaded into the bootstrap prompt, so
+   *   the model always plans this attempt fresh, exactly as attempt 1 did.
+   * - `startAction`: the public narrative for the attempt boundary itself
+   *   (`describeResumeStart`'s pinned string), appended as an `actionStarted` fact at bootstrap —
+   *   spec `review-run-activity`'s "activity and evidence identify the attempt boundary".
+   * - `payload.coverage`: replayed onto this attempt's own freshly enumerated inventory
+   *   (`applyCoverageSeed`) as each manifest page arrives — never a persisted enumeration/cursor,
+   *   which this attempt re-derives itself; identical heads (`decideResume` already checked) make
+   *   re-enumeration deterministic.
+   * - `payload.candidates`: loaded into this attempt's `CandidateTracker` verbatim, then revisited
+   *   once evidence re-import (below) is known: an accepted candidate whose cited source could not
+   *   be reused moves to unresolved rather than staying accepted on stale evidence (D8).
+   * - `payload.budget`: carried into this attempt's `BudgetTracker` as already-spent consumption
+   *   (D12/D15 docs on `BudgetTrackerOptions.carryForward` cover exactly what is and is not
+   *   reconstructible).
+   * - `payload.retainedEvidence`: imported into this attempt's own evidence ledger
+   *   (`harnessResume.ts`'s `importRetainedEvidence`) as soon as the ledger exists, before any
+   *   candidate seeding reads it — a source whose exact content and digest still match reuses its
+   *   prior id; one that does not is left for the model, or the caller, to fetch again.
+   *
+   * `payload.priorAttempt`/`.newAttempt`/`.retry` are not read here: attempt numbering lives on
+   * `snapshot` itself, and `RetryState` has no live consumer yet (`harnessCheckpoint.ts`'s own doc
+   * comment — `INITIAL_RETRY_STATE` is a placeholder until a real waiting/backoff loop reads it back).
+   */
+  readonly resumeSeed?: { readonly payload: ResumePayload; readonly startAction: string };
 }
 
 export interface HarnessAttemptResult {
@@ -554,13 +595,17 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return snap;
   }
 
+  /** Task 14.6: what this attempt carries forward from a prior attempt in the same lineage, if any — see `HarnessAttemptOptions.resumeSeed`'s own doc comment. */
+  const resumeSeed = options.resumeSeed;
+
   // ---- Mutable attempt state (everything else is owned by an imported module) ----
 
   let activityLog: ActivityLog = createActivityLog(runId, lineageId, attemptNumber);
   let currentPhase: RunPhase = 'bootstrap';
   /** The fitted bootstrap envelope (`runBootstrap`'s own `fit.envelope`) — set once, after `fitBootstrapToModel` confirms it fits, and handed to `options.modelSeam.askModel` on every `planning`/`investigating`/`verifying` call `runPhaseLoop` makes. See `HarnessModelSeam.envelope`'s own doc comment. */
   let fittedEnvelope: BootstrapEnvelope | undefined;
-  let plan: Plan | undefined;
+  /** Seeded from the prior attempt's checkpoint on a resume — a fresh attempt still creates its own on the first planning turn, same as always. */
+  let plan: Plan | undefined = resumeSeed?.payload.plan;
   let lastTurnResults: readonly HostToolResult[] = [];
   let toolCallsSinceCheckpoint = 0;
   let smallFlag = false;
@@ -595,12 +640,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     activityLog = appendActivityEvent(activityLog, fact, context);
   }
 
-  async function fireCheckpoint(phase: RunPhase, reason: CheckpointReason): Promise<void> {
-    const checkpointId = mintId('ckpt');
-    // The checkpoint's own activity event is appended first (unconditionally — it is public
-    // progress, independent of whether a persistence collaborator is injected), so a collaborator
-    // reading `activityLog` below sees its own checkpoint marker as the log's latest event.
-    appendActivity({ kind: 'checkpoint', checkpointId }, phase);
+  /**
+   * The state-snapshot half of a checkpoint, without appending an activity marker for it. Split out
+   * of `fireCheckpoint` (below) so `runPersisting`/`finalizeBootstrapFailure` can report a checkpoint
+   * for the terminal `activityLog` state — with the `terminalResult` fact already the log's last
+   * event — without appending a trailing `{kind:'checkpoint'}` marker that would displace it.
+   * `deriveLifecycle` (`harnessActivityProjection.ts`) reads only the log's last event, so a
+   * checkpoint marker appended after `terminalResult` would make every terminal checkpoint project
+   * as non-terminal — the bug task 14.6 found and fixed here: no attempt, successful or not, ever
+   * landed in `HarnessRunStore.terminalAttempts` before this change, because `fireCheckpoint`'s own
+   * marker for the 'persisting' phase boundary always fired *before* `runPersisting` appended the
+   * terminal fact.
+   */
+  async function reportCheckpoint(checkpointId: string, phase: RunPhase, reason: CheckpointReason): Promise<void> {
     if (!onCheckpoint) return; // nothing to gather a state snapshot for
     const coverage: MemberCoverage[] = [];
     for (const member of inventory.members()) {
@@ -627,12 +679,28 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     await onCheckpoint(info);
   }
 
+  async function fireCheckpoint(phase: RunPhase, reason: CheckpointReason): Promise<void> {
+    const checkpointId = mintId('ckpt');
+    // The checkpoint's own activity event is appended first (unconditionally — it is public
+    // progress, independent of whether a persistence collaborator is injected), so a collaborator
+    // reading `activityLog` below sees its own checkpoint marker as the log's latest event.
+    appendActivity({ kind: 'checkpoint', checkpointId }, phase);
+    await reportCheckpoint(checkpointId, phase, reason);
+  }
+
   // ---- Collaborators (ledger, budget, inventory, candidates, dispatcher) ----
 
   const ledgerMembers = ledgerMembersFromSnapshot(snapshot).filter((member) => memberIds.includes(member.memberId));
   const ledger = createEvidenceLedger({ runId, lineageId, attempt: attemptNumber }, ledgerMembers, { policy });
 
-  const budget: BudgetTracker = createBudgetTracker(policy, { members: memberIds });
+  // Evidence re-import happens as soon as the ledger exists, and before candidate seeding below
+  // reads its outcome (D8: an accepted candidate citing a source that came back `refetchRequired`
+  // must not stay accepted on stale evidence).
+  const evidenceReuse: readonly EvidenceReuseOutcome[] = resumeSeed
+    ? importRetainedEvidence(ledger, resumeSeed.payload.retainedEvidence, resumeSeed.payload.candidates)
+    : [];
+
+  const budget: BudgetTracker = createBudgetTracker(policy, { members: memberIds, carryForward: resumeSeed?.payload.budget });
 
   const inventory: ChangedFileInventory = createChangedFileInventory(
     options.members.map((member) => {
@@ -641,7 +709,23 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     }),
   );
 
-  const candidateTracker: CandidateTracker = createCandidateTracker({ maxRepairsPerCandidate: policy.protocolRepairsPerPhase });
+  const candidateTracker: CandidateTracker = createCandidateTracker({
+    maxRepairsPerCandidate: policy.protocolRepairsPerPhase,
+    seed: resumeSeed?.payload.candidates,
+  });
+
+  // A seeded accepted candidate whose cited source could not be reused moves to unresolved until
+  // the refetch lands and revalidates it — the same ordering rule `revalidateFindings` enforces
+  // for a live head change, applied here for a resumed evidence source instead.
+  for (const reuse of evidenceReuse) {
+    if (reuse.outcome.kind !== 'refetchRequired' || !reuse.requiredByCitation) continue;
+    for (const tracked of resumeSeed?.payload.candidates ?? []) {
+      if (tracked.state !== 'accepted' || !tracked.finding) continue;
+      const cites = tracked.finding.evidence.primary.sourceId === reuse.priorSourceId
+        || tracked.finding.evidence.supporting.some((source) => source.sourceId === reuse.priorSourceId);
+      if (cites) candidateTracker.invalidate(tracked.candidateId, [reuse.outcome.reason]);
+    }
+  }
 
   const dispatcherMembers: DispatcherMember[] = options.members.map((member) => {
     const snap = snapshotMember(member.memberId);
@@ -717,6 +801,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         const paths = changedPathsByMember.get(memberId);
         for (const entry of result.value) paths?.add(entry.path);
       }
+      // Re-applies whatever classifications this page's newly-known files carried on the prior
+      // attempt's checkpoint; a no-op for any file not yet enumerated, and safely idempotent for
+      // one already re-applied by an earlier page (`applyCoverageSeed`'s own doc comment).
+      if (resumeSeed) applyCoverageSeed(inventory, resumeSeed.payload.coverage);
     },
     policy,
     cancellation,
@@ -1201,6 +1289,15 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   async function runBootstrap(): Promise<{ ok: true } | { ok: false; limitation: Limitation }> {
     currentPhase = 'bootstrap';
+    // Task 14.6: the attempt-boundary narrative and the carried plan land in THIS attempt's own
+    // log before its first checkpoint — `buildCheckpoint`'s `plan` scans the log for the latest
+    // `planCreated`/`planRevised` fact rather than reading a value passed alongside it, so an
+    // attempt interrupted before its own first planning turn would otherwise report no plan at all,
+    // silently losing "preserve the plan" a second time on a resume-of-a-resume.
+    if (resumeSeed) {
+      appendActivity({ kind: 'actionStarted', action: resumeSeed.startAction }, 'bootstrap');
+      if (resumeSeed.payload.plan) appendActivity(planCreatedFact(resumeSeed.payload.plan), 'bootstrap');
+    }
     await fireCheckpoint('bootstrap', 'phaseBoundary');
     appendActivity({ kind: 'actionStarted', action: 'Assembling bootstrap and the changed-file inventory.' }, 'bootstrap');
 
@@ -1335,7 +1432,6 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   async function runPersisting(evaluation: CompletionEvaluation): Promise<HarnessAttemptResult> {
     currentPhase = 'persisting';
-    await fireCheckpoint('persisting', 'phaseBoundary');
     const cancelledNow = isCancelled();
     // D11: cancellation preserves only already-*validated* findings, as partial — never routed
     // through synthesis/dedup, and never eligible to replace a complete retained review.
@@ -1347,6 +1443,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       throw new Error(`HarnessAttempt computed a non-terminal lifecycle at persistence: ${lifecycle}`);
     }
     appendActivity({ kind: 'terminalResult', lifecycle, completeness: outcome.completeness, limitations: outcome.limitations }, 'persisting');
+    // Reported after the terminal fact above, deliberately without `fireCheckpoint`'s own marker
+    // event (see `reportCheckpoint`'s doc comment) — this is the checkpoint that must land in
+    // `HarnessRunStore` as terminal.
+    await reportCheckpoint(mintId('ckpt'), 'persisting', 'phaseBoundary');
     const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, cancelled: cancelledNow, contradicted: latestContradicted };
     await onPersist?.(attemptOutcome, activityLog);
     const consumption = budget.consumption();
@@ -1382,6 +1482,9 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   async function finalizeBootstrapFailure(limitation: Limitation): Promise<HarnessAttemptResult> {
     currentPhase = 'persisting';
     appendActivity({ kind: 'terminalResult', lifecycle: 'failed', completeness: 'none', limitations: [limitation] }, 'bootstrap');
+    // Reported after the terminal fact, same as `runPersisting` — a bootstrap failure must also
+    // land terminal in `HarnessRunStore` rather than leaving the lineage looking merely stalled.
+    await reportCheckpoint(mintId('ckpt'), 'bootstrap', 'phaseBoundary');
     const outcome: CompletionOutcome = {
       kind: 'failed',
       completeness: 'none',

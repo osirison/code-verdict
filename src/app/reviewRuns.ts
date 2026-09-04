@@ -77,6 +77,16 @@ export interface ReviewRun {
    * which have none of their own to report here.
    */
   limitations?: readonly Limitation[];
+  /**
+   * Task 14.6: the harness lineage this entry's checkpoint data (`resumable`/
+   * `resumeReasons` above) came from — the durable target-to-lineage lookup a
+   * resume control needs once `InFlightRunStore`'s own entry is gone (the
+   * activation sweep clears it unconditionally, same call that writes this
+   * record). Present only when the sweep actually had a `lineageId` to
+   * record; absent for every entry from before this field existed and for
+   * outcomes that were never `interrupted`.
+   */
+  lineageId?: string;
 }
 
 const KEY = 'codeVerdict.reviewRuns';

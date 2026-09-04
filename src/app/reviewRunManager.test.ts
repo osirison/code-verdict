@@ -1,25 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from './agents';
-import { ReviewRunStore } from './reviewRuns';
-import { partialDraftKeyFor, readRetained, type SessionDraft } from './retainedReview';
+import { ReviewRunStore, type ReviewRun } from './reviewRuns';
+import { partialDraftKeyFor, readRetained, runKeyForCr, type SessionDraft } from './retainedReview';
 import {
   InFlightRunStore,
   ReviewRunManager,
+  deriveRunControls,
   isLegalRunTransition,
   legacyStatusFor,
   sweepInterruptedRuns,
-  type DemoRunResult,
   type HarnessAttemptRunOptions,
   type ReviewHarnessFactory,
+  type RunControls,
   type RunInput,
   type RunRecord,
-  type RunnerOptions,
   type RunStatus,
 } from './reviewRunManager';
 import type { CheckpointInfo, HarnessAttemptResult } from './harnessAttempt';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
-import { createHarnessRunStore } from './harnessRunStore';
+import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import type { CitedEvidenceRef, TrackedCandidate, ValidatedFinding } from './harnessCandidateValidation';
 import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
 import { sha256Hex } from './contentDigest';
@@ -32,7 +32,6 @@ import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
 import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import type { ChangeRequestDiff } from '../platform/types';
 import type { KeyValueStore } from './storage';
 import { DEFAULT_CONTEXT_BUDGETS } from './reviewContext';
 
@@ -57,13 +56,9 @@ function memoryStore(): KeyValueStore & { snapshot(): Map<string, unknown> } {
  */
 const TIMEOUTS: AgentRunTimeouts = { inactivityMs: 90_000, ceilingMs: 600_000 };
 
-const diff: ChangeRequestDiff = {
-  ref: { repoId: 'repo-1', number: '2841' },
-  baseSha: 'base-1',
-  headSha: 'head-1',
-  files: [{ oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' }],
-  anchorRefs: {},
-};
+/** Task 15.8: `RunInput` carries only the revision identity, never the whole diff. */
+const BASE_SHA = 'base-1';
+const HEAD_SHA = 'head-1';
 
 function response(itemCount: number, headSha = 'head-1'): AgentReviewResponse {
   return {
@@ -89,7 +84,7 @@ function response(itemCount: number, headSha = 'head-1'): AgentReviewResponse {
 
 function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
   return {
-    target: { kind: 'cr', ref: { repoId: 'repo-1', number }, diff },
+    target: { kind: 'cr', ref: { repoId: 'repo-1', number }, baseSha: BASE_SHA, headSha: HEAD_SHA },
     refLabel: `!${number}`,
     podId: 'pod-a',
     criteria: DEFAULT_CRITERIA,
@@ -99,52 +94,8 @@ function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
     effort: 'none',
     timeouts: TIMEOUTS,
     contextBudgets: DEFAULT_CONTEXT_BUDGETS,
-    steps: ['Sending…', 'Indexing…', 'Cross-referencing…', 'Scoring…', 'Items ready'],
     demo: false,
     ...over,
-  };
-}
-
-/**
- * A pre-harness `{lm, demo}` runner whose every call is resolved by the
- * test, one deferred per target — exercised only through
- * `legacyRunnersToHarnessFactory`'s adapter (`reviewRunManager.ts`), which is
- * why `options` here is the narrow `RunnerOptions` shape with no
- * checkpoint/waiting/resuming hooks (`extension.ts` still injects exactly
- * this shape today). Tests that need those hooks use `controllableAttempts`
- * below instead, which drives a real `ReviewHarnessFactory` directly.
- */
-function controllableRunners() {
-  const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
-  const started: string[] = [];
-  const cancelled: string[] = [];
-  const progressOf = new Map<string, RunnerOptions['onProgress']>();
-  const warningsOf = new Map<string, RunnerOptions['onAttachmentWarnings']>();
-  return {
-    started,
-    cancelled,
-    pending,
-    progressOf,
-    warningsOf,
-    runners: {
-      lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse> {
-        const key = input.refLabel;
-        started.push(key);
-        progressOf.set(key, options.onProgress);
-        warningsOf.set(key, options.onAttachmentWarnings);
-        return new Promise<AgentReviewResponse>((resolve, reject) => {
-          pending.set(key, { resolve, reject });
-          options.cancellation.onCancellationRequested(() => {
-            cancelled.push(key);
-            // What a real transport does when its token trips.
-            reject(Object.assign(new Error('run cancelled'), { cancelled: true, requestId: 'abc123' }));
-          });
-        });
-      },
-      demo(): DemoRunResult {
-        return { response: response(1), steps: ['Reading the diff…', 'Items ready'] };
-      },
-    },
   };
 }
 
@@ -269,6 +220,61 @@ function cancelledResult(refLabel = 'run', itemCount = 0): HarnessAttemptResult 
   };
 }
 
+/** Shared by `controllableRunners`/`unresponsiveRunner`: the same items-in, `HarnessAttemptResult`-out conversion the deleted pre-harness `{lm, demo}` adapter (`reviewRunManager.ts`, removed task 15.8) used, kept here purely as a test fixture — never a shipped bypass. */
+function resultFromResponse(refLabel: string, response: AgentReviewResponse): HarnessAttemptResult {
+  return { ...succeededResult(response.items.length, refLabel), findings: response.items.map((item) => ({ item }) as unknown as ValidatedFinding) };
+}
+
+/**
+ * A `ReviewHarnessFactory` whose every attempt is driven entirely by the
+ * test, one deferred `AgentReviewResponse` per target — `pending.get(key)!
+ * .resolve(response)` concludes `.run()` with the equivalent
+ * `HarnessAttemptResult` (`resultFromResponse`), and `.reject(error)`
+ * rejects `.run()` with that error unchanged, for the genuine-crash path
+ * `executeAttempt`'s `catch` still covers. Tests that need the checkpoint/
+ * waiting/resuming hooks use `controllableAttempts` below instead, which
+ * drives a real `ReviewHarnessFactory` directly with a `HarnessAttemptResult`
+ * already in hand.
+ */
+function controllableRunners(): {
+  started: string[];
+  cancelled: string[];
+  pending: Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>;
+  warningsOf: Map<string, HarnessAttemptRunOptions['onAttachmentWarnings']>;
+  runners: ReviewHarnessFactory;
+} {
+  const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
+  const started: string[] = [];
+  const cancelled: string[] = [];
+  const warningsOf = new Map<string, HarnessAttemptRunOptions['onAttachmentWarnings']>();
+  function build(input: RunInput, options: HarnessAttemptRunOptions) {
+    const key = input.refLabel;
+    started.push(key);
+    warningsOf.set(key, options.onAttachmentWarnings);
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(key, { resolve: (r) => resolve(resultFromResponse(key, r)), reject });
+          options.cancellation.onCancellationRequested(() => {
+            cancelled.push(key);
+            // What a real transport does when its token trips.
+            reject(Object.assign(new Error('run cancelled'), { cancelled: true, requestId: 'abc123' }));
+          });
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
+  return { started, cancelled, pending, warningsOf, runners };
+}
+
+/** Drop-in replacement for the old `{lm, demo}` fixture shape at a call site that only ever needed an immediate, uncontrolled resolution — `demoItemCount` for a `RunInput.demo` run, defaulting to the same count as the model-backed path. */
+function instantRunners(itemCount: number, demoItemCount = itemCount): ReviewHarnessFactory {
+  function build(input: RunInput) {
+    return { run: () => Promise.resolve(succeededResult(input.demo ? demoItemCount : itemCount, input.refLabel)) };
+  }
+  return { create: build, createDemo: build, resume: build };
+}
+
 /**
  * A `ReviewHarnessFactory` whose every attempt is driven entirely by the
  * test: `pending.get(key)!.resolve(...)`/`.reject(...)` conclude `.run()`
@@ -276,8 +282,7 @@ function cancelledResult(refLabel = 'run', itemCount = 0): HarnessAttemptResult 
  * genuine-crash path `executeAttempt`'s `catch` still covers), and
  * `optionsOf.get(key)!.onCheckpoint`/`.onEnterWaiting`/`.onResuming` invoke
  * the exact hooks `HarnessAttemptRunOptions` exposes — task 12.1's real
- * integration point, exercised directly rather than through the legacy
- * `{lm, demo}` adapter, which has no such hooks.
+ * integration point.
  */
 function controllableAttempts(): {
   started: string[];
@@ -301,7 +306,7 @@ function controllableAttempts(): {
         }),
     };
   }
-  const runners: ReviewHarnessFactory = { create: build, createDemo: build };
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
   return { started, cancelled, pending, optionsOf, runners };
 }
 
@@ -319,15 +324,12 @@ function manager(
   const runs = new ReviewRunManager({
     workspaceState,
     globalState,
-    runners: { lm: async () => response(1), demo: () => ({ response: response(1), steps: [] }) },
+    runners: instantRunners(1),
     onChange: (record) => changes.push(record),
-    delay: async () => {},
     // Never resolves by default: a test that does not care about the cancel
     // grace timeout must never have it race ahead of a live attempt's own
-    // cancelled result (see `reviewRunManager.ts`'s own doc comment on
-    // `ReviewRunManagerDeps.cancelGrace` for why sharing `delay`'s
-    // resolves-at-once default would do exactly that). Only the dedicated
-    // timeout test below overrides this with something that actually settles.
+    // cancelled result. Only the dedicated timeout test below overrides this
+    // with something that actually settles.
     cancelGrace: () => new Promise<void>(() => {}),
     ...over,
   });
@@ -337,7 +339,7 @@ function manager(
 describe('a run completes with nobody watching', () => {
   it('writes the retained review and records the run for a finish no screen saw', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
     });
 
     runs.trigger(crInput('2841'), 3);
@@ -357,7 +359,7 @@ describe('a run completes with nobody watching', () => {
 
   it('writes a clean run as a record rather than as a deletion', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(0), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(0),
     });
 
     runs.trigger(crInput('2841'), 3);
@@ -375,7 +377,7 @@ describe('a run completes with nobody watching', () => {
   it('announces the finished review with the pod it belonged to', async () => {
     const ready: unknown[] = [];
     const { runs } = manager({
-      runners: { lm: async () => response(3), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(3, 0),
       onReviewReady: (info) => ready.push(info),
     });
 
@@ -403,7 +405,7 @@ describe('a run completes with nobody watching', () => {
     const seenAtNotify: Array<SessionDraft | undefined> = [];
     const { runs } = manager({
       workspaceState,
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
       onChange: (record) => {
         if (record.status === 'succeeded') {
           seenAtNotify.push(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'));
@@ -423,7 +425,7 @@ describe('a run completes with nobody watching', () => {
     const globalState = memoryStore();
     const { runs } = manager({
       globalState,
-      runners: { lm: async () => response(1), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(1, 0),
       onRunRecorded: () => seen.push(new ReviewRunStore(globalState).list().length),
     });
 
@@ -856,53 +858,32 @@ describe('progress and transitions', () => {
     });
   });
 
-  it('emits a finish at once even when it lands inside the progress throttle', async () => {
-    const { pending, progressOf, runners } = controllableRunners();
+  it('emits a finish at once even when it lands inside the checkpoint-repaint throttle', async () => {
+    const { pending, optionsOf, runners } = controllableAttempts();
     let now = 1_000;
     const changes: RunRecord[] = [];
     const { runs } = manager({ runners, now: () => now, onChange: (r) => changes.push(r) });
 
     runs.trigger(crInput('2841'), 3);
-    const onProgress = progressOf.get('!2841')!;
+    // A same-phase checkpoint repaints without forcing a notify (D14) —
+    // resets the throttle window without itself counting as a transition.
     now += 1_000;
-    onProgress({ requestId: 'r', fragmentsReceived: 1, charsReceived: 10, elapsedMs: 10 });
-    const afterProgress = changes.length;
+    optionsOf.get('!2841')!.onCheckpoint(checkpointAt('planning', '!2841'));
+    const afterRepaint = changes.length;
 
     // Well inside the 250ms floor: a throttle applied to transitions would
     // swallow this and leave the screen on a spinner after the run was over.
     now += 10;
-    pending.get('!2841')!.resolve(response(1));
-    await vi.waitFor(() => expect(changes.length).toBeGreaterThan(afterProgress));
+    pending.get('!2841')!.resolve(succeededResult(1, '!2841'));
+    await vi.waitFor(() => expect(changes.length).toBeGreaterThan(afterRepaint));
     expect(changes.at(-1)?.status).toBe('succeeded');
-  });
-
-  it('throttles progress updates without losing the counters they carried', () => {
-    const { progressOf, runners } = controllableRunners();
-    let now = 1_000;
-    const changes: RunRecord[] = [];
-    const { runs } = manager({ runners, now: () => now, onChange: (r) => changes.push(r) });
-
-    const record = runs.trigger(crInput('2841'), 3);
-    const onProgress = progressOf.get('!2841')!;
-    const before = changes.length;
-    // Three fragments inside one window: at most one emission, but the record
-    // holds the latest numbers, so a screen opening mid-run reads them all.
-    for (let n = 1; n <= 3; n += 1) {
-      now += 10;
-      onProgress({ requestId: 'r', fragmentsReceived: n, charsReceived: n * 10, elapsedMs: n });
-    }
-    expect(changes.length).toBe(before);
-    expect(runs.get(record.key)?.progress).toMatchObject({ fragmentsReceived: 3, charsReceived: 30 });
   });
 });
 
 describe('the demo agent runs in the background too', () => {
   it('walks its log and finishes with no screen attached', async () => {
     const { runs, workspaceState } = manager({
-      runners: {
-        lm: async () => response(0),
-        demo: () => ({ response: response(1), steps: ['Reading the diff…', 'Scoring…', 'Items ready'] }),
-      },
+      runners: instantRunners(0, 1),
     });
 
     runs.trigger(crInput('2841', { demo: true, agent: DEMO_AGENT_DESCRIPTOR, modelId: undefined }), 3);
@@ -913,20 +894,16 @@ describe('the demo agent runs in the background too', () => {
     expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(1);
   });
 
-  it('stops the walk when the run is cancelled', async () => {
-    let resolveStep: (() => void) | undefined;
-    const { runs, workspaceState } = manager({
-      runners: {
-        lm: async () => response(0),
-        demo: () => ({ response: response(1), steps: ['One', 'Two', 'Three'] }),
-      },
-      delay: () => new Promise<void>((resolve) => { resolveStep = resolve; }),
-    });
+  it('cancelling before the demo participant answers never writes a retained draft', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
 
     const record = runs.trigger(crInput('2841', { demo: true }), 3);
-    await vi.waitFor(() => expect(resolveStep).toBeDefined());
+    await vi.waitFor(() => expect(pending.get('!2841')).toBeDefined());
     runs.cancel(record.key);
-    resolveStep?.();
+    // The dispatched attempt answers for itself, same as any other run —
+    // the manager's own cancel does not settle the record synchronously.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 0));
 
     await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
@@ -936,7 +913,7 @@ describe('the demo agent runs in the background too', () => {
 describe('changeset runs', () => {
   it('records under the changeset identity, where no change-request row can match it', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
     });
 
     runs.trigger(
@@ -977,7 +954,7 @@ describe('changeset runs', () => {
 describe('stored effort attribution', () => {
   it('records the immutable run effort on the review', async () => {
     const { runs, workspaceState } = manager({
-      runners: { lm: async () => response(1), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(1, 0),
     });
 
     runs.trigger(crInput('2841', { effort: 'xhigh' }), 3);
@@ -1077,21 +1054,21 @@ describe('the in-flight record and the interrupted sweep', () => {
  * exercising the cooperative-cancellation fast path `controllableRunners`
  * already covers above.
  */
-function unresponsiveRunner() {
+function unresponsiveRunner(): {
+  pending: Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>;
+  runners: ReviewHarnessFactory;
+} {
   const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
-  return {
-    pending,
-    runners: {
-      lm(input: RunInput): Promise<AgentReviewResponse> {
-        return new Promise<AgentReviewResponse>((resolve, reject) => {
-          pending.set(input.refLabel, { resolve, reject });
-        });
-      },
-      demo(): DemoRunResult {
-        return { response: response(0), steps: [] };
-      },
-    },
-  };
+  function build(input: RunInput) {
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(input.refLabel, { resolve: (r) => resolve(resultFromResponse(input.refLabel, r)), reject });
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
+  return { pending, runners };
 }
 
 describe('task 12.2: every canonical lifecycle maps to a documented legacy status', () => {
@@ -1868,5 +1845,183 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     const entry = new ReviewRunStore(globalState).list()[0];
     expect(entry).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'interrupted', findingCount: 0 });
     expect(entry?.resumable).toBeUndefined();
+  });
+
+  // ---- Task 14.6: ReviewRunManager.resumeRun's own admission/identity lookup ----------
+
+  /** Tracks which of `create`/`createDemo`/`resume` the manager actually called, resolving instantly either way. */
+  function trackedRunners(): { calls: string[]; runners: ReviewHarnessFactory } {
+    const calls: string[] = [];
+    function build(kind: string) {
+      return (input: RunInput) => {
+        calls.push(kind);
+        return { run: () => Promise.resolve(succeededResult(1, input.refLabel)) };
+      };
+    }
+    return { calls, runners: { create: build('create'), createDemo: build('createDemo'), resume: build('resume') } };
+  }
+
+  async function seedResumableLineage(globalState: KeyValueStore, harnessRunStore: HarnessRunStore): Promise<void> {
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+  }
+
+  it('resumeRun mints attempt N+1 in the stored run and lineage, and routes execution through the factory\'s resume, never create', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.resumeRun(crInput('42'), 1);
+
+    expect(record).toBeDefined();
+    expect(record?.runId).toBe(SWEEP_RUN_ID);
+    expect(record?.lineageId).toBe(SWEEP_LINEAGE_ID);
+    expect(record?.attempt).toBe(2); // one past the stored checkpoint's attempt 1
+    await vi.waitFor(() => expect(calls).toEqual(['resume']));
+  });
+
+  it('resumeRun returns undefined when nothing was ever recorded for this target — no lineage to resume', () => {
+    const globalState = memoryStore();
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    expect(runs.resumeRun(crInput('42'), 1)).toBeUndefined();
+  });
+
+  it('resumeRun refuses — returns the existing record — when a run is already in flight for this target, the same admission rule trigger enforces', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const neverResolves = (): ReviewHarnessFactory => {
+      const build = () => ({ run: () => new Promise<never>(() => {}) });
+      return { create: build, createDemo: build, resume: build };
+    };
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners: neverResolves(), cancelGrace: () => new Promise<void>(() => {}) });
+
+    const first = runs.resumeRun(crInput('42'), 1);
+    const second = runs.resumeRun(crInput('42'), 1);
+
+    expect(second).toBe(first);
+  });
+
+  it('resumeRun refuses a demo target outright — the demo agent has no checkpoint continuity contract, and offering one would write a demo snapshot into a real lineage with no compatibility check at all', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.resumeRun(crInput('42', { demo: true }), 1);
+
+    expect(record).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+
+  // ---- Task 14.6: ReviewRunManager.controlsFor, the manager's own two stores wired through deriveRunControls ----
+
+  it('controlsFor reads the stored ReviewRun for a cr target and offers resume-from-checkpoint once the sweep has recorded a resumable lineage', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+    await seedResumableLineage(globalState, harnessRunStore);
+
+    const controls = runs.controlsFor(runKeyForCr({ repoId: 'repo-1', number: '42' }), { repoId: 'repo-1', number: '42' });
+
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+    expect(controls.canPause).toBe(false);
+  });
+
+  it('controlsFor with no ref (a changeset key) never reaches the stored ReviewRun lookup — no offer, even with a resumable cr lineage stored elsewhere', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+    await seedResumableLineage(globalState, harnessRunStore);
+
+    const controls = runs.controlsFor('changeset:cs-1', undefined);
+
+    expect(controls).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+  });
+});
+
+/**
+ * Task 14.6: `deriveRunControls` is the single derivation every screen reads
+ * (`reviewFlow.ts`'s `controlsFor` call) — tested directly here as a pure
+ * function so the full branch matrix is characterized without standing up a
+ * manager or a store for each case. `isLegalRunTransition` itself (not a
+ * hand-copied boolean) backs every pause/resume/cancel assertion, so this
+ * cannot silently drift from the transition table it is meant to mirror.
+ */
+describe('deriveRunControls (task 14.6): the one derivation every screen reads', () => {
+  function live(lifecycle: RunLifecycle): RunRecord {
+    return { lifecycle } as RunRecord;
+  }
+  function stored(over: Partial<ReviewRun> = {}): ReviewRun {
+    return {
+      repoId: 'repo-1',
+      crNumber: '42',
+      outcome: 'interrupted',
+      findingCount: 0,
+      agentLabel: 'Default review',
+      ranAt: '2026-01-01T00:00:00.000Z',
+      ...over,
+    };
+  }
+
+  it('a live non-terminal record wins outright: pause/resume/cancel from its own transition validity, checkpoint offer always false', () => {
+    const controls = deriveRunControls(live('investigating'), stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls).toEqual({
+      canPause: isLegalRunTransition('investigating', 'paused'),
+      canResume: isLegalRunTransition('investigating', 'resuming'),
+      canCancel: isLegalRunTransition('investigating', 'cancelling'),
+      canResumeFromCheckpoint: false,
+    });
+  });
+
+  it('a live TERMINAL record does not suppress the stored offer — only a non-terminal live record takes the first branch', () => {
+    const controls = deriveRunControls(live('succeeded'), stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+  });
+
+  it('interrupted, resumable, with a recorded lineage: offers resume-from-checkpoint and carries no reasons', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls.canPause).toBe(false);
+    expect(controls.canResume).toBe(false);
+    expect(controls.canCancel).toBe(false);
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+    expect(controls.resumeReasons).toBeUndefined();
+  });
+
+  it('interrupted, resumable true but no lineageId on record: no offer — resumeRun would have nothing to look up', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: true, lineageId: undefined }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+  });
+
+  it('interrupted, stored checkpoint integrity failed: every reason is surfaced, and there is no offer', () => {
+    const reasons: RunControls['resumeReasons'] = [
+      { code: 'snapshotDigest', message: 'The stored snapshot no longer matches its own digest.' },
+    ];
+    const controls = deriveRunControls(undefined, stored({ resumable: false, lineageId: 'lineage-1', resumeReasons: reasons }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+    expect(controls.resumeReasons).toEqual(reasons);
+  });
+
+  it('interrupted, a legacy entry the sweep never checked (resumable absent): neither an offer nor a reason — restart is the only path', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: undefined, resumeReasons: undefined, lineageId: undefined }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+    expect(controls.resumeReasons).toBeUndefined();
+  });
+
+  it('no live record and an outcome that was never interrupted (or nothing stored at all): every control is false', () => {
+    expect(deriveRunControls(undefined, undefined)).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+    expect(deriveRunControls(undefined, stored({ outcome: 'clean', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
+    expect(deriveRunControls(undefined, stored({ outcome: 'partial', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
   });
 });

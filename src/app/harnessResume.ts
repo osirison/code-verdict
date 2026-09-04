@@ -94,7 +94,7 @@ export type ResumeIncompatibilityCode = (typeof RESUME_INCOMPATIBILITY_CODES)[nu
 
 /** Bounds and validates a reason's message the same way `appendActivityEvent` would (`harnessActivityLog.ts`'s own `sanitizeLimitations`) — defense in depth: every message here is already a short, safe, our-own-template string, never raw snapshot content. */
 function reason(code: ResumeIncompatibilityCode, message: string): Limitation {
-  return { code, message: sanitizePublicText(message) ?? 'A resume compatibility check failed.' };
+  return { code, message: sanitizePublicText(message) ?? 'A checkpoint compatibility check failed.' };
 }
 
 // ---- Checkpoint integrity (task 11.5 "versions, digests") ---------------------------
@@ -117,7 +117,7 @@ export function checkCheckpointIntegrity(storedSnapshot: ReviewRunSnapshot, chec
     );
   }
   if (computeSnapshotDigest(storedSnapshot) !== checkpoint.snapshotDigest) {
-    reasons.push(reason('checkpointIntegrity', 'The stored snapshot no longer hashes to the digest its checkpoint recorded; the checkpoint cannot be trusted for resume.'));
+    reasons.push(reason('checkpointIntegrity', 'The stored snapshot no longer hashes to the digest its checkpoint recorded; a new attempt cannot trust this checkpoint.'));
   }
   if (!checkpoint.compatible) {
     for (const retentionReason of checkpoint.incompatibilityReasons) {
@@ -179,7 +179,7 @@ export function checkSnapshotCompatibility(stored: ReviewRunSnapshot, candidate:
   // lineage, never a different run or lineage. Nothing else below can catch a caller that built
   // `candidate` from the wrong run — this is the one structural guard for it.
   if (stored.runId !== candidate.runId || stored.lineageId !== candidate.lineageId) {
-    reasons.push(reason('lineageIdentity', 'A resumed attempt must stay in the same run and lineage as the attempt it resumes.'));
+    reasons.push(reason('lineageIdentity', 'A new attempt from this checkpoint must stay in the same run and lineage the checkpoint belongs to.'));
   }
 
   if (stored.schemaVersion !== candidate.schemaVersion) reasons.push(reason('schemaVersion', `Snapshot schema version changed from ${stored.schemaVersion} to ${candidate.schemaVersion}.`));
@@ -416,4 +416,26 @@ export function decideResume(input: ResumeCompatibilityInput): ResumeDecision {
     payload: buildResumePayload(input.checkpoint),
     startAction: describeResumeStart(input.checkpoint.attempt, newAttempt, input.checkpoint.phase),
   };
+}
+
+/**
+ * Task 14.6: what `harnessRuntime.ts`'s `resume()` throws when `decideResume` returns
+ * `'incompatible'` — thrown before `writeSnapshot`, so an attempt that will not start never
+ * litters the store with a snapshot for it. `ReviewRunManager.executeAttempt`'s catch block
+ * matches this type specifically (rather than the generic `RunFailure` string every other
+ * rejection becomes) so every reason reaches the settled `RunRecord.limitations` — "incompatible
+ * resume reasons visible", not merely a first-reason-wins message. The lineage's own
+ * `ReviewRun.resumable`/`lineageId` are untouched by this rejection: the *offer* those fields make
+ * is the stored checkpoint's own integrity, which a caller-side change (a different model, a moved
+ * head) never invalidates — the reviewer can undo that change and try resuming again.
+ */
+export class ResumeIncompatibleError extends Error {
+  constructor(readonly reasons: readonly Limitation[]) {
+    // D13's no-reconnect wording applies here too, even though every real
+    // throw site passes at least one reason and this fallback is otherwise
+    // unreachable today: it is exactly the string a future caller with zero
+    // reasons would see, and `harnessResume.test.ts`'s wording check scans it.
+    super(reasons.map((reason) => reason.message).join(' ') || 'No new attempt could be started from this checkpoint.');
+    this.name = 'ResumeIncompatibleError';
+  }
 }

@@ -435,6 +435,16 @@ export interface CandidateTracker {
 export interface CandidateTrackerOptions {
   /** Repairs allowed per candidate; defaults to the policy's protocol-repair allowance. */
   maxRepairsPerCandidate?: number;
+  /**
+   * Task 14.6: a resumed attempt's candidates, read straight off the prior attempt's last
+   * checkpoint (`harnessResume.ts`'s `ResumePayload.candidates`) — "validated findings and their
+   * validation state" is explicitly part of what a resume preserves. Loaded verbatim; unlike
+   * `BudgetTracker`'s carry-forward this needs no reconstruction, since `TrackedCandidate` is
+   * exactly this tracker's own state shape. An accepted candidate seeded here may still need
+   * `invalidate()` if evidence re-import (`importRetainedEvidence`) could not reuse a source it
+   * cites — the resume entry point's job, not this constructor's.
+   */
+  seed?: readonly TrackedCandidate[];
 }
 
 export function createCandidateTracker(options: CandidateTrackerOptions = {}): CandidateTracker {
@@ -446,6 +456,8 @@ export function createCandidateTracker(options: CandidateTrackerOptions = {}): C
     tracked.set(candidate.candidateId, frozen);
     return frozen;
   }
+
+  for (const candidate of options.seed ?? []) set(candidate);
 
   return {
     record(outcome) {

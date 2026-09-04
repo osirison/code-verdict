@@ -46,16 +46,12 @@
  * a real attempt's long backoff reports through them
  * (`enterPausedState`/`beginResuming`).
  *
- * `ReviewRunnersLegacy` (the old `lm`/`demo` shape) is accepted only as a
- * `@deprecated` compatibility path — normalized into a real
- * `ReviewHarnessFactory` by `legacyRunnersToHarnessFactory` in the
- * constructor, which is the *one* place this module still knows that shape
- * exists. `extension.ts` (out of scope, task 15.7) still constructs it today;
- * this module's own execution path (`executeAttempt`/`completeAttempt`)
- * never branches on it — it only ever drives an opaque `HarnessAttempt` and
- * reads back an opaque `HarnessAttemptResult`. See
- * `legacyRunnersToHarnessFactory`'s own doc comment for exactly what is and
- * is not preserved through that adapter.
+ * Task 15.8 removed the old `lm`/`demo` (`ReviewRunnersLegacy`) compatibility
+ * path entirely — nothing shipped ever reached it (`extension.ts` has
+ * constructed a real `ReviewHarnessFactory` since task 15.7), so this module
+ * now drives only an opaque `HarnessAttempt` and reads back an opaque
+ * `HarnessAttemptResult`, with no second shape to normalize in the
+ * constructor.
  *
  * **A real attempt cannot actually be paused while `waiting`.**
  * `reviewRunManagerHarnessIntegration.test.ts` drives a genuine
@@ -82,11 +78,9 @@
 import { randomBytes } from 'node:crypto';
 import type { AgentDescriptor } from './agents';
 import type { AttachmentWarning } from './attachments';
-import type { ChangesetAgentMember } from './combinedAgent';
 import type { AgentCancellationToken, AgentRunTimeouts } from './lmAgent';
-import type { AgentRunProgress } from './agentTrace';
 import type { Attachment, ContextBudgets, ReviewContext } from './reviewContext';
-import { ReviewRunStore } from './reviewRuns';
+import { ReviewRunStore, type ReviewRun } from './reviewRuns';
 import {
   changesetDraftKeyFor,
   changesetPartialDraftKeyFor,
@@ -99,10 +93,9 @@ import {
 import type { KeyValueStore } from './storage';
 import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './harnessAttempt';
 import { reduceActivity } from './harnessActivityProjection';
-import type { CompletionOutcome } from './harnessCompletion';
-import type { ValidatedFinding } from './harnessCandidateValidation';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
-import { checkCheckpointIntegrity, closeAttemptAsInterrupted } from './harnessResume';
+import { checkCheckpointIntegrity, closeAttemptAsInterrupted, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
+import { crKey } from './postedReviews';
 import { createReview } from '../domain/reviewState';
 import type { AgentReviewResponse } from '../domain/agentResponse';
 import type { EffortLevel } from '../domain/effort';
@@ -117,8 +110,8 @@ import {
   type RunId,
   type RunLifecycle,
 } from '../domain/harnessLifecycle';
-import type { Criteria, ReviewItem } from '../domain/types';
-import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
+import type { Criteria } from '../domain/types';
+import type { ChangeRequestRef } from '../platform/types';
 
 /**
  * Floor between two progress emissions, moved here from `RunLiveness` — four a
@@ -132,11 +125,24 @@ import type { ChangeRequestDiff, ChangeRequestRef } from '../platform/types';
  */
 export const PROGRESS_EMIT_MS = 250;
 
-/** A single change request, with everything the agent reads about it. */
+/**
+ * A single change request, with everything the agent reads about it.
+ *
+ * Task 15.8: carries only the revision identity (`baseSha`/`headSha`), never
+ * the whole fetched diff. The harness fetches diffs itself, in bounded
+ * pages, once it has a live `Connection` (`harnessRuntime.ts`) — capturing
+ * the entire diff up front, as the pre-harness one-shot runners did, is
+ * exactly the context-limit problem this change exists to fix. A caller that
+ * still needs the full diff for its own purposes (anchoring, submit,
+ * pre-run context-usage estimates) fetches it separately through
+ * `getChangeRequestDiff`; see `platform/provider.ts`'s own doc comment for
+ * who still does.
+ */
 export interface CrRunTarget {
   kind: 'cr';
   ref: ChangeRequestRef;
-  diff: ChangeRequestDiff;
+  baseSha: string;
+  headSha: string;
   reviewContext?: ReviewContext;
   /** Cached evidence selected before the immutable run snapshot is created. */
   attachments?: readonly Attachment[];
@@ -144,11 +150,26 @@ export interface CrRunTarget {
   workspaceRootLabel?: string;
 }
 
+/**
+ * One changeset member's identity for a run — the same `baseSha`/`headSha`-
+ * only shape `CrRunTarget` carries (task 15.8), never the whole diff
+ * `combinedAgent.ts`'s `ChangesetAgentMember` still carries for callers
+ * (`ui/changesetReview.ts`'s own held state) that read file content
+ * directly.
+ */
+export interface ChangesetRunMember {
+  ref: ChangeRequestRef;
+  baseSha: string;
+  headSha: string;
+  context?: ReviewContext;
+  attachments?: readonly Attachment[];
+}
+
 /** A changeset, reviewed as one distributed unit. */
 export interface ChangesetRunTarget {
   kind: 'changeset';
   changesetId: string;
-  members: readonly ChangesetAgentMember[];
+  members: readonly ChangesetRunMember[];
 }
 
 export type RunTarget = CrRunTarget | ChangesetRunTarget;
@@ -179,17 +200,8 @@ export interface RunInput {
   timeouts: AgentRunTimeouts;
   /** Normalized UI settings captured with the rest of the run input. */
   contextBudgets: ContextBudgets;
-  /** The log the running screen walks. The demo runner supplies its own instead. */
-  steps: string[];
   /** The demo agent produces findings from the diff without calling a model. */
   demo: boolean;
-}
-
-/** What the run screen renders under its log while a request is in flight. */
-export interface RunProgress {
-  startedAt: number;
-  fragmentsReceived: number;
-  charsReceived: number;
 }
 
 /** The failure fields the run screen already renders. */
@@ -229,7 +241,7 @@ export interface RunRecord {
   runId: RunId;
   /** Stable across a checkpoint-based resume of this run; a fresh `trigger()` always starts a new lineage. */
   lineageId: LineageId;
-  /** Monotonic within the lineage. Always `1` in this pass — resuming a *lost* attempt across restarts is task 12.7. */
+  /** Monotonic within the lineage. `1` for a fresh `trigger()`; one past the resumed checkpoint's own attempt for `resumeRun` (task 14.6). */
   attempt: AttemptNumber;
   /**
    * What every surface renders from (D14) — `../domain/harnessActivity.ts`'s
@@ -255,86 +267,40 @@ export interface RunRecord {
    * never upgraded into a store-ready `PersistedCheckpoint`: that needs a
    * `snapshotDigest` from a real `ReviewRunSnapshot`, which no code path
    * feeding this manager builds yet — `HarnessRunStore` wiring is task
-   * 12.5+'s job, once one does). Absent for a `ReviewRunnersLegacy`-adapted
-   * run, which reports no checkpoints at all.
+   * 12.5+'s job, once one does).
    */
   checkpoint?: CheckpointInfo;
-  /** From the attempt's own `CompletionOutcome.limitations` (`completeAttempt`); `[]` for a legacy-adapted run, which has none to report. */
+  /** From the attempt's own `CompletionOutcome.limitations` (`completeAttempt`). */
   limitations: readonly Limitation[];
-  /** Findings the attempt validated before ending without reaching `complete` (D11) — from `HarnessAttemptResult.findings` when `outcome.completeness !== 'complete'`. Always absent for a legacy-adapted run (`ReviewRunnersLegacy` has no partial concept). Held only in memory; task 12.5/12.6 make it durably, separately reachable. */
+  /** Findings the attempt validated before ending without reaching `complete` (D11) — from `HarnessAttemptResult.findings` when `outcome.completeness !== 'complete'`. Held only in memory; task 12.5/12.6 make it durably, separately reachable. */
   partialResult?: AgentReviewResponse;
   /** When it was triggered — queue order, and what the sidebar counts elapsed from. */
   queuedAt: number;
   /** When it actually started; absent while queued. */
   startedAt?: number;
   finishedAt?: number;
-  /** The log being walked, and how far. */
-  steps: string[];
-  step: number;
-  progress?: RunProgress;
   response?: AgentReviewResponse;
   failure?: RunFailure;
   /** Filesystem-backed attachments dropped at run start. */
   attachmentWarnings?: readonly AttachmentWarning[];
 }
 
-/** The demo agent's synchronous result, shaped as `demoAgent.ts` returns it. */
-export interface DemoRunResult {
-  response: AgentReviewResponse;
-  steps: string[];
-  attachmentWarnings?: readonly AttachmentWarning[];
-}
-
-/**
- * The pre-harness runner's reporting surface: timeouts, progress, attachment
- * warnings, cancellation. Deliberately narrow and unchanged so
- * `extension.ts` (out of scope, task 15.7) keeps compiling and behaving
- * exactly as it does today against `ReviewRunnersLegacy.lm`.
- *
- * @deprecated Only `ReviewRunnersLegacy` still uses this narrow shape.
- * `HarnessAttemptRunOptions` (below) is what a real `ReviewHarnessFactory`
- * receives.
- */
-export interface RunnerOptions {
-  timeouts: AgentRunTimeouts;
-  onProgress: (progress: AgentRunProgress) => void;
-  onAttachmentWarnings: (warnings: readonly AttachmentWarning[]) => void;
-  cancellation: AgentCancellationToken;
-}
-
-/**
- * The pre-harness runner shape: `lm`/`demo` each hand back an already-finished
- * result directly, rather than a `HarnessAttempt` the manager drives.
- *
- * @deprecated Temporary compatibility only. `extension.ts` still constructs
- * this shape (task 15.7 replaces it with a real `ReviewHarnessFactory`); this
- * module's own tests use it only as the fixture design.md's migration plan
- * sanctions ("tests may inject the old runner only as a fixture; no shipped
- * runtime setting exposes a bypass"). Normalized into a real
- * `ReviewHarnessFactory` by `legacyRunnersToHarnessFactory` in the
- * constructor — `ReviewRunManager`'s execution path never sees this shape
- * itself, only what that adapter produces from it.
- */
-export interface ReviewRunnersLegacy {
-  /** Model-backed. Rejects with `AgentRunError`. */
-  lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse>;
-  /** The demo participant: no model, no network, its own step log. */
-  demo(input: RunInput): DemoRunResult | Promise<DemoRunResult>;
-}
-
 /**
  * What the manager gives a `HarnessAttempt` factory to report back through
- * (task 12.1, design.md D1): the same reporting surface `RunnerOptions`
- * already had, plus the checkpoint/waiting/resuming hooks
+ * (task 12.1, design.md D1): timeouts, attachment-warning reporting, and
+ * cancellation, plus the checkpoint/waiting/resuming hooks
  * `harnessAttempt.ts`'s own `HarnessAttemptOptions.onCheckpoint` /
  * `.retry.onEnterWaiting` / `.retry.onResuming` already know how to call. A
- * real factory implementation (`extension.ts`, task 15.7) wires these
- * straight into `createHarnessAttempt`'s own options when it builds the
- * attempt; `ReviewRunManager` never reaches inside the attempt itself for
- * them — it only ever receives what the attempt chooses to report through
- * here, and through the settled `HarnessAttemptResult`.
+ * real factory implementation (`extension.ts`) wires these straight into
+ * `createHarnessAttempt`'s own options when it builds the attempt;
+ * `ReviewRunManager` never reaches inside the attempt itself for them — it
+ * only ever receives what the attempt chooses to report through here, and
+ * through the settled `HarnessAttemptResult`.
  */
-export interface HarnessAttemptRunOptions extends RunnerOptions {
+export interface HarnessAttemptRunOptions {
+  timeouts: AgentRunTimeouts;
+  onAttachmentWarnings: (warnings: readonly AttachmentWarning[]) => void;
+  cancellation: AgentCancellationToken;
   /**
    * The record's own harness identity (task 15.7 gap closure): `trigger()`
    * mints `runId`/`lineageId` into `RunRecord` before any factory ever runs,
@@ -382,6 +348,14 @@ export interface ReviewHarnessFactory {
   create(input: RunInput, options: HarnessAttemptRunOptions): HarnessAttempt;
   /** Builds the deterministic demo participant's attempt (task 10.7). */
   createDemo(input: RunInput, options: HarnessAttemptRunOptions): HarnessAttempt;
+  /**
+   * Task 14.6: resumes the lineage at `options.identity.lineageId`/`.attempt` — always the next
+   * attempt number in an *existing* lineage, never a fresh one (`resumeRun`'s own doc comment
+   * mints it from the stored checkpoint). `.run()` rejects with `harnessResume.ts`'s
+   * `ResumeIncompatibleError` when the live candidate snapshot disagrees with what is stored; never
+   * called for a demo run.
+   */
+  resume(input: RunInput, options: HarnessAttemptRunOptions): HarnessAttempt;
 }
 
 export interface ReviewReadyInfo {
@@ -432,16 +406,8 @@ export interface ReviewRunManagerDeps {
   workspaceState: KeyValueStore;
   /** `ReviewRunStore` and `InFlightRunStore`. */
   globalState: KeyValueStore;
-  /**
-   * `ReviewHarnessFactory` is the shipped shape (D1). `ReviewRunnersLegacy` is
-   * accepted only as the temporary compatibility path `extension.ts` (out of
-   * scope, task 15.7) and this module's pre-migration test fixtures still
-   * supply — normalized into a real factory by
-   * `legacyRunnersToHarnessFactory` in the constructor. Everything below the
-   * constructor drives a `ReviewHarnessFactory`; nothing branches on which
-   * one was actually injected.
-   */
-  runners: ReviewHarnessFactory | ReviewRunnersLegacy;
+  /** The shipped shape (D1): every admitted run creates a `HarnessAttempt` this factory builds. */
+  runners: ReviewHarnessFactory;
   onChange?: (record: RunRecord) => void;
   onReviewReady?: (info: ReviewReadyInfo) => void;
   /** Task 14.7: the `failed`/`cancelled` counterpart to `onReviewReady` — see `RunOutcomeInfo`'s own doc comment. */
@@ -449,8 +415,6 @@ export interface ReviewRunManagerDeps {
   /** Fired only after the store write resolves — see `completeAttempt` below. */
   onRunRecorded?: () => void;
   now?: () => number;
-  /** Injected so a legacy-adapted demo walk's step pauses do not make a test wait for them. */
-  delay?: (ms: number) => Promise<void>;
   /**
    * How long `cancel()` waits, once cancellation has reached a dispatched
    * attempt, for that attempt's own cancelled result to settle the record
@@ -462,20 +426,14 @@ export interface ReviewRunManagerDeps {
    */
   cancelGraceMs?: number;
   /**
-   * The sleep `armCancelGrace` waits on, deliberately its own injection
-   * point rather than a reuse of `delay` above: `delay` paces the
-   * legacy-adapted demo walk, and every test's default resolves it at once
-   * (so a step-by-step walk does not make a test actually wait) — sharing
-   * that default here would let the grace timer race ahead of, and discard,
-   * the very findings this exists to keep, on every single cancellation in
-   * every test that has no interest in the timeout at all. Defaults to a
-   * real `setTimeout`.
+   * The sleep `armCancelGrace` waits on. Every test's default resolves it at
+   * once — sharing that default would let the grace timer race ahead of, and
+   * discard, the very findings this exists to keep, on every single
+   * cancellation in every test that has no interest in the timeout at all.
+   * Defaults to a real `setTimeout`.
    */
   cancelGrace?: (ms: number) => Promise<void>;
 }
-
-/** How long a legacy-adapted demo walk pauses on each step (see `legacyRunnersToHarnessFactory`). */
-const DEMO_STEP_MS = 320;
 
 /**
  * `cancel()`'s own bounded wait — see `ReviewRunManagerDeps.cancelGraceMs`.
@@ -580,128 +538,8 @@ function reviewIdentityFor(target: RunTarget): { repoId: string; crNumber: strin
  * one line of that same format, not a second implementation of it.
  */
 function headShaFor(target: RunTarget): string {
-  if (target.kind === 'cr') return target.diff.headSha;
-  return target.members.map((member) => `${member.ref.repoId}!${member.ref.number}:${member.diff.headSha}`).join('|');
-}
-
-// ---- 12.1: the pre-harness runner shape, accepted only as a temporary fixture -------
-
-/**
- * Wraps the pre-harness `{lm, demo}` shape as a `ReviewHarnessFactory` (D1) —
- * the one place this module still knows `ReviewRunnersLegacy` exists.
- *
- * **What is preserved exactly.** A legacy `lm` rejection (a network/model
- * error, or the cancellation-token convention `asRunFailure` already
- * classifies) is rethrown as-is, never converted into a resolved
- * `HarnessAttemptResult` — so `executeAttempt`'s existing catch-block
- * failure/cancellation handling, and every characterization test built
- * against it, sees exactly what it did before this pass. A successful `lm`
- * call, and a demo walk that reaches its end uncancelled, become a
- * `HarnessAttemptResult` with `lifecycle: 'succeeded'`,
- * `outcome.completeness: 'complete'`, `outcome.replacesRetainedReview: true`
- * — the same "the whole thing worked" shape the pre-harness manager assumed
- * for any resolved promise.
- *
- * **What is deliberately not preserved.** There is no bridge from a resolved
- * `AgentReviewResponse` to `ValidatedFinding`'s richer provenance/evidence
- * fields — `findingsFrom` below fills only `.item` (the one field
- * `completeAttempt` ever reads) and type-erases the rest, since fabricating
- * plausible-looking evidence citations for findings that were never actually
- * validated against cited sources would be worse than admitting there is
- * none. `response.candidates` (the below-criteria bucket) has no channel
- * through `HarnessAttemptResult` in *either* direction, harness-backed or
- * legacy-adapted; see `completeAttempt`'s own note. A checkpoint is never
- * reported (`onCheckpoint` is simply never called) — `RunRecord.checkpoint`
- * stays absent for a legacy-adapted run, honestly, rather than a synthesized
- * one.
- *
- * **The demo step walk.** `RunRecord.step`/`.steps` used to be updated live,
- * once a step, by the manager's own loop. There is no
- * `HarnessAttemptRunOptions` hook for a bare step index (a checkpoint reports
- * a *phase*, not a step) — moving that loop here, unable to reach the
- * manager's private `patch`, means it can no longer animate `record.step`
- * live. It still exists to preserve the two behaviors that *are*
- * characterized: the walk takes real time (`clocks.delay`, so a screen
- * watching a long review does not see it resolve instantly) and a
- * cancellation mid-walk stops it before the retained review is ever written.
- * `extension.ts`'s own demo agent therefore temporarily loses its live step
- * counter until task 15.7 migrates it to a real harness factory (whose demo
- * participant, task 10.7, reports real checkpoints instead) — a known,
- * documented gap, not a silently absorbed one.
- */
-function legacyRunnersToHarnessFactory(
-  legacy: ReviewRunnersLegacy,
-  clocks: { readonly delay: (ms: number) => Promise<void> },
-): ReviewHarnessFactory {
-  function findingsFrom(items: readonly ReviewItem[]): readonly ValidatedFinding[] {
-    // Only `.item` is ever read back out (`completeAttempt`); every other
-    // `ValidatedFinding` field describes real citation provenance this
-    // adapter has none of. See the file header above.
-    return items.map((item) => ({ item }) as unknown as ValidatedFinding);
-  }
-
-  function outcomeFrom(response: AgentReviewResponse): CompletionOutcome {
-    const count = response.items.length;
-    return {
-      kind: count > 0 ? 'completeFindings' : 'completeClean',
-      completeness: 'complete',
-      findingCount: count,
-      limitations: [],
-      replacesRetainedReview: true,
-      clean: count === 0,
-    };
-  }
-
-  function resultFrom(input: RunInput, response: AgentReviewResponse): HarnessAttemptResult {
-    return {
-      runId: input.refLabel,
-      lineageId: input.refLabel,
-      attempt: 1,
-      lifecycle: 'succeeded',
-      outcome: outcomeFrom(response),
-      findings: findingsFrom(response.items),
-      activityLog: { runId: input.refLabel, lineageId: input.refLabel, attempt: 1, events: [] },
-      cancelled: false,
-      small: true,
-      turnsUsed: 0,
-      toolCallsUsed: 0,
-      contradicted: [],
-    };
-  }
-
-  function cancelledError(): unknown {
-    return Object.assign(new Error('run cancelled'), { cancelled: true, requestId: 'demo' });
-  }
-
-  return {
-    create(input, options) {
-      return {
-        run: () => legacy.lm(input, options).then((response) => resultFrom(input, response)),
-      };
-    },
-    createDemo(input, options) {
-      return {
-        async run(): Promise<HarnessAttemptResult> {
-          const result = await legacy.demo(input);
-          options.onAttachmentWarnings(result.attachmentWarnings ?? []);
-          // The walk is real (the demo agent exists to show what a review
-          // looks like; a result that appears instantly shows nothing) and
-          // stoppable (checked between every step) — it can no longer
-          // animate `record.step` live; see the file header.
-          for (let step = 0; step <= result.steps.length; step += 1) {
-            if (options.cancellation.isCancellationRequested) throw cancelledError();
-            await clocks.delay(DEMO_STEP_MS);
-          }
-          if (options.cancellation.isCancellationRequested) throw cancelledError();
-          return resultFrom(input, result.response);
-        },
-      };
-    },
-  };
-}
-
-function isLegacyRunners(runners: ReviewHarnessFactory | ReviewRunnersLegacy): runners is ReviewRunnersLegacy {
-  return typeof (runners as Partial<ReviewRunnersLegacy>).lm === 'function';
+  if (target.kind === 'cr') return target.headSha;
+  return target.members.map((member) => `${member.ref.repoId}!${member.ref.number}:${member.headSha}`).join('|');
 }
 
 // ---- 12.3: the one validated lifecycle-transition path -----------------------------
@@ -720,9 +558,9 @@ const ACTIVE_PHASE_ORDER: readonly RunLifecycle[] = ['planning', 'investigating'
  *   later phase — the diagram shows exactly one edge out of `queued`).
  * - A forward skip **among active phases** (e.g. `planning -> completing`) is
  *   legal, never a backward one: a real attempt reports whichever phases it
- *   actually visits through `onCheckpoint` (`applyCheckpoint`), and a
- *   legacy-adapted run (file header) reports none until its terminal
- *   settlement crosses straight to `completing`.
+ *   actually visits through `onCheckpoint` (`applyCheckpoint`), and `settle`
+ *   itself jumps straight to `completing` on a terminal result that arrives
+ *   before (or without) a `completing` checkpoint of its own.
  * - `succeeded` is reachable only from `completing` — the diagram funnels
  *   success through the whole active chain, never from an earlier phase.
  * - `waiting`/`paused` are reachable from any active phase (D12's long
@@ -774,6 +612,73 @@ const LEGAL_RUN_TRANSITIONS = buildLegalRunTransitions();
  */
 export function isLegalRunTransition(from: RunLifecycle, to: RunLifecycle): boolean {
   return LEGAL_RUN_TRANSITIONS.get(from)?.has(to) ?? false;
+}
+
+/**
+ * Task 14.6: what any screen may offer for one target right now — pause,
+ * live in-session resume, and cancel for a run in flight; resume-from-
+ * checkpoint (never both at once with the first three, see below) for a
+ * target with none in flight but an `interrupted` stored outcome whose
+ * checkpoint passed the sweep's integrity check. A plain restart (a fresh
+ * `trigger()`) needs no field here at all — it is legal exactly when nothing
+ * is in flight, which every screen already establishes for itself before
+ * offering its ordinary "run" action, and it accepts an `interrupted` prior
+ * outcome the same as any other terminal one.
+ */
+export interface RunControls {
+  readonly canPause: boolean;
+  readonly canResume: boolean;
+  readonly canCancel: boolean;
+  /**
+   * `ReviewRunManager.resumeRun` would attempt an actual resume (not merely
+   * "there is something interrupted to look at") — gated on the exact
+   * conditions it checks itself: a `cr` target, a non-demo prior selection,
+   * a recorded `lineageId`, and the sweep's own `resumable: true`. Never
+   * true while a live run occupies this target, structurally: the two
+   * branches below are mutually exclusive.
+   */
+  readonly canResumeFromCheckpoint: boolean;
+  /**
+   * Why the stored checkpoint itself cannot be trusted
+   * (`ReviewRun.resumeReasons` — `checkCheckpointIntegrity`'s findings),
+   * present only alongside `canResumeFromCheckpoint: false` for a target
+   * whose last outcome actually was `interrupted`. A legacy interrupted
+   * entry the sweep never checked (`resumable` absent) reports neither a
+   * reason nor an offer — restart is its only path, per design.md's own
+   * "legacy interrupted runs offer restart".
+   */
+  readonly resumeReasons?: readonly Limitation[];
+}
+
+/**
+ * The single derivation every screen reads (never a hand-listed set of
+ * lifecycles a later change could drift out of sync with). `live` wins
+ * outright when present and non-terminal — the same record `pause`/
+ * `resume`/`cancel` themselves guard against, via `isLegalRunTransition`.
+ * Otherwise `stored` (the durable `ReviewRun` entry, outliving the
+ * in-memory record across an extension-host restart) decides whether a
+ * resume-from-checkpoint offer exists at all.
+ */
+export function deriveRunControls(live: RunRecord | undefined, stored: ReviewRun | undefined): RunControls {
+  if (live !== undefined && !isTerminalLifecycle(live.lifecycle)) {
+    return {
+      canPause: isLegalRunTransition(live.lifecycle, 'paused'),
+      canResume: isLegalRunTransition(live.lifecycle, 'resuming'),
+      canCancel: isLegalRunTransition(live.lifecycle, 'cancelling'),
+      canResumeFromCheckpoint: false,
+    };
+  }
+  if (stored?.outcome !== 'interrupted') {
+    return { canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false };
+  }
+  const resumable = stored.resumable === true && stored.lineageId !== undefined;
+  return {
+    canPause: false,
+    canResume: false,
+    canCancel: false,
+    canResumeFromCheckpoint: resumable,
+    resumeReasons: resumable ? undefined : stored.resumeReasons,
+  };
 }
 
 /**
@@ -879,18 +784,20 @@ export class ReviewRunManager {
   /**
    * Task 12.7: the same bounded store `HarnessRunStore` (task 11.1) already
    * defines, built here exactly as `ReviewRunStore`/`InFlightRunStore` above
-   * are — self-contained, no `extension.ts` change needed. Nothing on the
-   * live execution path writes to it yet: durable checkpoint persistence
-   * needs a real `ReviewRunSnapshot` per run (`RunRecord.checkpoint`'s own
-   * doc comment — "once one does"), which is the section 15 runtime cutover,
-   * not this pass. It exists here so the activation sweep
-   * (`sweepInterrupted`) can honestly consult whatever a later pass writes,
-   * without a second store construction path to keep in sync — see
-   * `sweepInterruptedRuns`'s own doc comment for exactly what it does with
-   * an empty store today.
+   * are — self-contained, no `extension.ts` change needed. `extension.ts`
+   * builds its own `HarnessRunStore` too (task 15.7), passed into
+   * `deps.runners`'s own factory deps for the actual attempt run — a second
+   * wrapper over the *same* `globalState`, never a second store of record,
+   * so a checkpoint either one writes is what the other reads. This one's
+   * own two readers: `sweepInterrupted` (closing a lost attempt and
+   * checking its stored checkpoint's integrity) and `resumeRun` (task
+   * 14.6 — finding the checkpoint a resume-from-checkpoint admission needs
+   * to exist before the queue will accept it at all; the live compatibility
+   * check against it happens later, in `harnessRuntime.ts`'s own copy, once
+   * the attempt actually starts).
    */
   private readonly harnessRunStore: HarnessRunStore;
-  /** Always a real `ReviewHarnessFactory` by the time the constructor returns — `deps.runners`'s legacy shape, if that is what was injected, is normalized once here (see `legacyRunnersToHarnessFactory`). Nothing past this point branches on which one was supplied. */
+  /** The injected `ReviewHarnessFactory` (D1) — the only shape this module has driven since task 15.8 removed the `{lm, demo}` compatibility path. */
   private readonly harnessFactory: ReviewHarnessFactory;
   /** Resolved once here from `deps.cancelGrace` — see `armCancelGrace`. */
   private readonly cancelGrace: (ms: number) => Promise<void>;
@@ -899,11 +806,7 @@ export class ReviewRunManager {
     this.runs = new ReviewRunStore(deps.globalState);
     this.inFlight = new InFlightRunStore(deps.globalState);
     this.harnessRunStore = createHarnessRunStore(deps.globalState, { now: () => this.now() });
-    this.harnessFactory = isLegacyRunners(deps.runners)
-      ? legacyRunnersToHarnessFactory(deps.runners, {
-          delay: (ms) => this.deps.delay?.(ms) ?? new Promise((resolve) => setTimeout(resolve, ms)),
-        })
-      : deps.runners;
+    this.harnessFactory = deps.runners;
     this.cancelGrace = deps.cancelGrace ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
@@ -959,8 +862,6 @@ export class ReviewRunManager {
       attempt: 1,
       limitations: [],
       queuedAt: this.now(),
-      steps: input.steps,
-      step: 0,
     };
     const record: RunRecord = { ...base, projection: this.buildProjection(base) };
     this.records.set(key, record);
@@ -971,6 +872,89 @@ export class ReviewRunManager {
     // `pump` may have started it synchronously, so return what the map holds
     // rather than the queued literal above.
     return this.records.get(key) ?? record;
+  }
+
+  /**
+   * Task 14.6: start a new attempt in the lineage a prior attempt left `interrupted`, or refuse
+   * because one is already in flight for this target (the same admission rule `trigger` enforces)
+   * or because there is nothing on record to resume — `undefined` in that second case, distinct
+   * from `trigger`'s "return the existing record" refusal, since there is no record to return.
+   *
+   * `input` is the reviewer's CURRENT configuration (pod, agent, model, criteria) — never data
+   * replayed from the interrupted attempt — because the actual compatibility decision
+   * (`harnessResume.ts`'s `decideResume`, run once `ReviewHarnessFactory.resume` is actually
+   * invoked from the queue) compares it against what is stored. A caller that changed nothing gets
+   * a genuine resume; one that changed something incompatible settles `failed` with every reason
+   * as `RunRecord.limitations` (`executeAttempt`'s own `ResumeIncompatibleError` handling below) —
+   * the lineage's own resumable offer is untouched by that failure (`ResumeIncompatibleError`'s own
+   * doc comment), so the reviewer can undo the change and try again, or restart as an ordinary
+   * fresh `trigger()`.
+   *
+   * This method itself is deliberately as cheap as `trigger`: it only reads `this.runs`/
+   * `this.harnessRunStore` synchronously (the lineage id and the last checkpoint's own `runId`/
+   * `attempt`, mirroring the stored identity `checkSnapshotCompatibility`'s "same run and lineage"
+   * guard requires) and mints a `RunRecord` for the queue to pump like any other — the live I/O a
+   * real compatibility decision needs happens only once the queue actually starts it.
+   *
+   * Changeset targets have no lineage lookup yet: `ReviewRunStore`/`InFlightRun` are `repoId`+
+   * `crNumber`-keyed (a pre-existing scope limit, not new here), so a changeset target always
+   * refuses with `undefined` — nothing this method can honestly offer to resume.
+   */
+  resumeRun(input: RunInput, limit: number): RunRecord | undefined {
+    this.limit = limit;
+    const key = runKeyFor(input.target);
+    const existing = this.records.get(key);
+    if (existing && !isTerminalLifecycle(existing.lifecycle)) return existing;
+    // A demo run never carries a lineage worth resuming — the demo agent has
+    // no checkpoint continuity contract and route through `create`/`createDemo`
+    // exclusively (see `executeAttempt`'s `record.input.demo` check, which is
+    // evaluated before the attempt-number routing below and would otherwise
+    // silently drop this attempt's `resumeSeed`, writing a demo snapshot into
+    // a real lineage with no compatibility check at all). Demo lineages offer
+    // restart (a fresh `trigger()`) only, never resume-from-checkpoint.
+    if (input.demo) return undefined;
+    if (input.target.kind !== 'cr') return undefined;
+
+    const stored = this.runs.byRef().get(crKey(input.target.ref.repoId, input.target.ref.number));
+    if (!stored?.lineageId) return undefined;
+    const lineageId = stored.lineageId as LineageId;
+    const checkpoint = this.harnessRunStore.latestCheckpoint(lineageId);
+    if (!checkpoint) return undefined;
+
+    const base: Omit<RunRecord, 'projection'> = {
+      key,
+      input,
+      lifecycle: 'queued',
+      status: 'queued',
+      completeness: 'none',
+      runId: checkpoint.runId,
+      lineageId,
+      attempt: nextAttemptNumber(checkpoint.attempt),
+      limitations: [],
+      queuedAt: this.now(),
+    };
+    const record: RunRecord = { ...base, projection: this.buildProjection(base) };
+    this.records.set(key, record);
+    this.admissionSequence.set(key, this.nextAdmissionSequence++);
+    this.queue.push(key);
+    this.emit(record);
+    this.pump();
+    return this.records.get(key) ?? record;
+  }
+
+  /**
+   * Task 14.6: what a screen may offer for one target right now —
+   * `deriveRunControls` applied to this manager's own two stores, so a
+   * screen never re-derives lifecycle validity or reaches into either store
+   * itself. `ref` is only consulted for a `cr` target's stored `ReviewRun`
+   * (the same restriction `resumeRun` itself applies — a changeset target
+   * has no per-target stored entry to read); pass `undefined` for a
+   * changeset key and only the live branch can ever apply.
+   */
+  controlsFor(key: string, ref: ChangeRequestRef | undefined): RunControls {
+    const live = this.records.get(key);
+    const stored = ref ? this.runs.byRef().get(crKey(ref.repoId, ref.number)) : undefined;
+    return deriveRunControls(live, stored);
   }
 
   /**
@@ -1039,8 +1023,8 @@ export class ReviewRunManager {
 
   /**
    * The bounded wait behind `cancel()`'s `cancelling` state. A cooperative
-   * attempt — harness-backed or legacy-adapted — settles the record itself,
-   * through `executeAttempt`'s ordinary success/catch handling, well before
+   * attempt settles the record itself, through `executeAttempt`'s ordinary
+   * success/catch handling, well before
    * this ever fires; see `cancel`'s own doc comment. This exists for the one
    * risk design.md names directly: a provider or model that never notices
    * the cancellation token at all. When that happens, the record settles as
@@ -1138,7 +1122,7 @@ export class ReviewRunManager {
     // gets a chance to run — the attempt's own first `onCheckpoint` call
     // (`applyCheckpoint`) advances it from there, whenever it actually
     // arrives (which cannot be assumed synchronous — see `executeAttempt`).
-    this.transition(record, 'planning', { startedAt, step: 0 });
+    this.transition(record, 'planning', { startedAt });
     // Written before the request goes out, so a host that stops mid-run leaves
     // the evidence the sweep needs.
     void this.inFlight.add({
@@ -1148,8 +1132,10 @@ export class ReviewRunManager {
       ...reviewIdentityFor(record.input.target),
       startedAt: new Date(startedAt).toISOString(),
       // Task 12.7: lets the activation sweep find this run's lineage in
-      // `harnessRunStore`, once something writes one there (see the store
-      // field's own doc comment) — absent costs the sweep nothing today.
+      // `harnessRunStore` (see the store field's own doc comment) — a real
+      // harness attempt writes one there as it goes. A run persisted before
+      // this field existed has none, and costs the sweep nothing beyond its
+      // own crude fallback.
       runId: record.runId,
       lineageId: record.lineageId,
     });
@@ -1255,34 +1241,32 @@ export class ReviewRunManager {
    * normal failed or cancelled review outcome comes back as a *resolved*
    * result with `lifecycle: 'failed' | 'cancelled'` (`runPersisting`'s own
    * guarantee in `harnessAttempt.ts`; `completeAttempt` branches on it). The
-   * `catch` below therefore preserves exactly the pre-harness
-   * `asRunFailure`/cancellation-token classification, which is also what
-   * `legacyRunnersToHarnessFactory`'s rethrown `lm` rejection still lands on.
+   * `catch` below classifies that crash through `asRunFailure`/the
+   * cancellation-token convention.
    */
   private async executeAttempt(key: string): Promise<void> {
     const record = this.records.get(key);
     if (!record) return;
     const cancellation = runCancellation();
     this.cancellations.set(key, cancellation);
-    // The log parks on the last step before "ready" for the whole request; the
-    // liveness counters under it are what say the run is alive, not hung.
-    this.patch(key, {
-      step: Math.max(0, record.steps.length - 3),
-      progress: { startedAt: this.now(), fragmentsReceived: 0, charsReceived: 0 },
-    });
     const options: HarnessAttemptRunOptions = {
       identity: { runId: record.runId, lineageId: record.lineageId, attempt: record.attempt },
       timeouts: record.input.timeouts,
-      onProgress: (progress) => this.recordProgress(key, progress),
       onAttachmentWarnings: (warnings) => this.patch(key, { attachmentWarnings: warnings }),
       cancellation: cancellation.token,
       onCheckpoint: (info) => this.applyCheckpoint(key, info),
       onEnterWaiting: (info) => this.enterPausedState(key, 'waiting', info?.reason),
       onResuming: () => this.beginResuming(key),
     };
+    // Task 14.6: `attempt > 1` is exclusively `resumeRun`'s own signature — nothing else in this
+    // module ever mints a `RunRecord` at any attempt but `1` (`trigger`'s own literal `attempt: 1`,
+    // never incremented elsewhere) — so this is the single, honest place that distinguishes a fresh
+    // attempt from a resumed one, with no separate flag to keep in sync.
     const attempt = record.input.demo
       ? this.harnessFactory.createDemo(record.input, options)
-      : this.harnessFactory.create(record.input, options);
+      : record.attempt > 1
+        ? this.harnessFactory.resume(record.input, options)
+        : this.harnessFactory.create(record.input, options);
     try {
       const result = await attempt.run();
       if (!this.isSettleable(key)) return;
@@ -1290,6 +1274,19 @@ export class ReviewRunManager {
     } catch (error) {
       if (!this.isSettleable(key)) return;
       const current = this.records.get(key)!;
+      // Task 14.6: every reason `decideResume` refused for, not the single-string `RunFailure`
+      // every other rejection collapses to — "incompatible resume reasons visible". The lineage's
+      // own resumable offer is untouched (`ResumeIncompatibleError`'s own doc comment): this settles
+      // only the new attempt this method itself minted, never the stored checkpoint it read from.
+      if (error instanceof ResumeIncompatibleError) {
+        this.settle(current, {
+          lifecycle: 'failed',
+          failure: { message: error.message, requestId: '------', code: 'harness.resumeIncompatible' },
+          completeness: 'none',
+          limitations: error.reasons,
+        });
+        return;
+      }
       const failure = asRunFailure(error, record.input.timeouts);
       // A genuine crash (not the cancellation-token rejection convention
       // itself) arriving after the reviewer already asked this run to stop:
@@ -1327,26 +1324,6 @@ export class ReviewRunManager {
   private isSettleable(key: string): boolean {
     const record = this.records.get(key);
     return !!record && !isTerminalLifecycle(record.lifecycle);
-  }
-
-  private recordProgress(key: string, progress: AgentRunProgress): void {
-    const record = this.records.get(key);
-    if (!record || record.status !== 'running' || !record.progress) return;
-    // `progress.elapsedMs` is deliberately dropped: it is the trace's clock,
-    // and a reader measures against `startedAt` so one clock answers both.
-    const next: RunRecord = {
-      ...record,
-      progress: {
-        ...record.progress,
-        fragmentsReceived: progress.fragmentsReceived,
-        charsReceived: progress.charsReceived,
-      },
-    };
-    this.records.set(key, next);
-    const now = this.now();
-    if (now - this.lastEmit < PROGRESS_EMIT_MS) return;
-    this.lastEmit = now;
-    this.notify(next);
   }
 
   /**
@@ -1407,9 +1384,8 @@ export class ReviewRunManager {
    * made; it can never turn a genuine success into a reported failure.
    *
    * `response.candidates` (findings the criteria filtered below the bar) has
-   * no channel through `HarnessAttemptResult` in this pass — an honest `[]`,
-   * matching what `legacyRunnersToHarnessFactory` also reports, rather than
-   * a fabricated bucket.
+   * no channel through `HarnessAttemptResult` — an honest `[]`, never a
+   * fabricated bucket.
    */
   private async completeAttempt(key: string, rawResult: HarnessAttemptResult): Promise<void> {
     // An entry guard of its own, not only reliance on `executeAttempt`'s own
@@ -1480,10 +1456,8 @@ export class ReviewRunManager {
           filesRead: undefined,
           attachmentWarnings: record.attachmentWarnings,
           // Task 14.2 (design.md D16): `result.plan` is set only by a real
-          // harness attempt (D5: planning always produces one) — never set
-          // by the temporary `legacyRunnersToHarnessFactory` adapter, which
-          // fabricates no plan for the shape it wraps. Absent here, never
-          // guessed as `'legacy-one-shot'`: that inference belongs to
+          // harness attempt (D5: planning always produces one). Absent here,
+          // never guessed as `'legacy-one-shot'`: that inference belongs to
           // `readRetained` alone, over an absent stored value.
           protocolProvenance: result.plan ? 'harness' : undefined,
           lineageId: result.lineageId,
@@ -1726,7 +1700,6 @@ export class ReviewRunManager {
 
     const patch: Partial<RunRecord> = {
       finishedAt: this.now(),
-      progress: undefined,
       response: outcome.lifecycle === 'succeeded' ? outcome.response : undefined,
       failure: outcome.lifecycle === 'failed' ? outcome.failure : undefined,
       completeness: outcome.completeness ?? (outcome.lifecycle === 'succeeded' ? 'complete' : 'none'),
@@ -1894,10 +1867,10 @@ export interface InFlightRun {
   /**
    * Task 12.7: this run's harness identity, so the activation sweep can look
    * up its lineage in `HarnessRunStore` (`sweepInterruptedRuns`). Optional so
-   * every pre-this-change persisted entry (`migrationFixtures.ts`'s
-   * `LEGACY_IN_FLIGHT_RUN`) still parses unchanged, and so a legacy-adapted
-   * run (which reports no checkpoints at all) can still be swept the way it
-   * always was.
+   * every pre-harness persisted entry (`migrationFixtures.ts`'s
+   * `LEGACY_IN_FLIGHT_RUN`) still parses unchanged, and so a run persisted
+   * before this store existed (which reports no checkpoints at all) can
+   * still be swept the way it always was.
    */
   runId?: string;
   lineageId?: string;
@@ -1956,16 +1929,21 @@ function acceptedFindingCount(candidates: readonly { readonly state: string; rea
  * `closeAttemptAsInterrupted`, the same function task 11.6's own tests
  * already exercise, never a second close path. The recorded finding count
  * then reflects whatever validated findings the last checkpoint actually
- * held, and `ReviewRun.resumable` reports whether the *stored* checkpoint
- * alone is sound (`harnessResume.ts`'s `checkCheckpointIntegrity` — never
- * the live head/model/policy comparison `decideResume`'s remaining
- * dimensions need, which this sweep has no live snapshot to build; offering
- * an *actual* resume — starting a new attempt — needs that live snapshot too
- * and stays out of this pass, see `ReviewRunManager`'s own `harnessRunStore`
- * field doc comment). Every leftover entry with nothing to consult — every
- * entry today, since nothing on the live execution path writes checkpoints
- * yet, and every legacy-adapted run always — falls back to exactly the
- * crude behavior this function always had.
+ * held, `ReviewRun.lineageId` records where that checkpoint lives, and
+ * `ReviewRun.resumable` reports whether the *stored* checkpoint alone is
+ * sound (`harnessResume.ts`'s `checkCheckpointIntegrity` — never the live
+ * head/model/policy comparison `decideResume`'s remaining dimensions need,
+ * which this sweep still has no live snapshot to build at activation time).
+ * That live comparison, and starting the actual new attempt, happens later
+ * and lazily — only when a reviewer clicks the resume-from-checkpoint
+ * control this `resumable`/`lineageId` pair backs (task 14.6:
+ * `ReviewRunManager.resumeRun` → `harnessRuntime.ts`'s
+ * `assembleResumeAttempt`, which builds the live candidate snapshot right
+ * then and calls `decideResume` against it). Every leftover entry with
+ * nothing to consult — every run persisted before this store existed, and
+ * any legacy one-shot record with no `lineageId` at all — falls back to
+ * exactly the crude behavior this function always had: reported as
+ * `interrupted` with no resume offer, restart its only path forward.
  */
 export async function sweepInterruptedRuns(globalState: KeyValueStore, options: SweepInterruptedOptions = {}): Promise<number> {
   const inFlight = new InFlightRunStore(globalState);
@@ -2007,6 +1985,7 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
       ranAt: entry.startedAt,
       ...(resumable !== undefined ? { resumable } : {}),
       ...(resumeReasons !== undefined ? { resumeReasons } : {}),
+      ...(entry.lineageId !== undefined ? { lineageId: entry.lineageId } : {}),
     });
   }
   await inFlight.clear();

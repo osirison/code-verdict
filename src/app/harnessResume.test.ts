@@ -17,6 +17,7 @@ import {
   importRetainedEvidence,
   interruptedLimitation,
   nextAttemptNumber,
+  ResumeIncompatibleError,
   type ResumeIncompatibilityCode,
 } from './harnessResume';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
@@ -494,6 +495,68 @@ describe('no-reconnect wording (11.8, D13 "the rule that matters most")', () => 
     if (terminal.kind === 'terminalResult') {
       for (const limitation of terminal.limitations) assertClean(limitation.message);
     }
+  });
+
+  // Task 14.6: `ReviewRunManager.executeAttempt` surfaces every one of
+  // `checkSnapshotCompatibility`'s reason messages verbatim as
+  // `RunRecord.limitations` and as `RunFailure.message` (via
+  // `ResumeIncompatibleError`) — the first time these strings are shown to a
+  // reviewer rather than only compared by code. Every dimension's message
+  // must stay clean, not just the ones the tests above already happen to
+  // cover.
+  it('every checkSnapshotCompatibility reason, across every incompatibility dimension at once, stays clean — these are now shown to the reviewer verbatim (task 14.6)', () => {
+    const stored = testSnapshot();
+    const candidate = testSnapshot({
+      schemaVersion: '2',
+      toolContractVersion: 'v2',
+      harnessPolicyVersion: '2',
+      agentId: 'other-agent',
+      personaLabel: 'Other persona',
+      modelId: 'other-model',
+      effort: 'low',
+      criteria: { ...stored.criteria, severityFloor: 'blocker' },
+      members: [{ ...stored.members[0]!, headSha: 'head-changed', providerCapabilitySignature: 'sig-2' }],
+    });
+    const reasons = checkSnapshotCompatibility(stored, candidate);
+    expect(reasons.length).toBeGreaterThan(5); // sanity: this candidate really did trip many dimensions
+    for (const reason of reasons) assertClean(reason.message);
+  });
+
+  it('the lineageIdentity reason (D2\'s "the rule that matters most") stays clean too — a wrong-lineage candidate is exactly the case this dimension exists to catch', () => {
+    const stored = testSnapshot();
+    const reasons = checkSnapshotCompatibility(stored, testSnapshot({ lineageId: 'lineage-other' }));
+    expect(reasons.some((r) => r.code === 'lineageIdentity')).toBe(true);
+    for (const r of reasons) assertClean(r.message);
+  });
+
+  it('every checkCheckpointIntegrity reason stays clean too — task 14.6 renders these verbatim in the picker screen\'s banner (ReviewRun.resumeReasons -> limitationsList), the first time they are shown to a reviewer rather than only compared by code', () => {
+    const snapshot = testSnapshot();
+    const corrupted = testCheckpoint(snapshot, {
+      lineageId: 'lineage-other',
+      attempt: 99,
+      snapshotDigest: 'not-the-real-digest',
+      compatible: false,
+      incompatibilityReasons: [],
+    });
+    const reasons = checkCheckpointIntegrity(snapshot, corrupted);
+    // Sanity: this really did trip the lineage/attempt mismatch, the digest
+    // mismatch, and the empty-incompatibilityReasons fallback all at once.
+    expect(reasons.length).toBeGreaterThanOrEqual(3);
+    for (const r of reasons) assertClean(r.message);
+  });
+
+  it('ResumeIncompatibleError joins those reasons into its own message without introducing forbidden wording', () => {
+    const reasons = checkSnapshotCompatibility(testSnapshot(), testSnapshot({ modelId: 'other-model' }));
+    expect(reasons.length).toBeGreaterThan(0);
+    const error = new ResumeIncompatibleError(reasons);
+    assertClean(error.message);
+    expect(error.name).toBe('ResumeIncompatibleError');
+  });
+
+  it('ResumeIncompatibleError\'s own fallback message (no reasons at all) is clean too — unreachable from any real throw site today, but it is exactly the string a future zero-reason caller would see', () => {
+    const error = new ResumeIncompatibleError([]);
+    assertClean(error.message);
+    expect(error.message.length).toBeGreaterThan(0);
   });
 });
 

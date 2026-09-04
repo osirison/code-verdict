@@ -92,12 +92,14 @@ function aiPill(
   // Neither reviewed nor unreviewed: something ran and was lost with the
   // window. Said plainly, because the alternative — falling through to the
   // finding count — reports a confident "0 findings" about a run that never
-  // produced one. A resume-incompatible checkpoint's reasons (task 14.6,
-  // section 11's own collection) ride the same tooltip a partial result's
-  // limitations use below — visible on hover, never invented as a button
-  // this pass has no live "start a resumed attempt" path to back (see
-  // `harnessResume.ts`'s own header: a resume is a brand new attempt, never
-  // a claim of reconnecting).
+  // produced one. A stored checkpoint's own integrity reasons (task 12.7)
+  // ride the same tooltip a partial result's limitations use below — visible
+  // on hover, but this pill stays a passive status indicator, never a
+  // button: task 14.6's actual resume-from-checkpoint control (as well as
+  // restart) lives on the review flow panel this row already opens
+  // (`runControlsRow`/`interruptedPriorNotice` in `reviewFlowHtml.ts`),
+  // where the manager's current transition validity — not a snapshot taken
+  // here at dashboard-render time — decides what is legal to offer.
   if (run?.outcome === 'interrupted') {
     return { label: 'interrupted', cls: 'pill', title: limitationsTitle(run.resumeReasons) };
   }

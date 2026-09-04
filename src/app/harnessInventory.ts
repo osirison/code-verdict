@@ -404,3 +404,42 @@ export function coverageChangedFact(
 ): Extract<ActivityFact, { kind: 'coverageChanged' }> {
   return { kind: 'coverageChanged', coverage: inventory.coverageProgress(requiredRisks) };
 }
+
+/**
+ * Task 14.6: re-apply a resumed attempt's prior classification decisions onto a *freshly
+ * enumerated* inventory — never a persisted `enumeration`/`pendingCursor`/`knownRemainingUnits`,
+ * which this function deliberately does not accept. `decideResume`'s compatibility check already
+ * guarantees identical member heads between the checkpoint and the new attempt, and identical
+ * heads mean the provider's changed-file manifest is deterministic: the same files, in the same
+ * order. Re-enumerating instead of persisting pagination state is simpler, cannot drift from
+ * whatever the provider actually reports today, and needs no new persisted shape — the new
+ * attempt just runs its own manifest turn first, exactly as attempt 1 did, and this function
+ * replays classification decisions on top of what came back.
+ *
+ * `coverage` is `ResumePayload.coverage`, straight off the checkpoint. For each file whose
+ * checkpoint state moved past `unvisited`, `classify()` is called first (every terminal or
+ * inspected state requires it, per this module's own state machine) and then `markInspected`/
+ * `markTerminal` as the checkpoint state calls for. `policyId` is not carried — `MemberCoverage`'s
+ * own `ChangedFileRecord` never carried it (only the richer in-memory `InventoryFileRecord` does),
+ * so a re-applied classification omits it; this is a documented, deliberate precision loss, not an
+ * oversight. A checkpoint record for a path the fresh enumeration does not know (a stale record,
+ * or — impossible given identical heads, but handled defensively — a provider inconsistency) is
+ * skipped rather than thrown: the file simply starts `unvisited`, and the attempt re-investigates
+ * it rather than silently losing ground.
+ */
+export function applyCoverageSeed(inventory: ChangedFileInventory, coverage: readonly MemberCoverage[]): void {
+  for (const memberCoverage of coverage) {
+    for (const record of memberCoverage.files) {
+      if (record.state === 'unvisited') continue;
+      if (!inventory.file(record.memberId, record.path)) continue; // not (yet) known to the fresh enumeration
+      if (record.risk === undefined) continue; // defensive: production always classifies before any further transition
+      const classified = inventory.classify(record.memberId, record.path, { risk: record.risk, logicalUnit: record.logicalUnit });
+      if (!classified.ok) continue;
+      if (record.state === 'inspected') {
+        inventory.markInspected(record.memberId, record.path);
+      } else if (record.state !== 'classified') {
+        inventory.markTerminal(record.memberId, record.path, record.state, record.reason ?? 'Carried forward from the interrupted attempt.');
+      }
+    }
+  }
+}

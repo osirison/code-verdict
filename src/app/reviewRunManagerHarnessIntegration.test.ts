@@ -259,7 +259,7 @@ function realHarnessFactory(connection: Connection): ReviewHarnessFactory {
         longDelayThresholdMs: 0,
       },
     });
-  return { create: build, createDemo: build };
+  return { create: build, createDemo: build, resume: build };
 }
 
 function memoryStore(): KeyValueStore {
@@ -272,7 +272,8 @@ function crInput(refLabel: string): RunInput {
     target: {
       kind: 'cr',
       ref: { repoId: 'repo-1', number: '42' },
-      diff: { ref: { repoId: 'repo-1', number: '42' }, baseSha: 'base1', headSha: 'head1', files: [], anchorRefs: {} },
+      baseSha: 'base1',
+      headSha: 'head1',
     },
     refLabel,
     podId: 'pod-a',
@@ -283,7 +284,6 @@ function crInput(refLabel: string): RunInput {
     effort: 'none',
     timeouts: { inactivityMs: 90_000, ceilingMs: 600_000 },
     contextBudgets: DEFAULT_CONTEXT_BUDGETS,
-    steps: [],
     demo: false,
   };
 }

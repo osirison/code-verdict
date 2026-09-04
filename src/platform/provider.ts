@@ -271,6 +271,20 @@ export interface Connection {
   listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]>;
   listCiRuns(repoIds: readonly string[], limitPerRepo?: number): Promise<CiRun[]>;
 
+  /**
+   * The full diff, fetched in one call. Task 15.8 removed this from the
+   * harness's own review path — it fetches diffs itself, in bounded pages,
+   * once it has a live `Connection` (`harnessRuntime.ts`), rather than
+   * capturing one whole diff up front the way the pre-harness one-shot
+   * runners did. Non-harness callers still fetch the whole diff through this
+   * method directly: `ui/reviewFlow.ts` (loading the diff for display,
+   * checking staleness before a rerun, and re-fetching once more at submit
+   * time to anchor against the true current head), `ui/changesetReview.ts`
+   * (per-member diff for the changeset triage screen) and `ui/changeset.ts`
+   * (assembling every member's diff for the changeset submit/context-usage
+   * path). Each provider (`gitlabProvider.ts`, `githubProvider.ts`,
+   * `fixtureProvider.ts`) implements it once, unchanged by task 15.8.
+   */
   getChangeRequestDiff(ref: ChangeRequestRef): Promise<ChangeRequestDiff>;
 
   submitReview(

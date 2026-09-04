@@ -144,7 +144,7 @@ export type ReservationRefusal =
   | 'exhausted';
 
 export interface BudgetWarning {
-  readonly code: 'budgetNearLimit' | 'ordinaryBudgetExhausted' | 'reserveFallback' | 'insufficientMemberMinimum';
+  readonly code: 'budgetNearLimit' | 'ordinaryBudgetExhausted' | 'reserveFallback' | 'insufficientMemberMinimum' | 'carryForwardClamped';
   readonly pool?: BudgetPool;
   readonly memberId?: string;
   readonly usedPercent?: number;
@@ -167,7 +167,7 @@ type ReconcileSuccess = Extract<ReconcileOutcome, { ok: true }>;
 export interface BudgetLedgerEntry {
   readonly sequence: number;
   readonly elapsedMs: number;
-  readonly kind: 'reserved' | 'refused' | 'reconciled' | 'reconcileRefused' | 'cancelled';
+  readonly kind: 'reserved' | 'refused' | 'reconciled' | 'reconcileRefused' | 'cancelled' | 'seeded';
   readonly requestId?: string;
   readonly purpose?: ReservationPurpose;
   readonly memberId?: string;
@@ -210,6 +210,27 @@ export interface BudgetTrackerOptions {
   readonly members?: readonly string[];
   /** Percent of a pool's total capacity at which `budgetNearLimit` warnings begin. Default 80. */
   readonly nearLimitPercent?: number;
+  /**
+   * Task 14.6: a resumed attempt's carried-forward consumption, read straight off the prior
+   * attempt's last checkpoint (`harnessResume.ts`'s `ResumePayload.budget`) — "budget consumed so
+   * far" is explicitly part of what a resume preserves. This is a coarse aggregate, not a
+   * bucket-level ledger: `evidenceBytesUsed`/`modelTurnsUsed`/`toolCallsUsed` are each a pool's
+   * *total* across every lane and owner, and `highRiskReserveUsed`/`verificationReserveUsed` are
+   * reservation *counts*, not byte/turn amounts — a checkpoint cannot say which lane or which
+   * member's private slice a prior charge drew from. Seeding therefore charges only the
+   * `SHARED_OWNER` buckets (never a per-member private slice — attribution there is
+   * unrecoverable, and leaving per-member minimums fresh errs toward protecting members), in lane
+   * order (ordinary, then highRiskReserve, then verificationReserve) so a total that exceeds the
+   * ordinary lane alone still lands somewhere capacity allows; `decideResume`'s compatibility
+   * check guarantees the same policy, so the total is expected to always fit, but a seed that
+   * still doesn't is clamped with a `carryForwardClamped` warning rather than thrown.
+   * `highRiskReserveUsed`/`verificationReserveUsed` themselves are copied verbatim, since they are
+   * already lineage-cumulative counters, not something to re-derive from the seeded charges.
+   * `elapsedMs` is deliberately NOT carried forward: a checkpoint's elapsed time is attempt-scoped
+   * (the time gate bounds one model session's wall time), and the new attempt gets its own model
+   * and tool session, so it gets its own clock too.
+   */
+  readonly carryForward?: BudgetConsumption;
 }
 
 export interface BudgetTracker {
@@ -351,6 +372,39 @@ export function createBudgetTracker(policy: HarnessPolicy, options: BudgetTracke
 
   function bucket(pool: BudgetPool, lane: BudgetLane, owner: string): Bucket | undefined {
     return buckets.find((candidate) => candidate.pool === pool && candidate.lane === lane && candidate.owner === owner);
+  }
+
+  // Task 14.6: apply carried-forward consumption once, at construction — see `carryForward`'s own
+  // doc comment on `BudgetTrackerOptions` for what this can and cannot reconstruct.
+  if (options.carryForward) {
+    const carried = options.carryForward;
+    highRiskReserveUsed = carried.highRiskReserveUsed;
+    verificationReserveUsed = carried.verificationReserveUsed;
+    const seededAmounts: Record<BudgetPool, number> = { modelTurns: 0, toolCalls: 0, evidenceBytes: 0 };
+    for (const pool of BUDGET_POOLS) {
+      const total =
+        pool === 'modelTurns' ? carried.modelTurnsUsed : pool === 'toolCalls' ? carried.toolCallsUsed : carried.evidenceBytesUsed;
+      let remaining = total;
+      for (const lane of BUDGET_LANES) {
+        if (remaining <= 0) break;
+        const shared = bucket(pool, lane, SHARED_OWNER);
+        if (!shared) continue;
+        const take = Math.min(shared.capacity - shared.used, remaining);
+        if (take <= 0) continue;
+        shared.used += take;
+        remaining -= take;
+      }
+      seededAmounts[pool] = total - remaining;
+      if (remaining > 0) {
+        setupWarnings.push({
+          code: 'carryForwardClamped',
+          pool,
+          remaining,
+          message: `${pool}: carried-forward consumption ${total} exceeds this attempt's total capacity by ${remaining}; clamped.`,
+        });
+      }
+    }
+    log({ elapsedMs: 0, kind: 'seeded', amounts: seededAmounts });
   }
 
   function candidateBuckets(pool: BudgetPool, purpose: ReservationPurpose, memberId: string | undefined): Bucket[] {

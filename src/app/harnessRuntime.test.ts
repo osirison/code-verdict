@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
-import { checkCheckpointIntegrity } from './harnessResume';
+import { checkCheckpointIntegrity, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
 import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { CONTRADICTION_CHECK_MARKER } from './harnessSynthesisVerification';
@@ -211,13 +211,8 @@ function runInput(overrides: Partial<RunInput> = {}): RunInput {
   const target: CrRunTarget = {
     kind: 'cr',
     ref: { repoId: REPO_ID, number: CR_NUMBER },
-    diff: {
-      ref: { repoId: REPO_ID, number: CR_NUMBER },
-      baseSha: BASE_SHA,
-      headSha: HEAD_SHA,
-      files: [{ oldPath: FILE_PATH, newPath: FILE_PATH, diff: '@@ -1,1 +1,1 @@\n-old\n+new\n' }],
-      anchorRefs: {},
-    },
+    baseSha: BASE_SHA,
+    headSha: HEAD_SHA,
   };
   return {
     target,
@@ -230,7 +225,6 @@ function runInput(overrides: Partial<RunInput> = {}): RunInput {
     effort: 'none',
     timeouts: { inactivityMs: 0, ceilingMs: 0 },
     contextBudgets: DEFAULT_CONTEXT_BUDGETS,
-    steps: [],
     demo: false,
     ...overrides,
   };
@@ -298,6 +292,16 @@ describe('createReviewHarnessFactory — the real runtime wiring (task 15.7)', (
     const latest = harnessRunStore.latestCheckpoint(identity.lineageId as never)!;
     expect(checkCheckpointIntegrity(storedSnapshot!, latest)).toEqual([]);
     expect(latest.snapshotDigest).toBe(computeSnapshotDigest(storedSnapshot!));
+
+    // Task 14.6: the *last* checkpoint of a completed attempt must itself project as terminal, not
+    // merely as whichever phase last ran. `harnessAttempt.ts`'s `runPersisting` used to fire its
+    // 'persisting' phase-boundary checkpoint before appending the terminal activity fact, so this
+    // checkpoint's own `activityLog` snapshot never carried the fact that ended the run — every
+    // attempt, successful or not, landed in `HarnessRunStore` looking merely mid-flight, and
+    // `sweepInterruptedRuns`/any future resume-compatibility check reading the stored checkpoint
+    // alone (rather than the live `RunRecord`) could not tell a genuinely completed lineage from an
+    // interrupted one.
+    expect(latest.projection.lifecycle).toBe('succeeded');
   });
 
   it('fails truthfully with no fallback when the selected model is no longer available', async () => {
@@ -321,6 +325,96 @@ describe('createReviewHarnessFactory — the real runtime wiring (task 15.7)', (
     const attempt = factory.create(runInput(), noopRunOptions(identity));
 
     await expect(attempt.run()).rejects.toThrow(/no longer available/);
+  });
+});
+
+/** Runs `scriptedRunTurn`'s own real planning/investigating script, then throws once the model
+ * reaches the verifying phase — the real turn loop's own phase-boundary checkpoints (planning,
+ * investigating) have already fired and been durably written by then, so this stands in for an
+ * extension-host restart mid-attempt without needing a real one. */
+function scriptedRunTurnInterruptedAtVerifying(): (modelId: string, prompt: string) => Promise<string> {
+  const inner = scriptedRunTurn();
+  return async (modelId, prompt) => {
+    const phase = /You are in the "(\w+)" phase/.exec(prompt)?.[1];
+    if (phase === 'verifying') throw new Error('simulated extension host restart mid-attempt');
+    return inner(modelId, prompt);
+  };
+}
+
+describe('resuming an interrupted attempt (task 14.6)', () => {
+  it('a compatible resume starts attempt N+1 in the same run and lineage, seeded from the interrupted checkpoint, and reaches a genuine succeeded outcome', async () => {
+    const lostDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurnInterruptedAtVerifying() };
+    const factory = createReviewHarnessFactory(lostDeps);
+    const identity1 = { runId: 'run-resume-1', lineageId: 'lineage-resume-1', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    await expect(attempt1.run()).rejects.toThrow(/simulated extension host restart/);
+
+    // What the "restart" left behind: a real, non-terminal checkpoint from the live turn loop,
+    // carrying the accepted candidate and real budget consumption — never hand-built.
+    const lostCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    expect(lostCheckpoint).toBeDefined();
+    expect(lostCheckpoint.candidates.some((c) => c.state === 'accepted')).toBe(true);
+    expect(lostCheckpoint.budget.toolCallsUsed).toBeGreaterThan(0);
+
+    // The manager's own lookup, mirrored here: the resumed attempt's identity comes from the
+    // stored checkpoint (`runId`, `lineageId`), never freshly minted — `decideResume`'s
+    // `lineageIdentity` guard requires it (`ReviewRunManager.resumeRun`'s own doc comment).
+    const identity2 = { runId: lostCheckpoint.runId, lineageId: lostCheckpoint.lineageId, attempt: nextAttemptNumber(lostCheckpoint.attempt) };
+    expect(identity2.attempt).toBe(2);
+
+    // A second, independent full pass — the resumed attempt is a brand-new model session (design.md:
+    // "the model starts over"), so it goes through planning/investigating/verifying for real again.
+    const resumedDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurn() };
+    const resumeFactory = createReviewHarnessFactory(resumedDeps);
+    const attempt2 = resumeFactory.resume(runInput(), noopRunOptions(identity2));
+    const result = await attempt2.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.attempt).toBe(2);
+    expect(result.lineageId).toBe(identity1.lineageId);
+    // Budget is cumulative across the lineage, not reset per attempt: this attempt's own usage
+    // plus whatever attempt 1 already spent before it was lost.
+    expect(result.toolCallsUsed).toBeGreaterThan(lostCheckpoint.budget.toolCallsUsed);
+
+    const finalCheckpoint = harnessRunStore.latestCheckpoint(identity2.lineageId as never)!;
+    expect(finalCheckpoint.attempt).toBe(2);
+    expect(finalCheckpoint.projection.lifecycle).toBe('succeeded');
+  });
+
+  it('an incompatible resume — the model changed since the interrupted attempt — rejects with every reason, and never overwrites the stored (still nonterminal) checkpoint', async () => {
+    const lostDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurnInterruptedAtVerifying() };
+    const factory = createReviewHarnessFactory(lostDeps);
+    const identity1 = { runId: 'run-resume-2', lineageId: 'lineage-resume-2', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    await expect(attempt1.run()).rejects.toThrow();
+
+    const lostCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    const identity2 = { runId: lostCheckpoint.runId, lineageId: lostCheckpoint.lineageId, attempt: nextAttemptNumber(lostCheckpoint.attempt) };
+
+    // A different model than the interrupted attempt used — `decideResume`'s `model` dimension.
+    const differentModelDeps: HarnessRuntimeDeps = {
+      ...deps,
+      runTurn: scriptedRunTurn(),
+      discoverModel: async (modelId) => ({ id: modelId, label: 'Different model', description: '', vendor: 'test', family: 'other-model', maxInputTokens: undefined }),
+    };
+    const resumeFactory = createReviewHarnessFactory(differentModelDeps);
+    const attempt2 = resumeFactory.resume(runInput(), noopRunOptions(identity2));
+
+    const outcome = await attempt2.run().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error).toBeInstanceOf(ResumeIncompatibleError);
+    const reasons = (outcome.error as ResumeIncompatibleError).reasons;
+    expect(reasons.some((reason) => reason.code === 'model')).toBe(true);
+
+    // The lineage's own stored checkpoint is untouched by the rejected attempt: still there, still
+    // the same nonterminal one — a caller can switch the model back and resume can still succeed.
+    const stillThere = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    expect(stillThere.checkpointId).toBe(lostCheckpoint.checkpointId);
+    expect(stillThere.attempt).toBe(1);
   });
 });
 

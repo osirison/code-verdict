@@ -1,26 +1,16 @@
 /**
- * The demo review agent: deterministic findings generated from the actual
- * diff, so the whole review flow can be driven against the emulator with
- * no Copilot dependency. Every anchor lands on a real added line, which
- * means submits pass the emulator's (and GitLab's) position validation.
+ * The demo agent's deterministic per-file finding templates.
  *
- * The extension never ships its own prompt as the only option (spec §5) —
- * this agent exists for the demo pod and F5 debugging; real Copilot agents
- * are discovered alongside it.
+ * Task 15.8 removed `runDemoAgent`, the one-shot demo runner that used to
+ * live here (nothing shipped reached it any more — the harness demo
+ * participant, task 10.7, is what runs demo reviews now). `demoFindingsForFile`
+ * survives: it is the one piece of that runner's logic the harness demo
+ * participant (`harnessDemoParticipant.ts`) reuses, one file's patch bytes at
+ * a time, from a real `readDiff` tool result rather than a whole
+ * `ChangeRequestDiff` object it is never given.
  */
-import type { ChangeRequestDiff } from '../platform/types';
-import { manifestContainsLocation, parseAgentReviewResponse, type AgentReviewResponse, type CandidateBucket } from '../domain/agentResponse';
-import type { Category, Criteria, ReviewItem, Severity } from '../domain/types';
-import { filterReason } from '../domain/criteria';
-import { addedLines, diffStats } from '../domain/diffHunks';
-import { modelVisiblePath } from './modelVisiblePath';
-import {
-  ATTACHMENT_TOTAL_BUDGET,
-  neutralizeAttachmentWrapperTags,
-  renderAttachmentsForModel,
-  type Attachment,
-  type RenderedAttachments,
-} from './reviewContext';
+import type { Category, ReviewItem, Severity } from '../domain/types';
+import { addedLines } from '../domain/diffHunks';
 
 export const DEMO_AGENT_ID = 'verdict.demo-agent';
 export const DEMO_AGENT_LABEL = 'Verdict · Demo Review';
@@ -120,73 +110,13 @@ function hash(text: string): number {
   return h >>> 0;
 }
 
-export interface DemoAgentResult {
-  response: AgentReviewResponse;
-  /** Spec §4 progress log lines, in order. */
-  steps: string[];
-}
-
-export interface DemoAgentOptions {
-  workspaceRootLabel?: string;
-  attachments?: readonly Attachment[];
-  attachmentBudget?: number;
-  /** Exact records prepared by a changeset-wide budget allocation. */
-  renderedAttachments?: RenderedAttachments;
-}
-
-interface AttachmentLine {
-  path: string;
-  line: number;
-  text: string;
-}
-
-function detectedAttachmentLines(rendered: RenderedAttachments): AttachmentLine[] {
-  const detected = new Map<string, AttachmentLine>();
-  for (const attachment of rendered.attachments) {
-    const visibleLength = Math.min(
-      attachment.content.length,
-      attachment.visibleContentLength ?? attachment.content.length,
-    );
-    for (const source of attachment.evidence ?? []) {
-      const visibleEnd = Math.min(source.contentEnd, visibleLength);
-      if (visibleEnd <= source.contentStart) continue;
-      const content = neutralizeAttachmentWrapperTags(
-        attachment.content.slice(source.contentStart, visibleEnd),
-      );
-      const lines = source.wholeRange
-        ? [{ path: source.path, line: source.range.startLine, text: content.trim() }]
-        : content.split(/\r?\n/).map((text, index) => ({
-            path: source.path,
-            line: source.range.startLine + index,
-            text: text.trim(),
-          }));
-      const visibleLines = lines.filter((line) => (
-        line.text !== '' && manifestContainsLocation(rendered.manifest, line.path, line.line)
-      ));
-      if (visibleLines.length === 0) continue;
-      const representative = visibleLines.reduce((best, line) => (
-        hash(`${line.path}:${line.line}:${line.text}`) < hash(`${best.path}:${best.line}:${best.text}`)
-          ? line
-          : best
-      ));
-      detected.set(`${representative.path}:${representative.line}:${representative.text}`, representative);
-    }
-  }
-  return [...detected.values()];
-}
-
 /**
  * Deterministic candidate findings for one file's added lines, given its
  * `newPath`-qualified `filePath`, the composite/head sha the seed is drawn
- * from, and the file's own unified-diff patch text. Extracted out of
- * {@link runDemoAgent}'s per-file loop (task 10.7 of
- * `add-agentic-review-harness`) so the deterministic demo participant can
- * reuse the exact same finding logic one file at a time, from just that
- * file's own patch bytes (its `readDiff` tool result) — never from a whole
- * `ChangeRequestDiff` object it was never given. `sequenceStart` is the
+ * from, and the file's own unified-diff patch text. `sequenceStart` is the
  * running item-sequence counter a caller already owns (kept solely for id
- * uniqueness across files, matching `runDemoAgent`'s original behavior
- * exactly); a fresh caller with no running counter may pass `0`.
+ * uniqueness across files); a fresh caller with no running counter may pass
+ * `0`.
  */
 export function demoFindingsForFile(headSha: string, filePath: string, patch: string, sequenceStart: number): ReviewItem[] {
   const anchors = addedLines(patch);
@@ -229,94 +159,4 @@ export function demoFindingsForFile(headSha: string, filePath: string, patch: st
     });
   }
   return items;
-}
-
-export function runDemoAgent(
-  diff: ChangeRequestDiff,
-  criteria: Criteria,
-  options: DemoAgentOptions = {},
-): DemoAgentResult {
-  const items: ReviewItem[] = [];
-  const rejectedBuckets = new Map<string, CandidateBucket>();
-  let sequence = 0;
-  const renderedAttachments = options.renderedAttachments ?? renderAttachmentsForModel(
-    options.attachments ?? [],
-    options.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
-  );
-
-  const recordItem = (item: ReviewItem): void => {
-    const reason = filterReason(item, criteria);
-    if (reason === null) {
-      items.push(item);
-      return;
-    }
-    const key = `${reason}:${item.severity}:${item.category}`;
-    const bucket = rejectedBuckets.get(key);
-    if (bucket) {
-      bucket.count += 1;
-      bucket.confidence = Math.max(bucket.confidence, item.confidence);
-      return;
-    }
-    rejectedBuckets.set(key, {
-      severity: item.severity,
-      category: item.category,
-      confidence: item.confidence,
-      reason,
-      count: 1,
-    });
-  };
-
-  for (const file of diff.files) {
-    const filePath = modelVisiblePath(file.newPath, options.workspaceRootLabel);
-    const fileFindings = demoFindingsForFile(diff.headSha, filePath, file.diff, sequence);
-    sequence += fileFindings.length;
-    for (const item of fileFindings) recordItem(item);
-  }
-
-  for (const line of detectedAttachmentLines(renderedAttachments)) {
-    const seed = hash(`${line.path}:${line.line}:${line.text}`);
-    const template = TEMPLATES[seed % TEMPLATES.length] as Template;
-    recordItem({
-      id: `dem_attachment_${seed.toString(16)}_${sequence++}`,
-      file: line.path,
-      anchored: false,
-      line: line.line,
-      severity: template.severity,
-      category: template.category,
-      confidence: 80 + (seed % 18),
-      title: template.title(line.text),
-      body: template.body,
-      code: line.text,
-      answers: { ...template.answers },
-    });
-  }
-
-  const stats = diffStats(diff.files.map((f) => f.diff));
-  const response = parseAgentReviewResponse({
-    schemaVersion: '1',
-    agentId: DEMO_AGENT_ID,
-    agentLabel: DEMO_AGENT_LABEL,
-    headSha: diff.headSha,
-    stats: {
-      filesRead: diff.files.length,
-      linesAdded: stats.added,
-      linesRemoved: stats.removed,
-      durationMs: 1800,
-    },
-    items,
-    candidates: [...rejectedBuckets.values()],
-  }, {
-    diffPaths: diff.files.map((file) => modelVisiblePath(file.newPath, options.workspaceRootLabel)),
-    attachmentManifest: renderedAttachments.manifest,
-  }).response;
-  return {
-    response,
-    steps: [
-      'Resolving agent from Copilot workspace…',
-      `Indexing ${diff.files.length} changed files (+${stats.added} −${stats.removed})…`,
-      'Cross-referencing module history…',
-      'Scoring findings against your criteria…',
-      `${items.length} items ready`,
-    ],
-  };
 }

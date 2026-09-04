@@ -3,7 +3,7 @@ import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
 import type { FlowViewState, ReviewContextView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
-import type { RunProjection } from '../domain/harnessActivity';
+import type { Limitation, RunProjection } from '../domain/harnessActivity';
 
 const state: FlowViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -962,6 +962,64 @@ describe('run controls render only where the manager accepts them (task 14.6)', 
     expect(html).not.toContain('id="pause-run"');
     expect(html).not.toContain('id="resume-run"');
     expect(html).not.toContain('id="cancel-run"');
+  });
+});
+
+/**
+ * Task 14.6: the `'agent'` picker screen's resume-from-checkpoint offer —
+ * `FlowViewState.interruptedPrior`, set only for a target whose last outcome
+ * was `interrupted` and nothing is running now (`reviewFlow.ts`'s own
+ * `deriveRunControls`-backed derivation, never re-derived here). Mirrors
+ * `harnessResume.test.ts`'s own "no-reconnect wording" check (D13): a
+ * resumed run is always a new attempt from a checkpoint, never a claim the
+ * lost session picked back up.
+ */
+describe('resume-from-checkpoint offer on the picker screen (task 14.6)', () => {
+  const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
+
+  /**
+   * The rule is about what the reviewer reads, so the scan runs over text
+   * nodes only. Element ids and classes are machine-facing wiring the
+   * page script addresses buttons by — `id="resume-from-checkpoint"` names
+   * the control's job, and renaming it would not change one word anyone
+   * sees.
+   */
+  function visibleText(html: string): string {
+    return html.replace(/<[^>]*>/g, ' ');
+  }
+
+  function agentScreen(interruptedPrior: FlowViewState['interruptedPrior']): string {
+    return renderReviewFlowBody({ ...state, screen: 'agent', interruptedPrior }, 'HVE Core');
+  }
+
+  it('offers "Start new attempt from checkpoint" when the stored checkpoint is resumable, in wording that never implies reconnection', () => {
+    const html = agentScreen({ resumable: true });
+    expect(html).toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('Start new attempt from checkpoint');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('shows every stored reason and no button when the checkpoint cannot be carried into a new attempt', () => {
+    const reasons: Limitation[] = [
+      { code: 'model', message: 'The model changed since the checkpoint was written.' },
+      { code: 'repositoryIdentity', message: 'The repository no longer matches the checkpoint.' },
+    ];
+    const html = agentScreen({ resumable: false, reasons });
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('The model changed since the checkpoint was written.');
+    expect(html).toContain('The repository no longer matches the checkpoint.');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('renders nothing at all when the target has no interrupted prior attempt', () => {
+    const html = agentScreen(undefined);
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).not.toContain('interrupted');
+  });
+
+  it('the ordinary "Run review" button is always present alongside the offer — restart costs nothing new', () => {
+    const html = agentScreen({ resumable: true });
+    expect(html).toContain('id="run"');
   });
 });
 

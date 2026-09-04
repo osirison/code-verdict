@@ -7,15 +7,63 @@ import { describe, expect, it } from 'vitest';
 import { GitLabEmulator } from '../../../emulator/engine';
 import { emulatorFetch } from '../../../emulator/fetch';
 import { detectChangesets } from '../../app/changesets';
-import { runDemoChangesetAgent } from '../../app/combinedAgent';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../../app/changesetSubmit';
 import { DEFAULT_CRITERIA } from '../../domain/criteria';
 import { addedLines } from '../../domain/diffHunks';
 import { createReview, setVerdict } from '../../domain/reviewState';
-import type { Pod } from '../../domain/types';
+import type { Pod, ReviewItem } from '../../domain/types';
+import type { AgentReviewResponse } from '../../domain/agentResponse';
+import type { ChangeRequestDiff, ChangeRequestRef } from '../../platform/types';
 import { describeProviderContract } from '../../platform/contract/providerContract';
 import { isScmError } from '../../platform/errors';
 import { createGitLabProvider } from './gitlabProvider';
+
+/**
+ * A cross-repository finding built directly from real fetched diffs — the
+ * same "renamed field, stale reader" pattern the deleted demo changeset
+ * agent (`combinedAgent.ts`'s own `crossRepositoryFinding`, removed task
+ * 15.8) used to synthesize, kept here purely as a test fixture so this
+ * end-to-end submit test still has a genuine cross-repository item anchored
+ * on real added lines to post.
+ */
+function findCrossRepositoryFinding(
+  members: readonly { ref: ChangeRequestRef; diff: ChangeRequestDiff }[],
+): ReviewItem | undefined {
+  const gateway = members.find((member) => member.diff.files.some((file) => addedLines(file.diff).some((line) => line.text.includes('expires_at'))));
+  const consoleMember = members.find((member) => member.diff.files.some((file) => addedLines(file.diff).some((line) => /\.expiry\b/.test(line.text))));
+  if (!gateway || !consoleMember) return undefined;
+  const gatewayFile = gateway.diff.files.find((file) => addedLines(file.diff).some((line) => line.text.includes('expires_at')));
+  const consoleFile = consoleMember.diff.files.find((file) => addedLines(file.diff).some((line) => /\.expiry\b/.test(line.text)));
+  const gatewayLine = gatewayFile && addedLines(gatewayFile.diff).find((line) => line.text.includes('expires_at'));
+  const consoleLine = consoleFile && addedLines(consoleFile.diff).find((line) => /\.expiry\b/.test(line.text));
+  if (!gatewayFile || !consoleFile || !gatewayLine || !consoleLine) return undefined;
+  return {
+    id: `cross_${gateway.ref.repoId}_${consoleMember.ref.repoId}_expiry`,
+    repoId: consoleMember.ref.repoId,
+    crNumber: consoleMember.ref.number,
+    file: consoleFile.newPath,
+    anchored: true,
+    line: consoleLine.line,
+    severity: 'blocker',
+    category: 'apiContract',
+    confidence: 94,
+    title: 'Response field renamed in the gateway but still read in the console',
+    body: 'One member publishes expires_at while another still reads expiry. Both can pass independently and fail when deployed together.',
+    code: consoleLine.text.trim(),
+    cross: true,
+    spans: [
+      { repoId: gateway.ref.repoId, location: `${gatewayFile.newPath}:${gatewayLine.line}`, role: 'renames the field' },
+      { repoId: consoleMember.ref.repoId, location: `${consoleFile.newPath}:${consoleLine.line}`, role: 'still reads the old name' },
+    ],
+    suggestion: { old: consoleLine.text.trim(), new: consoleLine.text.replace(/\.expiry\b/, '.expires_at').trim() },
+    answers: {
+      explain: 'Each repository tests one side of the contract, so neither suite observes the mismatch.',
+      fix: 'Read expires_at in the consumer, or publish both names for one compatibility release.',
+      similar: 'Search changeset members for other reads of expiry and expires_at.',
+      why: 'The combined diff contains a producer rename and a consumer that retains the old field.',
+    },
+  };
+}
 
 const INSTANCE_URL = 'https://gitlab.emulator.local';
 const TOKEN = 'glpat-emulator';
@@ -100,12 +148,16 @@ describe('end-to-end flows against the emulator', () => {
       projectPath: member.projectPath,
       diff: await conn.getChangeRequestDiff(member.ref),
     })));
-    const response = runDemoChangesetAgent(
-      members,
-      { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories, 'apiContract'] },
-    ).response;
-    const cross = response.items.find((item) => item.cross);
+    const cross = findCrossRepositoryFinding(members);
     expect(cross).toMatchObject({ repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 41 });
+    const response: AgentReviewResponse = {
+      schemaVersion: '1',
+      agentId: 'verdict.demo-agent',
+      agentLabel: 'Verdict · Demo Review',
+      headSha: members.map((member) => `${member.ref.repoId}!${member.ref.number}:${member.diff.headSha}`).join('|'),
+      items: cross ? [cross] : [],
+      candidates: [],
+    };
 
     let review = createReview({
       repoId: 'changeset', crNumber: changeset?.id ?? '', agentId: response.agentId,

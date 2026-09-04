@@ -5,30 +5,21 @@
  * expects the agentReviewResponse contract back.
  */
 import * as vscode from 'vscode';
-import type { AgentResponsePaths, AgentReviewResponse } from '../domain/agentResponse';
-import { AgentResponseError, parseAgentReviewResponse } from '../domain/agentResponse';
+import { AgentResponseError } from '../domain/agentResponse';
 import type { Criteria } from '../domain/types';
 import { effortPrompt, type EffortLevel } from '../domain/effort';
 import type { ChangeRequestDiff } from '../platform/types';
 import { BUILTIN_AGENT_ID, type AgentDescriptor, type ModelDescriptor } from './agents';
 import { modelVisiblePath } from './modelVisiblePath';
 import { AgentTrace, type AgentProgressCallback, type AgentTimeoutReason, type AgentTraceSink } from './agentTrace';
-import { changesetHeadSha, validateChangesetResponse, type ChangesetAgentMember } from './combinedAgent';
-import {
-  revalidateAttachments,
-  type AttachmentWarning,
-  type RevalidatedAttachments,
-} from './attachments';
+import { changesetHeadSha, type ChangesetAgentMember } from './combinedAgent';
 import {
   ATTACHMENT_TOTAL_BUDGET,
-  attachmentEvidenceManifest,
   DEFAULT_CONTEXT_BUDGETS,
-  renderAttachmentsForModel,
   renderAttachmentsPrompt,
   renderReviewContextPrompt,
   type Attachment,
   type ContextBudgets,
-  type EvidenceManifest,
   type ReviewContext,
   type ReviewContextEntry,
 } from './reviewContext';
@@ -94,6 +85,14 @@ function defaultTraceSink(): AgentTraceSink {
   return defaultChannel;
 }
 
+/**
+ * Options for `runFollowUpPrompt`/`runHarnessModelTurn`, both thin callers
+ * of `streamText`. Task 15.8 removed `runLmAgent`/`runLmChangesetAgent` —
+ * the one-shot runners that used to also take this options shape and read
+ * its attachment/budget/workspace-root fields to assemble a request. Those
+ * fields had no other reader, so they left with the runners; what remains
+ * is exactly what `streamText` and `runFollowUpPrompt` themselves read.
+ */
 export interface RunAgentOptions {
   /** Called once per streamed fragment so a caller can show a "still alive" indicator without polling. */
   onProgress?: AgentProgressCallback;
@@ -110,20 +109,8 @@ export interface RunAgentOptions {
    * still keep the next one out.
    */
   cancellation?: AgentCancellationToken;
-  /** Explicit reviewable evidence. Empty or omitted contributes no prompt bytes. */
-  attachments?: readonly Attachment[];
-  /** Normalized in the UI layer; omitted callers retain the shipped defaults. */
-  contextBudgets?: ContextBudgets;
-  /** Fixed attachment pool override for focused tests. */
-  attachmentBudget?: number;
-  /** Run-start validation seam; production uses `vscode.workspace.fs`. */
-  attachmentRevalidator?: (attachments: readonly Attachment[]) => Promise<RevalidatedAttachments>;
-  /** Structured drops are available to the run manager before findings reach triage. */
-  onAttachmentWarnings?: (warnings: readonly AttachmentWarning[]) => void;
-  /** Prompt-level review instruction. `none` contributes no prompt bytes. */
+  /** Prompt-level review instruction. `none` contributes no prompt bytes. Read by `runFollowUpPrompt` only. */
   effort?: EffortLevel;
-  /** Host-assigned qualification for changed-file paths in a multi-root workspace. */
-  workspaceRootLabel?: string;
 }
 
 export interface AssembleReviewPromptOptions {
@@ -145,29 +132,6 @@ export interface AssembleReviewPromptOptions {
 export interface AgentCancellationToken {
   readonly isCancellationRequested: boolean;
   onCancellationRequested(listener: () => void): { dispose(): void };
-}
-
-async function attachmentsForRun(options?: RunAgentOptions): Promise<Attachment[]> {
-  const attachments = options?.attachments ?? [];
-  if (attachments.length === 0) return [];
-  const result = await (options?.attachmentRevalidator ?? revalidateAttachments)(attachments);
-  if (result.warnings.length > 0) options?.onAttachmentWarnings?.(result.warnings);
-  return result.attachments;
-}
-
-async function changesetMembersForRun(
-  members: readonly ChangesetAgentMember[],
-  options?: RunAgentOptions,
-): Promise<ChangesetAgentMember[]> {
-  const results = await Promise.all(members.map(async (member) => {
-    const attachments = member.attachments ?? [];
-    if (attachments.length === 0) return { member, warnings: [] as AttachmentWarning[] };
-    const result = await (options?.attachmentRevalidator ?? revalidateAttachments)(attachments);
-    return { member: { ...member, attachments: result.attachments }, warnings: result.warnings };
-  }));
-  const warnings = results.flatMap((result) => result.warnings);
-  if (warnings.length > 0) options?.onAttachmentWarnings?.(warnings);
-  return results.map((result) => result.member);
 }
 
 /**
@@ -224,39 +188,13 @@ export class AgentRunError extends Error {
 }
 
 /**
- * `context` carries what the change is for (title, description, linked work
- * items). It sits before attached evidence and diffs so intent is read before
- * evidence, and `renderReviewContextPrompt` states that it is intent rather
- * than more surface to review.
+ * The exact single-review prompt. Task 15.8 removed `runLmAgent`, the
+ * one-shot execution this prompt used to feed straight to `runPrompt` —
+ * nothing shipped reached it any more (the harness builds its own bootstrap
+ * envelope, `harnessModelSeam.ts`). This builder survives because
+ * `ui/reviewFlow.ts`'s pre-run context-usage estimate still calls it to show
+ * a token count before the reviewer starts a run — never to execute one.
  */
-export async function runLmAgent(
-  agent: AgentDescriptor,
-  modelId: string,
-  diff: ChangeRequestDiff,
-  criteria: Criteria,
-  context?: ReviewContext,
-  options?: RunAgentOptions,
-): Promise<AgentReviewResponse> {
-  const attachments = await attachmentsForRun(options);
-  const renderedAttachments = renderAttachmentsForModel(
-    attachments,
-    options?.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
-  );
-  const prompt = assembleReviewPrompt(agent, diff, criteria, context, {
-    attachments,
-    contextBudgets: options?.contextBudgets,
-    attachmentBudget: options?.attachmentBudget,
-    attachmentPrompt: renderedAttachments.prompt,
-    effort: options?.effort,
-    workspaceRootLabel: options?.workspaceRootLabel,
-  });
-  return runPrompt(modelId, prompt, options, {
-    diffPaths: diff.files.map((file) => modelVisiblePath(file.newPath, options?.workspaceRootLabel)),
-    attachmentManifest: renderedAttachments.manifest,
-  });
-}
-
-/** The exact single-review prompt, shared by execution and the pre-run usage indicator. */
 export function assembleReviewPrompt(
   agent: AgentDescriptor,
   diff: ChangeRequestDiff,
@@ -311,47 +249,6 @@ export function renderChangesetAttachmentsPrompt(
   return renderAttachmentsPrompt(labelled, totalBudget);
 }
 
-interface RenderedChangesetAttachments {
-  prompt: string;
-  manifest: EvidenceManifest;
-  memberManifests: ReadonlyMap<string, EvidenceManifest>;
-}
-
-function changesetMemberKey(member: Pick<ChangesetAgentMember, 'ref'>): string {
-  return `${member.ref.repoId}!${member.ref.number}`;
-}
-
-function renderChangesetAttachmentsForModel(
-  members: readonly ChangesetAgentMember[],
-  totalBudget: number,
-): RenderedChangesetAttachments {
-  const ownerById = new Map<string, string>();
-  const labelled = members.flatMap((member) => (member.attachments ?? []).map((attachment) => {
-    const id = `projectId=${member.ref.repoId} mrIid=${member.ref.number} attachment=${attachment.id}`;
-    ownerById.set(id, changesetMemberKey(member));
-    return {
-      ...attachment,
-      id,
-      // vocab-ok: the agent prompt's provider-neutral member wire format
-      path: `projectId=${member.ref.repoId} mrIid=${member.ref.number} project=${member.projectPath} file=${attachment.path}`,
-    };
-  }));
-  const rendered = renderAttachmentsForModel(labelled, totalBudget);
-  const byMember = new Map<string, Attachment[]>();
-  for (const attachment of rendered.attachments) {
-    const owner = ownerById.get(attachment.id);
-    if (!owner) continue;
-    const entries = byMember.get(owner) ?? [];
-    entries.push(attachment);
-    byMember.set(owner, entries);
-  }
-  return {
-    prompt: rendered.prompt,
-    manifest: rendered.manifest,
-    memberManifests: new Map([...byMember].map(([key, attachments]) => [key, attachmentEvidenceManifest(attachments)])),
-  };
-}
-
 export interface AssembleChangesetReviewPromptOptions {
   contextBudgets?: ContextBudgets;
   attachmentBudget?: number;
@@ -388,34 +285,6 @@ export function assembleChangesetReviewPrompt(
   ].filter((part) => part !== '').join('\n\n');
 }
 
-export async function runLmChangesetAgent(
-  agent: AgentDescriptor,
-  modelId: string,
-  members: readonly ChangesetAgentMember[],
-  criteria: Criteria,
-  options?: RunAgentOptions,
-): Promise<AgentReviewResponse> {
-  const runMembers = await changesetMembersForRun(members, options);
-  const renderedAttachments = renderChangesetAttachmentsForModel(
-    runMembers,
-    options?.attachmentBudget ?? ATTACHMENT_TOTAL_BUDGET,
-  );
-  const validationMembers = runMembers.map((member) => ({
-    ...member,
-    evidenceManifest: renderedAttachments.memberManifests.get(changesetMemberKey(member)) ?? Object.freeze([]),
-  }));
-  const prompt = assembleChangesetReviewPrompt(agent, runMembers, criteria, {
-    ...options,
-    attachmentPrompt: renderedAttachments.prompt,
-  });
-  return validateChangesetResponse(await runPrompt(modelId, prompt, options, {
-    diffPaths: runMembers.flatMap((member) => member.diff.files.map((file) => (
-      modelVisiblePath(file.newPath, member.workspaceRootLabel)
-    ))),
-    attachmentManifest: renderedAttachments.manifest,
-  }), validationMembers);
-}
-
 /**
  * A follow-up question about one finding (#37). Unlike a review run this
  * expects prose, not the JSON contract, so it shares the streaming, timeout
@@ -448,10 +317,12 @@ export async function runFollowUpPrompt(
  * adds nothing to it and reuses `streamText`'s existing streaming path,
  * cancellation, timeout windows, and tracing exactly as `runFollowUpPrompt`
  * does, returning the model's raw reply text for
- * `../domain/harnessProtocol.ts`'s `parseModelTurn` to parse. `runFollowUpPrompt`/
- * `runPrompt` are the pre-harness review paths and stay untouched by this
- * addition (task 10.2's second clause: follow-up questions and the legacy
- * one-shot contract are not review-harness concerns).
+ * `../domain/harnessProtocol.ts`'s `parseModelTurn` to parse. `runFollowUpPrompt`
+ * is the follow-up-question path and stays untouched by this addition (task
+ * 10.2's second clause: follow-up questions are not review-harness concerns).
+ * Task 15.8 removed `runPrompt`, the one-shot review path that used to sit
+ * beside this one — nothing shipped reached it once `runLmAgent`/
+ * `runLmChangesetAgent` were removed with it.
  *
  * A missing or refusing model, a timeout, or a cancellation surfaces as the
  * same `AgentRunError` `streamText` always throws — never swallowed here,
@@ -468,41 +339,6 @@ export async function runHarnessModelTurn(
     trace.response(text, true);
     trace.success(0);
     return text;
-  });
-}
-
-export async function runPrompt(
-  modelId: string,
-  prompt: string,
-  options?: RunAgentOptions,
-  responsePaths?: AgentResponsePaths,
-): Promise<AgentReviewResponse> {
-  return streamText(modelId, prompt, options, (text, trace) => {
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start < 0 || end <= start) {
-      trace.response(text, false, 'no JSON object found');
-      throw new AgentResponseError('agent returned no JSON object');
-    }
-    let parsed: AgentReviewResponse;
-    try {
-      parsed = parseAgentReviewResponse(JSON.parse(text.slice(start, end + 1)), responsePaths).response;
-    } catch (parseError) {
-      // `JSON.parse`'s own `SyntaxError` quotes a fragment of the input it failed on (e.g. `Unexpected
-      // token 'M', "MARKER_RAW"... is not valid JSON`) — a raw fragment of the model's own output, not
-      // a host-authored description. Trace diagnostics get a fixed, safe classification instead; a
-      // structured `AgentResponseError` from `parseAgentReviewResponse` is host-authored (at most it
-      // echoes one small field, e.g. `schemaVersion`) and is safe to forward through the shared
-      // sanitizer, same as any other error detail.
-      const traceDetail = parseError instanceof SyntaxError
-        ? 'malformed JSON'
-        : parseError instanceof Error ? parseError.message : String(parseError);
-      trace.response(text, false, traceDetail);
-      throw parseError;
-    }
-    trace.response(text, true);
-    trace.success(parsed.items.length);
-    return parsed;
   });
 }
 
@@ -611,8 +447,10 @@ async function streamText<T>(
       const message = `agent response did not match the contract: ${e.message}`;
       // The thrown `AgentRunError` keeps `e.message` verbatim (existing, tested behaviour: the
       // reviewer-facing failure card). The trace sink does not: a `SyntaxError` from `JSON.parse`
-      // quotes a fragment of the model's own output in its own message (the same reason `runPrompt`
-      // above never forwards it raw), so the sink gets a fixed classification instead.
+      // quotes a fragment of the model's own output in its own message, so the sink gets a fixed
+      // classification instead. Neither surviving `finish` callback below parses JSON — this
+      // branch is defensive, kept because it is shared, generic response-classification logic
+      // in `streamText` rather than something specific to the one-shot contract task 15.8 removed.
       trace.failure(e instanceof SyntaxError ? 'agent response did not match the contract: malformed JSON' : message);
       throw new AgentRunError(message, requestId, false);
     }

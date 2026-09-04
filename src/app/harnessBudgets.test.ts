@@ -358,3 +358,64 @@ describe('changeset per-member minimums (task 8.6)', () => {
     expect(tracker.reserve(request({ purpose: 'exploration', memberId: 'other', toolCalls: 1 })).ok).toBe(true);
   });
 });
+
+describe('carried-forward consumption on a resumed attempt (task 14.6)', () => {
+  // Ordinary/highRisk/verification for each pool, from this file's own POLICY comment:
+  // turns 20 -> 13/4/3, tools 100 -> 65/20/15, bytes 10000 -> 6500/2000/1500.
+  it('seeds pool totals cumulatively, resets elapsed time, and copies reserve counts verbatim', () => {
+    const tracker = createBudgetTracker(POLICY, {
+      carryForward: { modelTurnsUsed: 5, toolCallsUsed: 10, evidenceBytesUsed: 100, elapsedMs: 999_999, highRiskReserveUsed: 2, verificationReserveUsed: 1 },
+    });
+    expect(tracker.consumption()).toMatchObject({
+      modelTurnsUsed: 5, toolCallsUsed: 10, evidenceBytesUsed: 100, elapsedMs: 0, highRiskReserveUsed: 2, verificationReserveUsed: 1,
+    });
+    const pool = tracker.state().pools.modelTurns;
+    expect(pool.lanes.ordinary.used).toBe(5);
+    expect(pool.used).toBe(5);
+    expect(tracker.entries().map((e) => e.kind)).toEqual(['seeded']);
+  });
+
+  it('spends the ordinary lane before spilling into the reserves, in order', () => {
+    const tracker = createBudgetTracker(POLICY, {
+      carryForward: { modelTurnsUsed: 15, toolCallsUsed: 0, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+    });
+    const lanes = tracker.state().pools.modelTurns.lanes;
+    expect(lanes.ordinary.used).toBe(13); // ordinary capacity, fully spent first
+    expect(lanes.highRiskReserve.used).toBe(2); // the 2 left over
+    expect(lanes.verificationReserve.used).toBe(0);
+  });
+
+  it('clamps a carried total that exceeds this attempt\'s whole pool capacity and warns rather than throwing', () => {
+    const tracker = createBudgetTracker(POLICY, {
+      carryForward: { modelTurnsUsed: 25, toolCallsUsed: 0, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+    });
+    const pool = tracker.state().pools.modelTurns;
+    expect(pool.used).toBe(20); // 13 + 4 + 3: every lane exhausted, never more than capacity
+    // Alongside whatever live near-limit/exhausted warnings the now fully-spent pool also reports.
+    expect(tracker.warnings()).toContainEqual(
+      expect.objectContaining({ code: 'carryForwardClamped', pool: 'modelTurns', remaining: 5 }),
+    );
+  });
+
+  it('a carried-forward pool that exactly fills ordinary leaves ordinary genuinely exhausted for a later reservation', () => {
+    const tracker = createBudgetTracker(POLICY, {
+      carryForward: { modelTurnsUsed: 13, toolCallsUsed: 0, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+    });
+    expect(tracker.state().ordinaryExhausted.modelTurns).toBe(true);
+    expect(tracker.canContinue('exploration', 0)).toBe(false); // exploration only ever draws ordinary
+    // highRiskCoverage can still spill into the reserve the ordinary lane can no longer cover.
+    const outcome = tracker.reserve(request({ purpose: 'highRiskCoverage', modelTurns: 1, hostInitiated: true }));
+    expect(outcome.ok && outcome.reservation.charges).toEqual([{ pool: 'modelTurns', lane: 'highRiskReserve', owner: 'shared', amount: 1 }]);
+  });
+
+  it('never charges a carry-forward against a changeset member\'s private slice', () => {
+    const tracker = createBudgetTracker({ ...POLICY, changesetMemberMinimumToolCalls: 4 }, {
+      members: ['m1', 'm2'],
+      carryForward: { modelTurnsUsed: 0, toolCallsUsed: 10, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+    });
+    const state = tracker.state();
+    expect(state.members.m1?.privateOrdinary.toolCalls.used).toBe(0);
+    expect(state.members.m2?.privateOrdinary.toolCalls.used).toBe(0);
+    expect(state.pools.toolCalls.lanes.ordinary.used).toBe(10); // charged to the shared lane only
+  });
+});

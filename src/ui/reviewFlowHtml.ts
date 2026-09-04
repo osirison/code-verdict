@@ -199,6 +199,21 @@ export interface FlowViewState {
    */
   runControls?: { canPause: boolean; canResume: boolean; canCancel: boolean };
   /**
+   * Task 14.6: an earlier attempt on this target ended `interrupted` and
+   * nothing is running now — shown only by the `'agent'` picker screen,
+   * before the reviewer starts anything new. `resumable` mirrors
+   * `RunControls.canResumeFromCheckpoint`; `reasons` mirrors
+   * `RunControls.resumeReasons`, present only alongside `resumable: false`.
+   * Absent whenever the target's last outcome was not `interrupted` (the
+   * ordinary case). Wording here is pinned by
+   * `reviewFlowHtml.test.ts`'s own no-reconnect check, mirroring
+   * `harnessResume.test.ts`'s: a resumed run is always a new attempt from
+   * the checkpoint, never a reconnection — neither this field's renderer
+   * nor its button label may say "resume", "reconnect", or imply the lost
+   * session picked back up.
+   */
+  interruptedPrior?: { resumable: boolean; reasons?: readonly Limitation[] };
+  /**
    * A completed review is still held for this target and is reachable from the
    * screen currently showing. True only where the two coexist — the pickers
    * opened over a result, and a re-run in flight that has not replaced it yet.
@@ -287,6 +302,16 @@ export type FlowMessage =
   | { type: 'removeContextItem'; itemId: string }
   | { type: 'toggleAutoContextItem'; itemId: string }
   | { type: 'run'; instructions?: string }
+  /**
+   * Task 14.6: start a new attempt seeded from an earlier interrupted
+   * attempt's checkpoint (`ReviewRunManager.resumeRun`), never the plain
+   * `run`/`trigger()` path — only dispatched when `interruptedPrior.resumable`
+   * is true. Carries the same `instructions` shape as `run` because it goes
+   * through the identical context-reference resolution before building the
+   * `RunInput` (`reviewFlow.ts`'s `run()`, parameterized by which manager
+   * call it ends in).
+   */
+  | { type: 'resumeFromCheckpoint'; instructions?: string }
   | { type: 'cancel' }
   | { type: 'pauseRun' }
   | { type: 'resumeRun' }
@@ -859,6 +884,7 @@ function renderRunReview(s: FlowViewState): string {
         ? `<div class="notice"><span>${s.skippedAgents.length} agent ${s.skippedAgents.length === 1 ? 'file was' : 'files were'} skipped because ${s.skippedAgents.length === 1 ? 'it could' : 'they could'} not be read.</span><button class="dismiss" id="show-skipped">Show which</button></div>`
         : ''
     }
+    ${interruptedPriorNotice(s.interruptedPrior)}
     <div class="picker-stack">
       ${agentPicker(s, agent)}
       ${modelPicker(s, agent)}
@@ -898,6 +924,7 @@ function renderRunReview(s: FlowViewState): string {
     </div>
     ${contextArea(s)}
     <div class="footer-row">
+      ${s.interruptedPrior?.resumable ? '<button class="btn btn-accent" id="resume-from-checkpoint">Start new attempt from checkpoint</button>' : ''}
       <button class="btn btn-brand" id="run"${runBlocked ? ' disabled' : ''}>Run review</button>
       <button class="btn" id="cancel">Cancel</button>
       <span class="footer-hint">${
@@ -1002,6 +1029,26 @@ function coverageLine(coverage: CoverageProgress | undefined): string {
 function limitationsList(limitations: readonly Limitation[]): string {
   if (limitations.length === 0) return '';
   return `<div class="limitations">${limitations.map((l) => `<div class="limitation-chip">${e(l.message)}</div>`).join('')}</div>`;
+}
+
+/**
+ * Task 14.6: the `'agent'` picker screen's own banner for a target whose
+ * last attempt was `interrupted` — the plain-English fact of what
+ * happened, and either the "Start new attempt from checkpoint" offer
+ * (rendered as the footer-row button, gated on the same
+ * `s.interruptedPrior.resumable`) or every reason the checkpoint itself
+ * cannot back one. D13's rule applies here exactly as it does to
+ * `harnessResume.ts`'s own narrative strings: an attempt boundary is
+ * public and the old attempt stays closed, so nothing below may say
+ * "resume", "reconnect", or otherwise imply the reviewer is picking the
+ * same session back up rather than starting attempt N+1 from a checkpoint.
+ */
+function interruptedPriorNotice(prior: FlowViewState['interruptedPrior']): string {
+  if (!prior) return '';
+  const sentence = prior.resumable
+    ? 'An earlier attempt on this change request was interrupted. Its plan, findings, and coverage so far are available to carry into a new attempt.'
+    : 'An earlier attempt on this change request was interrupted, and its checkpoint cannot be carried into a new attempt.';
+  return `<div class="notice"><span>${e(sentence)}</span>${prior.resumable ? '' : limitationsList(prior.reasons ?? [])}</div>`;
 }
 
 /**
@@ -1869,6 +1916,12 @@ document.addEventListener('click', (ev) => {
   ev.preventDefault();
   const instructions = document.getElementById('extra')?.value;
   post({ type: 'run', instructions });
+});
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#resume-from-checkpoint')) return;
+  ev.preventDefault();
+  const instructions = document.getElementById('extra')?.value;
+  post({ type: 'resumeFromCheckpoint', instructions });
 });
 on('cancel', 'cancel'); on('cancel-run', 'cancel');
 on('pause-run', 'pauseRun'); on('resume-run', 'resumeRun');

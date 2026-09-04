@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ChangedFileEntry, ChangedFileManifestResult, InvestigationSnapshotRef } from '../platform/types';
-import { coverageChangedFact, createChangedFileInventory } from './harnessInventory';
+import { applyCoverageSeed, coverageChangedFact, createChangedFileInventory } from './harnessInventory';
+import type { MemberCoverage } from '../domain/harnessCoverage';
 
 const SNAPSHOT: InvestigationSnapshotRef = { repoId: 'repo-1', baseSha: 'base-1', headSha: 'head-1' };
 const OTHER_HEAD: InvestigationSnapshotRef = { ...SNAPSHOT, headSha: 'head-2' };
@@ -259,5 +260,53 @@ describe('coverage progress facts (section-5 integration)', () => {
       kind: 'coverageChanged',
       coverage: { classified: 2, inspected: 2, total: 3, requiredInspected: 1 },
     });
+  });
+});
+
+describe('applyCoverageSeed (task 14.6: replaying a resumed attempt\'s classifications onto a freshly enumerated inventory)', () => {
+  it('re-applies inspected, classified and terminal states onto matching freshly enumerated files', () => {
+    const inventory = inventoryWith([entry('inspected.ts'), entry('classified.ts'), entry('binary.png'), entry('untouched.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      totalFiles: 4,
+      files: [
+        { path: 'inspected.ts', memberId: 'm1', state: 'inspected', risk: 'high', logicalUnit: 'auth' },
+        { path: 'classified.ts', memberId: 'm1', state: 'classified', risk: 'low' },
+        { path: 'binary.png', memberId: 'm1', state: 'binary', risk: 'low', reason: 'Binary file.' },
+        { path: 'untouched.ts', memberId: 'm1', state: 'unvisited' },
+      ],
+    }];
+
+    applyCoverageSeed(inventory, coverage);
+
+    expect(inventory.file('m1', 'inspected.ts')).toMatchObject({ state: 'inspected', risk: 'high', logicalUnit: 'auth' });
+    expect(inventory.file('m1', 'classified.ts')).toMatchObject({ state: 'classified', risk: 'low' });
+    expect(inventory.file('m1', 'binary.png')).toMatchObject({ state: 'binary', risk: 'low', reason: 'Binary file.' });
+    expect(inventory.file('m1', 'untouched.ts')).toMatchObject({ state: 'unvisited' });
+  });
+
+  it('skips a checkpoint record for a path the fresh enumeration does not know, rather than throwing', () => {
+    const inventory = inventoryWith([entry('still-here.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      files: [{ path: 'renamed-away.ts', memberId: 'm1', state: 'inspected', risk: 'high' }],
+    }];
+
+    expect(() => applyCoverageSeed(inventory, coverage)).not.toThrow();
+    expect(inventory.file('m1', 'still-here.ts')).toMatchObject({ state: 'unvisited' });
+  });
+
+  it('leaves a file unvisited rather than guessing when a non-unvisited record carries no risk', () => {
+    const inventory = inventoryWith([entry('odd.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      files: [{ path: 'odd.ts', memberId: 'm1', state: 'inspected' }], // risk missing — should not happen in production
+    }];
+
+    applyCoverageSeed(inventory, coverage);
+    expect(inventory.file('m1', 'odd.ts')).toMatchObject({ state: 'unvisited' });
   });
 });

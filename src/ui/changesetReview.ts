@@ -49,7 +49,7 @@ import {
   type ChangesetDraft,
 } from '../app/retainedReview';
 import { CoalescedDraftWriter } from '../app/draftWriter';
-import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
+import type { ChangesetRunMember, ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
@@ -379,11 +379,31 @@ export class ChangesetReviewPanel {
     return [...entries.values()];
   }
 
+  /**
+   * The full member shape (with each member's whole fetched diff), still
+   * needed by the pre-run context-usage estimate below
+   * (`assembleChangesetReviewPrompt`, `scheduleContextUsage`) — a prompt-size
+   * estimate for display, never a review execution. `runMembers` is the
+   * slimmer sibling that actually starts a run (task 15.8): the harness
+   * fetches diffs itself, in bounded pages, once it has a live `Connection`,
+   * so `RunInput` carries only the revision identity.
+   */
   private promptMembers(): ChangesetAgentMember[] {
     return this.members.map((member) => ({
       ...member,
       context: this.promptContext(member),
       attachments: this.attachmentsForMember(member),
+    }));
+  }
+
+  /** Task 15.8: `promptMembers()`, slimmed to what `RunInput` carries — see that method's own doc comment. */
+  private runMembers(): ChangesetRunMember[] {
+    return this.promptMembers().map((member) => ({
+      ref: member.ref,
+      baseSha: member.diff.baseSha,
+      headSha: member.diff.headSha,
+      context: member.context,
+      attachments: member.attachments,
     }));
   }
 
@@ -651,7 +671,6 @@ export class ChangesetReviewPanel {
    */
   private async run(): Promise<void> {
     const pod = this.pod();
-    const runVocabulary = getProvider(pod.providerId).vocabulary;
     const effort = this.selectedEffort();
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
@@ -670,7 +689,7 @@ export class ChangesetReviewPanel {
     }
 
     const input: RunInput = {
-      target: { kind: 'changeset', changesetId: this.changesetId, members: this.promptMembers() },
+      target: { kind: 'changeset', changesetId: this.changesetId, members: this.runMembers() },
       refLabel: this.changeset.name,
       podId: pod.id,
       criteria: pod.criteria,
@@ -680,13 +699,6 @@ export class ChangesetReviewPanel {
       effort,
       timeouts: agentRunTimeouts(),
       contextBudgets: this.contextBudgets,
-      steps: [
-        'Resolving agent from Copilot workspace…',
-        `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
-        'Cross-referencing contracts between repositories…',
-        `Scoring findings against ${runVocabulary.repoNoun} criteria…`,
-        'Items ready',
-      ],
       demo,
     };
 

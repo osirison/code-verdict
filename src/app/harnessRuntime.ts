@@ -54,9 +54,16 @@ import { getProvider } from '../platform/registry';
 import type { ModelDescriptor } from './agents';
 import type { AttachmentWarning, RevalidatedAttachments } from './attachments';
 import { createAgentsPolicyResolver, rootAgentsPolicySourceFor, type AgentsPolicyMemberRef } from './harnessAgentsPolicy';
-import { createHarnessAttempt, type CheckpointInfo, type HarnessAttempt, type HarnessAttemptMemberInput } from './harnessAttempt';
+import {
+  createHarnessAttempt,
+  type CheckpointInfo,
+  type HarnessAttempt,
+  type HarnessAttemptMemberInput,
+  type HarnessAttemptOptions,
+} from './harnessAttempt';
 import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createDemoModelSeam } from './harnessDemoParticipant';
+import { decideResume, ResumeIncompatibleError } from './harnessResume';
 import { createLiveModelSeam } from './harnessModelSeam';
 import type { HarnessRunStore } from './harnessRunStore';
 import { createSynthesisVerification } from './harnessSynthesisVerification';
@@ -115,8 +122,8 @@ function rawMembersFrom(input: RunInput): readonly RawMember[] {
       {
         memberId: memberIdFor(input.target.ref),
         ref: input.target.ref,
-        baseSha: input.target.diff.baseSha,
-        headSha: input.target.diff.headSha,
+        baseSha: input.target.baseSha,
+        headSha: input.target.headSha,
         context: input.target.reviewContext,
         attachments: input.target.attachments,
       },
@@ -125,8 +132,8 @@ function rawMembersFrom(input: RunInput): readonly RawMember[] {
   return input.target.members.map((member) => ({
     memberId: memberIdFor(member.ref),
     ref: member.ref,
-    baseSha: member.diff.baseSha,
-    headSha: member.diff.headSha,
+    baseSha: member.baseSha,
+    headSha: member.headSha,
     context: member.context,
     attachments: member.attachments,
   }));
@@ -164,16 +171,27 @@ async function revalidateMemberAttachments(
   return results.map((result) => result.member);
 }
 
+interface CandidateAssembly {
+  readonly pod: ResolvedPod;
+  readonly revalidatedMembers: readonly RawMember[];
+  readonly snapshot: ReturnType<typeof buildReviewRunSnapshot>;
+}
+
 /**
- * Assembles a `ReviewRunSnapshot`, resolves every member's live `Connection`
- * and root `AGENTS.md` identity, and builds one `HarnessAttempt` — the async
- * work `ReviewHarnessFactory`'s own synchronous `create`/`createDemo` cannot
- * do inline (see this file's own header).
+ * Resolves every member's live `Connection` and root `AGENTS.md` identity and builds this
+ * attempt's `ReviewRunSnapshot` — shared by `create`/`createDemo` (a fresh lineage at attempt 1)
+ * and `resume` (the *candidate* snapshot `decideResume` below compares against a stored one, at
+ * `options.identity`'s already-next attempt number in an *existing* lineage). Never writes it:
+ * `create`/`createDemo` write immediately: no compatibility to check first. `resume` writes only
+ * after `decideResume` accepts it — see `resume`'s own doc comment for why.
  */
-async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, options: HarnessAttemptRunOptions, demo: boolean): Promise<HarnessAttempt> {
+async function buildCandidateAssembly(
+  deps: HarnessRuntimeDeps,
+  input: RunInput,
+  options: HarnessAttemptRunOptions,
+  demo: boolean,
+): Promise<CandidateAssembly> {
   const now = deps.now ?? (() => Date.now());
-  const startedAt = now();
-  const policy = deps.policy ?? DEFAULT_HARNESS_POLICY;
 
   const pod = await resolvePod(deps, input.podId);
   const revalidatedMembers = await revalidateMemberAttachments(deps, rawMembersFrom(input), options.onAttachmentWarnings);
@@ -209,7 +227,7 @@ async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, option
     runId: options.identity.runId,
     lineageId: options.identity.lineageId,
     attempt: options.identity.attempt,
-    createdAt: new Date(startedAt).toISOString(),
+    createdAt: new Date(now()).toISOString(),
     targetKind: input.target.kind,
     changesetId: input.target.kind === 'changeset' ? input.target.changesetId : undefined,
     members: snapshotMembers,
@@ -219,10 +237,25 @@ async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, option
     criteria: input.criteria,
   });
 
-  // Written before the first checkpoint can fire — `harnessResume.ts`'s compatibility checks and
-  // the activation sweep (`sweepInterruptedRuns`) both need a stored snapshot to check a checkpoint
-  // against.
-  await deps.harnessRunStore.writeSnapshot(snapshot);
+  return { pod, revalidatedMembers, snapshot };
+}
+
+/**
+ * Builds the live `HarnessAttempt` from an already-written snapshot — the second half both
+ * `assembleAttempt` and `resume` share once they have one, with `resumeSeed` threaded through only
+ * on the resume path.
+ */
+function buildHarnessAttempt(
+  deps: HarnessRuntimeDeps,
+  options: HarnessAttemptRunOptions,
+  assembly: CandidateAssembly,
+  demo: boolean,
+  resumeSeed: HarnessAttemptOptions['resumeSeed'],
+): HarnessAttempt {
+  const now = deps.now ?? (() => Date.now());
+  const startedAt = now();
+  const policy = deps.policy ?? DEFAULT_HARNESS_POLICY;
+  const { pod, revalidatedMembers, snapshot } = assembly;
 
   const modelSeam = demo
     ? createDemoModelSeam(snapshot)
@@ -231,7 +264,6 @@ async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, option
         runTurn: (prompt) => deps.runTurn(snapshot.modelId!, prompt, {
           cancellation: options.cancellation,
           timeouts: options.timeouts,
-          onProgress: options.onProgress,
         }),
       });
 
@@ -286,7 +318,63 @@ async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, option
       onEnterWaiting: () => options.onEnterWaiting?.(),
       onResuming: () => options.onResuming?.(),
     },
+    resumeSeed,
   });
+}
+
+/**
+ * Assembles a `ReviewRunSnapshot` and builds one `HarnessAttempt` — the async work
+ * `ReviewHarnessFactory`'s own synchronous `create`/`createDemo` cannot do inline (see this file's
+ * own header). A fresh lineage, always attempt 1 (`options.identity`, minted by the manager's own
+ * `trigger()`): nothing to compare against, so the snapshot is written immediately.
+ */
+async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, options: HarnessAttemptRunOptions, demo: boolean): Promise<HarnessAttempt> {
+  const assembly = await buildCandidateAssembly(deps, input, options, demo);
+  // Written before the first checkpoint can fire — `harnessResume.ts`'s compatibility checks and
+  // the activation sweep (`sweepInterruptedRuns`) both need a stored snapshot to check a checkpoint
+  // against.
+  await deps.harnessRunStore.writeSnapshot(assembly.snapshot);
+  return buildHarnessAttempt(deps, options, assembly, demo, undefined);
+}
+
+/**
+ * Task 14.6: resumes the lineage at `options.identity.lineageId` — the manager has already read
+ * `runId`/`lineageId` and computed `options.identity.attempt` as one past the lineage's last
+ * checkpoint (`ReviewRunManager.resumeRun`'s own doc comment). Never called for a demo run: a
+ * deterministic script has nothing worth resuming, and `ReviewRunManager` never offers it one.
+ *
+ * Builds this attempt's *candidate* snapshot the ordinary way (`buildCandidateAssembly`, the same
+ * ordinary live I/O `create` does — the reviewer's current pod, model, criteria), reads the
+ * lineage's stored snapshot and last checkpoint, and asks `decideResume` whether the two agree.
+ *
+ * Incompatible: throws `ResumeIncompatibleError` with every failing reason — *before*
+ * `writeSnapshot`, so an attempt that will not start never litters the store with a snapshot for
+ * it. `ReviewRunManager.executeAttempt`'s catch block turns this into a `failed` `RunRecord`
+ * carrying every reason as `limitations`; the lineage's own `resumable` offer is untouched (see
+ * `ResumeIncompatibleError`'s own doc comment) — the reviewer can undo whatever changed and try
+ * again, or restart as an ordinary fresh `trigger()`.
+ *
+ * Compatible: writes the candidate snapshot (a resume-of-a-resume needs it stored too, same
+ * ordering as `create`), then builds the attempt seeded with `decideResume`'s payload and start
+ * narrative (`harnessAttempt.ts`'s own `HarnessAttemptOptions.resumeSeed` doc comment covers what
+ * each piece does). The lost attempt itself is not re-closed here: the activation sweep
+ * (`sweepInterruptedRuns`) already closed it as `interrupted` before this ever runs, and
+ * `latestCheckpoint` below reads exactly that closed checkpoint.
+ */
+async function assembleResumeAttempt(deps: HarnessRuntimeDeps, input: RunInput, options: HarnessAttemptRunOptions): Promise<HarnessAttempt> {
+  const lineageId = options.identity.lineageId;
+  const storedCheckpoint = deps.harnessRunStore.latestCheckpoint(lineageId);
+  const storedSnapshot = storedCheckpoint ? deps.harnessRunStore.readSnapshot(lineageId, storedCheckpoint.attempt) : undefined;
+  if (!storedCheckpoint || !storedSnapshot) {
+    throw new ResumeIncompatibleError([{ code: 'noCheckpoint', message: 'No checkpoint was found for this run to resume from.' }]);
+  }
+
+  const assembly = await buildCandidateAssembly(deps, input, options, false);
+  const decision = decideResume({ storedSnapshot, checkpoint: storedCheckpoint, candidateSnapshot: assembly.snapshot });
+  if (decision.kind === 'incompatible') throw new ResumeIncompatibleError(decision.reasons);
+
+  await deps.harnessRunStore.writeSnapshot(assembly.snapshot);
+  return buildHarnessAttempt(deps, options, assembly, false, { payload: decision.payload, startAction: decision.startAction });
 }
 
 /** Builds the real `ReviewHarnessFactory` (D1) that `extension.ts` hands `ReviewRunManager`. */
@@ -297,6 +385,9 @@ export function createReviewHarnessFactory(deps: HarnessRuntimeDeps): ReviewHarn
     },
     createDemo(input, options) {
       return { run: () => assembleAttempt(deps, input, options, true).then((attempt) => attempt.run()) };
+    },
+    resume(input, options) {
+      return { run: () => assembleResumeAttempt(deps, input, options).then((attempt) => attempt.run()) };
     },
   };
 }

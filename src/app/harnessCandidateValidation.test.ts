@@ -7,6 +7,7 @@ import {
   toCandidateValidationResult,
   validateCandidate,
   type CandidateValidationContext,
+  type TrackedCandidate,
   type ValidatedFinding,
 } from './harnessCandidateValidation';
 import {
@@ -415,5 +416,34 @@ describe('revalidation and unresolved tracking (task 7.8)', () => {
     tracker.record(validateCandidate(candidate(fixture), fixture.context));
     expect(tracker.blocksCompletion()).toBe(false);
     expect(tracker.triageFindings()).toHaveLength(1);
+  });
+});
+
+describe('seeding from a resumed checkpoint (task 14.6)', () => {
+  it('loads every seeded candidate verbatim, in its prior state, before any new submission arrives', () => {
+    const fixture = setup();
+    const finding = accepted(fixture, { candidateId: 'cand-accepted' });
+    const seed: TrackedCandidate[] = [
+      { candidateId: 'cand-accepted', state: 'accepted', repairs: 0, reasons: [], finding },
+      { candidateId: 'cand-unresolved', state: 'unresolved', repairs: 1, reasons: [{ code: 'headChanged', message: 'moved' }] },
+      { candidateId: 'cand-rejected', state: 'rejected', repairs: 2, reasons: [{ code: 'repairLimit', message: 'too many repairs' }] },
+    ];
+    const tracker = createCandidateTracker({ seed });
+
+    expect(tracker.all().map((c) => c.candidateId).sort()).toEqual(['cand-accepted', 'cand-rejected', 'cand-unresolved']);
+    expect(tracker.get('cand-accepted')).toMatchObject({ state: 'accepted' });
+    expect(tracker.triageFindings().map((f) => f.candidateId)).toEqual(['cand-accepted']);
+    expect(tracker.unresolvedCount()).toBe(1);
+    expect(tracker.blocksCompletion()).toBe(true); // the seeded unresolved candidate still blocks, exactly as it did before the restart
+    expect(Object.isFrozen(tracker.all()[0])).toBe(true);
+  });
+
+  it('a seeded candidate stays fully live: repairs, invalidation and closure all still apply on top of it', () => {
+    const seed: TrackedCandidate[] = [{ candidateId: 'cand-rejected', state: 'rejected', repairs: 2, reasons: [] }];
+    const tracker = createCandidateTracker({ seed, maxRepairsPerCandidate: 1 });
+    // A rejected candidate is closed; resubmitting under the same id changes nothing (same rule a
+    // freshly-tracked rejected candidate follows).
+    const fixture = setup();
+    expect(tracker.record(validateCandidate(candidate(fixture, { candidateId: 'cand-rejected' }), fixture.context)).state).toBe('rejected');
   });
 });
