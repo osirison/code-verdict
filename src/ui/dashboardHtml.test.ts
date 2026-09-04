@@ -140,7 +140,7 @@ describe('dashboard fidelity (spec §2)', () => {
 
   it('derives every stat from the state and colors the AI pill by state', () => {
     expect(html).toContain('7/9');
-    expect(html).toContain('pill pill-warn');
+    expect(html).toContain('pill pill-ai pill-warn');
     expect(html).toContain('8 findings');
     expect(html).toContain('!2841 · @you · feat/auth-refresh');
   });

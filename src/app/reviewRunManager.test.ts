@@ -385,6 +385,7 @@ describe('a run completes with nobody watching', () => {
       ref: { repoId: 'repo-1', number: '2841' },
       refLabel: '!2841',
       itemCount: 3,
+      completeness: 'complete',
       // The notification's open action resolves a ref against the *active*
       // pod, so a run that finished after a switch has to be able to say it is
       // not about this one.
@@ -1575,6 +1576,98 @@ describe('task 12.5/12.6: a partial result is durable, separately reachable, and
     await vi.waitFor(() => expect(new ReviewRunStore(globalState).list()).toHaveLength(1));
 
     expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '2841', outcome: 'partial', findingCount: 2 });
+    // Task 14.4: the same `HarnessAttemptResult.outcome.limitations` the
+    // durable partial record carries — never a second read — so a
+    // dashboard row can say *why* this is partial, not only that it is.
+    expect(new ReviewRunStore(globalState).list()[0]?.limitations).toEqual([
+      { code: 'harness.test', message: 'Coverage did not reach every high-risk file.' },
+    ]);
+  });
+});
+
+// ---- Task 14.7: notifications distinguish failed, cancelled, and succeeded outcomes -----
+
+describe('task 14.7: onRunOutcome notifies the terminal states onReviewReady does not cover', () => {
+  it('fires for a failed result, naming the finding count kept as a partial', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toEqual({
+      lifecycle: 'failed',
+      completeness: 'partial',
+      refLabel: '!2841',
+      ref: { repoId: 'repo-1', number: '2841' },
+      podId: 'pod-a',
+      findingCount: 2,
+    });
+  });
+
+  it('fires for a failed result with nothing validated, naming no finding count', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed-file inventory is incomplete.', '!2841'));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toMatchObject({ lifecycle: 'failed', completeness: 'none', findingCount: undefined });
+  });
+
+  it('fires for a cancelled result, whichever of the settlement paths produced it', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toEqual({
+      lifecycle: 'cancelled',
+      completeness: 'partial',
+      refLabel: '!2841',
+      ref: { repoId: 'repo-1', number: '2841' },
+      podId: 'pod-a',
+      findingCount: 2,
+    });
+  });
+
+  it('fires for a cancellation of a run that never dispatched, with nothing to keep as partial', async () => {
+    const { runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+    // Limit 1: the first trigger holds the only slot, so the second is
+    // genuinely queued — the same "never reached the transport" branch
+    // `cancel()`'s own doc comment describes, settling straight to
+    // `cancelled` with no attempt to wait on.
+    runs.trigger(crInput('other'), 1);
+    const queued = runs.trigger(crInput('2841'), 1);
+
+    runs.cancel(queued.key);
+
+    expect(outcomes).toEqual([
+      { lifecycle: 'cancelled', completeness: 'none', refLabel: '!2841', ref: { repoId: 'repo-1', number: '2841' }, podId: 'pod-a', findingCount: undefined },
+    ]);
+  });
+
+  it('never fires for a succeeded result — onReviewReady already covers it, and this would double-notify', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const ready: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info), onReviewReady: (info) => ready.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+
+    await vi.waitFor(() => expect(ready).toHaveLength(1));
+    expect(outcomes).toEqual([]);
   });
 });
 

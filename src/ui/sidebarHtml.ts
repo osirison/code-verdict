@@ -402,13 +402,51 @@ function renderPending(pending: SidebarPendingReview): string {
  * exists; the shared `elapsedClock` (./vocab.ts — the same formatter the
  * active review screen ticks its own clock with) otherwise. Never a
  * percentage estimated from no denominator (task 14.3, design.md D10).
+ *
+ * Exported for task 14.5: the status bar's own compact summary
+ * (`statusBarRunsSummary` below) reads off this exact same decision —
+ * never a second determinate/indeterminate check that could disagree with
+ * this one about whether a real denominator exists.
  */
-function runMetaText(run: SidebarActiveRun): string {
+export function runMetaText(run: SidebarActiveRun): string {
   if (run.lifecycle === 'queued') return 'queued';
   if (run.progressMode === 'determinate' && run.progressUnits?.total !== undefined) {
     return `${run.progressUnits.completed}/${run.progressUnits.total}`;
   }
   return elapsedClock(run.elapsedMs);
+}
+
+/**
+ * Task 14.5 (design.md D10/D14): the status bar's own compact summary of
+ * the same active-run list the sidebar renders — never a second read of
+ * `RunRecord`, and never a second determinate/indeterminate decision
+ * (`runMetaText` above is the one place that reads `progressMode`/
+ * `progressUnits`/`elapsedMs` and decides which to show). `undefined` when
+ * nothing is running, so the caller hides the segment entirely rather than
+ * showing an empty one.
+ *
+ * The lead run is `runs[0]` — the earliest-triggered still-active run
+ * (`ReviewRunManager.active()`'s own FIFO order, which `toSidebarActiveRuns`
+ * preserves) — deterministic, and exactly the one "click to list them or
+ * cancel one" would show first. With more than one run in flight, the
+ * count alone already says "several"; naming only the lead run's own
+ * phase and unit keeps the bar from growing with every extra run,
+ * satisfying "keep it short enough not to push other items out of the bar."
+ */
+export function statusBarRunsSummary(
+  runs: readonly SidebarActiveRun[],
+): { count: number; lead: { label: string; phase: string; unit: string; attention: boolean } } | undefined {
+  const lead = runs[0];
+  if (!lead) return undefined;
+  return {
+    count: runs.length,
+    lead: {
+      label: lead.label,
+      phase: runLifecycleLabel(lead.lifecycle),
+      unit: runMetaText(lead),
+      attention: lead.attention === 'attentionRequired',
+    },
+  };
 }
 
 /**

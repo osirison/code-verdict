@@ -191,6 +191,14 @@ export interface FlowViewState {
   /** Waiting for a concurrency slot: accepted and held, not failed. */
   runQueued?: boolean;
   /**
+   * Task 14.6: which of pause/resume/cancel the manager will actually
+   * accept for this run right now — derived from its own transition
+   * validity (`isLegalRunTransition`), never a hand-listed set of
+   * lifecycles. Absent before the manager has admitted the run at all,
+   * same as `runProjection`.
+   */
+  runControls?: { canPause: boolean; canResume: boolean; canCancel: boolean };
+  /**
    * A completed review is still held for this target and is reachable from the
    * screen currently showing. True only where the two coexist — the pickers
    * opened over a result, and a re-run in flight that has not replaced it yet.
@@ -280,6 +288,8 @@ export type FlowMessage =
   | { type: 'toggleAutoContextItem'; itemId: string }
   | { type: 'run'; instructions?: string }
   | { type: 'cancel' }
+  | { type: 'pauseRun' }
+  | { type: 'resumeRun' }
   | { type: 'usePartial' }
   | { type: 'retryRun' }
   | { type: 'toggleReviewContext' }
@@ -1113,8 +1123,30 @@ function renderRunning(s: FlowViewState): string {
     ${planBlock(activity)}
     ${limitationsList(projection?.limitations ?? [])}
     ${activityFeed(activity)}
+    ${runControlsRow(s.runControls)}
     ${retainedRow(s)}
   </div>`;
+}
+
+/**
+ * Pause/resume/cancel, gated entirely by `FlowViewState.runControls` (task
+ * 14.6) — computed in `reviewFlow.ts` from the manager's own transition
+ * validity (`isLegalRunTransition`), never a hand-listed set of lifecycles
+ * this renderer would have to keep in sync on its own. A control this run's
+ * current lifecycle does not accept is not rendered at all, rather than
+ * rendered disabled: there is nothing here for a reviewer to be told "no"
+ * about that the manager itself will not already refuse as a silent no-op.
+ */
+function runControlsRow(controls: FlowViewState['runControls']): string {
+  if (!controls) return '';
+  const buttons = [
+    controls.canPause ? '<button class="btn" id="pause-run">Pause</button>' : '',
+    controls.canResume ? '<button class="btn btn-accent" id="resume-run">Resume</button>' : '',
+    controls.canCancel ? '<button class="btn" id="cancel-run">Cancel</button>' : '',
+  ]
+    .filter(Boolean)
+    .join('');
+  return buttons ? `<div class="actions-row actions-center">${buttons}</div>` : '';
 }
 
 /**
@@ -1839,6 +1871,7 @@ document.addEventListener('click', (ev) => {
   post({ type: 'run', instructions });
 });
 on('cancel', 'cancel'); on('cancel-run', 'cancel');
+on('pause-run', 'pauseRun'); on('resume-run', 'resumeRun');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
 on('new-run', 'newRun'); on('back-to-result', 'backToResult');

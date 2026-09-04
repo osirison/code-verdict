@@ -51,7 +51,7 @@ import {
   type SessionDraft,
 } from '../app/retainedReview';
 import { CoalescedDraftWriter } from '../app/draftWriter';
-import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
+import { isLegalRunTransition, type ReviewRunManager, type RunInput, type RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
@@ -1193,6 +1193,15 @@ export class ReviewFlowPanel {
         }
         this.deps.runs.cancel(this.runKey());
         return;
+      case 'pauseRun':
+        // Task 14.6: the button only renders when `runControls.canPause` is
+        // true, but a state change can race the click — `pause()` is its
+        // own no-op guard for exactly that, so nothing extra is needed here.
+        this.deps.runs.pause(this.runKey());
+        return;
+      case 'resumeRun':
+        this.deps.runs.resume(this.runKey());
+        return;
       case 'retryRun':
         void this.run();
         return;
@@ -1873,6 +1882,24 @@ export class ReviewFlowPanel {
         ? { ...this.runRecord.failure, partialCount: 0 }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
+      // Task 14.6: derived from the manager's own transition validity
+      // (`isLegalRunTransition`), never a hand-listed set of lifecycles a
+      // future lifecycle could quietly drift out of sync with. A control
+      // is offered only when the exact call it would make — `pause`/
+      // `resume`/`cancel` on this same key — is one the manager actually
+      // accepts; a stale click racing a state change is refused as a
+      // silent no-op by the manager itself, the same guard that already
+      // protects every other transition here. Live in-session resume has
+      // no compatibility gate (only a *lost* attempt across a restart
+      // does, section 11's own decision), so there is no separate
+      // "restart" control on this screen — resume alone covers it.
+      runControls: this.runRecord
+        ? {
+            canPause: isLegalRunTransition(this.runRecord.lifecycle, 'paused'),
+            canResume: isLegalRunTransition(this.runRecord.lifecycle, 'resuming'),
+            canCancel: isLegalRunTransition(this.runRecord.lifecycle, 'cancelling'),
+          }
+        : undefined,
       // The retained review stays reachable from the pickers and from a run in
       // flight: neither of them has replaced it yet.
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),

@@ -383,6 +383,36 @@ export interface ReviewReadyInfo {
    * must be able to say it is not about this one.
    */
   podId: string;
+  /**
+   * Task 14.7 (spec `review-run-activity`: "the notification distinguishes
+   * complete, partial, failed, and cancelled outcomes"): `onReviewReady`
+   * only ever fires for a `succeeded` lifecycle (D2: succeeded may still be
+   * `partial` — an attempt that validated findings but did not satisfy
+   * every completion condition), so this is the one thing a "review ready"
+   * toast still has to get right — never say "ready" for a result that is
+   * not actually done.
+   */
+  completeness: ResultCompleteness;
+}
+
+/**
+ * Task 14.7: the terminal outcomes `onReviewReady` does not cover — a
+ * `succeeded` result always fires `onReviewReady` instead (see that
+ * interface's own doc comment), so this never duplicates it. Fired from the
+ * one settlement funnel (`settle`), so every `failed`/`cancelled` path —
+ * a cooperative attempt result, the cancel grace timeout, a genuine crash,
+ * or cancelling a run that never dispatched — notifies exactly once,
+ * whether or not any Verdict screen is open (spec `background-review-runs`:
+ * "A run completes whether or not anyone is watching").
+ */
+export interface RunOutcomeInfo {
+  lifecycle: 'failed' | 'cancelled';
+  completeness: ResultCompleteness;
+  refLabel: string;
+  ref?: ChangeRequestRef;
+  podId: string;
+  /** Validated findings kept as an explicit partial (D11) — `undefined` when none were. */
+  findingCount?: number;
 }
 
 export interface ReviewRunManagerDeps {
@@ -402,6 +432,8 @@ export interface ReviewRunManagerDeps {
   runners: ReviewHarnessFactory | ReviewRunnersLegacy;
   onChange?: (record: RunRecord) => void;
   onReviewReady?: (info: ReviewReadyInfo) => void;
+  /** Task 14.7: the `failed`/`cancelled` counterpart to `onReviewReady` — see `RunOutcomeInfo`'s own doc comment. */
+  onRunOutcome?: (info: RunOutcomeInfo) => void;
   /** Fired only after the store write resolves — see `completeAttempt` below. */
   onRunRecorded?: () => void;
   now?: () => number;
@@ -1488,6 +1520,7 @@ export class ReviewRunManager {
           refLabel: input.refLabel,
           itemCount: response.items.length,
           podId: input.podId,
+          completeness: result.outcome.completeness,
         });
         return;
       }
@@ -1556,7 +1589,7 @@ export class ReviewRunManager {
         limitations: result.outcome.limitations,
         partialResult: partial,
       });
-      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt);
+      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
       return;
     }
     // 'failed', or (structurally unreachable from a live `.run()` — see this
@@ -1574,7 +1607,7 @@ export class ReviewRunManager {
       limitations: result.outcome.limitations,
       partialResult: partial,
     });
-    if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt);
+    if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
   }
 
   /**
@@ -1586,8 +1619,20 @@ export class ReviewRunManager {
    * result a panel reads back to render — see `completeAttempt`'s own
    * write-before-notify comment on the retained-review and durable-partial
    * writes themselves, which do precede notify).
+   *
+   * Task 14.4: `limitations` is the same `HarnessAttemptResult.outcome.
+   * limitations` the durable partial record and the `settle` call just
+   * above both already carry — never a second read or a re-derivation —
+   * so the dashboard row's "why partial" tooltip can read straight off
+   * `ReviewRun.limitations` instead of only off the record a panel opens.
    */
-  private async recordPartialHistory(identity: { repoId: string; crNumber: string }, agentLabel: string, findingCount: number, ranAt: string): Promise<void> {
+  private async recordPartialHistory(
+    identity: { repoId: string; crNumber: string },
+    agentLabel: string,
+    findingCount: number,
+    ranAt: string,
+    limitations: readonly Limitation[],
+  ): Promise<void> {
     await this.runs.record({
       repoId: identity.repoId,
       crNumber: identity.crNumber,
@@ -1595,6 +1640,7 @@ export class ReviewRunManager {
       findingCount,
       agentLabel,
       ranAt,
+      limitations,
     });
     this.deps.onRunRecorded?.();
   }
@@ -1678,6 +1724,23 @@ export class ReviewRunManager {
     };
     const applied = this.transition(current, outcome.lifecycle, patch);
     if (!applied) return; // already terminal — a late settlement, structurally refused (12.4)
+
+    // Task 14.7: `onReviewReady` already covers `succeeded` (including a
+    // `succeeded` result that is only `partial` — see that callback's own
+    // doc comment); every other terminal lifecycle reaching this, the one
+    // settlement funnel, notifies exactly once here — whichever of
+    // `completeAttempt`, the cancel grace timeout, or a genuine crash in
+    // `executeAttempt`'s catch block produced it.
+    if (outcome.lifecycle === 'failed' || outcome.lifecycle === 'cancelled') {
+      this.deps.onRunOutcome?.({
+        lifecycle: outcome.lifecycle,
+        completeness: patch.completeness!,
+        refLabel: record.input.refLabel,
+        ref: record.input.target.kind === 'cr' ? record.input.target.ref : undefined,
+        podId: record.input.podId,
+        findingCount: outcome.partialResult?.items.length,
+      });
+    }
 
     if (this.slotHolders.delete(record.key)) this.running = Math.max(0, this.running - 1);
     this.cancellations.get(record.key)?.dispose();
@@ -1902,6 +1965,11 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
   for (const entry of leftover) {
     let findingCount = 0;
     let resumable: boolean | undefined;
+    // Task 14.6: the same reasons `resumable`'s own boolean already
+    // collapsed `.length === 0` from — kept here too, never a second
+    // check, so a UI can show *why* a checkpoint failed integrity rather
+    // than only that it did.
+    let resumeReasons: readonly Limitation[] | undefined;
     if (harnessRunStore && entry.runId && entry.lineageId) {
       const lineageId = entry.lineageId as LineageId;
       const latest = harnessRunStore.latestCheckpoint(lineageId);
@@ -1911,7 +1979,9 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
           await harnessRunStore.writeCheckpoint(closed, policy);
           findingCount = acceptedFindingCount(closed.candidates);
           const storedSnapshot = harnessRunStore.readSnapshot(lineageId, closed.attempt);
-          resumable = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, closed).length === 0 : false;
+          const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, closed) : undefined;
+          resumable = reasons ? reasons.length === 0 : false;
+          if (reasons && reasons.length > 0) resumeReasons = reasons;
         }
       }
     }
@@ -1923,6 +1993,7 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
       agentLabel: '',
       ranAt: entry.startedAt,
       ...(resumable !== undefined ? { resumable } : {}),
+      ...(resumeReasons !== undefined ? { resumeReasons } : {}),
     });
   }
   await inFlight.clear();

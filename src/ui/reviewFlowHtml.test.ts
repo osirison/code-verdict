@@ -97,6 +97,11 @@ describe('generated review-flow script', () => {
     expect(script).toContain("a: () => verdict('accepted', !ev.shiftKey && acceptCanApplyFix())");
   });
 
+  it('wires the pause and resume buttons to their messages (task 14.6/14.8)', () => {
+    expect(script).toContain("on('pause-run', 'pauseRun')");
+    expect(script).toContain("on('resume-run', 'resumeRun')");
+  });
+
   it('compiles every script for complete single and changeset context fixtures', () => {
     const attachment = {
       id: 'repo-a:schema',
@@ -891,6 +896,72 @@ describe('the running screen renders from the shared projection alone (task 14.1
       }],
     });
     expect(html).not.toContain('style="');
+  });
+});
+
+/**
+ * Task 14.6: pause/resume/cancel render only where `runControls` (computed
+ * in `reviewFlow.ts` from `isLegalRunTransition`) says the manager actually
+ * accepts them — never a hand-listed set of lifecycles this renderer keeps
+ * in sync on its own.
+ */
+describe('run controls render only where the manager accepts them (task 14.6)', () => {
+  function running(overrides: Partial<FlowViewState> = {}): string {
+    return renderReviewFlowBody(
+      {
+        ...state,
+        screen: 'running',
+        runProjection: {
+          runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+          lifecycle: 'investigating', completeness: 'none', elapsedMs: 10_000,
+          progressMode: 'indeterminate', attention: 'none', limitations: [],
+        },
+        ...overrides,
+      },
+      'HVE Core',
+    );
+  }
+
+  it('offers pause and cancel during an active phase — resume is not a legal transition from investigating', () => {
+    const html = running({ runControls: { canPause: true, canResume: false, canCancel: true } });
+    expect(html).toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).toContain('id="cancel-run"');
+  });
+
+  it('offers resume and cancel, not pause, once the run is already paused', () => {
+    const html = running({
+      runProjection: {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+        lifecycle: 'paused', completeness: 'none', currentAction: 'Waiting on a rate limit', elapsedMs: 10_000,
+        progressMode: 'indeterminate', attention: 'attentionRequired', limitations: [],
+      },
+      runControls: { canPause: false, canResume: true, canCancel: true },
+    });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).toContain('id="resume-run"');
+    expect(html).toContain('id="cancel-run"');
+  });
+
+  it('offers no control at all once the run is cancelling — the manager would refuse every one of them', () => {
+    const html = running({
+      runProjection: {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+        lifecycle: 'cancelling', completeness: 'none', elapsedMs: 10_000,
+        progressMode: 'indeterminate', attention: 'none', limitations: [],
+      },
+      runControls: { canPause: false, canResume: false, canCancel: false },
+    });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).not.toContain('id="cancel-run"');
+  });
+
+  it('renders no controls row at all before the manager has admitted the run', () => {
+    const html = running({ runControls: undefined });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).not.toContain('id="cancel-run"');
   });
 });
 

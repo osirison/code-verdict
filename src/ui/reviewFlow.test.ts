@@ -283,6 +283,8 @@ function fakeRuns() {
     get: () => undefined,
     acknowledge: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
     trigger: vi.fn(),
     settle(record: Partial<RunRecord>): void {
       for (const listener of [...listeners]) listener(record as RunRecord);
@@ -624,6 +626,50 @@ describe('the generation guard and cancel-on-settle', () => {
     expect(stored?.ranAt).toBe('2026-09-02T08:00:00.000Z');
     expect(stored?.review.items).toEqual([]);
     expect(panel.webview.html).toContain('No findings above your criteria');
+  });
+});
+
+// ---- Task 14.6 — controls only where the manager accepts them ------------------
+
+describe('run controls are derived from the manager\'s own transition validity (task 14.6)', () => {
+  it('offers pause and cancel while investigating, and dispatches pause to the manager', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    // The attempt advances past queued — the same `onCheckpoint`-driven
+    // transition a real harness attempt reports, simulated here by settling
+    // the record the panel is subscribed to.
+    h.runs.settle({ key: runKeyForCr(REF), status: 'running', lifecycle: 'investigating' });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('id="pause-run"');
+    expect(panel.webview.html).toContain('id="cancel-run"');
+    expect(panel.webview.html).not.toContain('id="resume-run"');
+
+    await h.post({ type: 'pauseRun' });
+    expect(h.runs.pause).toHaveBeenCalledWith(runKeyForCr(REF));
+  });
+
+  it('offers resume, not pause, once the run is paused, and dispatches resume to the manager', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({ key: runKeyForCr(REF), status: 'running', lifecycle: 'paused' });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('id="resume-run"');
+    expect(panel.webview.html).not.toContain('id="pause-run"');
+
+    await h.post({ type: 'resumeRun' });
+    expect(h.runs.resume).toHaveBeenCalledWith(runKeyForCr(REF));
   });
 });
 

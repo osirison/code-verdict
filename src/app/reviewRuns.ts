@@ -13,6 +13,7 @@
  */
 import { crKey } from './postedReviews';
 import type { KeyValueStore } from './storage';
+import type { Limitation } from '../domain/harnessActivity';
 
 /**
  * `clean` = the agent ran and returned nothing; `findings` = it ran and left
@@ -54,6 +55,28 @@ export interface ReviewRun {
    * produced by the sweep).
    */
   resumable?: boolean;
+  /**
+   * Task 14.4/14.6: every failing dimension `checkCheckpointIntegrity`
+   * (`harnessResume.ts`) found for an `interrupted` entry, when there was
+   * a checkpoint to check at all — present only alongside `resumable:
+   * false`, so a UI reading this never has to fabricate a reason for a
+   * resumable run or an entry the sweep had nothing to check. This is the
+   * *stored-checkpoint-integrity* subset of the full resume decision
+   * (`decideResume`'s remaining live head/model/policy dimensions still
+   * need a live candidate snapshot no code path here builds yet — see
+   * `ReviewRun.resumable`'s own doc comment) — enough to tell a reviewer
+   * truthfully why the checkpoint itself cannot be trusted, never a claim
+   * that every resume dimension was checked.
+   */
+  resumeReasons?: readonly Limitation[];
+  /**
+   * Task 14.4: `HarnessAttemptResult.outcome.limitations` for a `partial`
+   * entry — why the run stopped short of `complete`, the same reasons
+   * `retainedReview.ts`'s own `RetainedResult.limitations` carries for a
+   * durably retained partial. Absent for `clean`/`findings`/`interrupted`,
+   * which have none of their own to report here.
+   */
+  limitations?: readonly Limitation[];
 }
 
 const KEY = 'codeVerdict.reviewRuns';

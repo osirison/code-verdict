@@ -14,6 +14,7 @@ import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
 import { ReviewRunManager, sweepInterruptedRuns, type RunInput, type RunnerOptions } from './app/reviewRunManager';
+import { isTerminalLifecycle } from './domain/harnessLifecycle';
 import { pruneClosedRetained } from './app/retainedReview';
 import { runDemoAgent } from './app/demoAgent';
 import { runDemoChangesetAgent } from './app/combinedAgent';
@@ -105,12 +106,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Before anything paints. A `vscode.lm` stream cannot be reattached after the
   // extension host stops, so whatever was running when the last window closed is
   // gone; recording it as interrupted is how the change request avoids reading
-  // exactly as it would have if no review had ever been started on it.
-  void sweepInterruptedRuns(context.globalState);
+  // exactly as it would have if no review had ever been started on it. The
+  // promise is captured (task 14.7), not fired-and-forgotten, so the summary
+  // notification below can be raised once `notifier` exists further down —
+  // the sweep itself still starts at this exact point in activation.
+  const interruptedSweep = sweepInterruptedRuns(context.globalState);
 
   /**
-   * The last status seen per run, so a progress emission — four a second on a
-   * streaming run — cannot be mistaken for a state change.
+   * The last lifecycle seen per run, so a progress emission — four a second
+   * on a streaming run — cannot be mistaken for a state change. Task 14.4:
+   * keyed on `record.lifecycle` rather than the coarser legacy `status`
+   * (`planning`/`investigating`/`verifying`/`completing` all collapse to
+   * one `'running'` status) — the dashboard row's pill now names the live
+   * phase, so a phase advance that used to repaint nothing now refreshes
+   * the row that phase actually belongs to.
    */
   const lastRunStatus = new Map<string, string>();
 
@@ -170,30 +179,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
     },
     onChange: (record) => {
-      // The run list and the status-bar count read live run state, so one
-      // fan-out keeps them from drifting apart. Both are cheap: local state,
-      // rendered into a webview.
+      // The run list and the status bar's runs segment both read live run
+      // state, so one fan-out keeps them from drifting apart — both are
+      // cheap: local state, rendered into a webview or a native status bar
+      // item. Task 14.3/14.5 (design.md D14): the same `RunProjection`
+      // mapping (`toSidebarActiveRuns`) feeds both, computed once — not a
+      // second, call-site-local read of `RunRecord` for the status bar.
       const active = runManager.active();
-      // Task 14.3 (design.md D14): the sidebar's compact list is the same
-      // `RunProjection` the active review screen reads, mapped by
-      // `toSidebarActiveRuns` — not a second, call-site-local read of
-      // `RunRecord`.
-      sidebar.setActiveRuns(toSidebarActiveRuns(active));
-      statusBar.setActiveRuns(active.filter((run) => run.status === 'running').length);
+      const activeRuns = toSidebarActiveRuns(active);
+      sidebar.setActiveRuns(activeRuns);
+      statusBar.setActiveRuns(activeRuns);
 
       // The dashboard is NOT cheap: `refreshIfOpen` refetches the whole pod.
       // Progress arrives at the 250 ms floor, so refreshing on every emission
       // would issue four platform fetches a second per streaming run — worse
-      // than the burst the notifier's focus throttle exists to prevent. Only a
-      // status change moves a row's pill, so only a status change refreshes.
+      // than the burst the notifier's focus throttle exists to prevent. Only
+      // a lifecycle change moves a row's pill, so only a lifecycle change
+      // refreshes (task 14.4: the dashboard now names the live phase, not
+      // only queued-vs-running, so a phase advance must refresh too).
       const previous = lastRunStatus.get(record.key);
-      if (previous === record.status) return;
-      lastRunStatus.set(record.key, record.status);
-      if (record.status !== 'queued' && record.status !== 'running') lastRunStatus.delete(record.key);
+      if (previous === record.lifecycle) return;
+      lastRunStatus.set(record.key, record.lifecycle);
+      if (isTerminalLifecycle(record.lifecycle)) lastRunStatus.delete(record.key);
       void DashboardPanel.refreshIfOpen();
     },
     onRunRecorded: () => repaintReviewSurfaces(),
     onReviewReady: (info) => notifier.reviewReady(info),
+    // Task 14.7: the `failed`/`cancelled` counterpart to `onReviewReady` —
+    // `onReviewReady` already covers `succeeded` (complete or partial).
+    onRunOutcome: (info) => notifier.runEnded(info),
   });
 
   const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
@@ -399,12 +413,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     reviewRuns: () => reviewRuns.byRef(),
-    activeRuns: () =>
-      new Map(
-        runManager
-          .active()
-          .map((record) => [record.key, record.status === 'queued' ? ('queued' as const) : ('running' as const)]),
-      ),
+    // Task 14.4 (design.md D14): the manager's own per-target projection —
+    // `activeByKey` is "keyed for the dashboard, which already looks its
+    // rows up this way" (its own doc comment) — never a dashboard-local
+    // `'running' | 'queued'` collapse that reported every phase the same.
+    activeRuns: () => new Map([...runManager.activeByKey()].map(([key, record]) => [key, record.projection])),
     onPodChanged: () => sidebar.refresh(),
     pruneRetained: (repoIds, openRefs) =>
       void pruneClosedRetained(context.workspaceState, repoIds, openRefs),
@@ -782,6 +795,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     notifier,
   );
   notifier.start();
+  // Task 14.7: one summary notification for whatever the activation sweep
+  // above closed as interrupted — never one toast per target, and never
+  // ahead of `notifier` existing to raise it.
+  void interruptedSweep.then((count) => notifier.runsInterrupted(count));
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and
