@@ -430,6 +430,23 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe('ReviewFlowPanel.isOpen: codeVerdict.showRunDiagnostics\'s side-effect-free "is a panel open" count', () => {
+  it('is false with no panel, true once opened, and false again once disposed — without revealing the panel as a side effect', async () => {
+    const { ReviewFlowPanel } = await import('./reviewFlow.js');
+    expect(ReviewFlowPanel.isOpen()).toBe(false);
+
+    const h = await harness();
+    await h.open();
+    panel.reveal.mockClear();
+    expect(ReviewFlowPanel.isOpen()).toBe(true);
+    // Unlike `revealIfOpen`, checking must not itself bring the panel into focus.
+    expect(panel.reveal).not.toHaveBeenCalled();
+
+    handlers.dispose?.();
+    expect(ReviewFlowPanel.isOpen()).toBe(false);
+  });
+});
+
 describe('run preparation stays bound to the target that started it', () => {
   it('drops delayed reference preparation after navigating to another change request', async () => {
     const h = await harness();

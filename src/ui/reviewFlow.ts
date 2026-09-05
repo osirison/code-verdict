@@ -179,6 +179,16 @@ export class ReviewFlowPanel {
     return panel && !panel.disposed ? panel.runRecord : undefined;
   }
 
+  /**
+   * Whether this panel is open at all — `codeVerdict.showRunDiagnostics`'s own "how many review
+   * panels were open" count for its not-found report. Deliberately side-effect-free, unlike
+   * `revealIfOpen`: a diagnostic count must not itself bring a panel into focus.
+   */
+  static isOpen(): boolean {
+    const panel = ReviewFlowPanel.current;
+    return Boolean(panel && !panel.disposed);
+  }
+
   static selectItem(itemId: string): void {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { buildCheckpoint, type CheckpointBuildInput } from './harnessCheckpoint';
-import { diagnosticsCheckpointFromPersisted, findRecentDiagnosticsCandidates, type IdentifyDiagnosticsTarget } from './harnessDiagnosticsSource';
+import { diagnosticsCheckpointFromPersisted, findRecentDiagnosticsCandidates, summarizeDiagnosticsDiscovery, type IdentifyDiagnosticsTarget } from './harnessDiagnosticsSource';
 import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText } from './harnessDiagnostics';
 import { createHarnessRunStore } from './harnessRunStore';
 import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
@@ -259,6 +259,68 @@ describe('findRecentDiagnosticsCandidates', () => {
 
     const candidates = findRecentDiagnosticsCandidates(runStore.listLineages(), identifyAll);
     expect(candidates.map((c) => c.lineageId)).toEqual(['lineage-2', 'lineage-1']);
+  });
+});
+
+describe('summarizeDiagnosticsDiscovery: the not-found report\'s counts, so "no review has ever run" reads differently from "runs exist but none matched" and from "the stored data would not parse"', () => {
+  it('is all zeroes when nothing has ever run', () => {
+    const summary = summarizeDiagnosticsDiscovery(0, [], identifyAll);
+    expect(summary).toEqual({ totalLineageKeys: 0, unparsedLineageKeys: 0, parsedLineages: 0, matchedThisPod: 0, rejected: [] });
+  });
+
+  it('leaves matchedThisPod undefined, never a fabricated zero, when no pod was given to match against', () => {
+    const summary = summarizeDiagnosticsDiscovery(2, [], undefined);
+    expect(summary.matchedThisPod).toBeUndefined();
+    expect(summary.totalLineageKeys).toBe(2);
+    expect(summary.parsedLineages).toBe(0);
+  });
+
+  it('classifies every rejection reason, and counts a key that failed to parse separately from one that parsed but did not match', async () => {
+    const store = jsonMemoryStore();
+    const runStore = await writeFailedLineage(store, 'lineage-matched', '2026-01-01T00:00:00.000Z');
+
+    // Belongs to a different pod's repo entirely.
+    await runStore.writeSnapshot(testSnapshot({
+      lineageId: 'lineage-other-pod',
+      runId: 'run-lineage-other-pod',
+      members: [{ ...testSnapshot().members[0]!, ref: { repoId: 'repo-other', number: '7' } }],
+    }));
+    const otherBuilt = buildCheckpoint(
+      checkpointInput({ runId: 'run-lineage-other-pod', lineageId: 'lineage-other-pod', occurredAt: '2026-01-01T00:00:00.000Z', activityEvents: failedActivityEvents('lineage-other-pod', 1) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await runStore.writeCheckpoint(otherBuilt, GENEROUS_RETENTION);
+
+    // Crashed before its first checkpoint — a snapshot with nothing else ever written.
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-incomplete', runId: 'run-incomplete' }));
+
+    // Every attempt evicted (task 11.4): the key survives on disk as an empty shell.
+    await store.update('codeVerdict.harness.lineage.lineage-empty', {
+      schemaVersion: '1', runId: 'run-empty', lineageId: 'lineage-empty', snapshots: {}, checkpoints: [], terminalAttempts: [],
+    });
+
+    // Shaped wrong entirely — dropped by every parser's guard.
+    await store.update('codeVerdict.harness.lineage.lineage-corrupt', { schemaVersion: '1', runId: 'x' });
+
+    const identifyRepo1: IdentifyDiagnosticsTarget = (snapshot) =>
+      (snapshot.members[0]!.ref.repoId === 'repo-1' ? identifyAll(snapshot) : undefined);
+
+    const lineages = runStore.listLineages();
+    const summary = summarizeDiagnosticsDiscovery(runStore.lineageKeyCount(), lineages, identifyRepo1);
+
+    expect(summary.totalLineageKeys).toBe(5);
+    expect(summary.parsedLineages).toBe(4);
+    expect(summary.unparsedLineageKeys).toBe(1);
+    expect(summary.matchedThisPod).toBe(1);
+
+    const reasons = Object.fromEntries(summary.rejected.map((r) => [r.lineageId, r.rejection.kind]));
+    expect(reasons['lineage-other-pod']).toBe('notThisPod');
+    expect(reasons['lineage-incomplete']).toBe('incompleteAttempt');
+    expect(reasons['lineage-empty']).toBe('noSnapshots');
+    expect(summary.rejected).toHaveLength(3);
+
+    const incomplete = summary.rejected.find((r) => r.lineageId === 'lineage-incomplete');
+    expect(incomplete?.rejection).toMatchObject({ kind: 'incompleteAttempt', targetKey: 'repo-1!42', refLabel: '!42', attempt: 1 });
   });
 });
 

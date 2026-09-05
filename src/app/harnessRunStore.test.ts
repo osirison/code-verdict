@@ -345,6 +345,34 @@ describe('HarnessRunStore.listLineages: the one way to find a target after ordin
   });
 });
 
+describe('HarnessRunStore.lineageKeyCount: the raw count listLineages cannot give, once a corrupt entry is silently dropped', () => {
+  it('is zero when nothing has ever run', () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    expect(runStore.lineageKeyCount()).toBe(0);
+  });
+
+  it('counts a key that failed to parse alongside one that parsed, so the two can be told apart', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-good' }));
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-bad', { schemaVersion: '1', runId: 'x' /* missing lineageId/snapshots/... */ });
+
+    expect(runStore.lineageKeyCount()).toBe(2);
+    expect(runStore.listLineages()).toHaveLength(1);
+  });
+
+  it('is zero rather than throwing when the backing store has no keys() (a minimal test double)', async () => {
+    const map = new Map<string, unknown>();
+    const noKeysStore = {
+      get: <T>(key: string) => map.get(key) as T | undefined,
+      update: async (key: string, value: unknown) => { map.set(key, value); },
+    };
+    const runStore = createHarnessRunStore(noKeysStore, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot());
+    expect(runStore.lineageKeyCount()).toBe(0);
+  });
+});
+
 describe('HarnessRunStore (11.2): the marker test at the actual persistence boundary', () => {
   it('scans every key the backing store actually holds after writeSnapshot + writeCheckpoint — no planted marker survives outside the one deliberate exception', async () => {
     const backing = jsonMemoryStore();

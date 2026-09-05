@@ -24,6 +24,12 @@ import type { ActivityEvent, Limitation } from '../domain/harnessActivity';
 import type { BudgetConsumption, MemberCoverage, UnresolvedWork } from '../domain/harnessCoverage';
 import type { ResultCompleteness, RunLifecycle } from '../domain/harnessLifecycle';
 import { COMPLETION_CLAUSES, type CompletionBlockerDetail, type CompletionClause, type CompletionEvaluation } from './harnessCompletion';
+// Type-only, so this stays the one-directional dependency `harnessDiagnosticsSource.ts`'s own file
+// header already documents the reverse of (it imports this module's `DiagnosticsSourceRecord`) —
+// erased entirely at build time, never a runtime cycle. Reused rather than re-declared: the
+// not-found report's discovery counts and rejection reasons are exactly what that module already
+// computes, and a second copy of `DiagnosticsLineageRejection`'s union here could drift from it.
+import type { DiagnosticsCandidate, DiagnosticsDiscoverySummary, DiagnosticsLineageRejection } from './harnessDiagnosticsSource';
 import type { RunRecord } from './reviewRunManager';
 
 /**
@@ -180,7 +186,8 @@ export function buildAttemptDiagnosticsReport(record: DiagnosticsSourceRecord, n
   };
 }
 
-function section(lines: string[], title: string, body: readonly string[]): void {
+/** Exported so `renderDiagnosticsNotFoundText` below shares the exact same section layout, rather than a second one. */
+export function section(lines: string[], title: string, body: readonly string[]): void {
   lines.push(`${title}:`);
   if (body.length === 0) lines.push('  (none)');
   else for (const line of body) lines.push(`  ${line}`);
@@ -261,6 +268,113 @@ export function renderAttemptDiagnosticsText(report: AttemptDiagnosticsReport): 
     'Tool call log',
     report.toolCalls.map((call) => `[#${call.sequence}] ${call.occurredAt} phase=${call.phase} tool=${call.tool}${call.target ? ` target=${call.target}` : ''} outcome=${call.outcome} — ${call.detail}`),
   );
+
+  return lines.join('\n').trimEnd();
+}
+
+/**
+ * Sibling of `AttemptDiagnosticsReport`/`buildAttemptDiagnosticsReport`/`renderAttemptDiagnosticsText`
+ * for the other half of `codeVerdict.showRunDiagnostics`: every path that used to resolve nothing —
+ * no pod connected, a pod connected but no lineage matched it, the run picker dismissed without a
+ * choice. The bug this fixes was never *which* attempt got reported; it was that these three paths
+ * wrote nothing at all. Reusing this module's own `section` layout rather than inventing a second
+ * rendering style for "nothing was found".
+ */
+export type DiagnosticsNotFoundReason =
+  | { readonly kind: 'noPodConnected' }
+  | { readonly kind: 'noMatchingRuns' }
+  /** The reviewer saw a picker (more than one candidate existed) and closed it without choosing one. */
+  | { readonly kind: 'pickerDismissed'; readonly offered: readonly DiagnosticsCandidate[] }
+  /**
+   * Resolving a target threw — an unregistered provider, a malformed pod — the one failure mode
+   * none of the other three reasons name. `message` is `Error.message` only, never a stack trace
+   * and never the thrown value's full shape.
+   */
+  | { readonly kind: 'resolutionFailed'; readonly message: string };
+
+/** The connected pod's identity, exactly what the reviewer would recognize it by — never a token, never a repo listing. */
+export interface DiagnosticsPodIdentity {
+  readonly name: string;
+  readonly providerId: string;
+  readonly instanceUrl: string;
+}
+
+export interface DiagnosticsNotFoundInput {
+  readonly reason: DiagnosticsNotFoundReason;
+  /** `undefined` exactly when `reason.kind === 'noPodConnected'` — there is no pod to name. */
+  readonly pod?: DiagnosticsPodIdentity;
+  /** How many single-CR or changeset review panels were open when the command ran. */
+  readonly openReviewPanels: number;
+  readonly discovery: DiagnosticsDiscoverySummary;
+}
+
+export interface DiagnosticsNotFoundReport extends DiagnosticsNotFoundInput {
+  readonly generatedAt: string;
+}
+
+/** Builds the not-found report from inputs the caller already gathered — never a re-fetch, never a guess at a reason not given. */
+export function buildDiagnosticsNotFoundReport(input: DiagnosticsNotFoundInput, now: () => string): DiagnosticsNotFoundReport {
+  return { ...input, generatedAt: now() };
+}
+
+function podLine(pod: DiagnosticsPodIdentity | undefined): string {
+  return pod ? `connected as "${pod.name}" (${pod.providerId} @ ${pod.instanceUrl})` : 'no pod connected';
+}
+
+function rejectionLine(entry: { readonly lineageId: string; readonly rejection: DiagnosticsLineageRejection }): string {
+  const { lineageId, rejection } = entry;
+  switch (rejection.kind) {
+    case 'noSnapshots':
+      return `${lineageId} — every attempt has been evicted from this lineage; nothing is left to diagnose`;
+    case 'notThisPod':
+      return `${lineageId} — belongs to a different pod's target`;
+    case 'incompleteAttempt':
+      return `${lineageId} — ${rejection.refLabel} (attempt ${rejection.attempt}) crashed before its first checkpoint`;
+  }
+}
+
+function headlineFor(reason: DiagnosticsNotFoundReason): string {
+  switch (reason.kind) {
+    case 'noPodConnected':
+      return 'No pod is connected, so there are no runs to report on.';
+    case 'noMatchingRuns':
+      return 'No run was found for the active pod.';
+    case 'pickerDismissed':
+      return 'The run picker was dismissed without a choice.';
+    case 'resolutionFailed':
+      return `Looking up this pod's runs failed: ${reason.message}`;
+  }
+}
+
+/** The output-channel rendering for a not-found report — house style of `renderAttemptDiagnosticsText`, never a second layout. */
+export function renderDiagnosticsNotFoundText(report: DiagnosticsNotFoundReport): string {
+  const lines: string[] = [];
+  lines.push(`Verdict run diagnostics — generated ${report.generatedAt}`);
+  lines.push(headlineFor(report.reason));
+  lines.push('');
+
+  section(lines, 'Pod', [podLine(report.pod)]);
+  section(lines, 'Review panels open', [String(report.openReviewPanels)]);
+
+  const discovery = report.discovery;
+  section(lines, 'Stored lineage records', [
+    `total on disk: ${discovery.totalLineageKeys}`,
+    `failed to parse: ${discovery.unparsedLineageKeys}`,
+    `parsed successfully: ${discovery.parsedLineages}`,
+    discovery.matchedThisPod === undefined
+      ? 'matched this pod: unknown — no pod is connected to match against'
+      : `matched this pod: ${discovery.matchedThisPod}`,
+  ]);
+
+  section(lines, 'Rejected records (parsed, but not this run)', discovery.rejected.map(rejectionLine));
+
+  if (report.reason.kind === 'pickerDismissed') {
+    section(
+      lines,
+      'Runs offered — none chosen',
+      report.reason.offered.map((candidate) => `${candidate.refLabel} — ${candidate.lifecycle} (${candidate.completeness}) — ran ${candidate.occurredAt}`),
+    );
+  }
 
   return lines.join('\n').trimEnd();
 }

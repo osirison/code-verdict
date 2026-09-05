@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText, type DiagnosticsSourceRecord } from './harnessDiagnostics';
+import {
+  buildAttemptDiagnosticsReport,
+  buildDiagnosticsNotFoundReport,
+  renderAttemptDiagnosticsText,
+  renderDiagnosticsNotFoundText,
+  type DiagnosticsSourceRecord,
+} from './harnessDiagnostics';
 import { appendActivityEvent, createActivityLog, type ActivityLog } from './harnessActivityLog';
 import type { CheckpointInfo } from './harnessAttempt';
 import { COMPLETION_CLAUSES, type CompletionEvaluation } from './harnessCompletion';
@@ -245,5 +251,92 @@ describe('renderAttemptDiagnosticsText', () => {
   it('writes the Unresolved work heading even with no checkpoint, never dropping the section outright', () => {
     const text = renderAttemptDiagnosticsText(buildAttemptDiagnosticsReport(record({ checkpoint: undefined, completionEvaluation: undefined }), () => 'now'));
     expect(text).toContain('Unresolved work:');
+  });
+});
+
+describe('buildDiagnosticsNotFoundReport / renderDiagnosticsNotFoundText: the sibling report for every path that used to write nothing at all', () => {
+  const zeroDiscovery = { totalLineageKeys: 0, unparsedLineageKeys: 0, parsedLineages: 0, matchedThisPod: 0, rejected: [] };
+
+  it('tells "no pod connected" apart from every other reason, and never claims a match count it cannot know', () => {
+    const report = buildDiagnosticsNotFoundReport(
+      { reason: { kind: 'noPodConnected' }, openReviewPanels: 0, discovery: { totalLineageKeys: 3, unparsedLineageKeys: 0, parsedLineages: 3, rejected: [] } },
+      () => '2026-09-03T00:00:00.000Z',
+    );
+    const text = renderDiagnosticsNotFoundText(report);
+    expect(text).toContain('generated 2026-09-03T00:00:00.000Z');
+    expect(text).toContain('No pod is connected');
+    expect(text).toContain('no pod connected');
+    expect(text).toContain('total on disk: 3');
+    expect(text).toContain('matched this pod: unknown — no pod is connected to match against');
+    expect(text.trim().length).toBeGreaterThan(0);
+  });
+
+  it('says plainly that nothing has ever run when the disk holds no lineage keys at all', () => {
+    const report = buildDiagnosticsNotFoundReport(
+      { reason: { kind: 'noMatchingRuns' }, pod: { name: 'Acme pod', providerId: 'fixture', instanceUrl: 'https://example.test' }, openReviewPanels: 1, discovery: zeroDiscovery },
+      () => 'now',
+    );
+    const text = renderDiagnosticsNotFoundText(report);
+    expect(text).toContain('No run was found for the active pod.');
+    expect(text).toContain('connected as "Acme pod" (fixture @ https://example.test)');
+    expect(text).toContain('Review panels open:');
+    expect(text).toContain('  1');
+    expect(text).toContain('total on disk: 0');
+    expect(text).toContain('matched this pod: 0');
+  });
+
+  it('names every rejected lineage and why, so "runs exist but none matched" is never bare numbers', () => {
+    const report = buildDiagnosticsNotFoundReport(
+      {
+        reason: { kind: 'noMatchingRuns' },
+        pod: { name: 'Acme pod', providerId: 'fixture', instanceUrl: 'https://example.test' },
+        openReviewPanels: 0,
+        discovery: {
+          totalLineageKeys: 4,
+          unparsedLineageKeys: 1,
+          parsedLineages: 3,
+          matchedThisPod: 0,
+          rejected: [
+            { lineageId: 'lineage-a', rejection: { kind: 'notThisPod' } },
+            { lineageId: 'lineage-b', rejection: { kind: 'noSnapshots' } },
+            { lineageId: 'lineage-c', rejection: { kind: 'incompleteAttempt', targetKey: 'repo-1!42', refLabel: '!42', attempt: 2 } },
+          ],
+        },
+      },
+      () => 'now',
+    );
+    const text = renderDiagnosticsNotFoundText(report);
+    expect(text).toContain('failed to parse: 1');
+    expect(text).toContain('lineage-a — belongs to a different pod\'s target');
+    expect(text).toContain('lineage-b — every attempt has been evicted');
+    expect(text).toContain('lineage-c — !42 (attempt 2) crashed before its first checkpoint');
+  });
+
+  it('writes a line for a dismissed picker, listing what was offered, rather than returning silently', () => {
+    const report = buildDiagnosticsNotFoundReport(
+      {
+        reason: {
+          kind: 'pickerDismissed',
+          offered: [
+            { targetKey: 'repo-1!42', refLabel: '!42', lineageId: 'lineage-1', attempt: 1, lifecycle: 'failed', completeness: 'none', occurredAt: '2026-09-01T00:00:00.000Z', record: record() },
+          ],
+        },
+        pod: { name: 'Acme pod', providerId: 'fixture', instanceUrl: 'https://example.test' },
+        openReviewPanels: 1,
+        discovery: { ...zeroDiscovery, totalLineageKeys: 1, parsedLineages: 1, matchedThisPod: 1 },
+      },
+      () => 'now',
+    );
+    const text = renderDiagnosticsNotFoundText(report);
+    expect(text).toContain('The run picker was dismissed without a choice.');
+    expect(text).toContain('Runs offered — none chosen:');
+    expect(text).toContain('!42 — failed (none) — ran 2026-09-01T00:00:00.000Z');
+  });
+
+  it('never carries raw model text, prompts, or hidden reasoning in the not-found report either', () => {
+    const report = buildDiagnosticsNotFoundReport({ reason: { kind: 'noPodConnected' }, openReviewPanels: 0, discovery: zeroDiscovery }, () => 'now');
+    const text = renderDiagnosticsNotFoundText(report);
+    expect(text.toLowerCase()).not.toContain('prompt');
+    expect(text.toLowerCase()).not.toContain('rationale');
   });
 });

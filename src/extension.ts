@@ -20,8 +20,20 @@ import { RunStatusGate } from './app/runStatusGate';
 import { revalidateAttachments } from './app/attachments';
 import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
 import { createHarnessRunStore } from './app/harnessRunStore';
-import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText, type DiagnosticsSourceRecord } from './app/harnessDiagnostics';
-import { findRecentDiagnosticsCandidates, type DiagnosticsCandidate, type IdentifyDiagnosticsTarget } from './app/harnessDiagnosticsSource';
+import {
+  buildAttemptDiagnosticsReport,
+  buildDiagnosticsNotFoundReport,
+  renderAttemptDiagnosticsText,
+  renderDiagnosticsNotFoundText,
+  type DiagnosticsNotFoundReason,
+  type DiagnosticsSourceRecord,
+} from './app/harnessDiagnostics';
+import {
+  findRecentDiagnosticsCandidates,
+  summarizeDiagnosticsDiscovery,
+  type DiagnosticsCandidate,
+  type IdentifyDiagnosticsTarget,
+} from './app/harnessDiagnosticsSource';
 import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './app/harnessRuntime';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
@@ -47,6 +59,20 @@ import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
 import { readHarnessCoverageRules, readHarnessPolicy } from './ui/harnessPolicyOptions';
 
+/** `codeVerdict.showRunDiagnostics`'s secondary notification for a not-found report — short, pointing at the channel for the real detail, never a replacement for it. */
+function hintForNotFound(reason: DiagnosticsNotFoundReason): string {
+  switch (reason.kind) {
+    case 'noPodConnected':
+      return 'connect first — run "Verdict: Sign in".';
+    case 'noMatchingRuns':
+      return 'no run matched the active pod.';
+    case 'pickerDismissed':
+      return 'no run was chosen.';
+    case 'resolutionFailed':
+      return 'looking up runs for this pod failed.';
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
 
@@ -57,8 +83,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const apiTraceChannel = vscode.window.createOutputChannel('Verdict: API');
   const apiTracingEnabled = (): boolean =>
     vscode.workspace.getConfiguration('codeVerdict').get<boolean>('trace.api', false);
+  // "Verdict: Show API trace" itself has no early return that skips `show(true)` — unlike run
+  // diagnostics, this command was never silently producing nothing. But an empty channel with the
+  // explanation living only in a notification the reviewer can miss is the same shape of confusion,
+  // so a request never yet traced still gets one line in the channel, not only a toast. Tracked here
+  // rather than read back off the channel (`vscode.OutputChannel` has no such read), and only ever
+  // set, never cleared — this channel is a running log across the whole session, never `clear()`-ed.
+  let apiTraceHasEverEmitted = false;
   const applyApiTraceSetting = (): void => {
-    setApiTraceSink(apiTracingEnabled() ? apiTraceChannel : undefined);
+    setApiTraceSink(
+      apiTracingEnabled()
+        ? {
+            appendLine: (line: string) => {
+              apiTraceHasEverEmitted = true;
+              apiTraceChannel.appendLine(line);
+            },
+          }
+        : undefined,
+    );
   };
   applyApiTraceSetting();
   context.subscriptions.push(
@@ -734,69 +776,184 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // usually while something else is failing.
       apiTraceChannel.show(true);
       if (!apiTracingEnabled()) {
+        // The channel gets its own line, not only the notification below: a toast can be missed,
+        // and an empty panel with no explanation in it is exactly the confusion run diagnostics had.
+        if (!apiTraceHasEverEmitted) {
+          apiTraceHasEverEmitted = true;
+          apiTraceChannel.appendLine('Verdict: API tracing is off, so nothing has been recorded yet. Switch on "codeVerdict.trace.api" and the next request will appear here.');
+        }
         void vscode.window.showInformationMessage(
           'Verdict: API tracing is off — switch on "codeVerdict.trace.api" and the next request appears here.',
         );
+      } else if (!apiTraceHasEverEmitted) {
+        apiTraceHasEverEmitted = true;
+        apiTraceChannel.appendLine('Verdict: API tracing is on — no request has been made yet this session.');
       }
     },
+    /**
+     * Two previous fixes here changed *what the command resolves*; neither was the actual bug. The
+     * old shape returned early — with only a transient notification — the moment resolution could
+     * not find a target, a picker was dismissed, or a pod was not connected, leaving the channel
+     * unwritten and unshown: an empty panel with no explanation the reviewer could act on.
+     *
+     * The fix is structural, not another resolution tweak: every branch below sets exactly one of
+     * `record` (a found attempt) or `notFound` (a `DiagnosticsNotFoundReport` naming why nothing was
+     * found, `harnessDiagnostics.ts`'s own sibling of the found-report builder/renderer) — and there
+     * is exactly one place, after the branching, that clears, writes, and shows the channel. No path
+     * through this handler can reach that point having written nothing, because nothing before it
+     * returns early.
+     */
     [COMMANDS.showRunDiagnostics]: async () => {
-      // Whichever review panel is open, single-CR or changeset, still holding its own live
-      // `RunRecord` — mirrors the "no active review" fallback the palette's other review-tab
-      // commands already use. This is the freshest source there is (a live `CheckpointInfo`, and
-      // `completionEvaluation`/`failure`, neither of which is ever persisted), but it is gone the
-      // moment a run ends and its panel is closed, dismissed, or the window reloads — exactly when
-      // diagnostics are actually wanted (`harnessDiagnosticsSource.ts`'s own file header).
-      let record: DiagnosticsSourceRecord | undefined = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+      const now = () => new Date().toISOString();
+      const openReviewPanelsCount = (): number => (ReviewFlowPanel.isOpen() ? 1 : 0) + (ChangesetReviewPanel.isOpen() ? 1 : 0);
+      let record: DiagnosticsSourceRecord | undefined;
+      let notFound: ReturnType<typeof buildDiagnosticsNotFoundReport> | undefined;
 
-      if (!record) {
-        const pod = podStore.activePod;
-        if (!pod) {
-          void vscode.window.showInformationMessage('Verdict: connect first — run "Verdict: Sign in".');
-          return;
+      try {
+        // Whichever review panel is open, single-CR or changeset, still holding its own live
+        // `RunRecord` — mirrors the "no active review" fallback the palette's other review-tab
+        // commands already use. This is the freshest source there is (a live `CheckpointInfo`, and
+        // `completionEvaluation`/`failure`, neither of which is ever persisted), but it is gone the
+        // moment a run ends and its panel is closed, dismissed, or the window reloads — exactly when
+        // diagnostics are actually wanted (`harnessDiagnosticsSource.ts`'s own file header).
+        record = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+
+        if (!record) {
+          const openReviewPanels = openReviewPanelsCount();
+          const pod = podStore.activePod;
+
+          if (!pod) {
+            notFound = buildDiagnosticsNotFoundReport(
+              {
+                reason: { kind: 'noPodConnected' },
+                openReviewPanels,
+                // No pod to match lineages against — `identify` omitted, never a fabricated match count.
+                discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), harnessRunStore.listLineages()),
+              },
+              now,
+            );
+          } else {
+            const identify = identifyDiagnosticsTargetForPod(pod);
+            const lineages = harnessRunStore.listLineages();
+            const candidates = findRecentDiagnosticsCandidates(lineages, identify);
+            const podIdentity = { name: pod.name, providerId: pod.providerId, instanceUrl: pod.instanceUrl };
+
+            if (candidates.length === 0) {
+              notFound = buildDiagnosticsNotFoundReport(
+                {
+                  reason: { kind: 'noMatchingRuns' },
+                  pod: podIdentity,
+                  openReviewPanels,
+                  discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), lineages, identify),
+                },
+                now,
+              );
+            } else {
+              let chosen: DiagnosticsCandidate = candidates[0]!;
+              if (candidates.length > 1) {
+                const picked = await vscode.window.showQuickPick(
+                  candidates.map((candidate) => ({
+                    label: candidate.refLabel,
+                    description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
+                    candidate,
+                  })),
+                  { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on?' },
+                );
+                if (!picked) {
+                  // Dismissed rather than silently returning: the picker only ever appears once a
+                  // real choice existed, so the channel names what was on offer.
+                  notFound = buildDiagnosticsNotFoundReport(
+                    {
+                      reason: { kind: 'pickerDismissed', offered: candidates },
+                      pod: podIdentity,
+                      openReviewPanels,
+                      discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), lineages, identify),
+                    },
+                    now,
+                  );
+                } else {
+                  chosen = picked.candidate;
+                }
+              }
+
+              if (!notFound) {
+                // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle`
+                // only ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure,
+                // the exact shape of this bug, so still has the fuller live record in memory even
+                // though no panel is showing it. Preferred only when it is still the *same* attempt
+                // the disk resolved, so a different, newer run in flight for this target is never
+                // silently substituted for the one the reviewer picked.
+                const live = runManager.get(chosen.targetKey);
+                record = live && live.lineageId === chosen.lineageId && live.attempt === chosen.attempt ? live : chosen.record;
+              }
+            }
+          }
         }
-        const candidates = findRecentDiagnosticsCandidates(harnessRunStore.listLineages(), identifyDiagnosticsTargetForPod(pod));
-        const first = candidates[0];
-        if (!first) {
-          void vscode.window.showInformationMessage('Verdict: no review has run yet for this pod.');
-          return;
+      } catch (e) {
+        // A target can throw while resolving (an unregistered provider, a malformed pod) — the one
+        // failure mode none of the branches above name. The channel still gets something rather than
+        // nothing: `Error.message` only, never a stack trace, never the thrown value's full shape.
+        //
+        // Every value gathered here is read defensively and on its own: whatever just threw could be
+        // any of `podStore.activePod`, a panel's `isOpen`, or the run store, so none of those reads
+        // may be trusted un-guarded a second time — an exception escaping this catch block would
+        // reach the caller with the channel still unwritten, resurrecting the exact bug this fix
+        // exists to close, only on a rarer path.
+        record = undefined;
+        let pod: { name: string; providerId: string; instanceUrl: string } | undefined;
+        try {
+          const active = podStore.activePod;
+          if (active) pod = { name: active.name, providerId: active.providerId, instanceUrl: active.instanceUrl };
+        } catch {
+          // Stays undefined — an honest "could not even tell if a pod is connected", never a guess.
         }
-        let chosen: DiagnosticsCandidate = first;
-        if (candidates.length > 1) {
-          const picked = await vscode.window.showQuickPick(
-            candidates.map((candidate) => ({
-              label: candidate.refLabel,
-              description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
-              candidate,
-            })),
-            { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on?' },
-          );
-          if (!picked) return;
-          chosen = picked.candidate;
+        let openReviewPanels = 0;
+        try {
+          openReviewPanels = openReviewPanelsCount();
+        } catch {
+          // Stays 0.
         }
-        // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle` only
-        // ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure, the exact
-        // shape of this bug, so still has the fuller live record in memory even though no panel is
-        // showing it. Preferred only when it is still the *same* attempt the disk resolved, so a
-        // different, newer run in flight for this target is never silently substituted for the one
-        // the reviewer picked.
-        const live = runManager.get(chosen.targetKey);
-        record = live && live.lineageId === chosen.lineageId && live.attempt === chosen.attempt ? live : chosen.record;
+        let discovery: ReturnType<typeof summarizeDiagnosticsDiscovery> = { totalLineageKeys: 0, unparsedLineageKeys: 0, parsedLineages: 0, rejected: [] };
+        try {
+          // No `identify` here even when `pod` resolved above: reaching this catch means resolution
+          // itself is untrustworthy, so a per-pod match count would risk compounding one failure into
+          // a second, fabricated one. Same reasoning `summarizeDiagnosticsDiscovery`'s own `identify`
+          // parameter being optional already encodes for "no pod to match against".
+          discovery = summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), harnessRunStore.listLineages());
+        } catch {
+          // Stays all-zero — `unparsedLineageKeys`/`parsedLineages` both 0 keeps the report's own
+          // arithmetic invariant (`unparsedLineageKeys === totalLineageKeys - parsedLineages`) true
+          // rather than mixing a real count with two fabricated zeroes.
+        }
+
+        notFound = buildDiagnosticsNotFoundReport(
+          { reason: { kind: 'resolutionFailed', message: e instanceof Error ? e.message : String(e) }, pod, openReviewPanels, discovery },
+          now,
+        );
       }
 
-      const report = buildAttemptDiagnosticsReport(record, () => new Date().toISOString());
+      // The one place either report reaches the channel — every branch above set exactly one of
+      // `record`/`notFound`, and none of them may skip past this.
       runDiagnosticsChannel.clear();
-      runDiagnosticsChannel.appendLine(renderAttemptDiagnosticsText(report));
-      runDiagnosticsChannel.show(true);
-      // The interesting cases are long — offered, never forced, so a quick
-      // glance at the channel above never waits on this prompt.
-      const choice = await vscode.window.showInformationMessage('Verdict: run diagnostics ready.', 'Save as JSON…');
-      if (choice !== 'Save as JSON…') return;
-      const uri = await vscode.window.showSaveDialog({
-        filters: { JSON: ['json'] },
-        defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
-      });
-      if (!uri) return;
-      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
+      if (record) {
+        const report = buildAttemptDiagnosticsReport(record, now);
+        runDiagnosticsChannel.appendLine(renderAttemptDiagnosticsText(report));
+        runDiagnosticsChannel.show(true);
+        // The interesting cases are long — offered, never forced, so a quick
+        // glance at the channel above never waits on this prompt.
+        const choice = await vscode.window.showInformationMessage('Verdict: run diagnostics ready.', 'Save as JSON…');
+        if (choice === 'Save as JSON…') {
+          const uri = await vscode.window.showSaveDialog({
+            filters: { JSON: ['json'] },
+            defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
+          });
+          if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
+        }
+      } else {
+        runDiagnosticsChannel.appendLine(renderDiagnosticsNotFoundText(notFound!));
+        runDiagnosticsChannel.show(true);
+        void vscode.window.showInformationMessage(`Verdict: ${hintForNotFound(notFound!.reason)} See the "Verdict: Run diagnostics" channel for detail.`);
+      }
     },
   };
 

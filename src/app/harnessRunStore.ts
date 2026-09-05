@@ -768,6 +768,15 @@ export interface HarnessRunStore {
    * `keys()` (a minimal test double) or nothing has ever run.
    */
   listLineages(): readonly PersistedLineageRecord[];
+  /**
+   * Every `codeVerdict.harness.lineage.*` key the backing store holds, counted before any parsing —
+   * `listLineages().length` alone cannot tell "nothing has ever run" apart from "something is on
+   * disk but every record failed to parse", because a corrupt entry is silently dropped there
+   * (`readLineageRaw`'s own contract). `codeVerdict.showRunDiagnostics`'s not-found report is the
+   * one caller that needs that distinction; nothing else should. Zero when the store has no
+   * `keys()` (a minimal test double), same as `listLineages`.
+   */
+  lineageKeyCount(): number;
 }
 
 function readLineageRaw(store: KeyValueStore, lineageId: LineageId): PersistedLineageRecord | undefined {
@@ -965,6 +974,11 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     return out;
   }
 
+  function lineageKeyCount(): number {
+    const keys = store.keys?.() ?? [];
+    return keys.filter((key) => key.startsWith(LINEAGE_KEY_PREFIX)).length;
+  }
+
   return {
     writeSnapshot,
     writeCheckpoint,
@@ -975,5 +989,6 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     latestCheckpoint,
     lineageIdsForRun: (runId) => readRunIndexRaw(store, runId)?.lineageIds ?? [],
     listLineages,
+    lineageKeyCount,
   };
 }
