@@ -460,3 +460,64 @@ describe('the cadence has to stay inside the window the engine still diffs', () 
     expect(world.polls).toBe(2);
   });
 });
+
+/**
+ * Task 14.7 (spec `review-run-activity`: "the notification distinguishes
+ * complete, partial, failed, and cancelled outcomes"). `reviewReady` and
+ * `runEnded` are local events — no poll involved — routed straight through
+ * the notification engine under its ordinary `agentFinished` policy
+ * (default `Interrupt`, delivered as a toast the mocked `vscode.window.
+ * showInformationMessage` records into `world.infos`).
+ */
+describe('terminal notifications distinguish complete, partial, failed, cancelled and interrupted (task 14.7)', () => {
+  beforeEach(() => {
+    world.infos = [];
+    world.warnings = [];
+    clearProviders();
+    registerProvider(PROVIDER);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+  });
+
+  it('says "ready" for a complete result', async () => {
+    const { notifier } = await notifierFor();
+    notifier.reviewReady({ ref: { repoId: 'acme/repo-0', number: '7' }, refLabel: '!7', itemCount: 3, podId: 'pod-1', completeness: 'complete' });
+    expect(world.infos).toEqual(['Review ready · 3 items on !7']);
+  });
+
+  it('never says "ready" for a partial result — a succeeded outcome can still be incomplete (D2)', async () => {
+    const { notifier } = await notifierFor();
+    notifier.reviewReady({ ref: { repoId: 'acme/repo-0', number: '7' }, refLabel: '!7', itemCount: 2, podId: 'pod-1', completeness: 'partial' });
+    expect(world.infos).toEqual(['Partial results · 2 items on !7']);
+    expect(world.infos[0]).not.toContain('ready');
+  });
+
+  it('reports a failed run, naming the findings kept as a partial when there were any', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'failed', completeness: 'partial', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1', findingCount: 2 });
+    expect(world.infos).toEqual(['Review failed · 2 findings kept as partial · !7']);
+  });
+
+  it('reports a failed run with nothing validated, naming no finding count', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'failed', completeness: 'none', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1' });
+    expect(world.infos).toEqual(['Review failed · !7']);
+  });
+
+  it('reports a cancelled run distinctly from a failed one, never as a timeout or a clean review', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'cancelled', completeness: 'none', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1' });
+    expect(world.infos).toEqual(['Review cancelled · !7']);
+  });
+
+  it('summarizes activation\'s interrupted sweep once, not one toast per target, and says nothing when nothing was interrupted', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runsInterrupted(0);
+    expect(world.infos).toEqual([]);
+    notifier.runsInterrupted(3);
+    expect(world.infos).toEqual(['3 reviews interrupted by the restart']);
+  });
+});

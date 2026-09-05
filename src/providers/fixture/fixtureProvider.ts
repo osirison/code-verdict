@@ -12,14 +12,36 @@ import type {
   HostDescriptor,
 } from '../../platform/provider';
 import type {
+  ChangedFileEntry,
+  ChangedFileKind,
+  ChangedFileManifestRequest,
+  ChangedFileManifestResult,
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   ConnectionStatus,
+  CurrentHeadResult,
+  DiffPage,
+  DiffPageRequest,
+  DiffPageResult,
+  DiffSearchMatch,
+  DiffSearchRequest,
+  DiffSearchResult,
+  FileDiff,
+  FileRange,
+  FileRangeRequest,
+  FileRangeResult,
+  IssueDetailRequest,
+  IssueDetailResult,
   Repository,
+  RepositorySearchRequest,
+  RepositorySearchResult,
   ReviewSubmission,
   ReviewThread,
+  SearchMatch,
   SourceResolution,
   SubmitResult,
   WorkItem,
@@ -29,6 +51,9 @@ import { ScmError } from '../../platform/errors';
 // shares that grammar. A pure parser, not the GitLab provider itself.
 import { parseSourceInput } from '../gitlab/sourceInput';
 import * as data from './data';
+// Task 1.3 deterministic harness fixtures — the investigation registry below
+// reuses these verbatim instead of inventing new adversarial content.
+import * as harnessFixtures from './harnessFixtures';
 
 const CAPABILITIES: ProviderCapabilities = {
   suggestions: true,
@@ -37,6 +62,21 @@ const CAPABILITIES: ProviderCapabilities = {
   threadResolution: true,
   groupHierarchy: true,
   batchedReview: false,
+  // D7/task 4.1: the fixture provider is the first, offline reference
+  // implementation — every operation is honestly supported so the shared
+  // contract suite's investigation cases (task 3.6) actually run.
+  reviewInvestigation: {
+    manifests: { supported: true },
+    diffReads: { supported: true },
+    // Small on purpose: forces the reconstructed token.ts fixture content to
+    // exercise `truncated`, not just `complete`, without a huge file.
+    fileReads: { supported: true, pageBound: { maxPageSize: 8 } },
+    repositorySearch: { supported: true },
+    diffSearch: { supported: true },
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: harnessFixtures.HUGE_REVIEW_PAGE_SIZE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -64,11 +104,154 @@ const HOST: HostDescriptor = {
   sourceSamples: [{ label: 'sample project', value: '9102' }],
 };
 
+// ---- Review-investigation operations (design.md D7, task 4.1) --------------
+//
+// A second dataset, independent of the demo-pod content above: investigation
+// operations are revision-pinned and keyed by `headSha`, never by
+// change-request identity, so the demo CR 2841 can keep serving its friendly
+// onboarding diff through `getChangeRequestDiff` while its investigation
+// manifest/reads/search come from this registry. Every entry is built from
+// the task-1.3 harness fixtures (`./harnessFixtures.ts`) or this module's own
+// demo diff; nothing here is newly authored adversarial content.
+
+interface InvestigationFile {
+  entry: ChangedFileEntry;
+  /** Original unified-diff hunk text, served by `readDiff`. */
+  patch?: string;
+  /** Deterministic reconstruction of head-revision text from `patch` (context + added lines), served by `readFile`/search. Absent for binary files. */
+  lines?: readonly string[];
+}
+
+interface InvestigationScenario {
+  readonly files: readonly InvestigationFile[];
+  /** Paths whose diff is too large to read as a patch (`readDiff` reports `tooLarge`). */
+  readonly oversizedPaths?: ReadonlySet<string>;
+  /** `searchDiff` cannot state completeness against this scenario's diff. */
+  readonly diffSearchUnknown?: boolean;
+  /**
+   * Repository content outside the diff — task 6.3's `AGENTS.md` chain reads
+   * a directory that was never changed, so it cannot be represented as an
+   * `InvestigationFile` (those are all diff-derived). `readFile` falls back
+   * here when a path is not among the changed files.
+   */
+  readonly repoFiles?: readonly harnessFixtures.FixtureRepoFile[];
+}
+
+/** Keeps context and added lines, drops removed lines and hunk headers \u2014 a deterministic head-revision approximation, never invented file content. */
+function linesFromUnifiedDiff(patch: string): string[] {
+  const lines: string[] = [];
+  for (const raw of patch.split('\n')) {
+    if (raw.startsWith('@@') || raw.startsWith('Binary files ') || raw.startsWith('-')) continue;
+    lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
+  }
+  return lines;
+}
+
+function fileFromFileDiff(fd: FileDiff, kind: ChangedFileKind): InvestigationFile {
+  const binary = fd.diff.startsWith('Binary files ');
+  return {
+    entry: {
+      path: fd.newPath,
+      oldPath: fd.isRenamed ? fd.oldPath : undefined,
+      kind: fd.isRenamed ? 'renamed' : kind,
+      binary,
+      byteSize: binary ? 4096 : undefined,
+    },
+    patch: fd.diff,
+    lines: binary ? undefined : linesFromUnifiedDiff(fd.diff),
+  };
+}
+
+// The demo pod's own CR 2841 diff \u2014 its investigation manifest layers the
+// huge/binary/renamed fixtures on top of these two real files.
+const DEFAULT_INVESTIGATION_DIFF = data.DIFFS.find((d) => d.ref.repoId === '9101' && d.ref.number === '2841')!;
+
+const INVESTIGATION_SNAPSHOTS: ReadonlyMap<string, InvestigationScenario> = new Map([
+  [
+    DEFAULT_INVESTIGATION_DIFF.headSha,
+    {
+      files: [
+        ...DEFAULT_INVESTIGATION_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')),
+        fileFromFileDiff(harnessFixtures.BINARY_FILE, 'added'),
+        fileFromFileDiff(harnessFixtures.RENAMED_FILE, 'modified'),
+      ],
+    },
+  ],
+  [
+    harnessFixtures.BINARY_AND_RENAMED_DIFF.headSha,
+    { files: harnessFixtures.BINARY_AND_RENAMED_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')) },
+  ],
+  [
+    harnessFixtures.HUGE_REVIEW_DIFF.headSha,
+    { files: harnessFixtures.HUGE_REVIEW_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')) },
+  ],
+  [
+    harnessFixtures.OVERSIZED_REVIEW_DIFF.headSha,
+    {
+      files: [
+        {
+          entry: {
+            path: harnessFixtures.OVERSIZED_FILE_PATH,
+            kind: 'modified',
+            binary: false,
+            byteSize: harnessFixtures.OVERSIZED_DIFF_BYTE_LENGTH,
+          },
+        },
+      ],
+      oversizedPaths: new Set([harnessFixtures.OVERSIZED_FILE_PATH]),
+      diffSearchUnknown: true,
+    },
+  ],
+  [
+    harnessFixtures.CHANGED_HEAD_SNAPSHOT_SHA,
+    { files: harnessFixtures.CHANGED_HEAD_SNAPSHOT_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')) },
+  ],
+  [
+    harnessFixtures.CHANGED_HEAD_LATER_SHA,
+    { files: harnessFixtures.CHANGED_HEAD_LATER_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')) },
+  ],
+  [
+    harnessFixtures.NESTED_AGENTS_MD_DIFF.headSha,
+    {
+      files: harnessFixtures.NESTED_AGENTS_MD_DIFF.files.map((f) => fileFromFileDiff(f, 'modified')),
+      repoFiles: harnessFixtures.NESTED_AGENTS_MD,
+    },
+  ],
+]);
+
+function paginate<T>(
+  items: readonly T[],
+  cursor: string | undefined,
+  pageSize: number,
+): { page: readonly T[]; nextCursor?: string } {
+  const start = cursor ? Number(cursor) : 0;
+  const end = Math.min(start + pageSize, items.length);
+  return { page: items.slice(start, end), nextCursor: end < items.length ? String(end) : undefined };
+}
+
+function searchScenario(scenario: InvestigationScenario, query: string, pathScope?: string): SearchMatch[] {
+  const matches: SearchMatch[] = [];
+  for (const file of scenario.files) {
+    if (file.entry.binary || !file.lines) continue;
+    if (pathScope && !file.entry.path.startsWith(pathScope)) continue;
+    file.lines.forEach((line, index) => {
+      if (line.includes(query)) matches.push({ path: file.entry.path, line: index + 1, excerpt: line.trim() });
+    });
+  }
+  return matches;
+}
+
+function investigationRateLimitedError(): ScmError {
+  return new ScmError('rateLimited', 'Investigation read is rate limited', { retryAfterSeconds: 30 });
+}
+
 export interface FixtureSimulation {
   /** Line-comment posts whose draft key is in this set fail with staleAnchor. */
   staleAnchorKeys?: ReadonlySet<string>;
   /** Every write fails with this error. */
   failAll?: ScmError;
+  /** Every review-investigation read fails with the neutral rate-limited error (task 3.5/4.2). */
+  investigationRateLimited?: boolean;
 }
 
 function crKey(ref: ChangeRequestRef): string {
@@ -238,6 +421,143 @@ export class FixtureConnection implements Connection {
 
   async approve(_ref: ChangeRequestRef): Promise<void> {
     // No-op in the fixture.
+  }
+
+  // ---- Review-investigation operations (design.md D7, task 4.1) ------------
+
+  async listChangedFiles(request: ChangedFileManifestRequest): Promise<ChangedFileManifestResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
+    if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
+    const bound = CAPABILITIES.reviewInvestigation!.manifests.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const { page, nextCursor } = paginate(
+      scenario.files.map((f) => f.entry),
+      request.cursor,
+      bound,
+    );
+    if (nextCursor) return { snapshot: request.snapshot, state: 'paginated', value: page, cursor: nextCursor };
+    return { snapshot: request.snapshot, state: 'complete', value: page };
+  }
+
+  async readDiff(request: DiffPageRequest): Promise<DiffPageResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
+    if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
+    const file = scenario.files.find((f) => f.entry.path === request.path);
+    if (scenario.oversizedPaths?.has(request.path)) {
+      return { snapshot: request.snapshot, state: 'tooLarge', byteSize: file?.entry.byteSize };
+    }
+    if (!file) return { snapshot: request.snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+    if (file.entry.binary) return { snapshot: request.snapshot, state: 'binary', byteSize: file.entry.byteSize };
+    const value: DiffPage = {
+      path: file.entry.path,
+      oldPath: file.entry.oldPath,
+      isRenamed: file.entry.kind === 'renamed',
+      patch: file.patch ?? '',
+      positions: [],
+    };
+    return { snapshot: request.snapshot, state: 'complete', value };
+  }
+
+  async readFile(request: FileRangeRequest): Promise<FileRangeResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
+    if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
+    const file = scenario.files.find((f) => f.entry.path === request.path);
+    const repoFile = !file ? scenario.repoFiles?.find((f) => f.path === request.path) : undefined;
+    if (!file && !repoFile) return { snapshot: request.snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+    if (file?.entry.binary) return { snapshot: request.snapshot, state: 'binary', byteSize: file.entry.byteSize };
+    const lines = file ? file.lines ?? [] : (repoFile!.content.split(/\r?\n/));
+    const bound = CAPABILITIES.reviewInvestigation!.fileReads.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const start = Math.max(1, request.startLine);
+    if (start > lines.length) return { snapshot: request.snapshot, state: 'notFound', reason: 'startLine beyond file length' };
+    const availableEnd = Math.min(request.endLine, lines.length);
+    const boundedEnd = Math.min(availableEnd, start + bound - 1);
+    const value: FileRange = { revision: request.revision, path: request.path, startLine: start, endLine: boundedEnd, text: lines.slice(start - 1, boundedEnd).join('\n') };
+    if (boundedEnd < availableEnd) {
+      return { snapshot: request.snapshot, state: 'truncated', value, knownRemainingUnits: availableEnd - boundedEnd };
+    }
+    return { snapshot: request.snapshot, state: 'complete', value };
+  }
+
+  async searchRepository(request: RepositorySearchRequest): Promise<RepositorySearchResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
+    if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
+    return { snapshot: request.snapshot, state: 'complete', value: searchScenario(scenario, request.query, request.pathScope) };
+  }
+
+  async searchDiff(request: DiffSearchRequest): Promise<DiffSearchResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
+    if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
+    if (scenario.diffSearchUnknown) return { snapshot: request.snapshot, state: 'unknown', reason: 'Diff exceeds searchable size' };
+    const value: DiffSearchMatch[] = searchScenario(scenario, request.query, request.pathScope).map((m) => ({
+      position: { path: m.path, side: 'new', line: m.line },
+      excerpt: m.excerpt,
+    }));
+    return { snapshot: request.snapshot, state: 'complete', value };
+  }
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const cr = data.CHANGE_REQUESTS.find((c) => c.ref.repoId === request.snapshot.repoId && c.ref.number === request.number);
+    if (!cr) return { snapshot: request.snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+    const discussion = data.THREADS.filter((t) => t.crRef.repoId === cr.ref.repoId && t.crRef.number === cr.ref.number).flatMap((t) => t.notes);
+    const partOf = /Part-of: #(\d+)/.exec(cr.description ?? '');
+    return {
+      snapshot: request.snapshot,
+      state: 'complete',
+      value: {
+        title: cr.title,
+        body: cr.description,
+        labels: [],
+        commits: [],
+        discussion,
+        checkSummaries: cr.ci ? [{ name: 'pipeline', status: cr.ci.status, summary: `Pipeline ${cr.ci.runId}` }] : [],
+        relationships: partOf ? [{ kind: 'partOf', ref: partOf[1]! }] : [],
+        unavailableSections: ['labels', 'commits'],
+      },
+    };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const isLongIssue =
+      request.issueRepoId === harnessFixtures.LONG_ISSUE.repoId && request.issueNumber === harnessFixtures.LONG_ISSUE.number;
+    const workItem = isLongIssue
+      ? harnessFixtures.LONG_ISSUE
+      : data.WORK_ITEMS.find((w) => w.repoId === request.issueRepoId && w.number === request.issueNumber);
+    if (!workItem) {
+      return { snapshot: request.snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+    }
+    return {
+      snapshot: request.snapshot,
+      state: 'complete',
+      value: {
+        title: workItem.title,
+        body: workItem.description,
+        labels: [],
+        commits: [],
+        discussion: isLongIssue ? harnessFixtures.LONG_DISCUSSION.notes : [],
+        checkSummaries: [],
+        relationships: [],
+        unavailableSections: isLongIssue
+          ? ['labels', 'commits', 'checkSummaries', 'relationships']
+          : ['labels', 'commits', 'discussion', 'checkSummaries', 'relationships'],
+      },
+    };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    // The one deliberately drifted fixture: a push landed after the snapshot.
+    if (ref.repoId === harnessFixtures.CHANGED_HEAD_REF.repoId && ref.number === harnessFixtures.CHANGED_HEAD_REF.number) {
+      return { repoId: ref.repoId, state: 'resolved', headSha: harnessFixtures.CHANGED_HEAD_LATER_SHA };
+    }
+    const cr = data.CHANGE_REQUESTS.find((c) => c.ref.repoId === ref.repoId && c.ref.number === ref.number);
+    if (!cr) return { repoId: ref.repoId, state: 'notFound' };
+    return { repoId: ref.repoId, state: 'resolved', headSha: cr.headSha };
   }
 }
 

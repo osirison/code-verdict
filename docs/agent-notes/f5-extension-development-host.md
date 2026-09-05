@@ -75,7 +75,15 @@ seconds, without a display.
 Treat those counts as a floor that grows, not a fixture: what matters is that `activate()` resolves
 rather than throwing or hanging, and that a command you have just added appears in the list. The
 stub needs `Memento.keys()` since retention reads it, and `lm.selectChatModels` returning `[]` is
-enough — nothing on the activation path awaits a model.
+enough — nothing on the activation path awaits a model. As of the agentic-review-harness change the
+probe resolves in ~2ms with 30 commands, 37 subscriptions and 6 status-bar items.
+
+**The trap when writing the stub:** a top-level permissive `Proxy` over the whole `vscode` object
+does not cover members of the namespaces you spell out. `window` is a real object in the stub, so a
+member it does not define — `onDidChangeWindowState`, which `VerdictNotifier.start` calls — is
+`undefined` rather than a no-op, and `activate()` throws for a reason that has nothing to do with
+what is being checked. Wrap each namespace in its own proxy that returns a disposable-returning
+function for anything unknown, then wrap the whole object as well.
 
 ## Two shell traps hit while doing this
 

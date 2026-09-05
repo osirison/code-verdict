@@ -49,7 +49,7 @@ import {
   type ChangesetDraft,
 } from '../app/retainedReview';
 import { CoalescedDraftWriter } from '../app/draftWriter';
-import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
+import type { ChangesetRunMember, ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
 import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
@@ -86,7 +86,6 @@ import { changesetDetectionOptions } from './changesetOptions';
 import { flowCommandMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
-import { livenessView } from './runLiveness';
 import { escapeHtml } from './theme';
 import { AppSurface, type AppRoute } from './appSurface';
 import { locateInWorkspace } from './inDiffEditor';
@@ -146,6 +145,22 @@ export class ChangesetReviewPanel {
   static isCommandTargetActive(): boolean {
     const panel = ChangesetReviewPanel.current;
     return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
+  }
+
+  /** `codeVerdict.showRunDiagnostics`'s own read: this panel's mirrored `RunRecord` (the same one `render()` builds `runError`/`runProjection` from), if this panel is open at all — no focus requirement, unlike `handleCommand`'s keyboard-command routing. */
+  static activeRunRecord(): RunRecord | undefined {
+    const panel = ChangesetReviewPanel.current;
+    return panel && !panel.disposed ? panel.runRecord : undefined;
+  }
+
+  /**
+   * Whether this panel is open at all — `codeVerdict.showRunDiagnostics`'s own "how many review
+   * panels were open" count for its not-found report. Deliberately side-effect-free, unlike
+   * `revealIfOpen`: a diagnostic count must not itself bring a panel into focus.
+   */
+  static isOpen(): boolean {
+    const panel = ChangesetReviewPanel.current;
+    return Boolean(panel && !panel.disposed);
   }
 
   static selectItem(itemId: string): void {
@@ -380,11 +395,31 @@ export class ChangesetReviewPanel {
     return [...entries.values()];
   }
 
+  /**
+   * The full member shape (with each member's whole fetched diff), still
+   * needed by the pre-run context-usage estimate below
+   * (`assembleChangesetReviewPrompt`, `scheduleContextUsage`) — a prompt-size
+   * estimate for display, never a review execution. `runMembers` is the
+   * slimmer sibling that actually starts a run (task 15.8): the harness
+   * fetches diffs itself, in bounded pages, once it has a live `Connection`,
+   * so `RunInput` carries only the revision identity.
+   */
   private promptMembers(): ChangesetAgentMember[] {
     return this.members.map((member) => ({
       ...member,
       context: this.promptContext(member),
       attachments: this.attachmentsForMember(member),
+    }));
+  }
+
+  /** Task 15.8: `promptMembers()`, slimmed to what `RunInput` carries — see that method's own doc comment. */
+  private runMembers(): ChangesetRunMember[] {
+    return this.promptMembers().map((member) => ({
+      ref: member.ref,
+      baseSha: member.diff.baseSha,
+      headSha: member.diff.headSha,
+      context: member.context,
+      attachments: member.attachments,
     }));
   }
 
@@ -652,7 +687,6 @@ export class ChangesetReviewPanel {
    */
   private async run(): Promise<void> {
     const pod = this.pod();
-    const runVocabulary = getProvider(pod.providerId).vocabulary;
     const effort = this.selectedEffort();
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
@@ -671,7 +705,7 @@ export class ChangesetReviewPanel {
     }
 
     const input: RunInput = {
-      target: { kind: 'changeset', changesetId: this.changesetId, members: this.promptMembers() },
+      target: { kind: 'changeset', changesetId: this.changesetId, members: this.runMembers() },
       refLabel: this.changeset.name,
       podId: pod.id,
       criteria: pod.criteria,
@@ -681,13 +715,6 @@ export class ChangesetReviewPanel {
       effort,
       timeouts: agentRunTimeouts(),
       contextBudgets: this.contextBudgets,
-      steps: [
-        'Resolving agent from Copilot workspace…',
-        `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
-        'Cross-referencing contracts between repositories…',
-        `Scoring findings against ${runVocabulary.repoNoun} criteria…`,
-        'Items ready',
-      ],
       demo,
     };
 
@@ -1341,9 +1368,11 @@ export class ChangesetReviewPanel {
       contextUsage: this.contextUsage,
       unresolvedContextReferences: this.unresolvedContextReferences,
       acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
-      runSteps: this.runRecord?.steps ?? [],
-      runStep: this.runRecord?.step ?? 0,
-      runLive: livenessView(this.runRecord),
+      // Task 14.1 (design.md D14): the shared reducer's own projection and
+      // ordered activity — never a fixed step list or a fragment count.
+      runProjection: this.runRecord?.projection,
+      runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      runStartedAt: this.runRecord?.startedAt,
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
         ? { ...this.runRecord.failure, partialCount: 0 }
         : undefined,
@@ -1351,6 +1380,18 @@ export class ChangesetReviewPanel {
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
         ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
+        : undefined,
+      // Task 14.2 (design.md D14/D16): the same retained record's own
+      // lineage/activity fields, never re-derived.
+      retainedDetails: this.retained
+        ? {
+            completeness: this.retained.completeness,
+            protocolProvenance: this.retained.protocolProvenance,
+            lineageId: this.retained.lineageId,
+            attempt: this.retained.attempt,
+            limitations: this.retained.limitations,
+            activity: this.retained.activity,
+          }
         : undefined,
       mode: this.mode,
       items,

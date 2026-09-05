@@ -25,6 +25,13 @@ import {
   readContextSourceDefaults,
   readContextUsageEnabled,
 } from './contextOptions';
+import { isRiskLevel } from '../domain/harnessCoverage';
+import {
+  harnessPolicyToSettingValues,
+  HARNESS_POLICY_SETTINGS,
+  readHarnessPolicy,
+  readRequireInspectionMinRisk,
+} from './harnessPolicyOptions';
 
 const CONTEXT_BUDGET_KEYS = {
   sectionBudget: 'context.sectionBudget',
@@ -38,6 +45,9 @@ const CONTEXT_TOGGLE_KEYS = {
   includeLinkedItems: 'context.includeLinkedItems',
   usageEnabled: 'contextUsage.enabled',
 } as const;
+
+/** Every harness numeric setting's key — `settings.ts`'s own membership check before writing a `setHarnessNumber` message, so a malformed message cannot write to an arbitrary config path. */
+const HARNESS_NUMBER_SETTING_KEYS = new Set(HARNESS_POLICY_SETTINGS.map((mapping) => mapping.settingKey));
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -159,6 +169,10 @@ export class SettingsPanel {
         ...contextSources,
         usageEnabled: readContextUsageEnabled(),
       },
+      harness: {
+        ...harnessPolicyToSettingValues(readHarnessPolicy()),
+        requireInspectionMinRisk: readRequireInspectionMinRisk(),
+      },
       agentLocations: this.agentLocations,
       notifications: NOTIFICATION_EVENTS.map((event) => ({
         key: event.key,
@@ -267,6 +281,23 @@ export class SettingsPanel {
         if (!key || typeof message.value !== 'boolean') return;
         await config.update(key, message.value, vscode.ConfigurationTarget.Global);
         this.paint(['set-context', 'set-json']);
+        return;
+      }
+      case 'setHarnessNumber': {
+        // The client's own `min`/`max` (set per field in `harnessRegion`, task 17.2) already
+        // gate what gets posted; this is only the same courtesy `setContextBudget` above pays —
+        // a malformed message cannot write to a config path outside the known harness settings.
+        // `normalizeHarnessPolicy` (`../domain/harnessPolicy.ts`) is the actual safety net,
+        // applied wherever `readHarnessPolicy` is read, regardless of what lands in settings.json.
+        if (!HARNESS_NUMBER_SETTING_KEYS.has(message.key) || !Number.isFinite(message.value)) return;
+        await config.update(`harness.${message.key}`, message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-harness', 'set-json']);
+        return;
+      }
+      case 'setHarnessMinRisk': {
+        if (!isRiskLevel(message.value)) return;
+        await config.update('harness.requireInspectionMinRisk', message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-harness', 'set-json']);
         return;
       }
       case 'setShareRates':

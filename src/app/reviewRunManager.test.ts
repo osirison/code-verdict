@@ -1,20 +1,38 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from './agents';
-import { ReviewRunStore } from './reviewRuns';
-import { readRetained, type SessionDraft } from './retainedReview';
+import { ReviewRunStore, type ReviewRun } from './reviewRuns';
+import { partialDraftKeyFor, readRetained, runKeyForCr, type SessionDraft } from './retainedReview';
 import {
   InFlightRunStore,
   ReviewRunManager,
+  deriveRunControls,
+  isLegalRunTransition,
+  legacyStatusFor,
   sweepInterruptedRuns,
-  type DemoRunResult,
+  type HarnessAttemptRunOptions,
+  type ReviewHarnessFactory,
+  type RunControls,
   type RunInput,
   type RunRecord,
-  type RunnerOptions,
+  type RunStatus,
 } from './reviewRunManager';
+import type { CheckpointInfo, HarnessAttemptResult } from './harnessAttempt';
+import type { CompletionBlockerDetail } from './harnessCompletion';
+import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
+import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
+import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
+import type { CitedEvidenceRef, TrackedCandidate, ValidatedFinding } from './harnessCandidateValidation';
+import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
+import { sha256Hex } from './contentDigest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { RUN_LIFECYCLES, type RunLifecycle } from '../domain/harnessLifecycle';
+import type { RunPhase } from '../domain/harnessActivity';
+import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
+import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
+import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
+import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 import type { AgentRunTimeouts } from './lmAgent';
 import type { AgentReviewResponse } from '../domain/agentResponse';
-import type { ChangeRequestDiff } from '../platform/types';
 import type { KeyValueStore } from './storage';
 import { DEFAULT_CONTEXT_BUDGETS } from './reviewContext';
 
@@ -39,12 +57,9 @@ function memoryStore(): KeyValueStore & { snapshot(): Map<string, unknown> } {
  */
 const TIMEOUTS: AgentRunTimeouts = { inactivityMs: 90_000, ceilingMs: 600_000 };
 
-const diff: ChangeRequestDiff = {
-  ref: { repoId: 'repo-1', number: '2841' },
-  headSha: 'head-1',
-  files: [{ oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' }],
-  anchorRefs: {},
-};
+/** Task 15.8: `RunInput` carries only the revision identity, never the whole diff. */
+const BASE_SHA = 'base-1';
+const HEAD_SHA = 'head-1';
 
 function response(itemCount: number, headSha = 'head-1'): AgentReviewResponse {
   return {
@@ -70,7 +85,7 @@ function response(itemCount: number, headSha = 'head-1'): AgentReviewResponse {
 
 function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
   return {
-    target: { kind: 'cr', ref: { repoId: 'repo-1', number }, diff },
+    target: { kind: 'cr', ref: { repoId: 'repo-1', number }, baseSha: BASE_SHA, headSha: HEAD_SHA },
     refLabel: `!${number}`,
     podId: 'pod-a',
     criteria: DEFAULT_CRITERIA,
@@ -80,45 +95,221 @@ function crInput(number: string, over: Partial<RunInput> = {}): RunInput {
     effort: 'none',
     timeouts: TIMEOUTS,
     contextBudgets: DEFAULT_CONTEXT_BUDGETS,
-    steps: ['Sending…', 'Indexing…', 'Cross-referencing…', 'Scoring…', 'Items ready'],
     demo: false,
     ...over,
   };
 }
 
-/** A runner whose every call is resolved by the test, one deferred per target. */
-function controllableRunners() {
+// ---- Task 12.1: a real `ReviewHarnessFactory`, driven directly ---------------------
+
+/** A minimal, all-zero `BudgetConsumption` — no test below reads it back. */
+const ZERO_BUDGET: BudgetConsumption = {
+  modelTurnsUsed: 0,
+  toolCallsUsed: 0,
+  evidenceBytesUsed: 0,
+  elapsedMs: 0,
+  highRiskReserveUsed: 0,
+  verificationReserveUsed: 0,
+};
+
+/** An activity log whose one event is tagged `phase` — enough for `reduceActivity` (inside `applyCheckpoint`) to derive the matching `RunLifecycle`. */
+function activityLogAt(phase: RunPhase, runId: string): CheckpointInfo['activityLog'] {
+  const log = createActivityLog(runId, runId, 1);
+  return appendActivityEvent(
+    log,
+    { kind: 'actionStarted', action: `Entering ${phase}` },
+    { occurredAt: new Date().toISOString(), phase, elapsedMs: 0 },
+  );
+}
+
+/** A `CheckpointInfo` reporting phase `phase` for `refLabel` — what a real attempt's `onCheckpoint` hands the manager. */
+function checkpointAt(phase: RunPhase, refLabel: string): CheckpointInfo {
+  return {
+    checkpointId: `ckpt-${refLabel}-${phase}`,
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    phase,
+    reason: 'phaseBoundary',
+    occurredAt: new Date().toISOString(),
+    elapsedMs: 0,
+    activityLog: activityLogAt(phase, refLabel),
+    evidenceSources: [],
+    candidates: [],
+    contradicted: [],
+    budget: ZERO_BUDGET,
+    coverage: [],
+    unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+  };
+}
+
+/** A terminal `HarnessAttemptResult` built from the same `response(...)` shape every other test already uses — `.item` is the only `ValidatedFinding` field `completeAttempt` ever reads (`reviewRunManager.ts`'s own note). */
+function succeededResult(itemCount: number, refLabel = 'run'): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'succeeded',
+    outcome: {
+      kind: itemCount > 0 ? 'completeFindings' : 'completeClean',
+      completeness: 'complete',
+      findingCount: itemCount,
+      limitations: [],
+      replacesRetainedReview: true,
+      clean: itemCount === 0,
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: false,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/** `itemCount > 0` produces a `partial` outcome with real findings (D11: "the run persists a partial result plus... limitation report") rather than a plain `none`-completeness failure. `blockerDetails` mirrors `CompletionOutcome.blockerDetails` (task: "say which files, not just that some files") — absent by default, matching every existing caller that never set it. */
+function failedResult(message: string, refLabel = 'run', itemCount = 0, blockerDetails?: readonly CompletionBlockerDetail[]): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'failed',
+    outcome: {
+      kind: itemCount > 0 ? 'partialFindings' : 'failed',
+      completeness: itemCount > 0 ? 'partial' : 'none',
+      findingCount: itemCount,
+      limitations: [{ code: 'harness.test', message }],
+      replacesRetainedReview: false,
+      clean: false,
+      ...(blockerDetails ? { blockerDetails } : {}),
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: false,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/** The cancelled counterpart to `failedResult` — `itemCount > 0` produces the same `partial` outcome shape D11 describes for "cancellation follows a validated partial result". */
+function cancelledResult(refLabel = 'run', itemCount = 0): HarnessAttemptResult {
+  const items = response(itemCount).items;
+  return {
+    runId: refLabel,
+    lineageId: refLabel,
+    attempt: 1,
+    lifecycle: 'cancelled',
+    outcome: {
+      kind: itemCount > 0 ? 'partialFindings' : 'failed',
+      completeness: itemCount > 0 ? 'partial' : 'none',
+      findingCount: itemCount,
+      limitations: itemCount > 0 ? [{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }] : [],
+      replacesRetainedReview: false,
+      clean: false,
+    },
+    findings: items.map((item) => ({ item }) as unknown as ValidatedFinding),
+    activityLog: createActivityLog(refLabel, refLabel, 1),
+    cancelled: true,
+    small: true,
+    turnsUsed: 1,
+    toolCallsUsed: 1,
+    contradicted: [],
+  };
+}
+
+/** Shared by `controllableRunners`/`unresponsiveRunner`: the same items-in, `HarnessAttemptResult`-out conversion the deleted pre-harness `{lm, demo}` adapter (`reviewRunManager.ts`, removed task 15.8) used, kept here purely as a test fixture — never a shipped bypass. */
+function resultFromResponse(refLabel: string, response: AgentReviewResponse): HarnessAttemptResult {
+  return { ...succeededResult(response.items.length, refLabel), findings: response.items.map((item) => ({ item }) as unknown as ValidatedFinding) };
+}
+
+/**
+ * A `ReviewHarnessFactory` whose every attempt is driven entirely by the
+ * test, one deferred `AgentReviewResponse` per target — `pending.get(key)!
+ * .resolve(response)` concludes `.run()` with the equivalent
+ * `HarnessAttemptResult` (`resultFromResponse`), and `.reject(error)`
+ * rejects `.run()` with that error unchanged, for the genuine-crash path
+ * `executeAttempt`'s `catch` still covers. Tests that need the checkpoint/
+ * waiting/resuming hooks use `controllableAttempts` below instead, which
+ * drives a real `ReviewHarnessFactory` directly with a `HarnessAttemptResult`
+ * already in hand.
+ */
+function controllableRunners(): {
+  started: string[];
+  cancelled: string[];
+  pending: Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>;
+  warningsOf: Map<string, HarnessAttemptRunOptions['onAttachmentWarnings']>;
+  runners: ReviewHarnessFactory;
+} {
   const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
   const started: string[] = [];
   const cancelled: string[] = [];
-  const progressOf = new Map<string, RunnerOptions['onProgress']>();
-  const warningsOf = new Map<string, RunnerOptions['onAttachmentWarnings']>();
-  return {
-    started,
-    cancelled,
-    pending,
-    progressOf,
-    warningsOf,
-    runners: {
-      lm(input: RunInput, options: RunnerOptions): Promise<AgentReviewResponse> {
-        const key = input.refLabel;
-        started.push(key);
-        progressOf.set(key, options.onProgress);
-        warningsOf.set(key, options.onAttachmentWarnings);
-        return new Promise<AgentReviewResponse>((resolve, reject) => {
-          pending.set(key, { resolve, reject });
+  const warningsOf = new Map<string, HarnessAttemptRunOptions['onAttachmentWarnings']>();
+  function build(input: RunInput, options: HarnessAttemptRunOptions) {
+    const key = input.refLabel;
+    started.push(key);
+    warningsOf.set(key, options.onAttachmentWarnings);
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(key, { resolve: (r) => resolve(resultFromResponse(key, r)), reject });
           options.cancellation.onCancellationRequested(() => {
             cancelled.push(key);
             // What a real transport does when its token trips.
             reject(Object.assign(new Error('run cancelled'), { cancelled: true, requestId: 'abc123' }));
           });
-        });
-      },
-      demo(): DemoRunResult {
-        return { response: response(1), steps: ['Reading the diff…', 'Items ready'] };
-      },
-    },
-  };
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
+  return { started, cancelled, pending, warningsOf, runners };
+}
+
+/** Drop-in replacement for the old `{lm, demo}` fixture shape at a call site that only ever needed an immediate, uncontrolled resolution — `demoItemCount` for a `RunInput.demo` run, defaulting to the same count as the model-backed path. */
+function instantRunners(itemCount: number, demoItemCount = itemCount): ReviewHarnessFactory {
+  function build(input: RunInput) {
+    return { run: () => Promise.resolve(succeededResult(input.demo ? demoItemCount : itemCount, input.refLabel)) };
+  }
+  return { create: build, createDemo: build, resume: build };
+}
+
+/**
+ * A `ReviewHarnessFactory` whose every attempt is driven entirely by the
+ * test: `pending.get(key)!.resolve(...)`/`.reject(...)` conclude `.run()`
+ * directly with a `HarnessAttemptResult` (or a thrown error, for the
+ * genuine-crash path `executeAttempt`'s `catch` still covers), and
+ * `optionsOf.get(key)!.onCheckpoint`/`.onEnterWaiting`/`.onResuming` invoke
+ * the exact hooks `HarnessAttemptRunOptions` exposes — task 12.1's real
+ * integration point.
+ */
+function controllableAttempts(): {
+  started: string[];
+  cancelled: string[];
+  pending: Map<string, { resolve(result: HarnessAttemptResult): void; reject(error: unknown): void }>;
+  optionsOf: Map<string, HarnessAttemptRunOptions>;
+  runners: ReviewHarnessFactory;
+} {
+  const pending = new Map<string, { resolve(result: HarnessAttemptResult): void; reject(error: unknown): void }>();
+  const optionsOf = new Map<string, HarnessAttemptRunOptions>();
+  const started: string[] = [];
+  const cancelled: string[] = [];
+  function build(input: RunInput, options: HarnessAttemptRunOptions) {
+    started.push(input.refLabel);
+    optionsOf.set(input.refLabel, options);
+    options.cancellation.onCancellationRequested(() => cancelled.push(input.refLabel));
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(input.refLabel, { resolve, reject });
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
+  return { started, cancelled, pending, optionsOf, runners };
 }
 
 function manager(
@@ -135,9 +326,13 @@ function manager(
   const runs = new ReviewRunManager({
     workspaceState,
     globalState,
-    runners: { lm: async () => response(1), demo: () => ({ response: response(1), steps: [] }) },
+    runners: instantRunners(1),
     onChange: (record) => changes.push(record),
-    delay: async () => {},
+    // Never resolves by default: a test that does not care about the cancel
+    // grace timeout must never have it race ahead of a live attempt's own
+    // cancelled result. Only the dedicated timeout test below overrides this
+    // with something that actually settles.
+    cancelGrace: () => new Promise<void>(() => {}),
     ...over,
   });
   return { runs, workspaceState, globalState, changes };
@@ -146,7 +341,7 @@ function manager(
 describe('a run completes with nobody watching', () => {
   it('writes the retained review and records the run for a finish no screen saw', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
     });
 
     runs.trigger(crInput('2841'), 3);
@@ -166,7 +361,7 @@ describe('a run completes with nobody watching', () => {
 
   it('writes a clean run as a record rather than as a deletion', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(0), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(0),
     });
 
     runs.trigger(crInput('2841'), 3);
@@ -184,7 +379,7 @@ describe('a run completes with nobody watching', () => {
   it('announces the finished review with the pod it belonged to', async () => {
     const ready: unknown[] = [];
     const { runs } = manager({
-      runners: { lm: async () => response(3), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(3, 0),
       onReviewReady: (info) => ready.push(info),
     });
 
@@ -195,6 +390,7 @@ describe('a run completes with nobody watching', () => {
       ref: { repoId: 'repo-1', number: '2841' },
       refLabel: '!2841',
       itemCount: 3,
+      completeness: 'complete',
       // The notification's open action resolves a ref against the *active*
       // pod, so a run that finished after a switch has to be able to say it is
       // not about this one.
@@ -211,7 +407,7 @@ describe('a run completes with nobody watching', () => {
     const seenAtNotify: Array<SessionDraft | undefined> = [];
     const { runs } = manager({
       workspaceState,
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
       onChange: (record) => {
         if (record.status === 'succeeded') {
           seenAtNotify.push(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'));
@@ -231,7 +427,7 @@ describe('a run completes with nobody watching', () => {
     const globalState = memoryStore();
     const { runs } = manager({
       globalState,
-      runners: { lm: async () => response(1), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(1, 0),
       onRunRecorded: () => seen.push(new ReviewRunStore(globalState).list().length),
     });
 
@@ -254,6 +450,24 @@ describe('one run per target, several targets at once', () => {
     expect(second.key).toBe(first.key);
     expect(second.status).toBe('running');
     expect(pending.size).toBe(1);
+  });
+
+  it('returns the identical queued record when the same target is triggered again before it starts', async () => {
+    const { started, pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    // Fill the only slot with a different target so the next trigger for '2841' queues.
+    runs.trigger(crInput('other'), 1);
+    const queued = runs.trigger(crInput('2841'), 1);
+    expect(queued.status).toBe('queued');
+
+    const second = runs.trigger(crInput('2841'), 1);
+    expect(second).toBe(queued);
+
+    pending.get('!other')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!other', '!2841']));
+    // The repeated trigger did not queue a second dispatch for the same target.
+    expect(started.filter((label) => label === '!2841')).toHaveLength(1);
   });
 
   it('runs two different change requests at the same time', async () => {
@@ -408,8 +622,185 @@ describe('cancellation', () => {
 
     runs.cancelForPod('pod-a');
 
+    // The token fires at once; '!1' itself only reaches `cancelling` here — it
+    // settles once its own cancelled result reports back (this legacy runner
+    // auto-rejects on the token, but only the `executeAttempt` catch that
+    // rejection resolves into is what actually moves the record on).
     expect(cancelled).toEqual(['!1']);
-    expect(runs.active().map((r) => r.input.podId)).toEqual(['pod-b']);
+    await vi.waitFor(() => expect(runs.active().map((r) => r.input.podId)).toEqual(['pod-b']));
+  });
+});
+
+describe('reviewer-initiated cancellation keeps validated findings (D11\'s cancellation MAY, resolved)', () => {
+  const PARTIAL_KEY = partialDraftKeyFor({ repoId: 'repo-1', number: '2841' });
+
+  it('cancelling a run with already-validated findings keeps them as a partial, explicitly marked incomplete, persisted before the notification fires', async () => {
+    const { pending, runners } = controllableAttempts();
+    const seenAtNotify: unknown[] = [];
+    const { runs, workspaceState } = manager({
+      runners,
+      onChange: (record) => {
+        if (record.status === 'cancelled') seenAtNotify.push(workspaceState.get(PARTIAL_KEY));
+      },
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    // The reviewer's cancel does not itself settle the record — it moves to
+    // `cancelling` and waits for the dispatched attempt's own answer.
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    // The attempt reports back with whatever it had already validated before
+    // the cancellation reached it.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+    await vi.waitFor(() => expect(seenAtNotify).toHaveLength(1));
+
+    // Write-before-notify: the durable partial was already there the moment
+    // a listener reacted to the cancelled notification — the same discipline
+    // the failed path's own durable write already keeps.
+    expect(seenAtNotify[0]).toBeDefined();
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Never the target's retained review — a cancelled run never replaces a
+    // complete one, partial or not (D11).
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('cancelling a run with no findings yet settles as cancelled with no partial written', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 0));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('an attempt that ignores cancellation and never reports back settles as cancelled with no findings once the bounded timeout elapses, rather than staying in cancelling forever', async () => {
+    const { pending, runners } = controllableAttempts();
+    let expireGrace: (() => void) | undefined;
+    const { runs, workspaceState } = manager({
+      runners,
+      cancelGrace: () => new Promise<void>((resolve) => { expireGrace = resolve; }),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    // This fixture's attempt never resolves or rejects at all — nothing
+    // cooperative is coming. Only the bounded grace timeout moves the record
+    // on; firing it here stands in for real time actually elapsing.
+    expireGrace?.();
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+
+    // A late report, arriving after the grace timeout already gave up, must
+    // not resurrect or overwrite the record either — the same late-result
+    // guard (task 12.4) that protects every other terminal settlement.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(runs.get(record.key)).toBeUndefined();
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  // `cancelling`'s only legal edge is to `cancelled` (`buildLegalRunTransitions`).
+  // The three tests below prove every other shape a dispatched attempt can still
+  // report — a plain crash, a `failed` result, or a `succeeded` one, each from an
+  // attempt that never actually noticed the cancellation token — is reclassified
+  // as a cancellation rather than settling illegally (silently stranding the
+  // record in `cancelling` until `armCancelGrace`'s fallback) or, worse for the
+  // `succeeded` case, reporting a run the reviewer stopped as done.
+
+  it('a plain crash arriving after the reviewer cancelled settles promptly as cancelled, without waiting on the grace timeout', async () => {
+    const { pending, runners } = controllableAttempts();
+    // The default `cancelGrace` never resolves — settling promptly here
+    // proves this path does not depend on it at all.
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.reject(new Error('boom'));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  it('a failed result with validated findings, arriving after the reviewer cancelled, still keeps them as a partial rather than stranding the record', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('a succeeded result from an attempt that ignored cancellation is never reported as success — it settles cancelled, keeping findings only as a partial', async () => {
+    const { pending, runners } = controllableAttempts();
+    const ready: unknown[] = [];
+    const { runs, globalState, workspaceState } = manager({
+      runners,
+      onReviewReady: (info) => ready.push(info),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    // No "review ready" notification, and no retained review written — the
+    // reviewer cancelled this run; it must not silently report as done.
+    expect(ready).toHaveLength(0);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    // What the model validated before the manager stopped listening for a
+    // success is still kept — as a partial, exactly like any other cancellation.
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Run history records this as a partial outcome too, never as a clean
+    // success — the succeeded branch's own 'findings'/'clean' write never runs.
+    expect(new ReviewRunStore(globalState).list()).toEqual([
+      expect.objectContaining({ outcome: 'partial', findingCount: 2 }),
+    ]);
+  });
+});
+
+describe('a later success replaces the retained review', () => {
+  it('overwrites the retained review written by an earlier successful run on the same target', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(response(2));
+    await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
+    expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(2);
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(response(5));
+    await vi.waitFor(() => {
+      expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(5);
+    });
   });
 });
 
@@ -469,53 +860,32 @@ describe('progress and transitions', () => {
     });
   });
 
-  it('emits a finish at once even when it lands inside the progress throttle', async () => {
-    const { pending, progressOf, runners } = controllableRunners();
+  it('emits a finish at once even when it lands inside the checkpoint-repaint throttle', async () => {
+    const { pending, optionsOf, runners } = controllableAttempts();
     let now = 1_000;
     const changes: RunRecord[] = [];
     const { runs } = manager({ runners, now: () => now, onChange: (r) => changes.push(r) });
 
     runs.trigger(crInput('2841'), 3);
-    const onProgress = progressOf.get('!2841')!;
+    // A same-phase checkpoint repaints without forcing a notify (D14) —
+    // resets the throttle window without itself counting as a transition.
     now += 1_000;
-    onProgress({ requestId: 'r', fragmentsReceived: 1, charsReceived: 10, elapsedMs: 10 });
-    const afterProgress = changes.length;
+    optionsOf.get('!2841')!.onCheckpoint(checkpointAt('planning', '!2841'));
+    const afterRepaint = changes.length;
 
     // Well inside the 250ms floor: a throttle applied to transitions would
     // swallow this and leave the screen on a spinner after the run was over.
     now += 10;
-    pending.get('!2841')!.resolve(response(1));
-    await vi.waitFor(() => expect(changes.length).toBeGreaterThan(afterProgress));
+    pending.get('!2841')!.resolve(succeededResult(1, '!2841'));
+    await vi.waitFor(() => expect(changes.length).toBeGreaterThan(afterRepaint));
     expect(changes.at(-1)?.status).toBe('succeeded');
-  });
-
-  it('throttles progress updates without losing the counters they carried', () => {
-    const { progressOf, runners } = controllableRunners();
-    let now = 1_000;
-    const changes: RunRecord[] = [];
-    const { runs } = manager({ runners, now: () => now, onChange: (r) => changes.push(r) });
-
-    const record = runs.trigger(crInput('2841'), 3);
-    const onProgress = progressOf.get('!2841')!;
-    const before = changes.length;
-    // Three fragments inside one window: at most one emission, but the record
-    // holds the latest numbers, so a screen opening mid-run reads them all.
-    for (let n = 1; n <= 3; n += 1) {
-      now += 10;
-      onProgress({ requestId: 'r', fragmentsReceived: n, charsReceived: n * 10, elapsedMs: n });
-    }
-    expect(changes.length).toBe(before);
-    expect(runs.get(record.key)?.progress).toMatchObject({ fragmentsReceived: 3, charsReceived: 30 });
   });
 });
 
 describe('the demo agent runs in the background too', () => {
   it('walks its log and finishes with no screen attached', async () => {
     const { runs, workspaceState } = manager({
-      runners: {
-        lm: async () => response(0),
-        demo: () => ({ response: response(1), steps: ['Reading the diff…', 'Scoring…', 'Items ready'] }),
-      },
+      runners: instantRunners(0, 1),
     });
 
     runs.trigger(crInput('2841', { demo: true, agent: DEMO_AGENT_DESCRIPTOR, modelId: undefined }), 3);
@@ -526,20 +896,16 @@ describe('the demo agent runs in the background too', () => {
     expect(readRetained(workspaceState.get<SessionDraft>('codeVerdict.draft.repo-1!2841'))?.draft.review.items).toHaveLength(1);
   });
 
-  it('stops the walk when the run is cancelled', async () => {
-    let resolveStep: (() => void) | undefined;
-    const { runs, workspaceState } = manager({
-      runners: {
-        lm: async () => response(0),
-        demo: () => ({ response: response(1), steps: ['One', 'Two', 'Three'] }),
-      },
-      delay: () => new Promise<void>((resolve) => { resolveStep = resolve; }),
-    });
+  it('cancelling before the demo participant answers never writes a retained draft', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
 
     const record = runs.trigger(crInput('2841', { demo: true }), 3);
-    await vi.waitFor(() => expect(resolveStep).toBeDefined());
+    await vi.waitFor(() => expect(pending.get('!2841')).toBeDefined());
     runs.cancel(record.key);
-    resolveStep?.();
+    // The dispatched attempt answers for itself, same as any other run —
+    // the manager's own cancel does not settle the record synchronously.
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 0));
 
     await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
@@ -549,7 +915,7 @@ describe('the demo agent runs in the background too', () => {
 describe('changeset runs', () => {
   it('records under the changeset identity, where no change-request row can match it', async () => {
     const { runs, workspaceState, globalState } = manager({
-      runners: { lm: async () => response(2), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(2, 0),
     });
 
     runs.trigger(
@@ -587,10 +953,154 @@ describe('changeset runs', () => {
   });
 });
 
+// ---- Task 16.6: the same concurrency/queueing/target-isolation/retained-review guarantees
+// proven for individual (cr) targets above, extended to changeset targets, and to a mix of both --
+
+/** The same inline changeset-target shape `describe('changeset runs')` above already builds, factored out once this file needs it repeatedly. */
+function changesetInput(changesetId: string, refLabel: string, over: Partial<RunInput> = {}): RunInput {
+  return crInput('ignored', { target: { kind: 'changeset', changesetId, members: [] }, refLabel, ...over });
+}
+
+describe('task 16.6: global concurrency, one-run-per-target, waiting-slot release, queue fairness, and target isolation hold for changeset runs exactly as for individual reviews', () => {
+  it('a shared global slot count and trigger-order queue fairness span both target kinds at once — a changeset does not get its own separate pool', async () => {
+    const { started, pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    // Interleaved cr/changeset admission, limit 2: exactly the two earliest-triggered targets run,
+    // regardless of kind, and the rest queue in the order they were triggered.
+    runs.trigger(crInput('1'), 2);
+    runs.trigger(changesetInput('cs-a', 'Changeset A'), 2);
+    const third = runs.trigger(crInput('2'), 2);
+    const fourth = runs.trigger(changesetInput('cs-b', 'Changeset B'), 2);
+
+    expect(started).toEqual(['!1', 'Changeset A']);
+    expect(third.status).toBe('queued');
+    expect(fourth.status).toBe('queued');
+
+    // Finishing order does not decide start order — original admission (trigger) order does: '2'
+    // was queued before 'Changeset B', so it starts first once a slot frees, however the two
+    // running slots happen to finish.
+    pending.get('Changeset A')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!1', 'Changeset A', '!2']));
+    pending.get('!1')!.resolve(response(0));
+    await vi.waitFor(() => expect(started).toEqual(['!1', 'Changeset A', '!2', 'Changeset B']));
+  });
+
+  it('one active run per changeset target: retriggering the same changeset while it runs returns the same record, never a second dispatch', async () => {
+    const { started, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const first = runs.trigger(changesetInput('cs-1', 'Changeset one'), 3);
+    const retrigger = runs.trigger(changesetInput('cs-1', 'Changeset one'), 3);
+
+    expect(started).toEqual(['Changeset one']);
+    expect(retrigger.key).toBe(first.key);
+    expect(runs.active()).toHaveLength(1);
+  });
+
+  it('a changeset entering waiting releases its slot for the next queued target, exactly like a cr run', async () => {
+    const { started, pending, optionsOf, runners } = controllableAttempts();
+    const { runs, changes } = manager({ runners });
+
+    const first = runs.trigger(changesetInput('cs-w', 'Waiting changeset'), 1); // limit 1: holds the only slot
+    const second = runs.trigger(crInput('2'), 1); // queued behind it
+    expect(started).toEqual(['Waiting changeset']);
+    expect(second.status).toBe('queued');
+
+    optionsOf.get('Waiting changeset')!.onEnterWaiting!({ reason: 'A transient provider issue requires a longer wait.' });
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+    await vi.waitFor(() => expect(started).toEqual(['Waiting changeset', '!2']));
+
+    // The waiting changeset still owns its target: a retrigger returns the same waiting record.
+    const stillOwned = runs.trigger(changesetInput('cs-w', 'Waiting changeset'), 1);
+    expect(stillOwned.key).toBe(first.key);
+    expect(stillOwned.lifecycle).toBe('waiting');
+
+    pending.get('!2')!.resolve(succeededResult(0, '!2'));
+    // A succeeded record is removed from the live map once settled (`settle`'s own doc comment).
+    await vi.waitFor(() => expect(runs.get(second.key)).toBeUndefined());
+    expect([...changes].reverse().find((record) => record.key === second.key)?.status).toBe('succeeded');
+    // The waiting changeset itself is untouched by '!2' finishing: it still owns its slotless
+    // 'waiting' lifecycle until it either resumes or its own attempt settles — neither happened
+    // here, so it correctly has not moved.
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+
+    // Explicitly resuming (task 12.4/9.6's own mechanism) moves it back to its prior active phase,
+    // and its own eventual result settles it normally — exactly as for a cr run.
+    optionsOf.get('Waiting changeset')!.onResuming!();
+    expect(runs.get(first.key)?.lifecycle).not.toBe('waiting');
+    pending.get('Waiting changeset')!.resolve(succeededResult(0, 'Waiting changeset'));
+    await vi.waitFor(() => expect(runs.active()).toHaveLength(0));
+  });
+
+  it('a changeset run and an individual review proceed independently — cancelling one never touches the other\'s slot, lifecycle, or record', async () => {
+    const { started, cancelled, pending, runners } = controllableAttempts();
+    const { runs, changes } = manager({ runners });
+
+    const csRecord = runs.trigger(changesetInput('cs-iso', 'Isolated changeset'), 5);
+    const crRecord = runs.trigger(crInput('iso'), 5);
+    expect(started).toEqual(['Isolated changeset', '!iso']);
+    expect(runs.active()).toHaveLength(2);
+
+    runs.cancel(csRecord.key);
+    expect(cancelled).toEqual(['Isolated changeset']);
+    // The unrelated cr run is completely untouched: still an active, running record, its own slot
+    // still held.
+    expect(runs.get(crRecord.key)?.status).toBe('running');
+    expect(runs.active().some((r) => r.key === crRecord.key)).toBe(true);
+    // The cancelled changeset's slot is released at once regardless of its attempt ever answering
+    // (task 12.4's own guarantee) — the cr run's slot count is unaffected either way.
+    expect(runs.get(csRecord.key)?.lifecycle).toBe('cancelling');
+
+    pending.get('!iso')!.resolve(succeededResult(1, '!iso'));
+    await vi.waitFor(() => expect(runs.get(crRecord.key)).toBeUndefined());
+    // The cr run's own successful completion is likewise untouched by the changeset's cancellation
+    // — a genuine success, not silently reclassified as cancelled or failed. A succeeded record is
+    // removed from the live map once settled (`settle`'s own doc comment), so its terminal outcome
+    // is read off the last `onChange` notification for its key instead.
+    const lastForCr = [...changes].reverse().find((record) => record.key === crRecord.key);
+    expect(lastForCr?.status).toBe('succeeded');
+
+    // The changeset's own cancellation is likewise untouched by the cr run's success — still
+    // cancelling (this fixture's attempt never itself answers the cancellation token, so it is
+    // bounded only by `armCancelGrace`, which `manager()`'s default deliberately never resolves).
+    expect(runs.get(csRecord.key)?.lifecycle).toBe('cancelling');
+  });
+
+  it('retained-review behaviour is unchanged for a changeset run that had to wait its turn in the queue: it writes under its own changeset key alone, never under any member\'s cr key', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs, workspaceState } = manager({ runners });
+
+    // Queue the changeset behind a cr run occupying the only slot. The cr's own review is clean
+    // (0 items) and the changeset's is not (2 items) — a mix-up between the two keys would show up
+    // as the wrong item count under the wrong key, not merely a missing write.
+    runs.trigger(crInput('blocker'), 1);
+    const csRecord = runs.trigger(changesetInput('cs-queued', 'Queued changeset'), 1);
+    expect(csRecord.status).toBe('queued');
+
+    pending.get('!blocker')!.resolve(response(0));
+    await vi.waitFor(() => expect(runs.get(csRecord.key)?.status).toBe('running'));
+
+    pending.get('Queued changeset')!.resolve(response(2));
+    // A succeeded record is removed from the live map once settled (`settle`'s own doc comment) —
+    // the durable write is what this test cares about anyway.
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.changesetDraft.cs-queued')).toBeDefined());
+
+    // The changeset's own key carries exactly its own 2-item review — never a per-member cr draft
+    // key (this fixture's changeset has no members, so a leak would be unambiguous).
+    const changesetWritten = workspaceState.get('codeVerdict.changesetDraft.cs-queued') as { review?: { items: readonly unknown[] } } | undefined;
+    expect(changesetWritten?.review?.items).toHaveLength(2);
+    // The blocking cr run's own key carries exactly its own clean (0-item) review, untouched by
+    // the changeset's write — no cross-contamination in either direction.
+    const crWritten = workspaceState.get('codeVerdict.draft.repo-1!blocker') as { review?: { items: readonly unknown[] } } | undefined;
+    expect(crWritten?.review?.items).toHaveLength(0);
+  });
+});
+
 describe('stored effort attribution', () => {
   it('records the immutable run effort on the review', async () => {
     const { runs, workspaceState } = manager({
-      runners: { lm: async () => response(1), demo: () => ({ response: response(0), steps: [] }) },
+      runners: instantRunners(1, 0),
     });
 
     runs.trigger(crInput('2841', { effort: 'xhigh' }), 3);
@@ -678,5 +1188,1004 @@ describe('the in-flight record and the interrupted sweep', () => {
     // An interruption is reported alongside the last completed review, never
     // in place of it.
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toEqual(existing);
+  });
+});
+
+/**
+ * A runner that never settles on its own and, unlike `controllableRunners`,
+ * does not react to cancellation at all — it models the risk design.md names
+ * directly ("cancellation may not stop a provider or model immediately"), so
+ * a test can resolve/reject it *after* the manager already considers the
+ * record terminal and prove the late arrival is ignored, rather than only
+ * exercising the cooperative-cancellation fast path `controllableRunners`
+ * already covers above.
+ */
+function unresponsiveRunner(): {
+  pending: Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>;
+  runners: ReviewHarnessFactory;
+} {
+  const pending = new Map<string, { resolve(r: AgentReviewResponse): void; reject(e: unknown): void }>();
+  function build(input: RunInput) {
+    return {
+      run: () =>
+        new Promise<HarnessAttemptResult>((resolve, reject) => {
+          pending.set(input.refLabel, { resolve: (r) => resolve(resultFromResponse(input.refLabel, r)), reject });
+        }),
+    };
+  }
+  const runners: ReviewHarnessFactory = { create: build, createDemo: build, resume: build };
+  return { pending, runners };
+}
+
+describe('task 12.2: every canonical lifecycle maps to a documented legacy status', () => {
+  it('maps all thirteen lifecycles', () => {
+    const expected: Record<RunLifecycle, RunStatus> = {
+      queued: 'queued',
+      planning: 'running',
+      investigating: 'running',
+      verifying: 'running',
+      completing: 'running',
+      waiting: 'running',
+      paused: 'running',
+      resuming: 'running',
+      cancelling: 'running',
+      cancelled: 'cancelled',
+      succeeded: 'succeeded',
+      failed: 'failed',
+      interrupted: 'failed',
+    };
+    expect(RUN_LIFECYCLES).toHaveLength(13);
+    for (const lifecycle of RUN_LIFECYCLES) {
+      expect(legacyStatusFor(lifecycle)).toBe(expected[lifecycle]);
+    }
+  });
+});
+
+describe('task 12.3: the one validated transition path', () => {
+  it('accepts the edges the lifecycle diagram and the spec describe', () => {
+    expect(isLegalRunTransition('queued', 'planning')).toBe(true);
+    expect(isLegalRunTransition('planning', 'investigating')).toBe(true);
+    // A forward skip among active phases is legal: this pass's coarse
+    // lm/demo seam has no per-phase feedback of its own.
+    expect(isLegalRunTransition('investigating', 'completing')).toBe(true);
+    expect(isLegalRunTransition('completing', 'succeeded')).toBe(true);
+    expect(isLegalRunTransition('investigating', 'waiting')).toBe(true);
+    expect(isLegalRunTransition('verifying', 'paused')).toBe(true);
+    expect(isLegalRunTransition('waiting', 'resuming')).toBe(true);
+    expect(isLegalRunTransition('paused', 'resuming')).toBe(true);
+    expect(isLegalRunTransition('resuming', 'verifying')).toBe(true);
+    expect(isLegalRunTransition('investigating', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('queued', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('waiting', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('paused', 'cancelling')).toBe(true);
+    expect(isLegalRunTransition('cancelling', 'cancelled')).toBe(true);
+  });
+
+  it('refuses an illegal transition', () => {
+    expect(isLegalRunTransition('queued', 'succeeded')).toBe(false);
+    expect(isLegalRunTransition('queued', 'investigating')).toBe(false);
+    expect(isLegalRunTransition('completing', 'investigating')).toBe(false); // backward
+    expect(isLegalRunTransition('waiting', 'succeeded')).toBe(false);
+    expect(isLegalRunTransition('paused', 'failed')).toBe(false);
+    expect(isLegalRunTransition('cancelling', 'failed')).toBe(false);
+  });
+
+  it('gives every terminal lifecycle zero outgoing edges', () => {
+    for (const terminal of ['succeeded', 'failed', 'cancelled', 'interrupted'] as const) {
+      for (const to of RUN_LIFECYCLES) {
+        expect(isLegalRunTransition(terminal, to)).toBe(false);
+      }
+    }
+  });
+
+  it('refuses to move an already-terminal record through the manager itself', async () => {
+    const { pending, runners } = controllableRunners();
+    const { runs } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(Object.assign(new Error('boom'), { requestId: 'r1' }));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const finishedAt = runs.get(record.key)?.finishedAt;
+
+    // The only other public path that could move it: cancelling an
+    // already-failed record is refused, not silently applied.
+    runs.cancel(record.key);
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.lifecycle).toBe('failed');
+    expect(runs.get(record.key)?.finishedAt).toBe(finishedAt);
+  });
+});
+
+describe('task 12.4/9.6: waiting releases the slot, resuming keeps queue fairness', () => {
+  it('releases the slot on entering waiting, lets the next queued run start, and resumes without losing queue position', async () => {
+    const { started, pending, optionsOf, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+
+    const first = runs.trigger(crInput('1'), 1); // limit 1: holds the only slot
+    const second = runs.trigger(crInput('2'), 1); // queued behind it
+    expect(started).toEqual(['!1']);
+    expect(second.status).toBe('queued');
+
+    // '1' reports a real checkpoint advancing it to `investigating`, then
+    // enters a long backoff wait — the slot is released at once, so '2'
+    // starts even though '1' has not finished.
+    optionsOf.get('!1')!.onCheckpoint(checkpointAt('investigating', '!1'));
+    expect(runs.get(first.key)?.lifecycle).toBe('investigating');
+    optionsOf.get('!1')!.onEnterWaiting!({ reason: 'A transient provider issue requires a longer wait.' });
+    expect(runs.get(first.key)?.lifecycle).toBe('waiting');
+    await vi.waitFor(() => expect(started).toEqual(['!1', '!2']));
+
+    // '1' still owns its target while waiting: a retrigger returns the same
+    // waiting record rather than starting a second run.
+    const stillOwned = runs.trigger(crInput('1'), 1);
+    expect(stillOwned.key).toBe(first.key);
+    expect(stillOwned.lifecycle).toBe('waiting');
+
+    // A third target, triggered after '1' resumes, must not cut ahead of it.
+    const third = runs.trigger(crInput('3'), 1);
+    expect(third.status).toBe('queued');
+
+    optionsOf.get('!1')!.onResuming!();
+    expect(runs.get(first.key)?.lifecycle).toBe('resuming');
+
+    // '2' finishes, freeing the slot. '1' (resuming, original admission
+    // order) goes before '3' (queued after it) — original admission order,
+    // not FIFO by resume time.
+    pending.get('!2')!.resolve(succeededResult(0, '!2'));
+    await vi.waitFor(() => expect(runs.get(first.key)?.lifecycle).toBe('investigating'));
+    // No second dispatch for '1': a resumed attempt's own continuation from
+    // checkpoint is task 12.7's job (a *lost* attempt across a restart) —
+    // within one still-live process, the original `.run()` call is still the
+    // one unresolved promise.
+    expect(started).toEqual(['!1', '!2']);
+    expect(runs.get(third.key)?.status).toBe('queued');
+
+    pending.get('!1')!.resolve(succeededResult(0, '!1'));
+    await vi.waitFor(() => expect(runs.active().some((r) => r.key === third.key && r.status === 'running')).toBe(true));
+  });
+
+  it('cancellation from queued, active, waiting and paused each releases the slot at once, without waiting on the attempt', async () => {
+    const { started, cancelled, optionsOf, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+
+    // 'w' takes the only slot, then enters `waiting` (releasing it).
+    const waitingRun = runs.trigger(crInput('w'), 1);
+    optionsOf.get('!w')!.onEnterWaiting!();
+    expect(runs.get(waitingRun.key)?.lifecycle).toBe('waiting');
+
+    // 'p' takes the freed slot, then is explicitly paused (releasing it again).
+    const pausedRun = runs.trigger(crInput('p'), 1);
+    runs.pause(pausedRun.key);
+    expect(runs.get(pausedRun.key)?.lifecycle).toBe('paused');
+
+    // 'a' takes the slot and stays active.
+    const activeRun = runs.trigger(crInput('a'), 1);
+    expect(runs.get(activeRun.key)?.lifecycle).toBe('planning');
+
+    // 'q' finds the slot taken and queues behind it.
+    const queuedRun = runs.trigger(crInput('q'), 1);
+    expect(queuedRun.status).toBe('queued');
+
+    // Cancel 'q' first, while 'a' still holds the slot — otherwise cancelling
+    // 'a' below would free the slot and let 'q' start via the queue pump
+    // before this test gets to assert it was never dispatched.
+    runs.cancel(queuedRun.key);
+    runs.cancel(waitingRun.key);
+    runs.cancel(pausedRun.key);
+    runs.cancel(activeRun.key);
+
+    // 'q' never reached the transport at all — nothing will ever report back
+    // for it, so it settles at once, exactly as before this pass.
+    expect(runs.get(queuedRun.key)).toBeUndefined();
+    // 'w', 'p' and 'a' each had a live dispatch: cancelling them crosses into
+    // `cancelling` and *stays* there — settling as `cancelled` is now the
+    // dispatched attempt's own cancelled result to report (through the
+    // ordinary `executeAttempt` path), not something this call does
+    // synchronously. None of the three ever resolves in this test, so all
+    // three are still `cancelling` below; that they got there — and, more to
+    // the point, released their slot getting there — is what this test is
+    // actually about. See "cancelling a run with already-validated findings
+    // keeps them as a partial" below for the attempt actually reporting back.
+    expect(runs.get(waitingRun.key)?.lifecycle).toBe('cancelling');
+    expect(runs.get(pausedRun.key)?.lifecycle).toBe('cancelling');
+    expect(runs.get(activeRun.key)?.lifecycle).toBe('cancelling');
+    // Only the three that ever held a live dispatch had a token to stop;
+    // the queued run never made a request at all.
+    expect(cancelled).toEqual(['!w', '!p', '!a']);
+    expect(started).toEqual(['!w', '!p', '!a']);
+
+    // The slot cancelling 'a' released is usable at once — released
+    // synchronously by `cancel()` itself, not by 'a' actually finishing.
+    runs.trigger(crInput('fresh'), 1);
+    expect(started).toContain('!fresh');
+  });
+
+  it('does not double-release the slot when a waiting or paused attempt is cancelled', () => {
+    // A slot-accounting bug (releasing the running count a second time for a
+    // key that already released it on entering waiting/paused) would only
+    // show up once *another* run genuinely holds the slot at cancel time —
+    // the test above cancels 'w'/'p' after their slot has already gone to a
+    // later run, but never checks that cancelling them leaves that run's
+    // slot alone. This does, chaining the same relay through both cases:
+    // 'w' (waiting, released) -> 'b' (active) -> 'b' (paused, released) ->
+    // 'c' (active, was queued) -> 'd' (queued).
+    const { started, optionsOf, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+
+    const waitingRun = runs.trigger(crInput('w'), 1); // takes the only slot
+    optionsOf.get('!w')!.onEnterWaiting!(); // enters `waiting`, releasing it
+    const holder = runs.trigger(crInput('b'), 1); // takes the freed slot
+    expect(runs.get(holder.key)?.lifecycle).toBe('planning');
+    const queuedBehindHolder = runs.trigger(crInput('c'), 1); // must stay queued
+    expect(queuedBehindHolder.status).toBe('queued');
+
+    // Cancelling a `waiting` attempt must not touch the slot 'b' genuinely
+    // holds: a double release would drop `running` to 0 and let 'c' start
+    // past the limit-1 cap.
+    runs.cancel(waitingRun.key);
+    expect(started).toEqual(['!w', '!b']);
+    expect(runs.get(queuedBehindHolder.key)?.status).toBe('queued');
+
+    // Now pause 'b' itself, releasing its slot the same way. 'c' — already
+    // queued — legitimately takes it.
+    runs.pause(holder.key);
+    expect(runs.get(holder.key)?.lifecycle).toBe('paused');
+    expect(runs.get(queuedBehindHolder.key)?.lifecycle).toBe('planning');
+    const queuedBehindNextHolder = runs.trigger(crInput('d'), 1); // must stay queued
+    expect(queuedBehindNextHolder.status).toBe('queued');
+
+    // Cancelling the now-`paused` 'b' must not touch the slot 'c' holds.
+    runs.cancel(holder.key);
+    expect(started).toEqual(['!w', '!b', '!c']);
+    expect(runs.get(queuedBehindNextHolder.key)?.status).toBe('queued');
+  });
+});
+
+describe('task 12.4: late model/provider work cannot settle an already-terminal attempt', () => {
+  it('a late success arriving after cancellation does not overwrite the cancelled state or write a retained review', async () => {
+    const { pending, runners } = unresponsiveRunner();
+    let expireGrace: (() => void) | undefined;
+    const { runs, workspaceState } = manager({
+      runners,
+      // This fixture never reacts to the cancellation token at all — nothing
+      // will ever settle the record on its own, so the bounded grace timer
+      // `cancel()` arms is what has to. Triggered explicitly below, rather
+      // than left to the default (never-resolving) stand-in.
+      cancelGrace: () => new Promise<void>((resolve) => { expireGrace = resolve; }),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    // Cancelling a dispatched run no longer settles it synchronously — see
+    // "cancelling a run with already-validated findings keeps them as a
+    // partial" below for the path where the attempt actually answers. This
+    // fixture's attempt never will, so the grace timer is what eventually
+    // settles it.
+    expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+    expireGrace?.();
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    // Arrives late; this fixture, unlike `controllableRunners`, never reacted
+    // to the cancellation token at all, and now arrives even later than the
+    // grace timer that gave up waiting on it.
+    pending.get('!2841')!.resolve(response(3));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    expect(runs.get(record.key)).toBeUndefined();
+  });
+
+  it('a late waiting/resuming/checkpoint signal arriving after failure does not move the failed record', async () => {
+    const { pending, optionsOf, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(new Error('boom'));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+    // Stray hook calls racing the rejection — the same seam that could have
+    // reported a checkpoint, `onEnterWaiting`, or `onResuming` after the
+    // promise it belonged to already settled the record.
+    optionsOf.get('!2841')!.onCheckpoint(checkpointAt('verifying', '!2841'));
+    optionsOf.get('!2841')!.onEnterWaiting!();
+    optionsOf.get('!2841')!.onResuming!();
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.lifecycle).toBe('failed');
+  });
+
+  it('a late success resolving after the manager already settled the attempt as failed does not overwrite it', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.reject(new Error('crash'));
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const finishedAt = runs.get(record.key)?.finishedAt;
+
+    // The same deferred cannot resolve twice, so this proves the guard the
+    // other way: `completeAttempt` itself refuses to move an already-failed
+    // record even when handed a fresh, well-formed succeeded result. Reached
+    // via bracket access since it is private — deliberately, to prove the
+    // guard fires independently of which public entry point calls it.
+    type CompleteAttempt = (key: string, result: HarnessAttemptResult) => Promise<void>;
+    await (runs as unknown as { completeAttempt: CompleteAttempt }).completeAttempt(record.key, succeededResult(2, '!2841'));
+
+    expect(runs.get(record.key)?.status).toBe('failed');
+    expect(runs.get(record.key)?.finishedAt).toBe(finishedAt);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+});
+
+describe('task 12.2/12.4: one active run per target holds through waiting', () => {
+  it('refuses a second trigger for a waiting target while a different target runs independently', async () => {
+    const { started, optionsOf, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+
+    const waiting = runs.trigger(crInput('waiter'), 2);
+    optionsOf.get('!waiter')!.onEnterWaiting!();
+    expect(runs.get(waiting.key)?.lifecycle).toBe('waiting');
+
+    // Retriggering the same target returns the existing waiting record, not
+    // a second run.
+    const retriggered = runs.trigger(crInput('waiter'), 2);
+    expect(retriggered.key).toBe(waiting.key);
+    expect(retriggered.lifecycle).toBe('waiting');
+
+    // A different target runs completely independently.
+    const other = runs.trigger(crInput('other'), 2);
+    expect(started).toEqual(['!waiter', '!other']);
+    expect(other.status).toBe('running');
+  });
+});
+
+describe('task 12.1/12.2: completeness, limitations, and partial result come from the attempt\'s own outcome', () => {
+  it('a succeeded result reports the attempt\'s own completeness and limitations, not a manager guess', async () => {
+    const { pending, runners } = controllableAttempts();
+    const changes: RunRecord[] = [];
+    const { runs } = manager({ runners, onChange: (r) => changes.push(r) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+
+    // A succeeded record is deleted from `records` once notified (existing
+    // behavior) — the notification itself is where this pass's completeness
+    // plumbing has to be checked.
+    await vi.waitFor(() => expect(changes.some((r) => r.status === 'succeeded')).toBe(true));
+    const succeeded = changes.find((r) => r.status === 'succeeded')!;
+    expect(succeeded.completeness).toBe('complete');
+    expect(succeeded.limitations).toEqual([]);
+  });
+
+  it('a failed result with no findings reports completeness "none" and a message built from the outcome\'s limitations', async () => {
+    const { pending, runners } = controllableAttempts();
+    const changes: RunRecord[] = [];
+    const { runs } = manager({ runners, onChange: (r) => changes.push(r) });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed-file inventory is incomplete.', '!2841'));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    expect(failed.completeness).toBe('none');
+    expect(failed.limitations).toEqual([{ code: 'harness.test', message: 'The changed-file inventory is incomplete.' }]);
+    expect(failed.failure?.message).toContain('The changed-file inventory is incomplete.');
+    expect(failed.partialResult).toBeUndefined();
+  });
+
+  it('a failed result\'s blockerDetails reach the settled record\'s failure, naming the specific files behind the generic message (task: say which files)', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs } = manager({ runners });
+    const blockerDetails: readonly CompletionBlockerDetail[] = [
+      { blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', memberId: 'm1', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true },
+    ];
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Files at a risk level that requires inspection were not inspected.', '!2841', 0, blockerDetails));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    // The generic summary line survives unchanged.
+    expect(failed.failure?.message).toContain('Files at a risk level that requires inspection were not inspected.');
+    // The per-file detail underneath it is the outcome's own, verbatim.
+    expect(failed.failure?.blockerDetails).toEqual(blockerDetails);
+  });
+
+  it('a failed result with validated findings is retained only as an in-memory partial result, never as the retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+
+    await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+    const failed = runs.get(record.key)!;
+    expect(failed.completeness).toBe('partial');
+    expect(failed.partialResult?.items).toHaveLength(2);
+    // Never written as the target's retained review — only a `succeeded`
+    // result with `outcome.replacesRetainedReview` ever reaches that path.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+});
+
+// ---- Task 12.8: partial results are durable, separately reachable, and explicitly incomplete --
+
+describe('task 12.5/12.6: a partial result is durable, separately reachable, and explicitly incomplete', () => {
+  const PARTIAL_KEY = partialDraftKeyFor({ repoId: 'repo-1', number: '2841' });
+
+  it('partial after failure: a failed result with validated findings writes a durable partial record, under its own key, before the run is settled', async () => {
+    const { pending, runners } = controllableAttempts();
+    const seenAtNotify: unknown[] = [];
+    const { runs, workspaceState } = manager({
+      runners,
+      onChange: (record) => {
+        if (record.status === 'failed') seenAtNotify.push(workspaceState.get(PARTIAL_KEY));
+      },
+    });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(seenAtNotify).toHaveLength(1));
+
+    // Write-before-notify: the durable partial was already there the moment a
+    // listener reacted to the failed notification, same discipline as the
+    // succeeded path's own retained-review write.
+    expect(seenAtNotify[0]).toBeDefined();
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(2);
+    // Never the target's retained review.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('partial after cancellation: a cancelled result with validated findings writes a durable partial record the same way', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 3));
+    // A cancelled record is deleted from `records` once settled (existing
+    // behavior — "nothing left to tell a screen that did not see it"); the
+    // durable partial write is what this test actually proves.
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    expect(partial?.completeness).toBe('partial');
+    expect(partial?.draft.review.items).toHaveLength(3);
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+  });
+
+  it('reading a partial record is never indistinguishable from a complete retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+    // A reader that forgets `{ partial: true }` still cannot mistake this for
+    // a complete review: the record itself always carries its own explicit
+    // completeness, never relying on the caller's read-side default.
+    const readAsIfMainKey = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY));
+    expect(partial?.completeness).toBe('partial');
+    expect(readAsIfMainKey?.completeness).toBe('partial');
+    expect(partial?.completeness).not.toBe('complete');
+  });
+
+  it('partial non-replacement: a partial result never replaces an existing complete retained review', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    // First run succeeds and writes the retained review.
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeDefined());
+    const before = workspaceState.get('codeVerdict.draft.repo-1!2841');
+
+    // A re-run ends partial.
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed head could not be re-verified.', '!2841', 1));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    // The complete retained review is untouched — the partial went to its own key.
+    expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toEqual(before);
+    expect(readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true })?.completeness).toBe('partial');
+  });
+
+  it('a fresh complete success clears a stale partial from an earlier failed run', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, workspaceState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed head could not be re-verified.', '!2841', 1));
+    await vi.waitFor(() => expect(workspaceState.get(PARTIAL_KEY)).toBeDefined());
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeDefined());
+
+    expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
+  });
+
+  it('a partial result is recorded in run history under its own outcome, never folded into "findings"', async () => {
+    const { pending, runners } = controllableAttempts();
+    const { runs, globalState } = manager({ runners });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list()).toHaveLength(1));
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '2841', outcome: 'partial', findingCount: 2 });
+    // Task 14.4: the same `HarnessAttemptResult.outcome.limitations` the
+    // durable partial record carries — never a second read — so a
+    // dashboard row can say *why* this is partial, not only that it is.
+    expect(new ReviewRunStore(globalState).list()[0]?.limitations).toEqual([
+      { code: 'harness.test', message: 'Coverage did not reach every high-risk file.' },
+    ]);
+  });
+});
+
+// ---- Task 14.7: notifications distinguish failed, cancelled, and succeeded outcomes -----
+
+describe('task 14.7: onRunOutcome notifies the terminal states onReviewReady does not cover', () => {
+  it('fires for a failed result, naming the finding count kept as a partial', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', '!2841', 2));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toEqual({
+      lifecycle: 'failed',
+      completeness: 'partial',
+      refLabel: '!2841',
+      ref: { repoId: 'repo-1', number: '2841' },
+      podId: 'pod-a',
+      findingCount: 2,
+    });
+  });
+
+  it('fires for a failed result with nothing validated, naming no finding count', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(failedResult('The changed-file inventory is incomplete.', '!2841'));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toMatchObject({ lifecycle: 'failed', completeness: 'none', findingCount: undefined });
+  });
+
+  it('fires for a cancelled result, whichever of the settlement paths produced it', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    runs.cancel(record.key);
+    pending.get('!2841')!.resolve(cancelledResult('!2841', 2));
+
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(outcomes[0]).toEqual({
+      lifecycle: 'cancelled',
+      completeness: 'partial',
+      refLabel: '!2841',
+      ref: { repoId: 'repo-1', number: '2841' },
+      podId: 'pod-a',
+      findingCount: 2,
+    });
+  });
+
+  it('fires for a cancellation of a run that never dispatched, with nothing to keep as partial', async () => {
+    const { runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info) });
+    // Limit 1: the first trigger holds the only slot, so the second is
+    // genuinely queued — the same "never reached the transport" branch
+    // `cancel()`'s own doc comment describes, settling straight to
+    // `cancelled` with no attempt to wait on.
+    runs.trigger(crInput('other'), 1);
+    const queued = runs.trigger(crInput('2841'), 1);
+
+    runs.cancel(queued.key);
+
+    expect(outcomes).toEqual([
+      { lifecycle: 'cancelled', completeness: 'none', refLabel: '!2841', ref: { repoId: 'repo-1', number: '2841' }, podId: 'pod-a', findingCount: undefined },
+    ]);
+  });
+
+  it('never fires for a succeeded result — onReviewReady already covers it, and this would double-notify', async () => {
+    const { pending, runners } = controllableAttempts();
+    const outcomes: unknown[] = [];
+    const ready: unknown[] = [];
+    const { runs } = manager({ runners, onRunOutcome: (info) => outcomes.push(info), onReviewReady: (info) => ready.push(info) });
+
+    runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+
+    await vi.waitFor(() => expect(ready).toHaveLength(1));
+    expect(outcomes).toEqual([]);
+  });
+});
+
+// ---- Task 12.7: the activation sweep consults stored checkpoints ------------------------
+
+describe('task 12.7: the activation sweep consults stored checkpoints for a richer interrupted close', () => {
+  const SWEEP_RUN_ID = 'run-sweep-1';
+  const SWEEP_LINEAGE_ID = 'lineage-sweep-1';
+
+  function sweepSnapshot(overrides: Partial<ReviewRunSnapshot> = {}): ReviewRunSnapshot {
+    return {
+      schemaVersion: '1',
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+      attempt: 1,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      targetKind: 'cr',
+      members: [
+        {
+          memberId: 'm1',
+          providerId: 'fixture',
+          instanceUrl: 'https://example.test',
+          ref: { repoId: 'repo-1', number: '42' },
+          baseSha: 'base1',
+          headSha: 'head1',
+          providerCapabilitySignature: 'sig-1',
+          rootAgentsPolicy: { present: false },
+          context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+        },
+      ],
+      agentId: 'built-in',
+      agentInstructions: 'Review the change carefully.',
+      agentInstructionsDigest: 'digest-instructions',
+      personaLabel: 'Built-in reviewer',
+      modelId: 'test-model',
+      effort: 'none',
+      effortInstructionDigest: 'digest-effort',
+      criteria: DEFAULT_CRITERIA,
+      extraInstructionsDigest: 'digest-extra',
+      toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+      harnessPolicyVersion: HARNESS_POLICY_VERSION,
+      ...overrides,
+    };
+  }
+
+  const SWEEP_COVERAGE: readonly MemberCoverage[] = [{ memberId: 'm1', manifestComplete: true, totalFiles: 1, files: [] }];
+
+  function fakeSource(sourceId: string, exactContent: string): LedgerEvidenceSource {
+    return {
+      sourceId,
+      digest: sha256Hex(exactContent),
+      kind: 'diff',
+      repositoryId: 'repo-1',
+      baseSha: 'base1',
+      headSha: 'head1',
+      completeness: 'complete',
+      citable: true,
+      exactContent,
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+      attempt: 1,
+      memberId: 'm1',
+      origin: 'diffPage',
+      trust: 'untrusted',
+      sequence: 1,
+      locations: [],
+      byteLength: Buffer.byteLength(exactContent, 'utf8'),
+    };
+  }
+
+  function citedRef(source: LedgerEvidenceSource): CitedEvidenceRef {
+    return { sourceId: source.sourceId, digest: source.digest, origin: source.origin, memberId: source.memberId, repositoryId: source.repositoryId, baseSha: source.baseSha, headSha: source.headSha, path: 'file1.ts', range: { startLine: 1, endLine: 1 } };
+  }
+
+  function acceptedCandidate(candidateId: string, primary: LedgerEvidenceSource): TrackedCandidate {
+    const finding: ValidatedFinding = {
+      candidateId,
+      memberId: 'm1',
+      routing: 'inline',
+      item: { id: candidateId, file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A finding', body: 'Body.', code: '' },
+      provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
+      evidence: { repositoryId: primary.repositoryId, baseSha: primary.baseSha, headSha: primary.headSha, primary: citedRef(primary), supporting: [] },
+    };
+    return { candidateId, state: 'accepted', repairs: 0, reasons: [], finding };
+  }
+
+  /** A genuinely nonterminal checkpoint: one real `investigating`-phase activity event, not an empty log (which would derive lifecycle `queued`). */
+  function nonterminalActivityEvents() {
+    let log = createActivityLog(SWEEP_RUN_ID, SWEEP_LINEAGE_ID, 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+    return log.events;
+  }
+
+  function sweepCheckpointInput(snapshot: ReviewRunSnapshot, overrides: Partial<CheckpointBuildInput> = {}): CheckpointBuildInput {
+    return {
+      checkpointId: 'ckpt-sweep-1',
+      runId: snapshot.runId,
+      lineageId: snapshot.lineageId,
+      attempt: snapshot.attempt,
+      phase: 'investigating',
+      reason: 'phaseBoundary',
+      occurredAt: '2026-01-01T00:10:00.000Z',
+      elapsedMs: 1000,
+      snapshotDigest: computeSnapshotDigest(snapshot),
+      activityEvents: nonterminalActivityEvents(),
+      evidenceSources: [],
+      candidates: [],
+      contradicted: [],
+      budget: ZERO_BUDGET,
+      coverage: SWEEP_COVERAGE,
+      unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+      retry: INITIAL_RETRY_STATE,
+      ...overrides,
+    };
+  }
+
+  async function addInFlightEntry(globalState: KeyValueStore): Promise<void> {
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!42',
+      podId: 'pod-a',
+      refLabel: '!42',
+      repoId: 'repo-1',
+      crNumber: '42',
+      startedAt: '2026-01-01T00:05:00.000Z',
+      runId: SWEEP_RUN_ID,
+      lineageId: SWEEP_LINEAGE_ID,
+    });
+  }
+
+  it('interruption: closes an unattached nonterminal checkpoint as interrupted, and records its validated finding count', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const primary = fakeSource('ev_a00000000000000000000000000000', 'exact diff bytes');
+    const candidate = acceptedCandidate('cand-1', primary);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot, { evidenceSources: [primary], candidates: [candidate] }), DEFAULT_HARNESS_POLICY);
+    expect(built.projection.lifecycle).toBe('investigating'); // sanity: genuinely nonterminal
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'interrupted', findingCount: 1 });
+    // The lineage's own checkpoint is closed as interrupted too, not only the coarse history row.
+    const closed = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
+    expect(closed?.projection.lifecycle).toBe('interrupted');
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
+  });
+
+  it('compatible resume: marks a resumable interrupted run when the stored checkpoint is sound', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ resumable: true });
+  });
+
+  it('incompatible restart: marks a non-resumable interrupted run when the stored checkpoint fails integrity', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    // A digest that no longer verifies against the stored snapshot — the checkpoint itself is
+    // unsound (`checkCheckpointIntegrity`), independent of any live head/model/policy comparison.
+    const corrupted: PersistedCheckpoint = { ...built, snapshotDigest: 'stale-digest' };
+    await harnessRunStore.writeCheckpoint(corrupted, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ resumable: false });
+  });
+
+  it('a leftover entry with no lineage data to consult falls back to the crude interrupted behavior unchanged', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    // No snapshot/checkpoint ever written for this lineage — exactly today's
+    // production reality (nothing on the live execution path writes one yet).
+    await addInFlightEntry(globalState);
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    const entry = new ReviewRunStore(globalState).list()[0];
+    expect(entry).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'interrupted', findingCount: 0 });
+    expect(entry?.resumable).toBeUndefined();
+  });
+
+  // ---- Task 14.6: ReviewRunManager.resumeRun's own admission/identity lookup ----------
+
+  /** Tracks which of `create`/`createDemo`/`resume` the manager actually called, resolving instantly either way. */
+  function trackedRunners(): { calls: string[]; runners: ReviewHarnessFactory } {
+    const calls: string[] = [];
+    function build(kind: string) {
+      return (input: RunInput) => {
+        calls.push(kind);
+        return { run: () => Promise.resolve(succeededResult(1, input.refLabel)) };
+      };
+    }
+    return { calls, runners: { create: build('create'), createDemo: build('createDemo'), resume: build('resume') } };
+  }
+
+  async function seedResumableLineage(globalState: KeyValueStore, harnessRunStore: HarnessRunStore): Promise<void> {
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+  }
+
+  it('resumeRun mints attempt N+1 in the stored run and lineage, and routes execution through the factory\'s resume, never create', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.resumeRun(crInput('42'), 1);
+
+    expect(record).toBeDefined();
+    expect(record?.runId).toBe(SWEEP_RUN_ID);
+    expect(record?.lineageId).toBe(SWEEP_LINEAGE_ID);
+    expect(record?.attempt).toBe(2); // one past the stored checkpoint's attempt 1
+    await vi.waitFor(() => expect(calls).toEqual(['resume']));
+  });
+
+  it('resumeRun returns undefined when nothing was ever recorded for this target — no lineage to resume', () => {
+    const globalState = memoryStore();
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    expect(runs.resumeRun(crInput('42'), 1)).toBeUndefined();
+  });
+
+  it('resumeRun refuses — returns the existing record — when a run is already in flight for this target, the same admission rule trigger enforces', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const neverResolves = (): ReviewHarnessFactory => {
+      const build = () => ({ run: () => new Promise<never>(() => {}) });
+      return { create: build, createDemo: build, resume: build };
+    };
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners: neverResolves(), cancelGrace: () => new Promise<void>(() => {}) });
+
+    const first = runs.resumeRun(crInput('42'), 1);
+    const second = runs.resumeRun(crInput('42'), 1);
+
+    expect(second).toBe(first);
+  });
+
+  it('resumeRun refuses a demo target outright — the demo agent has no checkpoint continuity contract, and offering one would write a demo snapshot into a real lineage with no compatibility check at all', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.resumeRun(crInput('42', { demo: true }), 1);
+
+    expect(record).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+
+  // ---- Task 14.6: ReviewRunManager.controlsFor, the manager's own two stores wired through deriveRunControls ----
+
+  it('controlsFor reads the stored ReviewRun for a cr target and offers resume-from-checkpoint once the sweep has recorded a resumable lineage', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+    await seedResumableLineage(globalState, harnessRunStore);
+
+    const controls = runs.controlsFor(runKeyForCr({ repoId: 'repo-1', number: '42' }), { repoId: 'repo-1', number: '42' });
+
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+    expect(controls.canPause).toBe(false);
+  });
+
+  it('controlsFor with no ref (a changeset key) never reaches the stored ReviewRun lookup — no offer, even with a resumable cr lineage stored elsewhere', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+    await seedResumableLineage(globalState, harnessRunStore);
+
+    const controls = runs.controlsFor('changeset:cs-1', undefined);
+
+    expect(controls).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+  });
+});
+
+/**
+ * Task 14.6: `deriveRunControls` is the single derivation every screen reads
+ * (`reviewFlow.ts`'s `controlsFor` call) — tested directly here as a pure
+ * function so the full branch matrix is characterized without standing up a
+ * manager or a store for each case. `isLegalRunTransition` itself (not a
+ * hand-copied boolean) backs every pause/resume/cancel assertion, so this
+ * cannot silently drift from the transition table it is meant to mirror.
+ */
+describe('deriveRunControls (task 14.6): the one derivation every screen reads', () => {
+  function live(lifecycle: RunLifecycle): RunRecord {
+    return { lifecycle } as RunRecord;
+  }
+  function stored(over: Partial<ReviewRun> = {}): ReviewRun {
+    return {
+      repoId: 'repo-1',
+      crNumber: '42',
+      outcome: 'interrupted',
+      findingCount: 0,
+      agentLabel: 'Default review',
+      ranAt: '2026-01-01T00:00:00.000Z',
+      ...over,
+    };
+  }
+
+  it('a live non-terminal record wins outright: pause/resume/cancel from its own transition validity, checkpoint offer always false', () => {
+    const controls = deriveRunControls(live('investigating'), stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls).toEqual({
+      canPause: isLegalRunTransition('investigating', 'paused'),
+      canResume: isLegalRunTransition('investigating', 'resuming'),
+      canCancel: isLegalRunTransition('investigating', 'cancelling'),
+      canResumeFromCheckpoint: false,
+    });
+  });
+
+  it('a live TERMINAL record does not suppress the stored offer — only a non-terminal live record takes the first branch', () => {
+    const controls = deriveRunControls(live('succeeded'), stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+  });
+
+  it('interrupted, resumable, with a recorded lineage: offers resume-from-checkpoint and carries no reasons', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: true, lineageId: 'lineage-1' }));
+    expect(controls.canPause).toBe(false);
+    expect(controls.canResume).toBe(false);
+    expect(controls.canCancel).toBe(false);
+    expect(controls.canResumeFromCheckpoint).toBe(true);
+    expect(controls.resumeReasons).toBeUndefined();
+  });
+
+  it('interrupted, resumable true but no lineageId on record: no offer — resumeRun would have nothing to look up', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: true, lineageId: undefined }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+  });
+
+  it('interrupted, stored checkpoint integrity failed: every reason is surfaced, and there is no offer', () => {
+    const reasons: RunControls['resumeReasons'] = [
+      { code: 'snapshotDigest', message: 'The stored snapshot no longer matches its own digest.' },
+    ];
+    const controls = deriveRunControls(undefined, stored({ resumable: false, lineageId: 'lineage-1', resumeReasons: reasons }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+    expect(controls.resumeReasons).toEqual(reasons);
+  });
+
+  it('interrupted, a legacy entry the sweep never checked (resumable absent): neither an offer nor a reason — restart is the only path', () => {
+    const controls = deriveRunControls(undefined, stored({ resumable: undefined, resumeReasons: undefined, lineageId: undefined }));
+    expect(controls.canResumeFromCheckpoint).toBe(false);
+    expect(controls.resumeReasons).toBeUndefined();
+  });
+
+  it('no live record and an outcome that was never interrupted (or nothing stored at all): every control is false', () => {
+    expect(deriveRunControls(undefined, undefined)).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+    expect(deriveRunControls(undefined, stored({ outcome: 'clean', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
+    expect(deriveRunControls(undefined, stored({ outcome: 'partial', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
   });
 });

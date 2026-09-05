@@ -10,6 +10,7 @@ import { COMMANDS, INTERNAL_COMMANDS } from '../commands';
 import {
   renderSidebarHtml,
   renderSidebarRegions,
+  statusBarRunsSummary,
   type SidebarActiveReview,
   type SidebarActiveRun,
   type SidebarMessage,
@@ -431,18 +432,29 @@ export class VerdictStatusBar {
   }
 
   /**
-   * How many reviews are in flight. Independent of every other segment: a run
-   * belongs to the extension now, not to whatever review happens to be open, so
-   * this is the one place a reviewer working somewhere else can see that
-   * something is happening. Hidden at zero, like the bell.
+   * How many reviews are in flight, plus a concise read on the lead one.
+   * Independent of every other segment: a run belongs to the extension now,
+   * not to whatever review happens to be open, so this is the one place a
+   * reviewer working somewhere else can see that something is happening.
+   * Hidden when nothing is, like the bell.
+   *
+   * Task 14.5 (design.md D10/D14): `statusBarRunsSummary` (./sidebarHtml.ts)
+   * is the one place that decides the lead run's phase label and its
+   * determinate-or-indeterminate unit — the same decision the sidebar's own
+   * active-run list renders from, never a second one made here that could
+   * read a run's progress differently. A real denominator shows as a
+   * fraction; otherwise an elapsed clock — never a fabricated percentage.
    */
-  setActiveRuns(count: number): void {
-    if (count === 0) {
+  setActiveRuns(runs: readonly SidebarActiveRun[]): void {
+    const summary = statusBarRunsSummary(runs);
+    if (!summary) {
       this.runs.hide();
       return;
     }
-    this.runs.text = `$(sync~spin) ${count}`;
-    this.runs.tooltip = `${count} review${count === 1 ? '' : 's'} running — click to list them or cancel one`;
+    const { count, lead } = summary;
+    this.runs.text = `$(sync~spin) ${count} · ${lead.phase} · ${lead.unit}`;
+    this.runs.tooltip = `${count} review${count === 1 ? '' : 's'} running — ${lead.label}: ${lead.phase} (${lead.unit})`
+      + `${lead.attention ? ' — needs your attention' : ''} — click to list them or cancel one`;
     this.runs.show();
   }
 

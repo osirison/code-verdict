@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, BUILTIN_AGENT_ID } from './agents';
+import { HOST_TOOL_NAMES } from '../domain/harnessTools';
 import { reconcile } from './podSelection';
 
 /**
@@ -102,6 +103,72 @@ describe('parseAgentFile accepts the documented subset', () => {
   it('tolerates CRLF and a BOM', () => {
     const result = parse('﻿---\r\nname: X\r\ndescription: Y\r\n---\r\n\r\nbody');
     expect(result).toMatchObject({ agent: { label: 'X', instructions: 'body' } });
+  });
+});
+
+describe('parseAgentFile: arbitrary frontmatter grants nothing (spec: review-agents, task 15.4)', () => {
+  // design.md D6: "Agent frontmatter remains prompt metadata only. It cannot add, remove,
+  // rename, configure, or grant a tool." `AgentDescriptor` (`./agents.ts`) has no field a tool
+  // grant could land in even if this parser tried to read one — these tests prove the header is
+  // read down to exactly `name`/`description`/`model`, nothing else, by diffing the whole parsed
+  // descriptor against a clean parse of the same name/description/instructions.
+  const parse = (text: string) => parseAgentFile(text, 'agent:ws/x.agent.md', '.github/agents', 'workspace');
+  const baseline = parse(VALID);
+
+  /** Same name/description/body as `VALID`, with extra header lines spliced in before the closing fence. */
+  function withExtraHeaderLines(extra: string): ReturnType<typeof parse> {
+    return parse(
+      `---\nname: Security Reviewer\ndescription: Reads for injection, authz and secret handling.\n${extra}\n---\n\nLook hard at authentication boundaries.`,
+    );
+  }
+
+  it('a `tools:` scalar declares nothing and leaves the descriptor identical', () => {
+    expect(withExtraHeaderLines('tools: bash,read,write')).toEqual(baseline);
+  });
+
+  it('a `tools:` list (the shape another tool\'s agent format actually uses) declares nothing', () => {
+    expect(withExtraHeaderLines('tools:\n  - "bash"\n  - "read"')).toEqual(baseline);
+  });
+
+  it('`allowed-tools:` declares nothing', () => {
+    expect(withExtraHeaderLines('allowed-tools: "*"')).toEqual(baseline);
+  });
+
+  it('`permissions:` declares nothing', () => {
+    expect(withExtraHeaderLines('permissions: {bash: true, network: true}')).toEqual(baseline);
+  });
+
+  it('`budget:` declares nothing', () => {
+    expect(withExtraHeaderLines('budget: unlimited')).toEqual(baseline);
+  });
+
+  it('an unrecognized key is ignored entirely, not fatal', () => {
+    expect(withExtraHeaderLines('someRandomHostileKey: anything at all')).toEqual(baseline);
+  });
+
+  it.each(HOST_TOOL_NAMES)('a header key colliding with the host catalog tool name "%s" declares nothing', (toolName) => {
+    expect(withExtraHeaderLines(`${toolName}: true`)).toEqual(baseline);
+  });
+
+  it('every adversarial key at once still yields the identical descriptor', () => {
+    const everything = [
+      'tools:\n  - "bash"\n  - "write"',
+      'allowed-tools: "*"',
+      'permissions: {bash: true, network: true}',
+      'budget: unlimited',
+      'someRandomHostileKey: x',
+      ...HOST_TOOL_NAMES.map((name) => `${name}: true`),
+    ].join('\n');
+    expect(withExtraHeaderLines(everything)).toEqual(baseline);
+  });
+
+  // The one header key that legitimately has an effect — kept here, right next to the inert
+  // ones above, so a future change cannot accidentally make `model:` inert too while chasing
+  // "nothing in frontmatter has effect".
+  it('`model:` is the one key that legitimately changes the descriptor (preferred model, spec: An agent declares a preferred model)', () => {
+    const withModel = withExtraHeaderLines('model: copilot/gpt-5');
+    expect(withModel).not.toEqual(baseline);
+    expect(withModel).toMatchObject({ agent: { preferredModelId: 'lm:copilot/gpt-5' } });
   });
 });
 

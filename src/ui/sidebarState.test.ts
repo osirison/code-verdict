@@ -8,7 +8,9 @@ import { clearProviders } from '../platform/registry';
 import { registerBuiltInProviders } from '../registry';
 import type { PodData } from '../app/podQuery';
 import type { Pod } from '../domain/types';
-import { toSidebarViewState } from './sidebarState';
+import type { RunRecord } from '../app/reviewRunManager';
+import type { RunProjection } from '../domain/harnessActivity';
+import { toSidebarActiveRuns, toSidebarViewState } from './sidebarState';
 
 function pod(): Pod {
   return {
@@ -55,5 +57,47 @@ describe('sidebar issue state carries a navigation target (issue #40)', () => {
       title: 'Key rotation, end to end',
       project: 'notifications',
     }]);
+  });
+});
+
+/** Only `key`/`input.refLabel`/`projection` are read by `toSidebarActiveRuns`; the rest is cast away. */
+function runRecord(refLabel: string, projection: RunProjection): RunRecord {
+  return {
+    key: `repo-1!${refLabel}`,
+    input: { refLabel } as RunRecord['input'],
+    projection,
+  } as RunRecord;
+}
+
+describe('the sidebar active-run list mirrors each record\'s own projection (task 14.3, design.md D14)', () => {
+  it('copies lifecycle, current action, elapsed time, progress, and attention straight off the projection — never recomputed', () => {
+    const projection: RunProjection = {
+      runId: 'run-1',
+      lineageId: 'lineage-1',
+      attempt: 1,
+      lifecycle: 'investigating',
+      completeness: 'none',
+      currentAction: 'Reading src/auth/token.ts',
+      elapsedMs: 42_000,
+      progressMode: 'determinate',
+      progressUnits: { completed: 5, total: 20 },
+      attention: 'attentionRequired',
+      limitations: [],
+    };
+
+    expect(toSidebarActiveRuns([runRecord('!2841', projection)])).toEqual([{
+      key: 'repo-1!!2841',
+      label: '!2841',
+      lifecycle: 'investigating',
+      currentAction: 'Reading src/auth/token.ts',
+      elapsedMs: 42_000,
+      progressMode: 'determinate',
+      progressUnits: { completed: 5, total: 20 },
+      attention: 'attentionRequired',
+    }]);
+  });
+
+  it('reports an empty list for no active runs', () => {
+    expect(toSidebarActiveRuns([])).toEqual([]);
   });
 });

@@ -41,10 +41,10 @@ const pkg = JSON.parse(
 ) as PackageJson;
 
 describe('package.json contributions', () => {
-  it('contributes exactly the 21 Verdict commands', () => {
+  it('contributes exactly the 22 Verdict commands', () => {
     const contributed = pkg.contributes.commands.map((c) => c.command).sort();
     expect(contributed).toEqual([...ALL_COMMAND_IDS].sort());
-    expect(contributed).toHaveLength(21);
+    expect(contributed).toHaveLength(22);
   });
 
   it('prefixes every command title with "Verdict:"', () => {
@@ -139,7 +139,7 @@ describe('package.json contributions', () => {
 });
 
 // package.json cannot import the domain module, so agreement is enforced
-// here — the same mechanism that pins the 21 commands above.
+// here — the same mechanism that pins the 22 commands above.
 describe('notification settings contributions', () => {
   const properties = pkg.contributes.configuration.properties;
 

@@ -11,8 +11,14 @@ import type { AttachmentWarning } from '../app/attachments';
 import type { Attachment } from '../app/reviewContext';
 import type { HunkLine } from '../domain/diffHunks';
 import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
+import type { ActivityEvent, CoverageProgress, Limitation, PlanItem, RunProjection } from '../domain/harnessActivity';
+import type { AttemptNumber, LineageId, ResultCompleteness } from '../domain/harnessLifecycle';
+import type { ProtocolProvenance } from '../domain/harnessEvidence';
+import type { CompletionBlockerDetail } from '../app/harnessCompletion';
+import { planHistory } from '../app/harnessActivityPlan';
+import { orderActivity, reduceActivity } from '../app/harnessActivityProjection';
 import type { Vocabulary } from './vocab';
-import { cap, countOf } from './vocab';
+import { cap, countOf, elapsedClock, runLifecycleLabel } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
 import { renderPage, type RouteAssets } from './theme';
 import { MARKDOWN_CSS, renderMarkdown } from './markdown';
@@ -28,22 +34,6 @@ export interface SubmitProgressView {
   stage: 'comments' | 'summary' | 'verdict';
   posted: number;
   total: number;
-}
-
-/**
- * Proof the run is alive, for the running screen. The canned five-step log
- * parks on step 2 for the whole request, so a healthy multi-minute review and
- * a dead one used to look identical — that is half of what the timeout report
- * was about, the other half being that the run was then cancelled. These are
- * `AgentRunProgress` counters, straight from the fragments as they land.
- */
-export interface RunLivenessView {
-  /** Epoch ms the request started, so the page can tick its own clock between fragments. */
-  startedAt: number;
-  /** Elapsed at render time — the renderer stays pure rather than reading the clock itself. */
-  elapsedMs: number;
-  fragmentsReceived: number;
-  charsReceived: number;
 }
 
 export interface FlowHeaderInfo {
@@ -173,13 +163,64 @@ export interface FlowViewState {
    */
   selfAuthored?: boolean;
   // running
-  runSteps: string[];
-  runStep: number;
-  /** Set only while an `lm:` request is in flight; the demo agent walks its own log instead. */
-  runLive?: RunLivenessView;
-  runError?: { message: string; requestId: string; partialCount: number; code: string };
+  /**
+   * The shared reducer's own projection for this run (task 14.1, design.md
+   * D14) — the *only* source the running screen's lifecycle, current
+   * action, elapsed time, and progress render from. No second, screen-local
+   * notion of "how far along is this" exists: a fixed step list and a
+   * fragment/character counter both used to answer that question their own
+   * way, which is exactly how a healthy multi-minute review and a hung one
+   * used to look identical (issue behind #42/#45's own running-screen
+   * history). Absent only before the manager has admitted the run at all.
+   */
+  runProjection?: RunProjection;
+  /**
+   * The attempt's own full ordered sanitized activity (task 14.1, design.md
+   * D5/D14) — `RunProjection` carries only the *current* plan item and
+   * coverage snapshot, not the plan's revision history or the ordered feed
+   * a reviewer can scroll. Sourced from `RunRecord.checkpoint`'s own
+   * `activityLog` while a run is live; `[]`/absent before the first
+   * checkpoint (a legacy-adapted run, still the only shipped runner ahead
+   * of task 15.7, reports none at all — the screen shows no plan for it
+   * rather than a fabricated one, exactly as D16 requires for retained
+   * legacy results).
+   */
+  runActivity?: readonly ActivityEvent[];
+  /** Epoch ms the request actually started, so the page can tick its own elapsed clock between repaints — `RunRecord.startedAt`, independent of anything fragment-related. */
+  runStartedAt?: number;
+  /**
+   * `blockerDetails` is `RunFailure.blockerDetails` verbatim (task: "say which files, not just
+   * that some files") — the per-file reasons behind `message`'s generic sentence, already bounded
+   * per clause by `evaluateCompletion` and already public-safe deterministic host text. Absent for
+   * a clean complete result or a genuine crash the manager never ran a completion decision for;
+   * `message` alone still renders in either case, unchanged.
+   */
+  runError?: { message: string; requestId: string; partialCount: number; code: string; blockerDetails?: readonly CompletionBlockerDetail[] };
   /** Waiting for a concurrency slot: accepted and held, not failed. */
   runQueued?: boolean;
+  /**
+   * Task 14.6: which of pause/resume/cancel the manager will actually
+   * accept for this run right now — derived from its own transition
+   * validity (`isLegalRunTransition`), never a hand-listed set of
+   * lifecycles. Absent before the manager has admitted the run at all,
+   * same as `runProjection`.
+   */
+  runControls?: { canPause: boolean; canResume: boolean; canCancel: boolean };
+  /**
+   * Task 14.6: an earlier attempt on this target ended `interrupted` and
+   * nothing is running now — shown only by the `'agent'` picker screen,
+   * before the reviewer starts anything new. `resumable` mirrors
+   * `RunControls.canResumeFromCheckpoint`; `reasons` mirrors
+   * `RunControls.resumeReasons`, present only alongside `resumable: false`.
+   * Absent whenever the target's last outcome was not `interrupted` (the
+   * ordinary case). Wording here is pinned by
+   * `reviewFlowHtml.test.ts`'s own no-reconnect check, mirroring
+   * `harnessResume.test.ts`'s: a resumed run is always a new attempt from
+   * the checkpoint, never a reconnection — neither this field's renderer
+   * nor its button label may say "resume", "reconnect", or imply the lost
+   * session picked back up.
+   */
+  interruptedPrior?: { resumable: boolean; reasons?: readonly Limitation[] };
   /**
    * A completed review is still held for this target and is reachable from the
    * screen currently showing. True only where the two coexist — the pickers
@@ -188,6 +229,23 @@ export interface FlowViewState {
   retainedAvailable?: boolean;
   /** When the shown review ran, and what produced it. Absent while none is retained. */
   retainedMeta?: { ranAt?: string; agentLabel?: string; modelLabel?: string; effortLabel?: string };
+  /**
+   * Task 14.2 (design.md D14/D16): what the retained/completed run actually
+   * did — plan history, ordered activity, coverage, and lineage — read from
+   * the *same* typed activity union the running screen reads, never a
+   * second retained-details shape. `protocolProvenance` gates everything
+   * else: a `'legacy-one-shot'` result renders its provenance and nothing
+   * fabricated, per D16 ("does not invent plan, evidence, or coverage data
+   * for them"). Absent exactly when `retainedMeta` is.
+   */
+  retainedDetails?: {
+    completeness: ResultCompleteness;
+    protocolProvenance: ProtocolProvenance;
+    lineageId?: LineageId;
+    attempt?: AttemptNumber;
+    limitations: readonly Limitation[];
+    activity: readonly ActivityEvent[];
+  };
   /** Context omitted after its run-start filesystem revalidation failed. */
   attachmentWarnings: readonly AttachmentWarning[];
   // triage
@@ -252,7 +310,19 @@ export type FlowMessage =
   | { type: 'removeContextItem'; itemId: string }
   | { type: 'toggleAutoContextItem'; itemId: string }
   | { type: 'run'; instructions?: string }
+  /**
+   * Task 14.6: start a new attempt seeded from an earlier interrupted
+   * attempt's checkpoint (`ReviewRunManager.resumeRun`), never the plain
+   * `run`/`trigger()` path — only dispatched when `interruptedPrior.resumable`
+   * is true. Carries the same `instructions` shape as `run` because it goes
+   * through the identical context-reference resolution before building the
+   * `RunInput` (`reviewFlow.ts`'s `run()`, parameterized by which manager
+   * call it ends in).
+   */
+  | { type: 'resumeFromCheckpoint'; instructions?: string }
   | { type: 'cancel' }
+  | { type: 'pauseRun' }
+  | { type: 'resumeRun' }
   | { type: 'usePartial' }
   | { type: 'retryRun' }
   | { type: 'toggleReviewContext' }
@@ -467,9 +537,48 @@ ${WIDTH_CSS}
 .run-live { display: flex; align-items: center; justify-content: center; gap: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--fg-dimmer); }
 .run-live b { color: var(--fg); font-weight: 600; }
 .run-live .sep { opacity: .45; }
+.run-phase { font-size: 12.5px; color: var(--fg-dim); }
+.run-action { font-size: 11px; color: var(--fg-dimmer); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Determinate progress (task 14.1, D10): the fill is an SVG rect's width
+   attribute, not an inline style attribute — this page's CSP authorises
+   nonce'd style elements only, so an inline style is silently dropped
+   (issue #45). */
+.progress-det { width: 100%; height: 4px; display: block; border-radius: 2px; overflow: hidden; }
+.progress-det-track { fill: var(--bg3); }
+.progress-det-fill { fill: var(--agent); }
+/* Indeterminate progress (D10: a denominator may never be guessed) — a
+   sweep with no computed value in the markup at all, visually distinct from
+   the determinate bar rather than the same bar wearing a fabricated number. */
+.progress-indeterminate { height: 4px; border-radius: 2px; overflow: hidden; background: var(--bg3); position: relative; }
+.progress-indeterminate::after { content: ''; position: absolute; top: 0; bottom: 0; width: 40%; background: var(--agent); border-radius: 2px; animation: progress-sweep 1.4s ease-in-out infinite; }
+@keyframes progress-sweep { 0% { left: -40%; } 100% { left: 100%; } }
+.coverage-line { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+.plan-block, .retained-details { text-align: left; display: flex; flex-direction: column; gap: 8px; }
+.plan-block { border: 1px solid var(--line2); border-radius: 6px; background: var(--bg2); padding: 10px 12px; }
+.plan-block-head { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--fg-dimmer); }
+.plan-rationale { font-size: 11px; color: var(--fg-dim); }
+.plan-list { display: flex; flex-direction: column; gap: 4px; }
+.plan-item { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.plan-item-glyph { flex: none; width: 14px; color: var(--fg-dimmer); font-family: var(--font-mono); }
+.plan-item-active .plan-item-glyph { color: var(--agent); }
+.plan-item-completed .plan-item-glyph { color: var(--ok); }
+.plan-item-failed .plan-item-glyph { color: var(--sev-blocker); }
+.plan-item-desc { color: var(--fg); }
+.plan-item-completed .plan-item-desc, .plan-item-skipped .plan-item-desc { color: var(--fg-dimmer); }
+.limitations { text-align: left; display: flex; flex-direction: column; gap: 4px; }
+.limitation-chip { font-size: 11px; color: var(--sev-major); background: var(--sev-major-t); border-radius: 4px; padding: 5px 9px; }
+.activity-log { text-align: left; max-height: 220px; overflow-y: auto; border: 1px solid var(--line2); border-radius: 6px; display: flex; flex-direction: column; }
+.activity-row { padding: 5px 10px; font-size: 11px; color: var(--fg-dim); border-bottom: 1px solid var(--line2); }
+.activity-row:last-child { border-bottom: none; }
+.activity-row-more { color: var(--fg-dimmer); font-style: italic; }
+.legacy-notice { text-align: left; border: 1px dashed var(--line2); border-radius: 6px; padding: 10px 12px; font-size: 11.5px; color: var(--fg-dimmer); }
+.lineage-line { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
 .fail-card { text-align: left; border: 1px solid var(--sev-blocker-b); border-left: 3px solid var(--sev-blocker); background: var(--card); border-radius: 6px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
 .fail-title { font-size: 13.5px; font-weight: 600; color: var(--fg-hi); }
 .fail-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
+.fail-detail { display: flex; flex-direction: column; gap: 3px; }
+.fail-detail-row { font-size: 11px; color: var(--fg-dim); }
+.fail-detail-more { color: var(--fg-dimmer); font-style: italic; }
 /* Loading-page skeleton bars (issue #39), sized by a class rather than a
    style attribute — this page's CSP authorises nonce'd style elements
    only, and a nonce never covers a style attribute, so the bars rendered at
@@ -844,6 +953,7 @@ function renderRunReview(s: FlowViewState): string {
         ? `<div class="notice"><span>${s.skippedAgents.length} agent ${s.skippedAgents.length === 1 ? 'file was' : 'files were'} skipped because ${s.skippedAgents.length === 1 ? 'it could' : 'they could'} not be read.</span><button class="dismiss" id="show-skipped">Show which</button></div>`
         : ''
     }
+    ${interruptedPriorNotice(s.interruptedPrior)}
     <div class="picker-stack">
       ${agentPicker(s, agent)}
       ${modelPicker(s, agent)}
@@ -882,6 +992,7 @@ function renderRunReview(s: FlowViewState): string {
     </div>
     ${contextArea(s)}
     <div class="footer-row">
+      ${s.interruptedPrior?.resumable ? '<button class="btn btn-accent" id="resume-from-checkpoint">Start new attempt from checkpoint</button>' : ''}
       <button class="btn btn-brand" id="run"${runBlocked ? ' disabled' : ''}>Run review</button>
       <button class="btn" id="cancel">Cancel</button>
       <span class="footer-hint">${
@@ -920,46 +1031,206 @@ function renderSubmitting(s: FlowViewState): string {
   </div>`;
 }
 
-/** `m:ss`. The page's own ticker in SCRIPT repeats this format — the two must agree. */
-function elapsedClock(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+// ---- shared plan / activity / coverage rendering (tasks 14.1/14.2) --------
+//
+// One set of renderers for both the live running screen and retained/
+// completed run details: both read the same ordered `ActivityEvent[]` (D14),
+// so a plan, a coverage figure, or an activity line can never be described
+// two different ways depending on which screen happens to show it.
+
+const PLAN_ITEM_GLYPH: Record<PlanItem['state'], string> = {
+  pending: '○',
+  active: '●',
+  completed: '✓',
+  skipped: '⤼',
+  blocked: '⏸',
+  failed: '✕',
+};
+
+function planItemLine(item: PlanItem): string {
+  return `<div class="plan-item plan-item-${item.state}"><span class="plan-item-glyph">${PLAN_ITEM_GLYPH[item.state]}</span><span class="plan-item-desc">${e(item.description)}</span></div>`;
 }
 
 /**
- * The counters as one line. Exported because the panel pushes this same
- * string into the page between renders (`run:progress`, so a fast model does
- * not rebuild `#flow-body` many times a second) — a second formatter over
- * there would eventually describe the same run differently.
+ * The public plan and its revision history (task 14.1, design.md D5: "the
+ * plan is public operational intent, never hidden reasoning"). Reads
+ * straight off ordered activity via `planHistory` — never a second
+ * plan-tracking structure — so retained details (14.2) render identically
+ * from the identical events once a run has settled. Prior item identifiers
+ * stay stable across a revision (D5), so a reviewer who watched an item
+ * through a revision sees the same row, not a new one.
  */
-export function runOutputSummary(fragmentsReceived: number, charsReceived: number): string {
-  if (fragmentsReceived === 0) return 'waiting for the first output';
-  const chars = String(charsReceived).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return `${fragmentsReceived} ${fragmentsReceived === 1 ? 'fragment' : 'fragments'} · ${chars} characters`;
+function planBlock(activity: readonly ActivityEvent[]): string {
+  const revisions = planHistory(activity);
+  const latest = revisions[revisions.length - 1];
+  if (!latest) return '';
+  return `<div class="plan-block">
+    <div class="plan-block-head">Plan${revisions.length > 1 ? ` · revision ${latest.revision} of ${revisions.length}` : ''}</div>
+    ${latest.rationale ? `<div class="plan-rationale">${e(latest.rationale)}</div>` : ''}
+    <div class="plan-list">${latest.items.map(planItemLine).join('')}</div>
+  </div>`;
 }
 
 /**
- * `startedAt` rides in the markup so the clock keeps ticking between
- * fragments: a model that streams once a minute would otherwise freeze the
- * number for 60s at a time, which is exactly what read as a hung run.
+ * "12 of 20 files classified" (D10) — never a percentage of remaining model
+ * time. Two independent denominators: the changed-file inventory
+ * (`classified`/`total`) and, once configured coverage rules require it,
+ * how many of the files that must be inspected have been
+ * (`inspected`/`requiredInspected`) — shown side by side rather than
+ * collapsed into one number, since they answer different questions.
  */
-function runLiveness(live: RunLivenessView | undefined): string {
-  if (!live) return '';
-  return `<div class="run-live">
-      <span><b id="run-elapsed" data-started="${live.startedAt}">${e(elapsedClock(live.elapsedMs))}</b> elapsed</span>
-      <span class="sep">·</span>
-      <span id="run-output">${e(runOutputSummary(live.fragmentsReceived, live.charsReceived))}</span>
-    </div>`;
+function coverageLine(coverage: CoverageProgress | undefined): string {
+  if (!coverage) return '';
+  const parts: string[] = [
+    coverage.total !== undefined
+      ? `${coverage.classified} of ${coverage.total} changed files classified`
+      : `${coverage.classified} changed files classified so far`,
+  ];
+  if (coverage.requiredInspected !== undefined) {
+    parts.push(`${coverage.inspected} of ${coverage.requiredInspected} required files inspected`);
+  } else if (coverage.inspected > 0) {
+    parts.push(`${coverage.inspected} files inspected`);
+  }
+  return `<div class="coverage-line">${parts.map(e).join(' · ')}</div>`;
+}
+
+function limitationsList(limitations: readonly Limitation[]): string {
+  if (limitations.length === 0) return '';
+  return `<div class="limitations">${limitations.map((l) => `<div class="limitation-chip">${e(l.message)}</div>`).join('')}</div>`;
+}
+
+/** Bounded so one changeset with hundreds of uninspected files cannot turn the fail card into a wall of text. */
+const MAX_FAIL_DETAILS_SHOWN = 8;
+
+/**
+ * The specific files behind `runError.message`'s generic summary sentence ("say which files, not
+ * just that some files"). Each `detail.message` is already a complete, deterministic host sentence
+ * (`evaluateCompletion`, `harnessCompletion.ts`) naming its own file and reason — rendered
+ * verbatim, never re-derived here. Absent entirely (returns `''`) rather than an empty block when
+ * there is nothing to add under the summary line.
+ */
+function failDetailsList(details: readonly CompletionBlockerDetail[] | undefined): string {
+  if (!details || details.length === 0) return '';
+  const shown = details.slice(0, MAX_FAIL_DETAILS_SHOWN);
+  const remaining = details.length - shown.length;
+  const rows = shown.map((detail) => `<div class="fail-detail-row">${e(detail.message)}</div>`).join('');
+  const more = remaining > 0 ? `<div class="fail-detail-row fail-detail-more">and ${remaining} more</div>` : '';
+  return `<div class="fail-detail">${rows}${more}</div>`;
+}
+
+/**
+ * Task 14.6: the `'agent'` picker screen's own banner for a target whose
+ * last attempt was `interrupted` — the plain-English fact of what
+ * happened, and either the "Start new attempt from checkpoint" offer
+ * (rendered as the footer-row button, gated on the same
+ * `s.interruptedPrior.resumable`) or every reason the checkpoint itself
+ * cannot back one. D13's rule applies here exactly as it does to
+ * `harnessResume.ts`'s own narrative strings: an attempt boundary is
+ * public and the old attempt stays closed, so nothing below may say
+ * "resume", "reconnect", or otherwise imply the reviewer is picking the
+ * same session back up rather than starting attempt N+1 from a checkpoint.
+ */
+function interruptedPriorNotice(prior: FlowViewState['interruptedPrior']): string {
+  if (!prior) return '';
+  const sentence = prior.resumable
+    ? 'An earlier attempt on this change request was interrupted. Its plan, findings, and coverage so far are available to carry into a new attempt.'
+    : 'An earlier attempt on this change request was interrupted, and its checkpoint cannot be carried into a new attempt.';
+  return `<div class="notice"><span>${e(sentence)}</span>${prior.resumable ? '' : limitationsList(prior.reasons ?? [])}</div>`;
+}
+
+/**
+ * Determinate progress fills an SVG `<rect>` whose `width` is a plain
+ * geometry attribute, never a `style="width:…"` attribute — this page's CSP
+ * authorises nonce'd `<style>` elements only, so an inline style is silently
+ * dropped rather than erroring (issue #45). Indeterminate progress (D10: a
+ * denominator may never be guessed) is a CSS-animated sweep with no computed
+ * value in the markup at all — the two states are visually distinct, not
+ * the same bar with a fabricated number.
+ */
+function progressBar(projection: RunProjection | undefined): string {
+  if (projection?.progressMode === 'determinate' && (projection.progressUnits?.total ?? 0) > 0) {
+    const total = projection.progressUnits!.total!;
+    const pct = Math.max(0, Math.min(100, Math.round((projection.progressUnits!.completed / total) * 100)));
+    return `<svg class="progress-det" viewBox="0 0 100 4" preserveAspectRatio="none" role="img" aria-label="${pct}% of coverage complete"><rect class="progress-det-track" width="100" height="4"></rect><rect class="progress-det-fill" width="${pct}" height="4"></rect></svg>`;
+  }
+  return '<div class="progress-indeterminate" role="img" aria-label="progress not yet measurable"></div>';
+}
+
+/** One line of public activity — the coding-agent-style feed (spec `review-run-activity`), never raw model text. */
+function activityEventLine(event: ActivityEvent): string {
+  switch (event.kind) {
+    case 'planCreated':
+      return `Plan created — ${event.plan.items.length} ${event.plan.items.length === 1 ? 'item' : 'items'}`;
+    case 'planRevised':
+      return event.plan.rationale ? `Plan revised — ${event.plan.rationale}` : 'Plan revised';
+    case 'planItemStateChanged':
+      return `Plan item marked ${event.state}`;
+    case 'actionStarted':
+      return event.target ? `${event.action} — ${event.target}` : event.action;
+    case 'toolCompleted':
+      return event.target ? `${event.tool} — ${event.target}: ${event.summary}` : `${event.tool}: ${event.summary}`;
+    case 'toolFailed':
+      return event.target ? `${event.tool} — ${event.target} failed: ${event.reason}` : `${event.tool} failed: ${event.reason}`;
+    case 'coverageChanged':
+      return event.coverage.total !== undefined
+        ? `Coverage — ${event.coverage.classified} of ${event.coverage.total} files classified`
+        : `Coverage — ${event.coverage.classified} files classified so far`;
+    case 'checkpoint':
+      return 'Checkpoint saved';
+    case 'waiting':
+      return `Waiting — ${event.reason}`;
+    case 'paused':
+      return `Paused — ${event.reason}`;
+    case 'resuming':
+      return 'Resuming';
+    case 'cancelling':
+      return 'Cancelling';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'partialResult':
+      return 'Partial result recorded';
+    case 'terminalResult':
+      return `Finished — ${event.completeness}`;
+    default: {
+      const exhaustive: never = event;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * Bounded the same way `failDetailsList` bounds the blocker list: a long-
+ * running review can dispatch thousands of tool calls, and rendering every
+ * one would bloat the webview payload without helping a reviewer, who cares
+ * most about what just happened. Unlike the blocker list — where order
+ * carries no meaning — the feed is chronological, so the elided count is a
+ * leading "and N earlier" row rather than a trailing one: the newest work is
+ * what stays visible.
+ */
+const MAX_ACTIVITY_ROWS_SHOWN = 50;
+
+function activityFeed(activity: readonly ActivityEvent[]): string {
+  if (activity.length === 0) return '';
+  // Ordered by protocol sequence, not arrival order (spec
+  // `review-run-activity`) — the same normalization `reduceActivity` and
+  // `planHistory` apply, so a redelivered or reordered event cannot appear
+  // twice or out of order in the one place a reviewer reads the full feed.
+  const ordered = orderActivity(activity);
+  const shown = ordered.slice(-MAX_ACTIVITY_ROWS_SHOWN);
+  const remaining = ordered.length - shown.length;
+  const more = remaining > 0 ? `<div class="activity-row activity-row-more">and ${remaining} earlier</div>` : '';
+  const rows = shown.map((event) => `<div class="activity-row">${e(activityEventLine(event))}</div>`).join('');
+  return `<div class="activity-log">${more}${rows}</div>`;
 }
 
 function renderRunning(s: FlowViewState): string {
   const agent = s.agents.find((a) => a.id === s.agentId);
-  const pct = Math.round((Math.min(s.runStep, s.runSteps.length) / Math.max(1, s.runSteps.length)) * 100);
   if (s.runError) {
     return `<div class="run-col">
       <div class="fail-card">
         <div class="fail-title">Agent stopped · ${e(s.runError.message)}</div>
         <div>The run did not complete. ${s.runError.partialCount > 0 ? `${s.runError.partialCount} findings arrived before it stopped.` : 'No findings arrived before it stopped.'}</div>
+        ${failDetailsList(s.runError.blockerDetails)}
         <div class="actions-row">
           ${s.runError.partialCount > 0 ? `<button class="btn btn-accent" id="use-partial">Use ${s.runError.partialCount} partial findings</button>` : ''}
           <button class="btn" id="retry-run">Retry</button>
@@ -978,25 +1249,54 @@ function renderRunning(s: FlowViewState): string {
       <div class="actions-row actions-center"><button class="btn" id="cancel-run">Cancel</button></div>
     </div>`;
   }
+  const projection = s.runProjection;
+  const activity = s.runActivity ?? [];
+  const lifecycleText = projection ? runLifecycleLabel(projection.lifecycle) : 'Starting';
+  const actionText = projection?.currentAction
+    ? `${e(projection.currentAction)}${projection.currentTarget ? ` — ${e(projection.currentTarget)}` : ''}`
+    : '';
+  // A run in progress is `completeness: 'none'` until a checkpoint reports
+  // otherwise (D2: completeness is independent of lifecycle) — shown only
+  // once it stops being that default, so a healthy run says nothing extra.
+  const completenessNote = projection && projection.completeness !== 'none'
+    ? `<div class="lineage-line">Validated findings so far: ${e(projection.completeness)}</div>`
+    : '';
   return `<div class="run-col">
     <div class="spinner"></div>
     <div class="agent-name">${e(agent?.label ?? '')}</div>
-    <div class="dim">${pct}%</div>
-    <div class="progress"><div class="${widthClass(pct)}"></div></div>
-    ${runLiveness(s.runLive)}
-    <div class="runlog">
-      ${s.runSteps
-        .map((step, i) =>
-          i < s.runStep
-            ? `<div class="done">✓ ${e(step)}</div>`
-            : i === s.runStep
-              ? `<div class="now">· ${e(step)}</div>`
-              : `<div class="done step-future">${e(step)}</div>`,
-        )
-        .join('')}
-    </div>
+    <div class="run-phase">${e(lifecycleText)}</div>
+    ${actionText ? `<div class="run-action">${actionText}</div>` : ''}
+    ${progressBar(projection)}
+    <div class="run-live"><span><b id="run-elapsed" data-started="${s.runStartedAt ?? ''}">${e(elapsedClock(projection?.elapsedMs ?? 0))}</b> elapsed</span></div>
+    ${coverageLine(projection?.coverage)}
+    ${completenessNote}
+    ${planBlock(activity)}
+    ${limitationsList(projection?.limitations ?? [])}
+    ${activityFeed(activity)}
+    ${runControlsRow(s.runControls)}
     ${retainedRow(s)}
   </div>`;
+}
+
+/**
+ * Pause/resume/cancel, gated entirely by `FlowViewState.runControls` (task
+ * 14.6) — computed in `reviewFlow.ts` from the manager's own transition
+ * validity (`isLegalRunTransition`), never a hand-listed set of lifecycles
+ * this renderer would have to keep in sync on its own. A control this run's
+ * current lifecycle does not accept is not rendered at all, rather than
+ * rendered disabled: there is nothing here for a reviewer to be told "no"
+ * about that the manager itself will not already refuse as a silent no-op.
+ */
+function runControlsRow(controls: FlowViewState['runControls']): string {
+  if (!controls) return '';
+  const buttons = [
+    controls.canPause ? '<button class="btn" id="pause-run">Pause</button>' : '',
+    controls.canResume ? '<button class="btn btn-accent" id="resume-run">Resume</button>' : '',
+    controls.canCancel ? '<button class="btn" id="cancel-run">Cancel</button>' : '',
+  ]
+    .filter(Boolean)
+    .join('');
+  return buttons ? `<div class="actions-row actions-center">${buttons}</div>` : '';
 }
 
 /**
@@ -1031,6 +1331,49 @@ function formatRanAt(iso: string): string {
   return at.toLocaleString();
 }
 
+/**
+ * What actually happened, for a retained/completed run (task 14.2, design.md
+ * D14/D16). `reduceActivity` — the same reducer the live running screen's
+ * `RunProjection` comes from — folds the retained activity to read a final
+ * coverage figure, so a coverage number shown here can never disagree with
+ * what the same activity produced while the run was still in progress.
+ *
+ * A legacy result (`protocolProvenance: 'legacy-one-shot'`) states its
+ * provenance and nothing else: D16 is explicit that the UI must not invent a
+ * plan, evidence, or coverage report for a review the harness never
+ * produced.
+ */
+function retainedDetailsBlock(s: FlowViewState): string {
+  const details = s.retainedDetails;
+  if (!details) return '';
+  if (details.protocolProvenance === 'legacy-one-shot') {
+    return '<div class="legacy-notice">Legacy review — it ran before this change recorded plan, activity, and coverage detail. None of that detail is available for it.</div>';
+  }
+  const finalProjection = details.activity.length > 0
+    ? reduceActivity({
+        runId: details.lineageId ?? 'retained',
+        lineageId: details.lineageId ?? 'retained',
+        attempt: details.attempt ?? 1,
+        events: details.activity,
+      })
+    : undefined;
+  const lineageBits: string[] = [];
+  if (details.attempt !== undefined) lineageBits.push(`Attempt ${details.attempt}`);
+  // An attempt number greater than 1 exists in a lineage only once a prior
+  // attempt in it closed as `interrupted` (D2/D13: a new attempt number is
+  // minted exclusively by a checkpoint-based resume of a lost attempt).
+  if ((details.attempt ?? 1) > 1) lineageBits.push('an earlier attempt in this lineage was interrupted');
+  if (details.completeness !== 'complete') lineageBits.push(`result is ${details.completeness}`);
+  const lineageLine = lineageBits.length > 0 ? `<div class="lineage-line">${lineageBits.map(e).join(' · ')}</div>` : '';
+  return `<div class="retained-details">
+    ${lineageLine}
+    ${coverageLine(finalProjection?.coverage)}
+    ${planBlock(details.activity)}
+    ${limitationsList(details.limitations)}
+    ${activityFeed(details.activity)}
+  </div>`;
+}
+
 function attachmentWarningNotice(s: FlowViewState): string {
   if (s.attachmentWarnings.length === 0) return '';
   const failures = [...new Map(s.attachmentWarnings.map((warning) => [
@@ -1041,6 +1384,24 @@ function attachmentWarningNotice(s: FlowViewState): string {
 }
 
 // ---- §5 Triage ---------------------------------------------------------------
+
+/**
+ * Task 14.2: a one-line, honest suffix for the triage header's meta line —
+ * legacy provenance or an interrupted-earlier-attempt fact, never the full
+ * activity feed. Triage is the busiest screen in the product (item
+ * navigation, keyboard shortcuts, the diff pane); the full plan/coverage/
+ * activity detail belongs on the clean and done screens, where
+ * `retainedDetailsBlock` already renders it, not stacked above triage's own
+ * dense layout.
+ */
+function retainedTriageNote(s: FlowViewState): string {
+  const details = s.retainedDetails;
+  if (!details) return '';
+  if (details.protocolProvenance === 'legacy-one-shot') return ' · legacy review, no coverage detail';
+  if ((details.attempt ?? 1) > 1) return ` · attempt ${details.attempt} — an earlier attempt was interrupted`;
+  if (details.completeness !== 'complete') return ` · ${details.completeness}`;
+  return '';
+}
 
 function triageHeader(s: FlowViewState): string {
   const bySev = (sev: Severity) => s.items.filter((i) => i.item.severity === sev).length;
@@ -1054,7 +1415,7 @@ function triageHeader(s: FlowViewState): string {
   return `${scope}${attachmentWarningNotice(s)}<div class="tri-head">
     <div>
       <div class="tri-title">${e(s.header.title)}</div>
-      <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}${s.reviewEffortLabel ? ` · effort ${e(s.reviewEffortLabel)}` : ''}</div>
+      <div class="tri-meta">${e(s.header.refLabel)} · ${e(s.header.projectPath)}${s.reviewEffortLabel ? ` · effort ${e(s.reviewEffortLabel)}` : ''}${e(retainedTriageNote(s))}</div>
     </div>
     <div class="tallies">${tallies}</div>
     <div class="seg mode" id="mode">
@@ -1405,6 +1766,7 @@ function renderClean(s: FlowViewState): string {
         : ''
     }
     ${retainedMetaLine(s)}
+    ${retainedDetailsBlock(s)}
     ${s.selfAuthored ? `<div class="self-note">${selfAuthoredNote(s, 'an approval')}</div>` : ''}
     <div class="actions-row actions-center">
       ${approvable ? `<button class="btn btn-ok" id="approve">Approve ${e(s.vocabulary.changeRequestNoun)}</button>` : ''}
@@ -1524,6 +1886,7 @@ function renderDone(s: FlowViewState): string {
     <h1>${s.changeset ? `Review submitted across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestAbbrev)}s` : `Review submitted to ${e(s.header.refLabel)}`}</h1>
     <p class="lede">${e(s.doneSentence)}</p>
     ${retainedMetaLine(s)}
+    ${retainedDetailsBlock(s)}
     <div class="actions-row actions-center">
       <button class="btn btn-accent" id="track-replies">Track replies</button>
       <button class="btn" id="new-run">Run a new review</button>
@@ -1660,7 +2023,14 @@ document.addEventListener('click', (ev) => {
   const instructions = document.getElementById('extra')?.value;
   post({ type: 'run', instructions });
 });
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('#resume-from-checkpoint')) return;
+  ev.preventDefault();
+  const instructions = document.getElementById('extra')?.value;
+  post({ type: 'resumeFromCheckpoint', instructions });
+});
 on('cancel', 'cancel'); on('cancel-run', 'cancel');
+on('pause-run', 'pauseRun'); on('resume-run', 'resumeRun');
 on('use-partial', 'usePartial'); on('retry-run', 'retryRun'); on('switch-agent', 'cancel');
 on('retry-load', 'retryLoad');
 on('new-run', 'newRun'); on('back-to-result', 'backToResult');
@@ -1694,10 +2064,10 @@ document.addEventListener('click', (ev) => {
   if (id) post({ type: 'ask', itemId: id, preset: p.dataset.preset });
 });
 // The running screen ticks its own clock. Driving it from the host would only
-// move the number when a fragment lands, and the gap between two fragments is
-// precisely when a frozen screen reads as a dead run. Format must match
-// elapsedClock() above; the guard is that neither element exists off the
-// running screen.
+// move the number when the projection repaints, and the gap between two
+// repaints is precisely when a frozen screen reads as a dead run. Format must
+// match elapsedClock() (./vocab.ts) — the guard is that the element does not
+// exist off the running screen.
 setInterval(() => {
   const el = document.getElementById('run-elapsed');
   const started = Number(el && el.dataset.started);
@@ -1705,14 +2075,6 @@ setInterval(() => {
   const total = Math.max(0, Math.floor((Date.now() - started) / 1000));
   el.textContent = Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
 }, 1000);
-window.addEventListener('message', (ev) => {
-  const data = ev.data;
-  if (!data || data.type !== 'run:progress') return;
-  const el = document.getElementById('run-output');
-  // textContent: the counters are host-composed, but this element sits inches
-  // from model output and the rest of this page holds the same line.
-  if (el) el.textContent = data.summary;
-});
 // The agent's answer arrives as a message and is patched into place. Rendering
 // the whole document instead would rebuild the ask box mid-question: focus
 // falls back to <body>, and A/R/S then land on the triage handler as verdicts.

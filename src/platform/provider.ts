@@ -1,10 +1,25 @@
 import type {
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
+  ChangedFileManifestRequest,
+  ChangedFileManifestResult,
   CiRun,
   ConnectionStatus,
+  CurrentHeadResult,
+  DiffPageRequest,
+  DiffPageResult,
+  DiffSearchRequest,
+  DiffSearchResult,
+  FileRangeRequest,
+  FileRangeResult,
+  IssueDetailRequest,
+  IssueDetailResult,
   Repository,
+  RepositorySearchRequest,
+  RepositorySearchResult,
   ReviewSubmission,
   ReviewThread,
   SourceResolution,
@@ -27,6 +42,47 @@ export interface ProviderCapabilities {
   groupHierarchy: boolean;
   /** Comments can be posted as one review instead of N independent threads. */
   batchedReview: boolean;
+  /**
+   * Structured review-investigation support and bounds (design.md D7,
+   * `add-agentic-review-harness`), reported per operation instead of a
+   * provider-id check. Optional so today's `ProviderCapabilities` literals
+   * (fixture/GitLab/GitHub) keep compiling before their investigation
+   * operations exist (task 4.x); once a provider populates this, every
+   * operation below must be declared honestly — `supported: false` for a
+   * real gap, never a silent omission.
+   */
+  reviewInvestigation?: ReviewInvestigationCapabilities;
+}
+
+/** A page-size ceiling a provider declares for one review-investigation operation. */
+export interface InvestigationPageBound {
+  readonly maxPageSize: number;
+}
+
+/** Whether a provider supports one review-investigation operation, and its declared bound. */
+export interface InvestigationOperationCapability {
+  readonly supported: boolean;
+  /** Overrides `ReviewInvestigationCapabilities.pagination` for this operation; absent defers to it. */
+  readonly pageBound?: InvestigationPageBound;
+}
+
+/**
+ * D7: what a provider can do for review investigation. The harness decides
+ * from this declaration, never from `ScmProvider.id` — a provider that
+ * cannot guarantee an operation sets `supported: false` rather than omitting
+ * the key, so the harness can degrade to a partial/failed outcome truthfully
+ * instead of guessing.
+ */
+export interface ReviewInvestigationCapabilities {
+  readonly manifests: InvestigationOperationCapability;
+  readonly diffReads: InvestigationOperationCapability;
+  readonly fileReads: InvestigationOperationCapability;
+  readonly repositorySearch: InvestigationOperationCapability;
+  readonly diffSearch: InvestigationOperationCapability;
+  readonly changeRequestDetails: InvestigationOperationCapability;
+  readonly issueDetails: InvestigationOperationCapability;
+  /** Shared default when an operation above does not declare its own `pageBound`. */
+  readonly pagination: InvestigationPageBound;
 }
 
 /**
@@ -215,6 +271,20 @@ export interface Connection {
   listWorkItems(repoIds: readonly string[]): Promise<WorkItem[]>;
   listCiRuns(repoIds: readonly string[], limitPerRepo?: number): Promise<CiRun[]>;
 
+  /**
+   * The full diff, fetched in one call. Task 15.8 removed this from the
+   * harness's own review path — it fetches diffs itself, in bounded pages,
+   * once it has a live `Connection` (`harnessRuntime.ts`), rather than
+   * capturing one whole diff up front the way the pre-harness one-shot
+   * runners did. Non-harness callers still fetch the whole diff through this
+   * method directly: `ui/reviewFlow.ts` (loading the diff for display,
+   * checking staleness before a rerun, and re-fetching once more at submit
+   * time to anchor against the true current head), `ui/changesetReview.ts`
+   * (per-member diff for the changeset triage screen) and `ui/changeset.ts`
+   * (assembling every member's diff for the changeset submit/context-usage
+   * path). Each provider (`gitlabProvider.ts`, `githubProvider.ts`,
+   * `fixtureProvider.ts`) implements it once, unchanged by task 15.8.
+   */
   getChangeRequestDiff(ref: ChangeRequestRef): Promise<ChangeRequestDiff>;
 
   submitReview(
@@ -227,4 +297,24 @@ export interface Connection {
   resolveThread(ref: ChangeRequestRef, threadId: string, resolved: boolean): Promise<void>;
   replyToThread(ref: ChangeRequestRef, threadId: string, body: string): Promise<void>;
   approve(ref: ChangeRequestRef): Promise<void>;
+
+  /**
+   * Review-investigation operations (design.md D7, task 3.3). Every request
+   * pins an explicit repository and base/head or single revision; every
+   * result echoes that pin back (`InvestigationResult.snapshot`) so a caller
+   * can prove the provider answered the exact requested revision instead of
+   * a branch tip (task 3.7). Optional until a provider's declared
+   * `reviewInvestigation` capabilities and an implementation land together
+   * (section 4) — the host only calls one of these when the capability that
+   * covers it is declared `supported`.
+   */
+  listChangedFiles?(request: ChangedFileManifestRequest): Promise<ChangedFileManifestResult>;
+  readDiff?(request: DiffPageRequest): Promise<DiffPageResult>;
+  readFile?(request: FileRangeRequest): Promise<FileRangeResult>;
+  searchRepository?(request: RepositorySearchRequest): Promise<RepositorySearchResult>;
+  searchDiff?(request: DiffSearchRequest): Promise<DiffSearchResult>;
+  getChangeRequestDetails?(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult>;
+  getIssueDetails?(request: IssueDetailRequest): Promise<IssueDetailResult>;
+  /** Used only for the pre-completion head check (D3); never substitutes for `getChangeRequestDiff`'s own `headSha`. */
+  getCurrentHead?(ref: ChangeRequestRef): Promise<CurrentHeadResult>;
 }

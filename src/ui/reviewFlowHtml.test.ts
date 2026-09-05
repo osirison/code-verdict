@@ -4,7 +4,8 @@ import { GITLAB_VOCABULARY } from '../testing/specFixtures';
 import { CONTEXT_SECTION_BUDGET, reviewContextTruncatedForPrompt, type ReviewContext } from '../app/reviewContext';
 import { parseHunks } from '../domain/diffHunks';
 import type { FlowScreen, FlowViewState, ReviewContextView } from './reviewFlowHtml';
-import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, runOutputSummary } from './reviewFlowHtml';
+import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml } from './reviewFlowHtml';
+import type { Limitation, RunProjection } from '../domain/harnessActivity';
 import { INLINE_STYLE_ATTRIBUTE } from '../testing/inlineStyle';
 
 const state: FlowViewState = {
@@ -40,8 +41,6 @@ const state: FlowViewState = {
   attachments: [],
   autoContextItems: [],
   unresolvedContextReferences: [],
-  runSteps: [],
-  runStep: 0,
   mode: 'diff',
   items: [{
     item: {
@@ -99,6 +98,11 @@ describe('generated review-flow script', () => {
   it('keeps its only shortcut map inside the keyboard handler', () => {
     expect(script.match(/\bconst map =/g)).toHaveLength(1);
     expect(script).toContain("a: () => verdict('accepted', !ev.shiftKey && acceptCanApplyFix())");
+  });
+
+  it('wires the pause and resume buttons to their messages (task 14.6/14.8)', () => {
+    expect(script).toContain("on('pause-run', 'pauseRun')");
+    expect(script).toContain("on('resume-run', 'resumeRun')");
   });
 
   it('compiles every script for complete single and changeset context fixtures', () => {
@@ -737,42 +741,409 @@ describe('the context the agent was given, on the screen where the human decides
 });
 
 /**
- * The running screen used to be a spinner over a canned log parked on step 2,
- * so a healthy long review and a hung one looked the same. These assert the
- * numbers that tell them apart are actually on the page.
+ * The running screen used to be a spinner over a canned five-step log parked
+ * on step 2, with a fragment/character counter underneath — a healthy
+ * multi-minute review and a hung one looked identical, and the counters
+ * could never be more than the transport's own byte count (task 14.1,
+ * design.md D10/D14). These assert the screen now renders only what the
+ * shared `RunProjection` and ordered activity actually say.
  */
-describe('the running screen shows the run is alive', () => {
-  function running(runLive?: FlowViewState['runLive']): string {
-    return renderReviewFlowBody({ ...state, screen: 'running', runSteps: ['Resolving agent…', 'Items ready'], runStep: 1, runLive }, 'HVE Core');
+describe('the running screen renders from the shared projection alone (task 14.1)', () => {
+  function baseProjection(overrides: Partial<RunProjection> = {}): RunProjection {
+    return {
+      runId: 'run-1',
+      lineageId: 'lineage-1',
+      attempt: 1,
+      lifecycle: 'investigating',
+      completeness: 'none',
+      elapsedMs: 185_000,
+      progressMode: 'indeterminate',
+      attention: 'none',
+      limitations: [],
+      ...overrides,
+    };
   }
 
-  it('counts elapsed time and arriving output, with the start stamp the page ticks from', () => {
-    const html = running({ startedAt: 1_770_000_000_000, elapsedMs: 185_000, fragmentsReceived: 12, charsReceived: 8421 });
+  function running(overrides: Partial<FlowViewState> = {}): string {
+    return renderReviewFlowBody({ ...state, screen: 'running', runProjection: baseProjection(), ...overrides }, 'HVE Core');
+  }
+
+  it('shows the current lifecycle and action from the projection, with the start stamp the page ticks from', () => {
+    const html = running({
+      runProjection: baseProjection({ currentAction: 'Reading changed files', currentTarget: 'src/auth/token.ts' }),
+      runStartedAt: 1_770_000_000_000,
+    });
     expect(html).toContain('data-started="1770000000000"');
     expect(html).toContain('>3:05</b> elapsed');
-    expect(html).toContain('12 fragments · 8,421 characters');
+    expect(html).toContain('Investigating');
+    expect(html).toContain('Reading changed files — src/auth/token.ts');
   });
 
-  it('says it is waiting rather than showing a zero before the first fragment', () => {
-    const html = running({ startedAt: 1_770_000_000_000, elapsedMs: 0, fragmentsReceived: 0, charsReceived: 0 });
-    expect(html).toContain('>0:00</b> elapsed');
-    expect(html).toContain('waiting for the first output');
-    expect(html).not.toContain('0 fragments');
+  it('shows indeterminate progress, with no percentage, before any inventory exists', () => {
+    const html = running({ runProjection: baseProjection({ progressMode: 'indeterminate' }) });
+    expect(html).toContain('progress-indeterminate');
+    expect(html).not.toContain('progress-det');
+    expect(html).not.toMatch(/\d+%/);
   });
 
-  it('renders no liveness line for the demo agent, which walks its own log', () => {
-    expect(running(undefined)).not.toContain('run-live');
+  it('shows a real percentage only once a denominator exists, and it is exactly the projection\'s own numbers', () => {
+    const html = running({
+      runProjection: baseProjection({
+        progressMode: 'determinate',
+        progressUnits: { completed: 5, total: 20 },
+        coverage: { classified: 5, total: 20, inspected: 0 },
+      }),
+    });
+    expect(html).toContain('progress-det');
+    expect(html).not.toContain('progress-indeterminate');
+    expect(html).toContain('width="25"');
+    expect(html).toContain('5 of 20 changed files classified');
   });
 
+  it('never estimates a percentage from a partial (incomplete) inventory', () => {
+    // Known units, no total yet — D10: "it does not derive a completion
+    // percentage from the known subset".
+    const html = running({
+      runProjection: baseProjection({
+        progressMode: 'indeterminate',
+        coverage: { classified: 5, total: undefined, inspected: 0 },
+      }),
+    });
+    expect(html).toContain('progress-indeterminate');
+    expect(html).toContain('5 changed files classified so far');
+    expect(html).not.toMatch(/\d+%/);
+  });
+
+  // The `startedAt`/`fragmentsReceived`/`charsReceived` fields this test
+  // (#45, task 8.5) originally exercised belonged to the fragment-count
+  // progress view task 14.1 deleted; `running()` now builds its state from
+  // `runProjection` instead. The assertion itself — no screen ever emits a
+  // `style="…"` attribute, since the CSP drops it silently — still holds and
+  // is re-run here against the current determinate-progress shape (it is
+  // also covered, along with every other screen, by the "no screen writes an
+  // inline style attribute" suite below).
   it('carries no style attribute — a nonce authorises style elements only (#45, task 8.5)', () => {
-    const html = running({ startedAt: 1, elapsedMs: 0, fragmentsReceived: 1, charsReceived: 1 });
-    expect(html.match(/style="/g)?.length ?? 0).toBe(0);
+    const html = running({
+      runProjection: baseProjection({
+        progressMode: 'determinate',
+        progressUnits: { completed: 5, total: 20 },
+        coverage: { classified: 5, total: 20, inspected: 0 },
+      }),
+    });
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
-  it('formats the same counters for the page as for the markup, so a push never disagrees with a render', () => {
-    expect(runOutputSummary(1, 40)).toBe('1 fragment · 40 characters');
-    expect(runOutputSummary(0, 0)).toBe('waiting for the first output');
-    expect(runOutputSummary(9, 1_234_567)).toBe('9 fragments · 1,234,567 characters');
+  it('shows both coverage denominators when both exist', () => {
+    const html = running({
+      runProjection: baseProjection({
+        coverage: { classified: 20, total: 20, inspected: 6, requiredInspected: 9 },
+      }),
+    });
+    expect(html).toContain('20 of 20 changed files classified');
+    expect(html).toContain('6 of 9 required files inspected');
+  });
+
+  it('shows the public plan and its revisions, with stable item identifiers across a revision', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0,
+        kind: 'planCreated',
+        plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect authorization changes', state: 'active' }] },
+      },
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'planRevised',
+        plan: {
+          revision: 2,
+          rationale: 'A schema consumer was found in another member',
+          items: [
+            { id: 'p1', description: 'Inspect authorization changes', state: 'completed' },
+            { id: 'p2', description: 'Check the schema consumer', state: 'active' },
+          ],
+        },
+      },
+    ];
+    const html = running({ runActivity: activity });
+    expect(html).toContain('revision 2 of 2');
+    expect(html).toContain('A schema consumer was found in another member');
+    // The prior item's identifier survived the revision — same row, not a new one.
+    expect(html).toContain('Inspect authorization changes');
+    expect(html).toContain('Check the schema consumer');
+  });
+
+  it('shows the activity feed in protocol sequence order and drops a redelivered duplicate', () => {
+    // Spec `review-run-activity`: order by sequence, not arrival order; a
+    // duplicate event does not create duplicate activity. Handed
+    // deliberately out of order, as a deserialized persisted array would
+    // arrive — nothing guarantees storage returns events pre-sorted.
+    const activity: FlowViewState['runActivity'] = [
+      { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:00.000Z', phase: 'investigating', elapsedMs: 1_000, kind: 'actionStarted', action: 'Reading src/b.ts' },
+      { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'actionStarted', action: 'Reading src/a.ts' },
+      { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:00.000Z', phase: 'investigating', elapsedMs: 1_000, kind: 'actionStarted', action: 'Reading src/b.ts' },
+    ];
+    const html = running({ runActivity: activity });
+    const firstIndex = html.indexOf('Reading src/a.ts');
+    const secondIndex = html.indexOf('Reading src/b.ts');
+    expect(firstIndex).toBeGreaterThan(-1);
+    expect(secondIndex).toBeGreaterThan(firstIndex);
+    // Not rendered twice despite the redelivered duplicate.
+    expect(html.match(/Reading src\/b\.ts/g)?.length).toBe(1);
+  });
+
+  it('shows a completed tool call — tool, target, and outcome/size, live in the running review', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'toolCompleted', tool: 'readDiff', target: 'src/auth/token.ts', summary: '40 unit(s) returned.',
+      },
+    ];
+    const html = running({ runActivity: activity });
+    expect(html).toContain('readDiff');
+    expect(html).toContain('src/auth/token.ts');
+    expect(html).toContain('40 unit(s) returned.');
+  });
+
+  it('shows a failed tool call — including the sanitized reason — so a run that stopped early still shows the last thing it tried', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'toolFailed', tool: 'readFile', target: 'src/big.bin', reason: 'The content is binary.',
+      },
+    ];
+    const html = running({ runActivity: activity });
+    expect(html).toContain('readFile');
+    expect(html).toContain('src/big.bin');
+    expect(html).toContain('The content is binary.');
+  });
+
+  it('bounds a long activity list — newest work stays visible and the rest is a count, not a wall of rows (task: long lists must not break the layout)', () => {
+    const activity: FlowViewState['runActivity'] = Array.from({ length: 65 }, (_unused, index) => ({
+      runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: index + 1,
+      occurredAt: `2026-08-28T09:${String(index).padStart(2, '0')}:00.000Z`, phase: 'investigating' as const, elapsedMs: index * 1_000,
+      kind: 'toolCompleted' as const, tool: 'readDiff', target: `src/file${index}.ts`, summary: '1 unit(s) returned.',
+    }));
+    const html = running({ runActivity: activity });
+    // The oldest entries are elided, named only by count...
+    expect(html).not.toContain('src/file0.ts');
+    expect(html).not.toContain('src/file14.ts');
+    expect(html).toContain('and 15 earlier');
+    // ...while the newest is always rendered.
+    expect(html).toContain('src/file64.ts');
+  });
+
+  it('shows limitations from the projection', () => {
+    const html = running({
+      runProjection: baseProjection({ limitations: [{ code: 'incompleteInventory', message: 'The provider could not return the full changed-file manifest.' }] }),
+    });
+    expect(html).toContain('The provider could not return the full changed-file manifest.');
+  });
+
+  it('says nothing extra about completeness while it is still none (D2: independent of lifecycle)', () => {
+    const html = running({ runProjection: baseProjection({ completeness: 'none' }) });
+    expect(html).not.toContain('Validated findings so far');
+  });
+
+  it('shows a partial-completeness note the moment the projection reports one, without waiting for a terminal state', () => {
+    const html = running({ runProjection: baseProjection({ completeness: 'partial' }) });
+    expect(html).toContain('Validated findings so far: partial');
+  });
+
+  it('carries no inline style attribute — this page\'s CSP authorises nonce\'d style elements only (#45)', () => {
+    const html = running({
+      runProjection: baseProjection({
+        progressMode: 'determinate',
+        progressUnits: { completed: 5, total: 20 },
+        currentAction: 'Reading changed files',
+      }),
+      runActivity: [{
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0,
+        kind: 'planCreated',
+        plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect authorization changes', state: 'active' }] },
+      }],
+    });
+    expect(html).not.toContain('style="');
+  });
+});
+
+describe('the failure card names specific files, not just that some files (task: say which files)', () => {
+  function running(overrides: Partial<FlowViewState> = {}): string {
+    return renderReviewFlowBody({ ...state, screen: 'running', ...overrides }, 'HVE Core');
+  }
+
+  it('keeps the existing generic summary line and adds the per-file detail underneath it', () => {
+    const html = running({
+      runError: {
+        message: 'Files at a risk level that requires inspection were not inspected.',
+        requestId: 'r1',
+        partialCount: 0,
+        code: 'insufficientRiskCoverage',
+        blockerDetails: [
+          { blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', memberId: 'm1', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true },
+        ],
+      },
+    });
+    expect(html).toContain('Files at a risk level that requires inspection were not inspected.');
+    expect(html).toContain('src/auth/token.ts (high risk) was classified but never inspected.');
+  });
+
+  it('bounds the list and names how many more, rather than rendering every file', () => {
+    const detail = (path: string) => ({
+      blocker: 'insufficientRiskCoverage' as const,
+      clause: 'configuredRiskCoverageSatisfied' as const,
+      memberId: 'm1',
+      path,
+      message: `${path} was classified but never inspected.`,
+      repairable: true,
+    });
+    const blockerDetails = Array.from({ length: 14 }, (_, i) => detail(`src/file${i}.ts`));
+    const html = running({
+      runError: { message: 'Files at a risk level that requires inspection were not inspected.', requestId: 'r1', partialCount: 0, code: 'insufficientRiskCoverage', blockerDetails },
+    });
+    expect(html).toContain('src/file0.ts was classified but never inspected.');
+    expect(html).toContain('and 6 more');
+    expect(html).not.toContain('src/file13.ts was classified but never inspected.');
+  });
+
+  it('renders nothing extra when there is no per-file detail to add', () => {
+    const html = running({ runError: { message: 'The review could not be completed.', requestId: 'r1', partialCount: 0, code: 'harness.incomplete' } });
+    expect(html).not.toContain('fail-detail-row');
+  });
+
+  it('carries no inline style attribute in the failure detail list', () => {
+    const html = running({
+      runError: {
+        message: 'Files at a risk level that requires inspection were not inspected.',
+        requestId: 'r1',
+        partialCount: 0,
+        code: 'insufficientRiskCoverage',
+        blockerDetails: [{ blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', path: 'src/auth/token.ts', message: 'src/auth/token.ts (high risk) was classified but never inspected.', repairable: true }],
+      },
+    });
+    expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+});
+
+/**
+ * Task 14.6: pause/resume/cancel render only where `runControls` (computed
+ * in `reviewFlow.ts` from `isLegalRunTransition`) says the manager actually
+ * accepts them — never a hand-listed set of lifecycles this renderer keeps
+ * in sync on its own.
+ */
+describe('run controls render only where the manager accepts them (task 14.6)', () => {
+  function running(overrides: Partial<FlowViewState> = {}): string {
+    return renderReviewFlowBody(
+      {
+        ...state,
+        screen: 'running',
+        runProjection: {
+          runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+          lifecycle: 'investigating', completeness: 'none', elapsedMs: 10_000,
+          progressMode: 'indeterminate', attention: 'none', limitations: [],
+        },
+        ...overrides,
+      },
+      'HVE Core',
+    );
+  }
+
+  it('offers pause and cancel during an active phase — resume is not a legal transition from investigating', () => {
+    const html = running({ runControls: { canPause: true, canResume: false, canCancel: true } });
+    expect(html).toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).toContain('id="cancel-run"');
+  });
+
+  it('offers resume and cancel, not pause, once the run is already paused', () => {
+    const html = running({
+      runProjection: {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+        lifecycle: 'paused', completeness: 'none', currentAction: 'Waiting on a rate limit', elapsedMs: 10_000,
+        progressMode: 'indeterminate', attention: 'attentionRequired', limitations: [],
+      },
+      runControls: { canPause: false, canResume: true, canCancel: true },
+    });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).toContain('id="resume-run"');
+    expect(html).toContain('id="cancel-run"');
+  });
+
+  it('offers no control at all once the run is cancelling — the manager would refuse every one of them', () => {
+    const html = running({
+      runProjection: {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1,
+        lifecycle: 'cancelling', completeness: 'none', elapsedMs: 10_000,
+        progressMode: 'indeterminate', attention: 'none', limitations: [],
+      },
+      runControls: { canPause: false, canResume: false, canCancel: false },
+    });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).not.toContain('id="cancel-run"');
+  });
+
+  it('renders no controls row at all before the manager has admitted the run', () => {
+    const html = running({ runControls: undefined });
+    expect(html).not.toContain('id="pause-run"');
+    expect(html).not.toContain('id="resume-run"');
+    expect(html).not.toContain('id="cancel-run"');
+  });
+});
+
+/**
+ * Task 14.6: the `'agent'` picker screen's resume-from-checkpoint offer —
+ * `FlowViewState.interruptedPrior`, set only for a target whose last outcome
+ * was `interrupted` and nothing is running now (`reviewFlow.ts`'s own
+ * `deriveRunControls`-backed derivation, never re-derived here). Mirrors
+ * `harnessResume.test.ts`'s own "no-reconnect wording" check (D13): a
+ * resumed run is always a new attempt from a checkpoint, never a claim the
+ * lost session picked back up.
+ */
+describe('resume-from-checkpoint offer on the picker screen (task 14.6)', () => {
+  const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
+
+  /**
+   * The rule is about what the reviewer reads, so the scan runs over text
+   * nodes only. Element ids and classes are machine-facing wiring the
+   * page script addresses buttons by — `id="resume-from-checkpoint"` names
+   * the control's job, and renaming it would not change one word anyone
+   * sees.
+   */
+  function visibleText(html: string): string {
+    return html.replace(/<[^>]*>/g, ' ');
+  }
+
+  function agentScreen(interruptedPrior: FlowViewState['interruptedPrior']): string {
+    return renderReviewFlowBody({ ...state, screen: 'agent', interruptedPrior }, 'HVE Core');
+  }
+
+  it('offers "Start new attempt from checkpoint" when the stored checkpoint is resumable, in wording that never implies reconnection', () => {
+    const html = agentScreen({ resumable: true });
+    expect(html).toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('Start new attempt from checkpoint');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('shows every stored reason and no button when the checkpoint cannot be carried into a new attempt', () => {
+    const reasons: Limitation[] = [
+      { code: 'model', message: 'The model changed since the checkpoint was written.' },
+      { code: 'repositoryIdentity', message: 'The repository no longer matches the checkpoint.' },
+    ];
+    const html = agentScreen({ resumable: false, reasons });
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('The model changed since the checkpoint was written.');
+    expect(html).toContain('The repository no longer matches the checkpoint.');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('renders nothing at all when the target has no interrupted prior attempt', () => {
+    const html = agentScreen(undefined);
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).not.toContain('interrupted');
+  });
+
+  it('the ordinary "Run review" button is always present alongside the offer — restart costs nothing new', () => {
+    const html = agentScreen({ resumable: true });
+    expect(html).toContain('id="run"');
   });
 });
 
@@ -1216,18 +1587,18 @@ describe('a retained review, and the way back to it', () => {
   });
 
   it('keeps the retained review reachable from a run in flight', () => {
-    const html = body({ screen: 'running', runSteps: ['One', 'Two'], runStep: 1, retainedAvailable: true });
+    const html = body({ screen: 'running', retainedAvailable: true });
     expect(html).toContain('id="back-to-result"');
     expect(html).toContain('Back to the review you have');
   });
 
   it('offers no way back when there is no retained review to go back to', () => {
-    const html = body({ screen: 'running', runSteps: ['One', 'Two'], runStep: 1, retainedAvailable: false });
+    const html = body({ screen: 'running', retainedAvailable: false });
     expect(html).not.toContain('id="back-to-result"');
   });
 
   it('says a queued run is waiting for a slot, not that it is failing', () => {
-    const html = body({ screen: 'running', runQueued: true, runSteps: [], runStep: 0 });
+    const html = body({ screen: 'running', runQueued: true });
     expect(html).toContain('Waiting for a free slot');
     expect(html).toContain('id="cancel-run"');
     // Accepted and held: nothing here may read as an error.
@@ -1240,11 +1611,109 @@ describe('a retained review, and the way back to it', () => {
     const html = body({
       screen: 'running',
       runQueued: true,
-      runSteps: [],
-      runStep: 0,
       retainedAvailable: true,
     });
     expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+  });
+});
+
+/**
+ * Task 14.2 (design.md D14/D16): retained/completed run details — the full
+ * ordered activity, plan, coverage, and attempt lineage a real harness
+ * attempt produced, or an honest statement of provenance and nothing
+ * fabricated for a legacy result.
+ */
+describe('retained/completed run details show what actually happened (task 14.2)', () => {
+  const body = (over: Partial<FlowViewState>): string =>
+    renderReviewFlowBody({ ...state, ...over } as FlowViewState, 'Security Reviewer');
+
+  it('states a legacy review\'s provenance and shows no plan, activity, or coverage it does not have', () => {
+    const html = body({
+      screen: 'clean',
+      retainedMeta: { ranAt: '2026-07-28T09:00:00.000Z' },
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'legacy-one-shot', limitations: [], activity: [] },
+    });
+    expect(html).toContain('Legacy review');
+    expect(html).toContain('plan, activity, and coverage detail');
+    expect(html).not.toContain('plan-block');
+    expect(html).not.toContain('activity-log');
+    expect(html).not.toContain('coverage-line');
+  });
+
+  it('renders a harness result\'s plan, coverage, and lineage on the clean screen', () => {
+    const activity: FlowViewState['runActivity'] = [
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0,
+        kind: 'planCreated',
+        plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect authorization changes', state: 'completed' }] },
+      },
+      {
+        runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:00.000Z', phase: 'investigating', elapsedMs: 1_000,
+        kind: 'coverageChanged',
+        coverage: { classified: 20, total: 20, inspected: 20 },
+      },
+    ];
+    const html = body({
+      screen: 'clean',
+      retainedMeta: { ranAt: '2026-08-28T09:00:00.000Z' },
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 1, limitations: [], activity },
+    });
+    expect(html).not.toContain('Legacy review');
+    expect(html).toContain('Inspect authorization changes');
+    expect(html).toContain('20 of 20 changed files classified');
+    expect(html).toContain('Attempt 1');
+  });
+
+  it('shows an interrupted earlier attempt when the retained result is attempt 2 or later', () => {
+    const html = body({
+      screen: 'done',
+      doneSentence: 'Review submitted.',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 2, limitations: [], activity: [] },
+    });
+    expect(html).toContain('Attempt 2');
+    expect(html).toContain('an earlier attempt in this lineage was interrupted');
+  });
+
+  it('says nothing about an interrupted attempt for a first, un-resumed attempt', () => {
+    const html = body({
+      screen: 'done',
+      doneSentence: 'Review submitted.',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 1, limitations: [], activity: [] },
+    });
+    expect(html).not.toContain('was interrupted');
+  });
+
+  it('shows the same legacy/lineage fact on the triage header, without the full activity feed', () => {
+    const legacy = body({
+      screen: 'triage',
+      mode: 'split',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'legacy-one-shot', limitations: [], activity: [] },
+    });
+    expect(legacy).toContain('legacy review, no coverage detail');
+    expect(legacy).not.toContain('activity-log');
+
+    const resumed = body({
+      screen: 'triage',
+      mode: 'split',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 2, limitations: [], activity: [] },
+    });
+    expect(resumed).toContain('attempt 2 — an earlier attempt was interrupted');
+  });
+
+  it('writes no inline style attribute in the retained-details block', () => {
+    const activity: FlowViewState['runActivity'] = [{
+      runId: 'run-1', lineageId: 'lineage-1', attempt: 2, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0,
+      kind: 'planCreated',
+      plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect authorization changes', state: 'completed' }] },
+    }];
+    const html = body({
+      screen: 'clean',
+      retainedDetails: {
+        completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 2,
+        limitations: [{ code: 'someLimit', message: 'A limitation.' }], activity,
+      },
+    });
+    expect(html).not.toContain('style="');
   });
 });
 
@@ -1330,7 +1799,22 @@ describe('in-progress text is committed to the host (task 9.3)', () => {
 describe('no screen writes an inline style attribute (issue #45, task 8.5)', () => {
   const SCREEN_STATES: Record<FlowScreen, FlowViewState> = {
     agent: { ...state, screen: 'agent' },
-    running: { ...state, screen: 'running', runSteps: ['Resolving agent…', 'Items ready'], runStep: 1 },
+    running: {
+      ...state,
+      screen: 'running',
+      runProjection: {
+        runId: 'run-1',
+        lineageId: 'lineage-1',
+        attempt: 1,
+        lifecycle: 'investigating',
+        completeness: 'none',
+        elapsedMs: 5_000,
+        progressMode: 'determinate',
+        progressUnits: { completed: 1, total: 2 },
+        attention: 'none',
+        limitations: [],
+      },
+    },
     triage: { ...state, screen: 'triage', mode: 'diff' },
     clean: { ...state, screen: 'clean', items: [], selectedId: undefined, diffLines: undefined },
     summary: {
@@ -1361,7 +1845,7 @@ describe('no screen writes an inline style attribute (issue #45, task 8.5)', () 
     );
     expect(runError).not.toMatch(INLINE_STYLE_ATTRIBUTE);
     const runQueued = renderReviewFlowBody(
-      { ...state, screen: 'running', runQueued: true, runSteps: [], runStep: 0 },
+      { ...state, screen: 'running', runQueued: true },
       'HVE Core / PR Review',
     );
     expect(runQueued).not.toMatch(INLINE_STYLE_ATTRIBUTE);

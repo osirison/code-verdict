@@ -17,8 +17,9 @@ import { fetchPodData, repoIdsOf, repoLabel } from './podQuery';
 import { PodStore } from './pods';
 import type { KeyValueStore, SecretStore } from './storage';
 import { runDebugBootstrap } from './debugBootstrap';
-import { runDemoAgent } from './demoAgent';
+import { DEMO_AGENT_ID, DEMO_AGENT_LABEL, demoFindingsForFile } from './demoAgent';
 import { BUILTIN_AGENT_DESCRIPTOR } from './agents';
+import type { ReviewItem } from '../domain/types';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from './submit';
 import { composeSummary } from '../domain/summary';
 import { addedLines } from '../domain/diffHunks';
@@ -160,8 +161,24 @@ describe('debug bootstrap against a live emulator', () => {
     const ref = { repoId: '9101', number: '2841' };
     const diff = await connection.getChangeRequestDiff(ref);
 
-    // §5: the agent reads the diff and produces anchored items.
-    const { response } = runDemoAgent(diff, pod.criteria);
+    // §5: the agent reads the diff and produces anchored items — one file's
+    // patch bytes at a time, the same shape the real harness demo participant
+    // (`harnessDemoParticipant.ts`) reuses `demoFindingsForFile` for.
+    let sequence = 0;
+    const demoItems: ReviewItem[] = [];
+    for (const file of diff.files) {
+      const found = demoFindingsForFile(diff.headSha, file.newPath, file.diff, sequence);
+      sequence += found.length;
+      demoItems.push(...found);
+    }
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      agentId: DEMO_AGENT_ID,
+      agentLabel: DEMO_AGENT_LABEL,
+      headSha: diff.headSha,
+      items: demoItems,
+      candidates: [],
+    }, { diffPaths: diff.files.map((file) => file.newPath) });
     expect(response.items.length).toBeGreaterThan(0);
 
     // §6: triage every item — accept all, applying fixes where offered.

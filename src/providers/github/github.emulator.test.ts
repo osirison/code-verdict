@@ -419,6 +419,19 @@ describe('auth modes are declared per host', () => {
       threadResolution: true,
       groupHierarchy: true,
       batchedReview: true,
+      // D7/task 4.6: repositorySearch is honestly false — GitHub's code
+      // search only indexes each repository's default branch and cannot be
+      // pinned to an explicit revision.
+      reviewInvestigation: {
+        manifests: { supported: true, pageBound: { maxPageSize: 100 } },
+        diffReads: { supported: true, pageBound: { maxPageSize: 200 } },
+        fileReads: { supported: true, pageBound: { maxPageSize: 200 } },
+        repositorySearch: { supported: false },
+        diffSearch: { supported: true },
+        changeRequestDetails: { supported: true },
+        issueDetails: { supported: true },
+        pagination: { maxPageSize: 100 },
+      },
     });
   });
 });

@@ -51,6 +51,7 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
 | Verdict: Sign in | `codeVerdict.signIn` | |
 | Verdict: Show API trace | `codeVerdict.showApiTrace` | Reveals the API log; says which setting turns tracing on when it is off |
+| Verdict: Show run diagnostics | `codeVerdict.showRunDiagnostics` | Reveals a metadata-only report of the active review's most recent attempt — phases, coverage, completion clauses, budget, and tool calls; offers to save it as JSON. No prompts, model output, or secrets. |
 
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.
@@ -79,11 +80,29 @@ Not in the palette — reached from a control, a keybinding, or a status-bar seg
 `codeVerdict.context.includeDescription`, `codeVerdict.context.includeLinkedItems`,
 `codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
 `codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`,
-`codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`.
+`codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`,
+`codeVerdict.harness.maxElapsedSecondsPerAttempt`, `codeVerdict.harness.maxModelTurnsPerAttempt`,
+`codeVerdict.harness.maxToolRequestsPerAttempt`, `codeVerdict.harness.maxEvidenceMegabytesPerAttempt`,
+`codeVerdict.harness.highRiskReservePercent`, `codeVerdict.harness.verificationReservePercent`,
+`codeVerdict.harness.transientRetriesPerOperation`, `codeVerdict.harness.checkpointCadenceToolCalls`,
+`codeVerdict.harness.retainedCheckpointsPerLineage`, `codeVerdict.harness.maxActivityEventsPerAttempt`,
+`codeVerdict.harness.terminalAttemptHistoryCount`, `codeVerdict.harness.terminalAttemptHistoryMaxAgeDays`,
+`codeVerdict.harness.requireInspectionMinRisk`.
 
 The three `agentRun` settings share one convention: `0` removes that limit. For the two windows
 that means "never time out on this"; for `maxConcurrent` it means "run as many reviews at once as
 are triggered".
+
+Every `harness.*` setting bounds one review attempt: how long it may run, how many model turns and
+tool calls it may use, how much evidence it may hold, how much of that is held back for high-risk
+files and final verification, how many times a failed step retries, how often it checkpoints, and
+how much history is kept. A missing or unusable value falls back to its own documented default, never
+to zero. `requireInspectionMinRisk` is the one non-numeric setting — `low / medium / high` — and its
+default, `medium`, requires every changed file classified medium or high risk to actually be read, not
+just classified, before a review can complete. A file classified low can be skipped — but a host risk
+floor keeps real source code out of `low` regardless of what the reviewing model proposes, so only
+documentation, specification, and similar plain-text files are ever skipped at the default setting.
+Setting this to `low` requires every changed file, including those, to actually be read.
 
 The access token is never a setting — it lives in the VS Code secret store.
 
@@ -99,6 +118,30 @@ Never state that only the diff is sent or that the whole repository is never sen
 footer: `N changed files + M attachments go to the agent.` Thinking Effort is applied as review
 instructions in the prompt, not as the model provider's native reasoning setting.
 
+## Review run wording
+
+Lifecycle labels are the same word everywhere a run's state is shown — the active review screen, the
+sidebar's active-run list, and the status bar — never a shortened or reworded copy on any one screen:
+`Queued / Planning / Investigating / Verifying / Completing / Waiting / Paused / Resuming /
+Cancelling / Cancelled / Succeeded / Failed / Interrupted`.
+
+A result's completeness is reported separately from its lifecycle and never implied by it. The
+dashboard's Verdict column shows one of: the live lifecycle label while a review is running,
+`submitted`, `no findings` (clean and complete), `N partial` (stopped early, findings kept — always
+with a reason on hover), `interrupted`, `N finding(s)`, or `not run`. `N partial` never appears as a
+plain finding count; a partial result is always named as partial.
+
+Progress is a real count ("N of M") only once a full inventory exists; before that, or with nothing
+to count, progress is elapsed time — never a percentage guessed from an incomplete inventory.
+
+Cancelling a run shows `Cancel`. A run that stopped early with findings already kept offers `Use N
+partial findings`. Reviving an interrupted review is never called "resume" where the reviewer can see
+it — the control reads `Start new attempt from checkpoint`, and when the checkpoint cannot back one
+it instead lists the reasons why, with a plain restart offered in its place. A review from before
+this harness shipped is labeled a legacy review and states plainly that it has no plan, activity, or
+coverage detail, rather than showing none of those and letting the reviewer assume there was nothing
+to record.
+
 ## UI strings as shipped
 
 - Activity bar tooltip: `Verdict`
@@ -110,6 +153,10 @@ instructions in the prompt, not as the model provider's native reasoning setting
 - Onboarding step 1 heading: `Welcome to Code Verdict`
 - Notification titles stay MR-first, not brand-first: `Review ready · 8 items on !2841`
   (the source is already obvious from the icon)
+- A review that stopped short of complete but kept validated findings:
+  `Review failed · 3 findings kept as partial · !2841`, or `Review cancelled · 3 findings kept as
+  partial · !2841`. Never "Review ready" for a result that stopped short of complete.
+- Attempts closed by an editor restart: `2 reviews interrupted by the restart`
 
 ## Category vocabulary
 

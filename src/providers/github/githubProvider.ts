@@ -13,13 +13,29 @@ import type {
 } from '../../platform/provider';
 import { bearerToken } from '../../platform/provider';
 import type {
+  ChangedFileManifestRequest,
+  ChangedFileManifestResult,
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   CommentOutcome,
   ConnectionStatus,
+  CurrentHeadResult,
   DiffAnchor,
+  DiffPage,
+  DiffPageRequest,
+  DiffPageResult,
+  DiffSearchMatch,
+  DiffSearchRequest,
+  DiffSearchResult,
+  FileRange,
+  FileRangeRequest,
+  FileRangeResult,
+  IssueDetailRequest,
+  IssueDetailResult,
   Repository,
   ReviewCommentDraft,
   ReviewSubmission,
@@ -35,25 +51,45 @@ import { EtagCache, GitHubHttp, RateBudget, hostOf, isDotCom, splitRepoId } from
 import { parseGitHubSourceInput } from './sourceInput';
 import { isVerdictRefused } from './errors';
 import {
+  isBinaryCompareFile,
   isRealIssue,
+  isTooLargeCompareFile,
+  linesFromUnifiedDiff,
   toCiSummary,
+  toChangedFileEntry,
   toChangeRequest,
+  toCheckSummariesFromRollup,
   toCiRun,
   toFileDiff,
+  toNormalizedDetail,
+  toNormalizedDetailFromIssue,
   toRepoGroup,
   toRepository,
   toReviewThread,
+  toThreadNoteFromIssueComment,
   toWorkItem,
+  type GhCompareResult,
+  type GhContentFile,
   type GhFile,
   type GhIssue,
+  type GhIssueComment,
   type GhOrg,
   type GhPull,
+  type GhPullCommit,
   type GhRepo,
   type GhWorkflowRun,
   type GqlChecksResponse,
+  type GqlRollup,
   type GqlThread,
   type CiSummary,
 } from './mappers';
+
+/** Declared review-investigation page bounds (design.md D7, task 4.6) — self-imposed, since GitHub returns each of these payloads in one call rather than paginating them itself. */
+const INVESTIGATION_MANIFEST_PAGE = 100;
+const INVESTIGATION_DIFF_LINE_PAGE = 200;
+const INVESTIGATION_FILE_LINE_PAGE = 200;
+/** Compare caps `files` at 300 for the whole comparison (GitHub docs) — reaching it means the manifest cannot be proven complete. */
+const GITHUB_COMPARE_FILES_CAP = 300;
 
 const CAPABILITIES: ProviderCapabilities = {
   // ```suggestion blocks render as an applyable "Commit suggestion".
@@ -65,6 +101,25 @@ const CAPABILITIES: ProviderCapabilities = {
   groupHierarchy: true,
   // POST /pulls/{n}/reviews carries the whole review at once.
   batchedReview: true,
+  // D7/task 4.6: manifest/diff/diff-search read the Compare API
+  // (`/compare/{base}...{head}`, snapshot-only — no pull-request number
+  // needed, mirroring the GitLab provider's identical reasoning for using its
+  // own Compare API instead of an MR/PR-scoped diff endpoint). Repository
+  // search is NOT revision-pinnable on GitHub: `/search/code` only indexes
+  // each repository's default branch and takes no ref/commit parameter at all
+  // (docs.github.com/en/rest/search/search#search-code, "Only the default
+  // branch is considered") — declared `supported: false` rather than
+  // silently searching the wrong revision.
+  reviewInvestigation: {
+    manifests: { supported: true, pageBound: { maxPageSize: INVESTIGATION_MANIFEST_PAGE } },
+    diffReads: { supported: true, pageBound: { maxPageSize: INVESTIGATION_DIFF_LINE_PAGE } },
+    fileReads: { supported: true, pageBound: { maxPageSize: INVESTIGATION_FILE_LINE_PAGE } },
+    repositorySearch: { supported: false },
+    diffSearch: { supported: true },
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: INVESTIGATION_MANIFEST_PAGE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -238,6 +293,47 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }`;
 
+/** The same rollup shape as `CHECKS_QUERY`, scoped to one pull request — used by `getChangeRequestDetails` (task 4.6), which needs every check, not just the one worth linking to. */
+const PR_ROLLUP_QUERY = `
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 20) {
+                nodes {
+                  __typename
+                  ... on CheckRun { databaseId name conclusion status permalink summary }
+                  ... on StatusContext { context state targetUrl description }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** In-memory pagination over an already-fully-fetched array — Compare/contents return their payload in one call; the cursor is host-defined and never inspected by GitHub. */
+function paginateArray<T>(
+  items: readonly T[],
+  cursor: string | undefined,
+  pageSize: number,
+): { page: readonly T[]; nextCursor?: string } {
+  const start = cursor ? Number(cursor) : 0;
+  const end = Math.min(start + pageSize, items.length);
+  return { page: items.slice(start, end), nextCursor: end < items.length ? String(end) : undefined };
+}
+
+/** GitHub's contents API takes a literal multi-segment path, unlike GitLab's single opaque path parameter — each segment is encoded, but the separating slashes are not. */
+function encodePathSegments(path: string): string {
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
 export class GitHubConnection implements Connection {
   constructor(
     private readonly http: GitHubHttp,
@@ -252,6 +348,210 @@ export class GitHubConnection implements Connection {
 
   private prPath(ref: ChangeRequestRef): string {
     return `${this.repoPath(ref.repoId)}/pulls/${encodeURIComponent(ref.number)}`;
+  }
+
+  // ---- review-investigation operations (design.md D7, task 4.6) -----------
+  //
+  // `listChangedFiles`/`readDiff`/`searchDiff` all read the Compare API
+  // (`GET /repos/{owner}/{repo}/compare/{base}...{head}`), not
+  // `/pulls/{n}/files`: every neutral request type here carries only
+  // `snapshot` (repoId+baseSha+headSha), never the pull-request number, and
+  // only Compare is revision-scoped rather than PR-scoped — the identical
+  // structural reasoning the GitLab provider already documents for choosing
+  // its own Compare API over an MR-scoped diff endpoint. A 404 from Compare
+  // always means the revision pair itself does not resolve (Compare has no
+  // path parameter to get wrong), so it maps directly to `unavailable`.
+
+  private async compare(repoId: string, baseSha: string, headSha: string): Promise<GhCompareResult | undefined> {
+    try {
+      return await this.http.get<GhCompareResult>(
+        `${this.repoPath(repoId)}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+      );
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') return undefined;
+      throw e;
+    }
+  }
+
+  async listChangedFiles(request: ChangedFileManifestRequest): Promise<ChangedFileManifestResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    const files = compared.files ?? [];
+    const bound =
+      CAPABILITIES.reviewInvestigation!.manifests.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const { page, nextCursor } = paginateArray(files.map(toChangedFileEntry), request.cursor, bound);
+    if (nextCursor) return { snapshot, state: 'paginated', value: page, cursor: nextCursor };
+    // Compare shows `files` only on its first page and caps it at 300 for the
+    // whole comparison — at exactly the cap a 301st file cannot be ruled out.
+    if (files.length >= GITHUB_COMPARE_FILES_CAP) return { snapshot, state: 'truncated', value: page };
+    return { snapshot, state: 'complete', value: page };
+  }
+
+  async readDiff(request: DiffPageRequest): Promise<DiffPageResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    const file = (compared.files ?? []).find((f) => f.filename === request.path || f.previous_filename === request.path);
+    if (!file) return { snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+    if (isBinaryCompareFile(file)) return { snapshot, state: 'binary' };
+    if (isTooLargeCompareFile(file)) return { snapshot, state: 'tooLarge' };
+    const bound =
+      CAPABILITIES.reviewInvestigation!.diffReads.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const { page, nextCursor } = paginateArray((file.patch ?? '').split('\n'), request.cursor, bound);
+    const value: DiffPage = {
+      path: file.filename,
+      oldPath: file.status === 'renamed' ? file.previous_filename : undefined,
+      isRenamed: file.status === 'renamed',
+      patch: page.join('\n'),
+      positions: [],
+    };
+    if (nextCursor) return { snapshot, state: 'paginated', value, cursor: nextCursor };
+    return { snapshot, state: 'complete', value };
+  }
+
+  async readFile(request: FileRangeRequest): Promise<FileRangeResult> {
+    const { snapshot } = request;
+    const revisionSha = request.revision === 'base' ? snapshot.baseSha : snapshot.headSha;
+    let content: GhContentFile | GhContentFile[];
+    try {
+      content = await this.http.get<GhContentFile | GhContentFile[]>(
+        `${this.repoPath(snapshot.repoId)}/contents/${encodePathSegments(request.path)}`,
+        { ref: revisionSha },
+      );
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') {
+        const message = e instanceof Error ? e.message : '';
+        // Disclosed, moderate confidence: GitHub's contents endpoint is not
+        // documented to distinguish a bad ref from a bad path in its 404
+        // message, but a bad ref is commonly observed to read "No commit
+        // found for the ref …" — the same message-sniffing technique the
+        // GitLab provider uses for its own revision-vs-path disambiguation.
+        return /no commit found for the ref/i.test(message)
+          ? { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${revisionSha}` }
+          : { snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
+      }
+      throw e;
+    }
+    if (Array.isArray(content) || content.type !== 'file') {
+      return { snapshot, state: 'notFound', reason: `Not a file: ${request.path}` };
+    }
+    // GitHub withholds `content` once a file exceeds 1 MB under the default JSON media type (`encoding: 'none'`) — its own signal, not a locally imposed cap.
+    if (content.encoding !== 'base64' || content.content === undefined) {
+      return { snapshot, state: 'tooLarge', byteSize: content.size };
+    }
+    const decoded = Buffer.from(content.content, 'base64');
+    if (decoded.includes(0)) return { snapshot, state: 'binary', byteSize: content.size };
+    const lines = decoded.toString('utf8').split('\n');
+    const bound =
+      CAPABILITIES.reviewInvestigation!.fileReads.pageBound?.maxPageSize ?? CAPABILITIES.reviewInvestigation!.pagination.maxPageSize;
+    const start = Math.max(1, request.startLine);
+    if (start > lines.length) return { snapshot, state: 'notFound', reason: 'startLine beyond file length' };
+    const availableEnd = Math.min(request.endLine, lines.length);
+    const boundedEnd = Math.min(availableEnd, start + bound - 1);
+    const value: FileRange = {
+      revision: request.revision,
+      path: request.path,
+      startLine: start,
+      endLine: boundedEnd,
+      text: lines.slice(start - 1, boundedEnd).join('\n'),
+    };
+    if (boundedEnd < availableEnd) return { snapshot, state: 'truncated', value, knownRemainingUnits: availableEnd - boundedEnd };
+    return { snapshot, state: 'complete', value };
+  }
+
+  async searchDiff(request: DiffSearchRequest): Promise<DiffSearchResult> {
+    const { snapshot } = request;
+    const compared = await this.compare(snapshot.repoId, snapshot.baseSha, snapshot.headSha);
+    if (!compared) {
+      return { snapshot, state: 'unavailable', reason: `Unresolvable revision: ${snapshot.baseSha}..${snapshot.headSha}` };
+    }
+    const files = compared.files ?? [];
+    // A comparison capped at the platform's file limit cannot be claimed exhaustively searchable.
+    if (files.length >= GITHUB_COMPARE_FILES_CAP) {
+      return { snapshot, state: 'unknown', reason: 'Comparison exceeds the platform file cap and cannot be exhaustively searched' };
+    }
+    const value: DiffSearchMatch[] = [];
+    for (const file of files) {
+      if (isBinaryCompareFile(file) || isTooLargeCompareFile(file)) continue;
+      if (request.pathScope && !file.filename.startsWith(request.pathScope)) continue;
+      linesFromUnifiedDiff(file.patch ?? '').forEach((line, index) => {
+        if (line.includes(request.query)) {
+          value.push({ position: { path: file.filename, side: 'new', line: index + 1 }, excerpt: line.trim() });
+        }
+      });
+    }
+    return { snapshot, state: 'complete', value };
+  }
+
+  private async checkRollupForPull(ref: ChangeRequestRef): Promise<GqlRollup | null | undefined> {
+    const { owner, repo } = splitRepoId(ref.repoId);
+    try {
+      const data = await this.http.graphql<{
+        repository?: {
+          pullRequest?: { commits?: { nodes?: Array<{ commit?: { statusCheckRollup?: GqlRollup | null } } | null> } } | null;
+        } | null;
+      }>(PR_ROLLUP_QUERY, { owner, repo, number: Number(ref.number) });
+      return data.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+    } catch {
+      // Checks are decoration on the detail; a repository whose checks cannot be read must still return the rest.
+      return undefined;
+    }
+  }
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    const { snapshot } = request;
+    const ref: ChangeRequestRef = { repoId: snapshot.repoId, number: request.number };
+    let pull: GhPull;
+    try {
+      pull = await this.http.get<GhPull>(this.prPath(ref));
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+      }
+      throw e;
+    }
+    const [commits, threads, rollup] = await Promise.all([
+      this.http.getAll<GhPullCommit>(`${this.prPath(ref)}/commits`),
+      this.fetchThreads(ref),
+      this.checkRollupForPull(ref),
+    ]);
+    const discussion = threads.flatMap((thread) => toReviewThread(ref, thread).notes);
+    return {
+      snapshot,
+      state: 'complete',
+      value: toNormalizedDetail(pull, commits, discussion, toCheckSummariesFromRollup(rollup)),
+    };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    const { snapshot } = request;
+    const issuePath = `${this.repoPath(request.issueRepoId)}/issues/${encodeURIComponent(request.issueNumber)}`;
+    let issue: GhIssue;
+    try {
+      issue = await this.http.get<GhIssue>(issuePath);
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+      }
+      throw e;
+    }
+    const comments = await this.http.getAll<GhIssueComment>(`${issuePath}/comments`);
+    return { snapshot, state: 'complete', value: toNormalizedDetailFromIssue(issue, comments.map(toThreadNoteFromIssueComment)) };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    try {
+      const pull = await this.http.get<GhPull>(this.prPath(ref));
+      return { repoId: ref.repoId, state: 'resolved', headSha: pull.head.sha };
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') return { repoId: ref.repoId, state: 'notFound' };
+      throw e;
+    }
   }
 
   async testConnection(): Promise<ConnectionStatus> {
@@ -419,6 +719,7 @@ export class GitHubConnection implements Connection {
     const files = await this.http.getAll<GhFile>(`${this.prPath(ref)}/files`);
     return {
       ref,
+      baseSha: pull.base.sha,
       headSha: pull.head.sha,
       files: files.map(toFileDiff),
       // Opaque to the platform layer: GitHub needs one commit id where GitLab

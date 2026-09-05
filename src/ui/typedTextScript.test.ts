@@ -58,8 +58,6 @@ function flowState(overrides: Partial<FlowViewState> = {}): FlowViewState {
     selectionNotices: [],
     skippedAgents: [],
     criteria: { severityFloor: 'minor', minConfidence: 70, categories: ['security'], extraInstructions: '' },
-    runSteps: [],
-    runStep: 0,
     mode: 'diff',
     items: [{
       item: {

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SidebarActiveRun } from './sidebarHtml';
 
 interface FakeItem {
   priority: number;
@@ -46,6 +47,24 @@ function segments(): [FakeItem, FakeItem, FakeItem, FakeItem] {
 /** The fifth: background polling paused, hidden whenever it is running. */
 function pausedSegment(): FakeItem {
   return items[4] as unknown as FakeItem;
+}
+
+/** The sixth: how many reviews are running, plus a concise read on the lead one. */
+function runsSegment(): FakeItem {
+  return items[5] as unknown as FakeItem;
+}
+
+/** A `SidebarActiveRun` fixture (task 14.5) — the same shape `toSidebarActiveRuns` produces, never a status-bar-local re-derivation. */
+function run(over: Partial<SidebarActiveRun> = {}): SidebarActiveRun {
+  return {
+    key: 'repo-1!2841',
+    label: '!2841',
+    lifecycle: 'investigating',
+    elapsedMs: 30_000,
+    progressMode: 'indeterminate',
+    attention: 'none',
+    ...over,
+  };
 }
 
 const review = {
@@ -175,5 +194,80 @@ describe('status bar segments (spec §14)', () => {
     expect(agent.visible).toBe(false);
     expect(keys.visible).toBe(false);
     bar.dispose();
+  });
+
+  /**
+   * Task 14.5 (design.md D10/D14): active-run count plus a concise read on
+   * the lead run — the same `runLifecycleLabel`/determinate-or-indeterminate
+   * decision the sidebar's own active-run list renders from
+   * (`statusBarRunsSummary`, ./sidebarHtml.ts), never a status-bar-local
+   * re-derivation.
+   */
+  describe('the running-reviews segment (task 14.5)', () => {
+    it('hides when nothing is running', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([]);
+      expect(runsSegment().visible).toBe(false);
+      bar.dispose();
+    });
+
+    it('names the count and the lead run\'s phase, with an elapsed clock while progress is indeterminate', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([run({ lifecycle: 'investigating', elapsedMs: 65_000 })]);
+      const runs = runsSegment();
+      expect(runs.visible).toBe(true);
+      expect(runs.text).toBe('$(sync~spin) 1 · Investigating · 1:05');
+      expect(runs.tooltip).toContain('!2841');
+      expect(runs.tooltip).toContain('Investigating');
+      expect(runs.tooltip).toContain('1:05');
+      bar.dispose();
+    });
+
+    it('shows a real fraction only once a denominator exists — never a fabricated percentage', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([
+        run({ lifecycle: 'verifying', progressMode: 'determinate', progressUnits: { completed: 5, total: 20 } }),
+      ]);
+      expect(runsSegment().text).toBe('$(sync~spin) 1 · Verifying · 5/20');
+      expect(runsSegment().text).not.toMatch(/%/);
+      bar.dispose();
+    });
+
+    it('counts every run in flight, naming only the lead (earliest-triggered) one — never growing with every extra run', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([
+        run({ key: 'repo-1!1', label: '!1', lifecycle: 'planning' }),
+        run({ key: 'repo-1!2', label: '!2', lifecycle: 'investigating' }),
+        run({ key: 'repo-1!3', label: '!3', lifecycle: 'queued' }),
+      ]);
+      expect(runsSegment().text).toBe('$(sync~spin) 3 · Planning · 0:30');
+      bar.dispose();
+    });
+
+    it('reports "queued" as the lead run\'s unit, never an elapsed clock for a slot it has not started using', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([run({ lifecycle: 'queued' })]);
+      expect(runsSegment().text).toBe('$(sync~spin) 1 · Queued · queued');
+      bar.dispose();
+    });
+
+    it('names when the lead run needs attention', async () => {
+      const { VerdictStatusBar } = await import('./sidebar.js');
+      const bar = new VerdictStatusBar();
+
+      bar.setActiveRuns([run({ lifecycle: 'paused', attention: 'attentionRequired' })]);
+      expect(runsSegment().tooltip).toContain('needs your attention');
+      bar.dispose();
+    });
   });
 });

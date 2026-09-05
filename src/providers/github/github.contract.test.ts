@@ -32,4 +32,15 @@ describeProviderContract('github (REST + GraphQL against fake fetch)', {
   threadMutationsPersist: true,
   crRef: { repoId: 'acme/core', number: '2841' },
   anchor: { filePath: 'src/limiter.ts', line: 12 },
+  makeRateLimitedInvestigationConnection: () =>
+    createGitHubProvider(makeFakeGitHubFetch({ investigationRateLimited: true })).connect(CONFIG),
+  investigation: {
+    baseSha: '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091',
+    changedFilePath: 'src/limiter.ts',
+    binaryFilePath: 'assets/logo.png',
+    // Strictly older than #2841's own head — proves no branch-tip substitution (task 3.7).
+    priorRevision: { baseSha: 'prior-base-1', headSha: 'prior-head-1' },
+    noMatchQuery: 'ZZZ_NOPE_NEVER_MATCHES',
+    matchQuery: 'context',
+  },
 });

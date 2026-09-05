@@ -17,7 +17,7 @@ import {
   runKeyForCr,
   type SessionDraft,
 } from '../app/retainedReview';
-import type { ReviewRunManager, RunRecord } from '../app/reviewRunManager';
+import { deriveRunControls, type ReviewRunManager, type RunControls, type RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore } from '../app/storage';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Review } from '../domain/types';
@@ -204,6 +204,7 @@ const RAN_AT = '2026-09-01T10:14:00.000Z';
 
 const DIFF: ChangeRequestDiff = {
   ref: REF,
+  baseSha: 'base-aaaa',
   headSha: 'aaaa',
   files: [
     { oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' },
@@ -320,6 +321,13 @@ function pod() {
  */
 function fakeRuns() {
   const listeners = new Set<(record: RunRecord) => void>();
+  // Task 14.6: the one record `controlsFor` derives from below, kept in step
+  // with whatever the test last `settle()`d — the fake's stand-in for the
+  // real manager's own live-record map. `deriveRunControls` is the real
+  // function (`reviewRunManager.ts`), never reimplemented here, so these
+  // tests exercise the actual transition-validity table, not a duplicate of
+  // it that could quietly drift.
+  let current: RunRecord | undefined;
   return {
     subscribe(listener: (record: RunRecord) => void) {
       listeners.add(listener);
@@ -328,8 +336,13 @@ function fakeRuns() {
     get: () => undefined,
     acknowledge: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
     trigger: vi.fn(),
+    resumeRun: vi.fn(),
+    controlsFor: vi.fn((): RunControls => deriveRunControls(current, undefined)),
     settle(record: Partial<RunRecord>): void {
+      current = record as RunRecord;
       for (const listener of [...listeners]) listener(record as RunRecord);
     },
   };
@@ -415,6 +428,23 @@ afterEach(() => {
   handlers.viewState = undefined;
   handlers.windowState = undefined;
   vi.useRealTimers();
+});
+
+describe('ReviewFlowPanel.isOpen: codeVerdict.showRunDiagnostics\'s side-effect-free "is a panel open" count', () => {
+  it('is false with no panel, true once opened, and false again once disposed — without revealing the panel as a side effect', async () => {
+    const { ReviewFlowPanel } = await import('./reviewFlow.js');
+    expect(ReviewFlowPanel.isOpen()).toBe(false);
+
+    const h = await harness();
+    await h.open();
+    panel.reveal.mockClear();
+    expect(ReviewFlowPanel.isOpen()).toBe(true);
+    // Unlike `revealIfOpen`, checking must not itself bring the panel into focus.
+    expect(panel.reveal).not.toHaveBeenCalled();
+
+    handlers.dispose?.();
+    expect(ReviewFlowPanel.isOpen()).toBe(false);
+  });
 });
 
 describe('run preparation stays bound to the target that started it', () => {
@@ -671,6 +701,91 @@ describe('the generation guard and cancel-on-settle', () => {
     expect(stored?.ranAt).toBe('2026-09-02T08:00:00.000Z');
     expect(stored?.review.items).toEqual([]);
     expect(panel.webview.html).toContain('No findings above your criteria');
+  });
+});
+
+// ---- Task 14.6 — controls only where the manager accepts them ------------------
+
+describe('run controls are derived from the manager\'s own transition validity (task 14.6)', () => {
+  it('offers pause and cancel while investigating, and dispatches pause to the manager', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    // The attempt advances past queued — the same `onCheckpoint`-driven
+    // transition a real harness attempt reports, simulated here by settling
+    // the record the panel is subscribed to.
+    h.runs.settle({ key: runKeyForCr(REF), status: 'running', lifecycle: 'investigating' });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('id="pause-run"');
+    expect(panel.webview.html).toContain('id="cancel-run"');
+    expect(panel.webview.html).not.toContain('id="resume-run"');
+
+    await h.post({ type: 'pauseRun' });
+    expect(h.runs.pause).toHaveBeenCalledWith(runKeyForCr(REF));
+  });
+
+  it('offers resume, not pause, once the run is paused, and dispatches resume to the manager', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({ key: runKeyForCr(REF), status: 'running', lifecycle: 'paused' });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('id="resume-run"');
+    expect(panel.webview.html).not.toContain('id="pause-run"');
+
+    await h.post({ type: 'resumeRun' });
+    expect(h.runs.resume).toHaveBeenCalledWith(runKeyForCr(REF));
+  });
+
+  it('resumeFromCheckpoint dispatches to the manager\'s resumeRun, never trigger, and the panel goes live off its returned record', async () => {
+    const h = await harness();
+    await h.open();
+    const record = { key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord;
+    h.runs.resumeRun.mockReturnValue(record);
+
+    void h.post({ type: 'resumeFromCheckpoint' });
+    await vi.waitFor(() => expect(h.runs.resumeRun).toHaveBeenCalled());
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(panel.webview.html).toContain('id="cancel-run"'); // the running screen, same as a plain trigger would reach
+  });
+
+  it('a stale resumeFromCheckpoint offer (resumeRun returns undefined) shows a clean notice and stays on the picker screen, never starting an unrequested plain run', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.resumeRun.mockReturnValue(undefined);
+
+    void h.post({ type: 'resumeFromCheckpoint' });
+    await vi.waitFor(() => expect(h.runs.resumeRun).toHaveBeenCalled());
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+    expect(panel.webview.html).toContain('id="run"'); // still the picker screen, not "running"
+    expect(panel.webview.html).toContain('checkpoint');
+    // Task 14.6/D13: this is the one new user-facing string no other test
+    // scans — a stale offer must never be reported in reconnection wording.
+    // `panel.webview.html` is the *full* page, script included — element
+    // ids/selectors like `#resume-from-checkpoint` are machine-facing
+    // wiring the FORBIDDEN scan must not trip on (mirroring
+    // `reviewFlowHtml.test.ts`'s own `visibleText` helper, which only ever
+    // sees the body and never has a `<script>` block to strip), so the
+    // script/style elements are dropped entirely before scanning what a
+    // reviewer actually reads.
+    const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
+    const visibleText = panel.webview.html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]*>/g, ' ');
+    for (const pattern of FORBIDDEN) expect(visibleText).not.toMatch(pattern);
   });
 });
 

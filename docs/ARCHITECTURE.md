@@ -187,9 +187,211 @@ options) and reports **per-comment outcomes**. Nothing above the platform layer 
 on partial failure the app retries only the remainder. This is also what makes changeset submit
 across N change requests (handoff §16) implementable without provider knowledge upstream.
 
-## Commands: the specified 19, plus internal ids
+### Review-investigation capabilities
 
-`contributes.commands` carries **exactly** the 19 palette entries in
+`ProviderCapabilities.reviewInvestigation` reports, per operation, whether a provider can enumerate
+changed files, read a diff or a file range, search the repository or a diff, and read normalized
+change-request/issue details, plus each operation's page-size bound. The review harness (below)
+reads this declaration, never `ScmProvider.id`, so a gap degrades a review honestly instead of
+substituting different data.
+
+GitHub declares `repositorySearch: { supported: false }`: its code-search endpoint only indexes the
+default branch and takes no revision parameter, so a search cannot be pinned to the commit under
+review. GitLab and the fixture provider support every operation. `Connection` gains one optional
+method per operation (`listChangedFiles`, `readDiff`, `readFile`, `searchRepository`, `searchDiff`,
+`getChangeRequestDetails`, `getIssueDetails`, `getCurrentHead`); every request carries an explicit
+repository and base/head or single revision, and every result echoes it back, so a caller can prove
+the provider answered the exact commit asked for rather than a moving branch tip.
+
+A result is exactly one of `complete`, `paginated` (more pages, with a cursor), `truncated` (a size
+limit was hit but here is what fits), `unavailable`, `binary`, `tooLarge`, `notFound`, or `unknown` —
+never an empty successful payload standing in for "nothing here."
+
+`getChangeRequestDiff` — the whole diff in one call — still exists and is unchanged: the harness no
+longer calls it, but `ui/reviewFlow.ts`, `ui/changesetReview.ts`, and `ui/changeset.ts` still do, for
+display, staleness checks, and submit-time anchoring.
+
+## The review harness
+
+`ReviewRunManager` (`src/app/reviewRunManager.ts`) still owns target admission, FIFO concurrency,
+cancellation, and retained-review writes — nothing about that changed. What changed is what it hands
+each admitted run to: not a function that returns an already-finished review, but a `HarnessAttempt`
+(`src/app/harnessAttempt.ts`) that the manager drives turn by turn to a finish.
+
+```
+active review / sidebar / dashboard / status bar / retained details
+                              |
+                        RunProjection (one reducer, every surface)
+                              |
+                      ReviewRunManager
+              admission, queue, cancellation, retained writes
+                              |
+                       HarnessAttempt
+         phases, plan, budgets, coverage, completion gate
+                 /             |                \
+        model turns    HostToolDispatcher   HarnessRunStore
+                              |
+              EvidenceLedger + provider Connection
+```
+
+Every review — first run, rerun, single change request, changeset member, built-in agent, discovered
+agent, or the demo agent — goes through this one engine. There is no shipped code path that produces
+a review any other way: the one-shot prompt-and-parse-the-whole-diff runners this replaced
+(`runLmAgent`, `runDemoAgent`, and their changeset equivalents) were deleted, not merely stopped
+calling. A "small" review is not a separate mode — it is what happens when the whole changed-file
+list fits in one manifest page and its bytes fit inside the ordinary evidence budget without
+touching a reserve (`isSmallReview`, `harnessAttempt.ts`); the same phases still run, just fewer times.
+
+### Phases and lifecycle
+
+One attempt moves through six phases: `bootstrap`, `planning`, `investigating`, `verifying`,
+`completing`, `persisting`. Risk classification runs at the start of `investigating`; synthesis and
+model contradiction-checking run inside `verifying`; host validation runs in `completing`.
+
+Risk classification is a model proposal maximized against a deterministic host floor
+(`harnessRiskFloors.ts`): sensitive paths (auth, authorization, security, secrets, key material, CI
+and infra definitions, payments), binary/deleted/large-changed files, policy-governed paths, and
+cross-member contracts each raise the floor independently, and the model's own proposal can raise a
+file's risk further but never lower it below the floor. A dedicated floor keyed on file extension —
+not path — holds any changed file whose extension names a general-purpose or scripting language at
+`medium` regardless of what the model proposes, with generated/built output explicitly exempted; this
+is what makes it safe for `DEFAULT_RISK_COVERAGE_RULES.requireInspection` (and the reviewer-facing
+`codeVerdict.harness.requireInspectionMinRisk`, default `medium`) to require actual inspection only at
+medium risk and above instead of every level — a model can decline to read a low-risk documentation or
+specification file without that ever letting real source code go uninspected under a low label.
+
+The lifecycle a reviewer sees has more states than that, because it also covers being queued and
+being interrupted:
+
+```
+queued -> planning -> investigating -> verifying -> completing -> succeeded
+             |             |              |             |
+             +-------------+--------------+-------------+-> cancelling -> cancelled
+                           |
+                           +-> waiting -> resuming -> prior active phase
+                           +-> paused  -> resuming -> prior active phase
+
+planning / investigating / verifying / completing -> failed
+any nonterminal attempt found at activation -> interrupted
+```
+
+Completeness (`none | partial | complete`) is tracked independently of lifecycle: a run can fail with
+partial findings kept, succeed with a complete clean result, or be cancelled with nothing to show. A
+lifecycle value never implies a completeness by itself (`src/domain/harnessLifecycle.ts`); the labels
+themselves — Queued, Planning, Investigating, Verifying, Completing, Waiting, Paused, Resuming,
+Cancelling, Cancelled, Succeeded, Failed, Interrupted — are one function, `runLifecycleLabel`
+(`src/ui/vocab.ts`), read by the active review screen, the sidebar, and the status bar alike, so they
+cannot drift into three different spellings of the same state.
+
+Only `succeeded + complete` may replace a complete retained review. Zero findings is reported clean
+through exactly one path: every completion clause passed and nothing survived. Stopping early with
+zero findings is `failed`/`none`, never clean — an incomplete review that found nothing is not the
+same fact as a complete review that found nothing, and the two are never allowed to look alike.
+
+### Bounded investigation and the host tool dispatcher
+
+The model does not receive a diff. It receives a fixed, versioned tool catalog
+(`src/domain/harnessTools.ts`) and asks for what it needs, page by page, everything pinned to the
+base/head revision the attempt snapshotted at admission:
+
+| Tool | Purpose |
+| ------ | --------- |
+| `listChangedFiles` | One page of the complete changed-file inventory |
+| `readDiff` | One bounded page of exact diff content, with anchors for inline comments |
+| `readFile` | A bounded line range from a pinned base or head revision |
+| `searchRepository` | A bounded, revision-pinned text search across the repository |
+| `searchDiff` | A bounded text search restricted to changed content |
+| `resolvePolicy` | The chain of `AGENTS.md` files from the repository root down to one changed file's own directory |
+| `getChangeRequestDetails` | One section of the change request's normalized metadata, commits, discussion, or checks |
+| `getIssueDetails` | One section of a linked issue's normalized detail |
+| `submitCandidateFinding` | One candidate finding, checked and recorded before it can reach triage |
+| `requestCompletion` | The model's own claim that it is done, evaluated independently by the host |
+
+`HostToolDispatcher` (`src/app/harnessToolDispatcher.ts`) validates every request in one fixed order
+before dispatch — unknown tool, disallowed in this phase, unknown member, invalid path, revision
+mismatch, forged cursor, out of bounds, capability unavailable, budget refused, cancelled — and
+returns a typed refusal rather than throwing for any of them. A cursor the dispatcher never issued,
+or replayed against a different tool or member, is refused as forged; nothing in this module ever
+parses a cursor's contents. `listChangedFiles` results are handed to inventory tracking directly and
+are never registered as citable evidence — a file list is inventory, not a claim about content.
+
+Budgets (`HarnessPolicy`, reviewer-configurable under `codeVerdict.harness.*`) are hierarchical:
+elapsed time, model turns, tool requests, and evidence bytes per attempt, with a percentage of each
+held back — by default 20% for files the model did not pick but the host judged high-risk, 15% for
+final verification — so early low-risk exploration cannot spend the capacity later work needs. A
+changeset gives every member a minimum turn/tool/evidence allotment before any shared pool opens.
+Transient failures retry with the provider's own `Retry-After` guidance first, exponential backoff
+otherwise; a long wait moves the attempt to `waiting`, checkpoints it, and releases its concurrency
+slot, resuming through `resuming` in original queue order once the wait is over.
+
+### The evidence ledger
+
+`EvidenceLedger` (`src/app/harnessEvidenceLedger.ts`) is append-only for one attempt. Every exact
+payload a tool handed to the model is recorded with an unguessable id, a SHA-256 digest of exactly
+those bytes, and its trust category. Only five categories are citable — diff pages, file ranges,
+repository search results, diff search results, and reviewer attachments; change-request/issue detail
+pages, root/nested `AGENTS.md` policy, and auto-derived title/description/discussion text are recorded
+but never citable. A finding cites a source id and digest, not a path and line re-fetched later, so
+validation checks against what the model actually saw rather than what the host can see now — a
+result whose repository, base, or head does not match the declared member is refused at registration,
+so evidence from one head or one changeset member can never back a finding scoped to another.
+
+An unchanged file the model reads to understand changed behavior can support a finding about that
+changed code; it cannot become an unrelated finding on its own. An explicit attachment can.
+
+### One shared run projection
+
+`reduceActivity` (`src/app/harnessActivityProjection.ts`) folds one attempt's ordered, sanitized
+activity events into a single `RunProjection`: lifecycle, completeness, current phase and action,
+elapsed time, coverage, the active plan item, attention state, the latest checkpoint id, limitations,
+and result. Every surface — the active review panel, the sidebar's active-run list, the dashboard
+row, the status bar, and retained/completed run details — renders from this one reducer; none of them
+derives a percentage, a label, or a "what's it doing right now" independently. Coverage progress is
+only ever a real count once a manifest is fully enumerated; before that, or with no denominator at
+all, progress is elapsed time, never a guessed percentage.
+
+The activity events themselves carry only what task `review-run-activity` allows onto that channel:
+plan creation and revision (with stable plan-item ids that survive a revision), plan-item state
+changes, short public rationale, which tool ran and a sanitized summary of what it returned, coverage
+changes, checkpoints, waiting/pausing/resuming, cancellation, and the terminal result. A recursive
+allowlist sanitizer (`src/app/harnessActivitySanitizer.ts`) redacts anything shaped like a credential
+and bounds every string before it is allowed onto the log; nothing in the `ActivityEvent` union has a
+field shaped to carry a raw prompt or a full tool payload in the first place.
+
+### Checkpoints and resume — always a new attempt
+
+`HarnessRunStore` (`src/app/harnessRunStore.ts`) persists a lineage's snapshot, its checkpoint
+history, and terminal-attempt records to workspace storage
+(`codeVerdict.harness.lineage.<lineageId>`, `codeVerdict.harness.run.<runId>`), bounded by the
+`codeVerdict.harness.*` retention settings. It never stores a client, a stream handle, a raw prompt,
+or a full tool payload — only what a resumed attempt or a retained-details screen needs to read back.
+
+Every ordinary trigger — a first run or a manual rerun — mints a brand-new `lineageId` and starts at
+attempt 1. The only thing that reuses a `lineageId` and increments the attempt number is an explicit
+resume of a checkpoint. Resuming is never a reconnection: nothing about the model's prior turns, an
+open stream, or a live provider connection survives a restart, and no code path is allowed to say it
+does — `harnessResume.ts`'s own decision functions are checked against a forbidden-wording test
+("reconnect", "reattach", "resumed", "still connected", "picks ... back up"), so a resumed review is
+described, honestly, as a fresh attempt seeded from the last checkpoint. `checkSnapshotCompatibility`
+compares the checkpoint's repository identity, head revision, model, resolved agent instructions,
+persona, effort, criteria, context selections, attachment digests, and provider capability signature
+against what a new attempt would use right now; any mismatch is reported by reason and the caller
+offers a plain restart instead. A demo-agent run is never eligible for checkpoint resume, only
+restart — there is no model turn to make compatible. At activation, every attempt still marked
+nonterminal from a previous session is closed as `interrupted` before anything renders.
+
+### Metadata-only trace
+
+`AgentTrace` (`src/app/agentTrace.ts`) writes to the "Code Verdict: Agent Trace" output channel — a
+different channel from the "Verdict: API" one `codeVerdict.trace.api` gates. It never accepts a
+string and writes it verbatim: a prompt or response becomes a byte count and a SHA-256 digest, and an
+error message or parse-failure detail passes through the same redaction every other public field in
+the harness does before it is appended. `vscode.lm` hands back text fragments only, never the model's
+internal reasoning, so this is a request/response trace, not a chain-of-thought log.
+
+## Commands: the specified 21, plus internal ids
+
+`contributes.commands` carries **exactly** the 21 palette entries in
 `spec/specs/Code Verdict - naming & commands.md` — `src/commands.test.ts` fails the build if that
 set drifts. Anything else the UI needs (the `⇧A` / `U` / `1`–`4` / `?` triage keys, the Posted
 reviews entry point, comment-thread actions) is an **internal id** in `INTERNAL_COMMANDS`
@@ -359,4 +561,10 @@ scoped one, so existing pods are not silently signed out.
   own `window.scrollTo` double in `beforeParse` and redefines `scrollX`/`scrollY` over it
   (`dashboardScript.test.ts`), asserting on what was set and read back — never on layout, which
   jsdom does not do. Issue #43 tracks generalising this into a harness.
+- **Adversarial and limits** (the review harness): tests feed forged tool names, fabricated source
+  ids, changed digests, another head's evidence, and oversized/unavailable provider content into a
+  real attempt, and assert it cannot forge host instructions, complete without inspecting a file, or
+  report a clean result on incomplete work. Persistence-inspection tests scan checkpoints, activity,
+  and the trace channel for a raw prompt, a secret, or a full tool payload and fail if one is found.
+  `harnessResume.test.ts` scans every resume-decision string for reconnection wording.
 - **Extension host** (later): smoke tests via `@vscode/test-electron`.

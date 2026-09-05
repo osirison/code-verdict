@@ -8,8 +8,9 @@ import { detectChangesets } from '../app/changesets';
 import type { ChangesetDetectionOptions } from '../app/changesets';
 import type { ReviewRun } from '../app/reviewRuns';
 import { getProvider } from '../platform/registry';
+import type { RunProjection } from '../domain/harnessActivity';
 import type { ActivityEntry, DashboardRow, DashboardViewState, RowScope } from './dashboardHtml';
-import { cap, repoCountOf } from './vocab';
+import { cap, repoCountOf, runLifecycleLabel } from './vocab';
 
 export function formatAge(iso: string, now: number): string {
   const ms = now - Date.parse(iso);
@@ -34,33 +35,80 @@ export function formatClock(at: number): string {
 }
 
 /**
- * Precedence, strictly: happening now > submitted (it is on the platform) >
- * clean (the agent ran and found nothing) > findings waiting for triage >
- * interrupted > never run. Only the second of those is a `ReviewHistory`
- * entry; the rest come from the run store, which is why a clean run used to
- * read "not run" forever.
+ * "prev: …" — the earlier recorded outcome on this same target, shown
+ * alongside a live pill so a reviewer never has to wonder whether the row
+ * that used to say "8 findings" still has that review, or whether the
+ * rerun in progress already erased it (task 14.4). `undefined` when there
+ * is nothing earlier to report — a first-ever run on this target has no
+ * "prev" to distinguish itself from.
+ */
+function retainedSummary(submitted: boolean, run: ReviewRun | undefined): string | undefined {
+  if (submitted) return 'prev: submitted';
+  if (run?.outcome === 'clean') return 'prev: no findings';
+  if (run?.outcome === 'findings') return `prev: ${run.findingCount} finding${run.findingCount === 1 ? '' : 's'}`;
+  return undefined;
+}
+
+/** Every `Limitation`'s message, one line for a `title=""` tooltip — never truncated, since a tooltip has no fixed-width column to break. */
+function limitationsTitle(limitations: readonly { message: string }[] | undefined): string | undefined {
+  return limitations && limitations.length > 0 ? limitations.map((l) => l.message).join(' ') : undefined;
+}
+
+/**
+ * Precedence, strictly: happening now (task 14.4: the live `RunProjection`'s
+ * own lifecycle, verbatim off `runLifecycleLabel` — the same shared label
+ * every other surface renders, D14) > submitted (it is on the platform) >
+ * clean (the agent ran and found nothing) > partial (validated findings, but
+ * short of complete — D11) > findings waiting for triage > interrupted >
+ * never run. Only the second of those is a `ReviewHistory` entry; the rest
+ * come from the run store, which is why a clean run used to read "not run"
+ * forever.
  *
  * A run in flight outranks every recorded outcome because it is about to
  * replace one: showing last week's verdict on a row whose review is running
- * says the wrong thing about what the reviewer is waiting for.
+ * says the wrong thing about what the reviewer is waiting for. It never
+ * *hides* that verdict, though — `retainedSummary` above rides alongside the
+ * live pill as `.note`, so a complete retained review a rerun might replace
+ * stays visible and distinct from the rerun itself, exactly the row task
+ * 14.4 asks for (never conflated with the rerun's own current status).
  *
  * Labels are sized for the 104px "AI review" column: at 11px mono a pill fits
  * about eleven characters inside its 8px padding, so "N findings" and "no
- * findings" fit and "N findings ready" would not.
+ * findings" fit and "N findings ready" would not — a lifecycle label like
+ * "Investigating" instead truncates on its own line (`.pill-cell .pill`) the
+ * same way a long repository name already does in `.cell-repo`, rather than
+ * being shortened or re-worded away from `runLifecycleLabel`'s own spelling.
  */
 function aiPill(
   submitted: boolean,
   run: ReviewRun | undefined,
-  active: 'running' | 'queued' | undefined,
+  projection: RunProjection | undefined,
 ): DashboardRow['ai'] {
-  if (active) return { label: active === 'queued' ? 'queued' : 'running…', cls: 'pill-agent' };
+  if (projection) {
+    return { label: runLifecycleLabel(projection.lifecycle), cls: 'pill-agent', note: retainedSummary(submitted, run) };
+  }
   if (submitted) return { label: 'submitted', cls: 'pill-agent' };
   if (run?.outcome === 'clean') return { label: 'no findings', cls: 'pill-ok' };
   // Neither reviewed nor unreviewed: something ran and was lost with the
   // window. Said plainly, because the alternative — falling through to the
   // finding count — reports a confident "0 findings" about a run that never
-  // produced one.
-  if (run?.outcome === 'interrupted') return { label: 'interrupted', cls: 'pill' };
+  // produced one. A stored checkpoint's own integrity reasons (task 12.7)
+  // ride the same tooltip a partial result's limitations use below — visible
+  // on hover, but this pill stays a passive status indicator, never a
+  // button: task 14.6's actual resume-from-checkpoint control (as well as
+  // restart) lives on the review flow panel this row already opens
+  // (`runControlsRow`/`interruptedPriorNotice` in `reviewFlowHtml.ts`),
+  // where the manager's current transition validity — not a snapshot taken
+  // here at dashboard-render time — decides what is legal to offer.
+  if (run?.outcome === 'interrupted') {
+    return { label: 'interrupted', cls: 'pill', title: limitationsTitle(run.resumeReasons) };
+  }
+  // A partial result is never folded into the plain "N findings" pill below
+  // (D11: "no surface presents the run as a complete or clean review") —
+  // its own label, and its own tooltip naming why it stopped short.
+  if (run?.outcome === 'partial') {
+    return { label: `${run.findingCount} partial`, cls: 'pill-warn', title: limitationsTitle(run.limitations) };
+  }
   if (run) return { label: `${run.findingCount} finding${run.findingCount === 1 ? '' : 's'}`, cls: 'pill-warn' };
   return { label: 'not run', cls: 'pill' };
 }
@@ -77,9 +125,12 @@ export interface DashboardDeps {
   /**
    * Which of those refs has a review in flight right now. Read separately from
    * `reviewRuns` because it is live state, not a recorded outcome: it outranks
-   * whatever the last run concluded, and it clears on its own.
+   * whatever the last run concluded, and it clears on its own. Task 14.4
+   * (design.md D14): the run's own `RunProjection`, not a dashboard-local
+   * `'running' | 'queued'` re-derivation — the same projection the active
+   * review screen and the sidebar render from.
    */
-  activeRuns?: () => ReadonlyMap<string, 'running' | 'queued'>;
+  activeRuns?: () => ReadonlyMap<string, RunProjection>;
   /** Row click: submitted rows open Posted reviews, others Run review (§2). */
   openCr?: (ref: { repoId: string; number: string }, submitted: boolean) => void;
   openChangeset?: (changesetId: string) => void;
@@ -113,8 +164,14 @@ export function toViewState(
   submittedRefs: ReadonlySet<string>,
   changesetOptions?: ChangesetDetectionOptions,
   reviewRuns: ReadonlyMap<string, ReviewRun> = new Map(),
-  /** Targets with a review in flight or waiting for a slot, keyed the same way. */
-  activeRuns: ReadonlyMap<string, 'running' | 'queued'> = new Map(),
+  /**
+   * Targets with a review in flight or waiting for a slot, keyed the same
+   * way. Task 14.4 (design.md D14): the same `RunProjection` the active
+   * review screen and the sidebar already render from — never a
+   * dashboard-local `'running' | 'queued'` re-derivation, which used to
+   * report every phase of a run as the same "running…" pill.
+   */
+  activeRuns: ReadonlyMap<string, RunProjection> = new Map(),
 ): DashboardViewState {
   const pod = data.pod;
   const you = pod.username;

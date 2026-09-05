@@ -24,7 +24,10 @@ import type { KeyValueStore } from './storage';
 import type { ChangesetSubmitState } from './changesetSubmit';
 import type { AttachmentWarning } from './attachments';
 import type { CandidateBucket } from '../domain/agentResponse';
+import type { ActivityEvent, Limitation } from '../domain/harnessActivity';
 import { normalizeEffortLevel } from '../domain/effort';
+import type { AttemptNumber, LineageId, ResultCompleteness } from '../domain/harnessLifecycle';
+import type { ProtocolProvenance } from '../domain/harnessEvidence';
 import { isReviewItemAnchored, type Review } from '../domain/types';
 
 /**
@@ -40,6 +43,27 @@ export function draftKeyFor(ref: { repoId: string; number: string }): string {
 /** The changeset equivalent, under its own prefix. */
 export function changesetDraftKeyFor(changesetId: string): string {
   return `codeVerdict.changesetDraft.${changesetId}`;
+}
+
+/**
+ * Where a single change request's *partial* result lives (task 12.5,
+ * design.md D16, spec `background-review-runs` "A cached review is replaced
+ * only by a review that succeeds": "those findings remain an explicitly
+ * incomplete partial result associated with the new run... they do not
+ * replace the complete retained review").
+ *
+ * A deliberately separate key, never the draft key above: a partial must
+ * stay reachable on its own without ever being mistaken for — or silently
+ * merged into — the target's retained complete review. Same repo!number
+ * addressing as `draftKeyFor`, under its own prefix.
+ */
+export function partialDraftKeyFor(ref: { repoId: string; number: string }): string {
+  return `codeVerdict.partial.${ref.repoId}!${ref.number}`;
+}
+
+/** The changeset equivalent of `partialDraftKeyFor`. */
+export function changesetPartialDraftKeyFor(changesetId: string): string {
+  return `codeVerdict.changesetPartial.${changesetId}`;
 }
 
 const DRAFT_PREFIX = 'codeVerdict.draft.';
@@ -135,6 +159,45 @@ export interface RetainedResult {
   filesRead?: number;
   /** Filesystem-backed context omitted when its run-start revalidation failed. */
   attachmentWarnings?: readonly AttachmentWarning[];
+  /**
+   * Task 12.5 (design.md D11/D16): independent result completeness, exactly
+   * `HarnessAttemptResult.outcome.completeness`. Absent on every record
+   * written before this field existed (the main draft key's whole history, and
+   * `legacy-one-shot` reviews generally) — `readRetained` defaults an absent
+   * value to `'complete'` there, matching D16's "historical successful
+   * reviews... are read as complete". A record written under
+   * `partialDraftKeyFor`/`changesetPartialDraftKeyFor` always sets this
+   * explicitly to `'partial'`; nothing in this module ever defaults *that*
+   * key's absence to `'complete'` (see `readRetained`'s own `options.partial`
+   * parameter) — an unmarked record is never mistaken for a finished review.
+   */
+  completeness?: ResultCompleteness;
+  /** The attempt's own `CompletionOutcome.limitations` — why this result did not reach `complete`. `[]`/absent for an ordinary complete record. */
+  limitations?: readonly Limitation[];
+  /**
+   * Task 14.2 (design.md D16): set only when the writer actually knows this
+   * result came from a real harness attempt (`HarnessAttemptResult.plan`
+   * present — see `reviewRunManager.ts`'s two `retainedFromRun` call sites).
+   * Left absent otherwise, never written as `'legacy-one-shot'` from an
+   * inference: `readRetained` below is the one place an absent value is
+   * read as legacy, so a fact and a guess can never be confused in storage.
+   */
+  protocolProvenance?: ProtocolProvenance;
+  /** Stable across a checkpoint-based resume of the run that produced this result (D2). Absent for a legacy record, which predates the concept. */
+  lineageId?: LineageId;
+  /** Monotonic within `lineageId`. Greater than 1 only once a prior attempt in this lineage closed as `interrupted` (D2/D13). */
+  attempt?: AttemptNumber;
+  /**
+   * The full ordered sanitized activity from the attempt that produced this
+   * result (task 14.2, design.md D14) — the same typed union every other
+   * surface reads, never a second retained-details shape. `planHistory`
+   * (`./harnessActivityPlan`) and `reduceActivity` (`./harnessActivityProjection`)
+   * both read straight off this array, so retained details cannot derive a
+   * plan or a coverage figure that disagrees with what the live screen showed
+   * while the run was still in progress. Absent (never `[]` written as if it
+   * were a real empty activity) for a legacy record, which has none.
+   */
+  activity?: readonly ActivityEvent[];
 }
 
 /**
@@ -161,6 +224,12 @@ export function carryRetainedResult(raw: RetainedResult | undefined): RetainedRe
     candidates: raw?.candidates,
     filesRead: raw?.filesRead,
     attachmentWarnings: raw?.attachmentWarnings,
+    completeness: raw?.completeness,
+    limitations: raw?.limitations,
+    protocolProvenance: raw?.protocolProvenance,
+    lineageId: raw?.lineageId,
+    attempt: raw?.attempt,
+    activity: raw?.activity,
   };
 }
 
@@ -223,6 +292,14 @@ export function retainedFromRun(input: {
   candidates?: CandidateBucket[];
   filesRead?: number;
   attachmentWarnings?: readonly AttachmentWarning[];
+  /** Defaults to `'complete'` — every existing caller (a finished, retained-review-replacing run) is complete by construction; a partial write (task 12.5) passes `'partial'` explicitly. */
+  completeness?: ResultCompleteness;
+  limitations?: readonly Limitation[];
+  /** Task 14.2: set only when the caller knows this came from a real harness attempt — see `RetainedResult.protocolProvenance`'s own doc comment. */
+  protocolProvenance?: ProtocolProvenance;
+  lineageId?: LineageId;
+  attempt?: AttemptNumber;
+  activity?: readonly ActivityEvent[];
 }): RetainedRecord {
   return {
     review: input.review,
@@ -237,6 +314,12 @@ export function retainedFromRun(input: {
     candidates: input.candidates,
     filesRead: input.filesRead,
     attachmentWarnings: input.attachmentWarnings,
+    completeness: input.completeness ?? 'complete',
+    limitations: input.limitations,
+    protocolProvenance: input.protocolProvenance,
+    lineageId: input.lineageId,
+    attempt: input.attempt,
+    activity: input.activity,
   };
 }
 
@@ -254,6 +337,31 @@ export interface RetainedReview<D extends RetainedRecord> {
   candidates: CandidateBucket[];
   filesRead?: number;
   attachmentWarnings: readonly AttachmentWarning[];
+  /**
+   * Task 12.5: never left ambiguous with a complete review. `readRetained`'s
+   * default (an absent value reads as `'complete'`) matches D16 for the main
+   * draft key, whose entire pre-this-change history is complete reviews by
+   * construction. A caller reading the *partial* key
+   * (`partialDraftKeyFor`/`changesetPartialDraftKeyFor`) passes
+   * `{ partial: true }` so an absent value there instead reads as `'partial'`
+   * — the direction that can never overstate completeness — rather than
+   * silently borrowing the main key's default.
+   */
+  completeness: ResultCompleteness;
+  limitations: readonly Limitation[];
+  /**
+   * Task 14.2 (design.md D16): defaults to `'legacy-one-shot'` when the raw
+   * record carries no value — every record written before this field
+   * existed predates the harness protocol, and this is the one place that
+   * inference is allowed to happen (never in storage; see
+   * `RetainedResult.protocolProvenance`).
+   */
+  protocolProvenance: ProtocolProvenance;
+  /** Absent exactly when `protocolProvenance` is `'legacy-one-shot'` — a legacy record has no lineage to report. */
+  lineageId?: LineageId;
+  attempt?: AttemptNumber;
+  /** `[]` for a legacy record — never fabricated activity for a review the harness never produced. */
+  activity: readonly ActivityEvent[];
 }
 
 /**
@@ -261,9 +369,18 @@ export interface RetainedReview<D extends RetainedRecord> {
  * it. A record written before the result fields existed carries its agent and
  * model on the `Review` it holds, so nothing about it is actually missing —
  * only differently placed.
+ *
+ * `options.partial` marks the caller as reading the separate partial key
+ * (task 12.5) rather than the main draft key — the only thing this changes
+ * is the default `completeness` for a record that (should never happen, but
+ * fails closed rather than assumed) omits it. Every partial record this
+ * module's own writer produces always sets `completeness` explicitly; this
+ * default exists only so a partial slot can never be misread as a complete
+ * review through a mere absent field.
  */
 export function readRetained<D extends RetainedRecord>(
   raw: D | undefined,
+  options: { partial?: boolean } = {},
 ): RetainedReview<D> | undefined {
   if (!raw?.review) return undefined;
   const draft = {
@@ -286,6 +403,12 @@ export function readRetained<D extends RetainedRecord>(
     candidates: raw.candidates ?? [],
     filesRead: raw.filesRead,
     attachmentWarnings: raw.attachmentWarnings ?? [],
+    completeness: raw.completeness ?? (options.partial ? 'partial' : 'complete'),
+    limitations: raw.limitations ?? [],
+    protocolProvenance: raw.protocolProvenance ?? 'legacy-one-shot',
+    lineageId: raw.lineageId,
+    attempt: raw.attempt,
+    activity: raw.activity ?? [],
   };
 }
 

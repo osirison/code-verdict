@@ -26,6 +26,33 @@ export interface ContextSettingsView {
   usageEnabled: boolean;
 }
 
+/**
+ * The reviewer-relevant slice of `HarnessPolicy` (task 17.1/17.2), in the
+ * unit the panel and `package.json` both use — seconds and megabytes, not
+ * `HarnessPolicy`'s own milliseconds and bytes. `../ui/harnessPolicyOptions.ts`
+ * (which this file never imports, staying `vscode`-free like every other
+ * settings-region view) is the one place that converts between the two and
+ * falls back per field; this view only ever holds already-normalized values.
+ */
+export interface HarnessSettingsView {
+  maxElapsedSecondsPerAttempt: number;
+  maxModelTurnsPerAttempt: number;
+  maxToolRequestsPerAttempt: number;
+  maxEvidenceMegabytesPerAttempt: number;
+  highRiskReservePercent: number;
+  verificationReservePercent: number;
+  transientRetriesPerOperation: number;
+  checkpointCadenceToolCalls: number;
+  retainedCheckpointsPerLineage: number;
+  maxActivityEventsPerAttempt: number;
+  terminalAttemptHistoryCount: number;
+  terminalAttemptHistoryMaxAgeDays: number;
+  /** Drives `RiskCoverageRules.requireInspection` through `risksAtLeast` — see `harnessPolicyOptions.ts`. 'low' is the shipped fail-closed default: every changed file must be read. */
+  requireInspectionMinRisk: 'low' | 'medium' | 'high';
+}
+
+export type HarnessNumberKey = Exclude<keyof HarnessSettingsView, 'requireInspectionMinRisk'>;
+
 export interface SettingsViewState {
   /** Platform nouns for the active pod's provider — never hardcoded here. */
   vocabulary: Vocabulary;
@@ -37,6 +64,7 @@ export interface SettingsViewState {
   digestCadence: DigestCadence;
   shareRates: boolean;
   context: ContextSettingsView;
+  harness: HarnessSettingsView;
   notifications: NotificationSettingView[];
   /** Where `*.agent.md` definitions are searched, and what each one yielded. */
   agentLocations: AgentLocationView[];
@@ -87,6 +115,8 @@ export type SettingsMessage =
     key: 'includeTitle' | 'includeDescription' | 'includeLinkedItems' | 'usageEnabled';
     value: boolean;
   }
+  | { type: 'setHarnessNumber'; key: HarnessNumberKey; value: number }
+  | { type: 'setHarnessMinRisk'; value: HarnessSettingsView['requireInspectionMinRisk'] }
   | { type: 'addAgentLocation' }
   | { type: 'removeAgentLocation'; label: string }
   | { type: 'openSettingsJson' };
@@ -212,6 +242,117 @@ function contextRegion(state: SettingsViewState): string {
     </section>`;
 }
 
+/** One row per `HARNESS_POLICY_SETTINGS` entry (`harnessPolicyOptions.ts`) — key, label, hint, and input bounds, so `min`/`max` on the input always match what `normalizeHarnessPolicy` actually accepts (task 17.2: no hardcoded `> 0` that would make 0 impossible to enter for a field that allows it). */
+/**
+ * Exported only so `harnessPolicyOptions.test.ts` can assert this list and
+ * `HARNESS_POLICY_SETTINGS` name exactly the same settings. Without that,
+ * adding a setting to one and not the other ships a value with no control,
+ * or a control writing a key nothing reads — neither of which fails loudly.
+ */
+export const HARNESS_NUMBER_FIELDS: ReadonlyArray<{
+  key: HarnessNumberKey;
+  label: string;
+  hint: string;
+  min: number;
+  max?: number;
+}> = [
+  {
+    key: 'maxElapsedSecondsPerAttempt',
+    label: 'Time limit per attempt',
+    hint: 'Maximum seconds one review attempt may run before it must stop and report what it has.',
+    min: 1,
+  },
+  {
+    key: 'maxModelTurnsPerAttempt',
+    label: 'Model turns per attempt',
+    hint: 'Maximum back-and-forth turns with the model in one attempt.',
+    min: 1,
+  },
+  {
+    key: 'maxToolRequestsPerAttempt',
+    label: 'Tool requests per attempt',
+    hint: 'Maximum reads, diffs, and searches one attempt may issue in total.',
+    min: 1,
+  },
+  {
+    key: 'maxEvidenceMegabytesPerAttempt',
+    label: 'Evidence held per attempt',
+    hint: 'Maximum cited evidence content, in megabytes, one attempt holds at once.',
+    min: 1,
+  },
+  {
+    key: 'highRiskReservePercent',
+    label: 'High-risk investigation reserve',
+    hint: 'Percent of the attempt held back for host-identified high-risk files the model did not pick to investigate.',
+    min: 0,
+    max: 100,
+  },
+  {
+    key: 'verificationReservePercent',
+    label: 'Final verification reserve',
+    hint: 'Percent of the attempt held back for final verification before completion.',
+    min: 0,
+    max: 100,
+  },
+  {
+    key: 'transientRetriesPerOperation',
+    label: 'Retries after a transient error',
+    hint: 'How many times a failed tool call or model turn is retried before giving up.',
+    min: 0,
+  },
+  {
+    key: 'checkpointCadenceToolCalls',
+    label: 'Checkpoint cadence',
+    hint: 'Tool calls between checkpoints, in addition to one taken at every phase boundary.',
+    min: 1,
+  },
+  {
+    key: 'retainedCheckpointsPerLineage',
+    label: 'Retained checkpoints',
+    hint: 'How many checkpoints are kept for one review\'s resume history.',
+    min: 1,
+  },
+  {
+    key: 'maxActivityEventsPerAttempt',
+    label: 'Activity log length',
+    hint: 'How many activity entries one attempt keeps before the oldest are dropped.',
+    min: 1,
+  },
+  {
+    key: 'terminalAttemptHistoryCount',
+    label: 'Attempt history kept',
+    hint: 'How many finished attempts are kept in history per review target.',
+    min: 1,
+  },
+  {
+    key: 'terminalAttemptHistoryMaxAgeDays',
+    label: 'Attempt history age limit',
+    hint: 'Days a finished attempt\'s history is kept before it is pruned regardless of count.',
+    min: 1,
+  },
+];
+
+const MIN_RISK_LEVELS: ReadonlyArray<{ value: HarnessSettingsView['requireInspectionMinRisk']; label: string }> = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+];
+
+function harnessRegion(state: SettingsViewState): string {
+  const rows = HARNESS_NUMBER_FIELDS.map((field) => `<div class="context-setting">
+        <label class="notification-copy" for="harness-${field.key}"><span class="notification-name">${escapeHtml(field.label)}</span><span class="hint">${escapeHtml(field.hint)}</span></label>
+        <input class="input number-input" id="harness-${field.key}" data-harness-number="${field.key}" type="number" min="${field.min}"${field.max !== undefined ? ` max="${field.max}"` : ''} step="1" value="${state.harness[field.key]}">
+      </div>`).join('');
+  return `<section class="section"><div class="label">Harness</div>
+      <p class="subnote">Limits for how much work one review attempt does, and how much of its history is kept afterward.</p>
+      ${rows}
+      <div class="context-setting">
+        <label class="notification-copy"><span class="notification-name">Inspection required from</span><span class="hint">The lowest risk level that must actually be read, not just classified, before a review can be marked complete. Medium (the default) requires every file classified medium or high risk to be read; low-risk files — documentation, specifications, generated output — can be skipped, and real source code is never classified low. Low requires every changed file, regardless of risk, to be read.</span></label>
+        <div class="segments">${MIN_RISK_LEVELS.map((level) => `<button class="${state.harness.requireInspectionMinRisk === level.value ? 'active' : ''}" data-min-risk="${level.value}">${level.label}</button>`).join('')}</div>
+      </div>
+    </section>`;
+}
+
 function privacyRegion(state: SettingsViewState): string {
   const e = escapeHtml;
   return `<section class="section"><div class="label">Data &amp; privacy</div>
@@ -234,6 +375,19 @@ function jsonPreviewRegion(state: SettingsViewState): string {
     'codeVerdict.context.includeDescription': state.context.includeDescription,
     'codeVerdict.context.includeLinkedItems': state.context.includeLinkedItems,
     'codeVerdict.contextUsage.enabled': state.context.usageEnabled,
+    'codeVerdict.harness.maxElapsedSecondsPerAttempt': state.harness.maxElapsedSecondsPerAttempt,
+    'codeVerdict.harness.maxModelTurnsPerAttempt': state.harness.maxModelTurnsPerAttempt,
+    'codeVerdict.harness.maxToolRequestsPerAttempt': state.harness.maxToolRequestsPerAttempt,
+    'codeVerdict.harness.maxEvidenceMegabytesPerAttempt': state.harness.maxEvidenceMegabytesPerAttempt,
+    'codeVerdict.harness.highRiskReservePercent': state.harness.highRiskReservePercent,
+    'codeVerdict.harness.verificationReservePercent': state.harness.verificationReservePercent,
+    'codeVerdict.harness.transientRetriesPerOperation': state.harness.transientRetriesPerOperation,
+    'codeVerdict.harness.checkpointCadenceToolCalls': state.harness.checkpointCadenceToolCalls,
+    'codeVerdict.harness.retainedCheckpointsPerLineage': state.harness.retainedCheckpointsPerLineage,
+    'codeVerdict.harness.maxActivityEventsPerAttempt': state.harness.maxActivityEventsPerAttempt,
+    'codeVerdict.harness.terminalAttemptHistoryCount': state.harness.terminalAttemptHistoryCount,
+    'codeVerdict.harness.terminalAttemptHistoryMaxAgeDays': state.harness.terminalAttemptHistoryMaxAgeDays,
+    'codeVerdict.harness.requireInspectionMinRisk': state.harness.requireInspectionMinRisk,
     'codeVerdict.shareAcceptRejectRates': state.shareRates,
   }, null, 2);
   return `<section class="section"><div class="settings-head"><span class="label">settings.json</span><button class="link" id="open-json">Open in editor</button></div>
@@ -246,6 +400,7 @@ export const SETTINGS_REGION_IDS = [
   'set-notifications',
   'set-agents',
   'set-context',
+  'set-harness',
   'set-privacy',
   'set-json',
 ] as const;
@@ -259,6 +414,7 @@ export function renderSettingsRegions(state: SettingsViewState): Record<Settings
     'set-notifications': notificationsRegion(state),
     'set-agents': agentsRegion(state),
     'set-context': contextRegion(state),
+    'set-harness': harnessRegion(state),
     'set-privacy': privacyRegion(state),
     'set-json': jsonPreviewRegion(state),
   };
@@ -311,6 +467,22 @@ const SCRIPT = `
   document.addEventListener('click', (ev) => {
     const el = ev.target.closest('#share-rates');
     if (el) post({ type: 'setShareRates', value: el.dataset.checked !== 'true' });
+  });
+  document.addEventListener('change', (ev) => {
+    const input = ev.target.closest('[data-harness-number]');
+    if (!input) return;
+    const value = Number(input.value);
+    // Bounds come from the input's own min/max (set per field in harnessRegion — task 17.2),
+    // not a hardcoded '> 0': several harness fields (retries, both reserve percents) allow 0.
+    const min = input.min === '' ? -Infinity : Number(input.min);
+    const max = input.max === '' ? Infinity : Number(input.max);
+    if (Number.isFinite(value) && value >= min && value <= max) {
+      post({ type: 'setHarnessNumber', key: input.dataset.harnessNumber, value });
+    }
+  });
+  document.addEventListener('click', (ev) => {
+    const button = ev.target.closest('[data-min-risk]');
+    if (button) post({ type: 'setHarnessMinRisk', value: button.dataset.minRisk });
   });
   on('open-json', 'openSettingsJson');
   on('add-location', 'addAgentLocation');

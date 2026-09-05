@@ -8,18 +8,33 @@ import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
 import { deleteTokenIfUnused } from './app/storage';
 import { repoIdsOf } from './app/podQuery';
-import type { PodSource } from './domain/types';
-import { getProvider, listRealProviders, tryGetProvider } from './platform/registry';
+import type { Pod, PodSource } from './domain/types';
+import { getProvider, listRealProviders } from './platform/registry';
 import { repoCountOf } from './ui/vocab';
 import { ReviewHistory } from './app/reviewHistory';
 import { ReviewRunStore } from './app/reviewRuns';
-import { ReviewRunManager, sweepInterruptedRuns, type RunInput, type RunnerOptions } from './app/reviewRunManager';
-import { pruneClosedRetained } from './app/retainedReview';
+import { ReviewRunManager } from './app/reviewRunManager';
+import { isTerminalLifecycle } from './domain/harnessLifecycle';
+import { pruneClosedRetained, runKeyForChangeset, runKeyForCr } from './app/retainedReview';
 import { RunStatusGate } from './app/runStatusGate';
-import { runDemoAgent } from './app/demoAgent';
-import { runDemoChangesetAgent } from './app/combinedAgent';
 import { revalidateAttachments } from './app/attachments';
-import { runLmAgent, runLmChangesetAgent } from './app/lmAgent';
+import { countPromptTokens, discoverModels, runHarnessModelTurn } from './app/lmAgent';
+import { createHarnessRunStore } from './app/harnessRunStore';
+import {
+  buildAttemptDiagnosticsReport,
+  buildDiagnosticsNotFoundReport,
+  renderAttemptDiagnosticsText,
+  renderDiagnosticsNotFoundText,
+  type DiagnosticsNotFoundReason,
+  type DiagnosticsSourceRecord,
+} from './app/harnessDiagnostics';
+import {
+  findRecentDiagnosticsCandidates,
+  summarizeDiagnosticsDiscovery,
+  type DiagnosticsCandidate,
+  type IdentifyDiagnosticsTarget,
+} from './app/harnessDiagnosticsSource';
+import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './app/harnessRuntime';
 import { getDebugAuthBypass } from './debugAuth';
 import { setSessionProvider } from './app/connections';
 import { setApiTraceSink } from './app/apiTrace';
@@ -35,12 +50,28 @@ import { ReviewFlowPanel } from './ui/reviewFlow';
 import { SettingsPanel } from './ui/settings';
 import { VerdictSidebarProvider, VerdictStatusBar } from './ui/sidebar';
 import type { SidebarActiveReview, SidebarPendingReview, SidebarThreads } from './ui/sidebarHtml';
+import { toSidebarActiveRuns } from './ui/sidebarState';
 import { createDemoPod } from './app/demoPod';
 import { TuningPanel } from './ui/tuning';
 import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
 import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
+import { readHarnessCoverageRules, readHarnessPolicy } from './ui/harnessPolicyOptions';
+
+/** `codeVerdict.showRunDiagnostics`'s secondary notification for a not-found report — short, pointing at the channel for the real detail, never a replacement for it. */
+function hintForNotFound(reason: DiagnosticsNotFoundReason): string {
+  switch (reason.kind) {
+    case 'noPodConnected':
+      return 'connect first — run "Verdict: Sign in".';
+    case 'noMatchingRuns':
+      return 'no run matched the active pod.';
+    case 'pickerDismissed':
+      return 'no run was chosen.';
+    case 'resolutionFailed':
+      return 'looking up runs for this pod failed.';
+  }
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   registerBuiltInProviders();
@@ -52,8 +83,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const apiTraceChannel = vscode.window.createOutputChannel('Verdict: API');
   const apiTracingEnabled = (): boolean =>
     vscode.workspace.getConfiguration('codeVerdict').get<boolean>('trace.api', false);
+  // "Verdict: Show API trace" itself has no early return that skips `show(true)` — unlike run
+  // diagnostics, this command was never silently producing nothing. But an empty channel with the
+  // explanation living only in a notification the reviewer can miss is the same shape of confusion,
+  // so a request never yet traced still gets one line in the channel, not only a toast. Tracked here
+  // rather than read back off the channel (`vscode.OutputChannel` has no such read), and only ever
+  // set, never cleared — this channel is a running log across the whole session, never `clear()`-ed.
+  let apiTraceHasEverEmitted = false;
   const applyApiTraceSetting = (): void => {
-    setApiTraceSink(apiTracingEnabled() ? apiTraceChannel : undefined);
+    setApiTraceSink(
+      apiTracingEnabled()
+        ? {
+            appendLine: (line: string) => {
+              apiTraceHasEverEmitted = true;
+              apiTraceChannel.appendLine(line);
+            },
+          }
+        : undefined,
+    );
   };
   applyApiTraceSetting();
   context.subscriptions.push(
@@ -62,6 +109,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // points at; drop it with the channel rather than leave a disposed one wired.
     new vscode.Disposable(() => setApiTraceSink(undefined)),
   );
+
+  // House style of the API trace channel above: created whether or not there is
+  // anything to show yet, so "Verdict: Show run diagnostics" always has a place
+  // to reveal its output.
+  const runDiagnosticsChannel = vscode.window.createOutputChannel('Verdict: Run diagnostics');
+  context.subscriptions.push(runDiagnosticsChannel);
 
   // The session bridge: `connections.ts` stays vscode-free, so the editor's
   // account API is injected here. A provider that declares the 'session' mode
@@ -102,18 +155,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     baseSeconds: () => readPollIntervalSeconds(),
   });
 
-  // Before anything paints. A `vscode.lm` stream cannot be reattached after the
-  // extension host stops, so whatever was running when the last window closed is
-  // gone; recording it as interrupted is how the change request avoids reading
-  // exactly as it would have if no review had ever been started on it.
-  void sweepInterruptedRuns(context.globalState);
+  /**
+   * The last lifecycle seen per run, so a progress emission — four a second
+   * on a streaming run — cannot be mistaken for a state change. Task 14.4:
+   * keyed on `record.lifecycle` rather than the coarser legacy `status`
+   * (`planning`/`investigating`/`verifying`/`completing` all collapse to
+   * one `'running'` status) — the dashboard row's pill now names the live
+   * phase, so a phase advance that used to repaint nothing now refreshes
+   * the row that phase actually belongs to. `RunStatusGate` (task 10.1)
+   * extracted the guard so it is unit-testable on its own; it is generic so
+   * this lifecycle-keyed use and its own `RunStatus`-keyed test share one
+   * implementation.
+   */
+  const runStatusGate = new RunStatusGate(isTerminalLifecycle);
 
   /**
-   * The last status seen per run, so a progress emission — four a second on a
-   * streaming run — cannot be mistaken for a state change (`RunStatusGate`,
-   * task 10.1: extracted so the guard below is unit-testable on its own).
+   * The harness's own bounded store (task 11.1), built once here over the
+   * same `context.globalState` `ReviewRunManager` already reads its own
+   * internal copy from (see that module's `harnessRunStore` field doc
+   * comment — the two instances share every underlying key, so a checkpoint
+   * written through this one is exactly what the manager's activation sweep
+   * below, and any future resume compatibility check, finds). Nothing on the
+   * live execution path wrote a checkpoint here before this pass (task
+   * 15.7) — the sweep and resume compatibility had no production data.
    */
-  const runStatusGate = new RunStatusGate();
+  const harnessRunStore = createHarnessRunStore(context.globalState, { now: () => Date.now() });
+
+  /**
+   * The real `ReviewHarnessFactory` (task 15.7, the runtime cutover):
+   * assembles a live `ReviewRunSnapshot`, a provider-backed tool dispatcher
+   * (through `harnessAttempt.ts`'s own `createHostToolDispatcher` wiring),
+   * the real model seam (`./app/harnessModelSeam.ts`, over
+   * `runHarnessModelTurn`'s existing streaming/cancellation path), and the
+   * real synthesis/verification collaborator — every collaborator built and
+   * tested in sections 1-14, assembled for the first time. Every shipped
+   * entry point (built-in agent, discovered agent, demo agent, individual
+   * review, changeset review, first run, rerun) reaches a review only
+   * through `runManager.trigger`, which drives this one factory — there is
+   * no shipped path left that reaches the deprecated one-shot runners (task
+   * 10.8) — the old `{lm, demo}` compatibility shape `reviewRunManager.ts`
+   * still accepts remains only that module's own test fixture.
+   */
+  const harnessRuntimeDeps: HarnessRuntimeDeps = {
+    podStore,
+    secrets,
+    discoverModel: async (modelId) => (await discoverModels()).find((model) => model.id === modelId),
+    countTokens: (modelId, text) => countPromptTokens(modelId, text),
+    runTurn: (modelId, prompt, options) => runHarnessModelTurn(modelId, prompt, options),
+    revalidateAttachments,
+    harnessRunStore,
+    // Getters, not values read once at activation: `harnessRuntime.ts`'s own
+    // `HarnessRuntimeDeps.policy`/`riskCoverageRules` doc comment says these
+    // are read fresh per attempt built, so a setting changed in the settings
+    // panel applies to the reviewer's next run without a window reload.
+    get policy() {
+      return readHarnessPolicy();
+    },
+    get riskCoverageRules() {
+      return readHarnessCoverageRules();
+    },
+  };
 
   /**
    * Runs live here, for the window's lifetime — not on the panel that started
@@ -123,79 +224,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const runManager = new ReviewRunManager({
     workspaceState: context.workspaceState,
     globalState: context.globalState,
-    runners: {
-      lm: (input: RunInput, options: RunnerOptions) =>
-        input.target.kind === 'cr'
-          ? runLmAgent(
-              input.agent,
-              input.modelId ?? '',
-              input.target.diff,
-              input.criteria,
-              input.target.reviewContext,
-              {
-                ...options,
-                attachments: input.target.attachments,
-                contextBudgets: input.contextBudgets,
-                effort: input.effort,
-                workspaceRootLabel: input.target.workspaceRootLabel,
-              },
-            )
-          : runLmChangesetAgent(input.agent, input.modelId ?? '', input.target.members, input.criteria, {
-              ...options,
-              contextBudgets: input.contextBudgets,
-              effort: input.effort,
-            }),
-      demo: async (input: RunInput) => {
-        if (input.target.kind === 'cr') {
-          const validated = await revalidateAttachments(input.target.attachments ?? []);
-          return {
-            ...runDemoAgent(input.target.diff, input.criteria, {
-              attachments: validated.attachments,
-              workspaceRootLabel: input.target.workspaceRootLabel,
-            }),
-            attachmentWarnings: validated.warnings,
-          };
-        }
-        const validated = await Promise.all(input.target.members.map(async (member) => {
-          const result = await revalidateAttachments(member.attachments ?? []);
-          return { member: { ...member, attachments: result.attachments }, warnings: result.warnings };
-        }));
-        return {
-          ...runDemoChangesetAgent(
-            validated.map((result) => result.member),
-            input.criteria,
-            tryGetProvider(podStore.list().find((pod) => pod.id === input.podId)?.providerId ?? '')?.vocabulary,
-          ),
-          attachmentWarnings: validated.flatMap((result) => result.warnings),
-        };
-      },
-    },
+    runners: createReviewHarnessFactory(harnessRuntimeDeps),
     onChange: (record) => {
-      // The run list and the status-bar count read live run state, so one
-      // fan-out keeps them from drifting apart. Both are cheap: local state,
-      // rendered into a webview.
+      // The run list and the status bar's runs segment both read live run
+      // state, so one fan-out keeps them from drifting apart — both are
+      // cheap: local state, rendered into a webview or a native status bar
+      // item. Task 14.3/14.5 (design.md D14): the same `RunProjection`
+      // mapping (`toSidebarActiveRuns`) feeds both, computed once — not a
+      // second, call-site-local read of `RunRecord` for the status bar.
       const active = runManager.active();
-      sidebar.setActiveRuns(
-        active.map((run) => ({
-          key: run.key,
-          label: run.input.refLabel,
-          state: run.status === 'queued' ? ('queued' as const) : ('running' as const),
-          elapsedMs: Date.now() - (run.startedAt ?? run.queuedAt),
-        })),
-      );
-      statusBar.setActiveRuns(active.filter((run) => run.status === 'running').length);
+      const activeRuns = toSidebarActiveRuns(active);
+      sidebar.setActiveRuns(activeRuns);
+      statusBar.setActiveRuns(activeRuns);
 
       // The dashboard is NOT cheap: `refreshIfOpen` refetches the whole pod.
       // Progress arrives at the 250 ms floor, so refreshing on every emission
       // would issue four platform fetches a second per streaming run — worse
-      // than the burst the notifier's focus throttle exists to prevent. Only a
-      // status change moves a row's pill, so only a status change refreshes.
-      if (!runStatusGate.changed(record.key, record.status)) return;
+      // than the burst the notifier's focus throttle exists to prevent. Only
+      // a lifecycle change moves a row's pill, so only a lifecycle change
+      // refreshes (task 14.4: the dashboard now names the live phase, not
+      // only queued-vs-running, so a phase advance must refresh too).
+      if (!runStatusGate.changed(record.key, record.lifecycle)) return;
       void DashboardPanel.refreshIfOpen();
     },
     onRunRecorded: () => repaintReviewSurfaces(),
     onReviewReady: (info) => notifier.reviewReady(info),
+    // Task 14.7: the `failed`/`cancelled` counterpart to `onReviewReady` —
+    // `onReviewReady` already covers `succeeded` (complete or partial).
+    onRunOutcome: (info) => notifier.runEnded(info),
   });
+
+  // Before anything paints. A `vscode.lm` stream cannot be reattached after the
+  // extension host stops, so whatever was running when the last window closed is
+  // gone; recording it as interrupted is how the change request avoids reading
+  // exactly as it would have if no review had ever been started on it. The
+  // promise is captured (task 14.7), not fired-and-forgotten, so the summary
+  // notification below can be raised once `notifier` exists further down —
+  // the sweep itself still starts at this exact point in activation, now
+  // through the manager's own `sweepInterrupted` (task 15.7) so it consults
+  // the same `harnessRunStore` a live run actually wrote checkpoints into,
+  // not just the crude in-flight marker `sweepInterruptedRuns` always had on
+  // its own (see that function's own doc comment on what an empty store gave
+  // it before this pass).
+  const interruptedSweep = runManager.sweepInterrupted();
 
   const changesetOptions = () => changesetDetectionOptions(context.globalState, podStore.activePod?.id);
 
@@ -400,12 +471,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const dashboardDeps: DashboardDeps = {
     submittedRefs: () => reviewHistory.submittedRefs(),
     reviewRuns: () => reviewRuns.byRef(),
-    activeRuns: () =>
-      new Map(
-        runManager
-          .active()
-          .map((record) => [record.key, record.status === 'queued' ? ('queued' as const) : ('running' as const)]),
-      ),
+    // Task 14.4 (design.md D14): the manager's own per-target projection —
+    // `activeByKey` is "keyed for the dashboard, which already looks its
+    // rows up this way" (its own doc comment) — never a dashboard-local
+    // `'running' | 'queued'` collapse that reported every phase the same.
+    activeRuns: () => new Map([...runManager.activeByKey()].map(([key, record]) => [key, record.projection])),
     onPodChanged: () => sidebar.refresh(),
     pruneRetained: (repoIds, openRefs) =>
       void pruneClosedRetained(context.workspaceState, repoIds, openRefs),
@@ -454,6 +524,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       { title: 'Verdict: reviews running', placeHolder: 'Pick one to cancel it' },
     );
     if (picked) runManager.cancel(picked.key);
+  };
+
+  /**
+   * `codeVerdict.showRunDiagnostics`'s disk-fallback scoping: which of `HarnessRunStore`'s
+   * lineages belong to the pod currently active, and what to call each one — the same repo
+   * membership `repoIdsOf` already answers for a live fetch, and the same `vocabulary.formatCrRef`
+   * every other ref label in this file already reuses (`switchPod`, `showActiveRuns`'s own
+   * `record.input.refLabel` was built with it too, upstream in `ui/*.ts`).
+   */
+  const identifyDiagnosticsTargetForPod = (pod: Pod): IdentifyDiagnosticsTarget => {
+    const repoIds = new Set(repoIdsOf(pod));
+    const vocabulary = getProvider(pod.providerId).vocabulary;
+    return (snapshot) => {
+      const members = snapshot.members.filter(
+        (member) => member.providerId === pod.providerId && member.instanceUrl === pod.instanceUrl && repoIds.has(member.ref.repoId),
+      );
+      const first = members[0];
+      if (!first) return undefined; // no member of this snapshot belongs to the active pod
+      if (snapshot.targetKind === 'cr') {
+        return { targetKey: runKeyForCr(first.ref), refLabel: vocabulary.formatCrRef(first.ref.number) };
+      }
+      return {
+        targetKey: runKeyForChangeset(snapshot.changesetId ?? snapshot.lineageId),
+        refLabel: members.map((member) => vocabulary.formatCrRef(member.ref.number)).join(' · '),
+      };
+    };
   };
 
   const bootstrapFromDebugBypass = async (): Promise<void> => {
@@ -680,9 +776,183 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // usually while something else is failing.
       apiTraceChannel.show(true);
       if (!apiTracingEnabled()) {
+        // The channel gets its own line, not only the notification below: a toast can be missed,
+        // and an empty panel with no explanation in it is exactly the confusion run diagnostics had.
+        if (!apiTraceHasEverEmitted) {
+          apiTraceHasEverEmitted = true;
+          apiTraceChannel.appendLine('Verdict: API tracing is off, so nothing has been recorded yet. Switch on "codeVerdict.trace.api" and the next request will appear here.');
+        }
         void vscode.window.showInformationMessage(
           'Verdict: API tracing is off — switch on "codeVerdict.trace.api" and the next request appears here.',
         );
+      } else if (!apiTraceHasEverEmitted) {
+        apiTraceHasEverEmitted = true;
+        apiTraceChannel.appendLine('Verdict: API tracing is on — no request has been made yet this session.');
+      }
+    },
+    /**
+     * Two previous fixes here changed *what the command resolves*; neither was the actual bug. The
+     * old shape returned early — with only a transient notification — the moment resolution could
+     * not find a target, a picker was dismissed, or a pod was not connected, leaving the channel
+     * unwritten and unshown: an empty panel with no explanation the reviewer could act on.
+     *
+     * The fix is structural, not another resolution tweak: every branch below sets exactly one of
+     * `record` (a found attempt) or `notFound` (a `DiagnosticsNotFoundReport` naming why nothing was
+     * found, `harnessDiagnostics.ts`'s own sibling of the found-report builder/renderer) — and there
+     * is exactly one place, after the branching, that clears, writes, and shows the channel. No path
+     * through this handler can reach that point having written nothing, because nothing before it
+     * returns early.
+     */
+    [COMMANDS.showRunDiagnostics]: async () => {
+      const now = () => new Date().toISOString();
+      const openReviewPanelsCount = (): number => (ReviewFlowPanel.isOpen() ? 1 : 0) + (ChangesetReviewPanel.isOpen() ? 1 : 0);
+      let record: DiagnosticsSourceRecord | undefined;
+      let notFound: ReturnType<typeof buildDiagnosticsNotFoundReport> | undefined;
+
+      try {
+        // Whichever review panel is open, single-CR or changeset, still holding its own live
+        // `RunRecord` — mirrors the "no active review" fallback the palette's other review-tab
+        // commands already use. This is the freshest source there is (a live `CheckpointInfo`, and
+        // `completionEvaluation`/`failure`, neither of which is ever persisted), but it is gone the
+        // moment a run ends and its panel is closed, dismissed, or the window reloads — exactly when
+        // diagnostics are actually wanted (`harnessDiagnosticsSource.ts`'s own file header).
+        record = ReviewFlowPanel.activeRunRecord() ?? ChangesetReviewPanel.activeRunRecord();
+
+        if (!record) {
+          const openReviewPanels = openReviewPanelsCount();
+          const pod = podStore.activePod;
+
+          if (!pod) {
+            notFound = buildDiagnosticsNotFoundReport(
+              {
+                reason: { kind: 'noPodConnected' },
+                openReviewPanels,
+                // No pod to match lineages against — `identify` omitted, never a fabricated match count.
+                discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), harnessRunStore.listLineages()),
+              },
+              now,
+            );
+          } else {
+            const identify = identifyDiagnosticsTargetForPod(pod);
+            const lineages = harnessRunStore.listLineages();
+            const candidates = findRecentDiagnosticsCandidates(lineages, identify);
+            const podIdentity = { name: pod.name, providerId: pod.providerId, instanceUrl: pod.instanceUrl };
+
+            if (candidates.length === 0) {
+              notFound = buildDiagnosticsNotFoundReport(
+                {
+                  reason: { kind: 'noMatchingRuns' },
+                  pod: podIdentity,
+                  openReviewPanels,
+                  discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), lineages, identify),
+                },
+                now,
+              );
+            } else {
+              let chosen: DiagnosticsCandidate = candidates[0]!;
+              if (candidates.length > 1) {
+                const picked = await vscode.window.showQuickPick(
+                  candidates.map((candidate) => ({
+                    label: candidate.refLabel,
+                    description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
+                    candidate,
+                  })),
+                  { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on?' },
+                );
+                if (!picked) {
+                  // Dismissed rather than silently returning: the picker only ever appears once a
+                  // real choice existed, so the channel names what was on offer.
+                  notFound = buildDiagnosticsNotFoundReport(
+                    {
+                      reason: { kind: 'pickerDismissed', offered: candidates },
+                      pod: podIdentity,
+                      openReviewPanels,
+                      discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), lineages, identify),
+                    },
+                    now,
+                  );
+                } else {
+                  chosen = picked.candidate;
+                }
+              }
+
+              if (!notFound) {
+                // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle`
+                // only ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure,
+                // the exact shape of this bug, so still has the fuller live record in memory even
+                // though no panel is showing it. Preferred only when it is still the *same* attempt
+                // the disk resolved, so a different, newer run in flight for this target is never
+                // silently substituted for the one the reviewer picked.
+                const live = runManager.get(chosen.targetKey);
+                record = live && live.lineageId === chosen.lineageId && live.attempt === chosen.attempt ? live : chosen.record;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // A target can throw while resolving (an unregistered provider, a malformed pod) — the one
+        // failure mode none of the branches above name. The channel still gets something rather than
+        // nothing: `Error.message` only, never a stack trace, never the thrown value's full shape.
+        //
+        // Every value gathered here is read defensively and on its own: whatever just threw could be
+        // any of `podStore.activePod`, a panel's `isOpen`, or the run store, so none of those reads
+        // may be trusted un-guarded a second time — an exception escaping this catch block would
+        // reach the caller with the channel still unwritten, resurrecting the exact bug this fix
+        // exists to close, only on a rarer path.
+        record = undefined;
+        let pod: { name: string; providerId: string; instanceUrl: string } | undefined;
+        try {
+          const active = podStore.activePod;
+          if (active) pod = { name: active.name, providerId: active.providerId, instanceUrl: active.instanceUrl };
+        } catch {
+          // Stays undefined — an honest "could not even tell if a pod is connected", never a guess.
+        }
+        let openReviewPanels = 0;
+        try {
+          openReviewPanels = openReviewPanelsCount();
+        } catch {
+          // Stays 0.
+        }
+        let discovery: ReturnType<typeof summarizeDiagnosticsDiscovery> = { totalLineageKeys: 0, unparsedLineageKeys: 0, parsedLineages: 0, rejected: [] };
+        try {
+          // No `identify` here even when `pod` resolved above: reaching this catch means resolution
+          // itself is untrustworthy, so a per-pod match count would risk compounding one failure into
+          // a second, fabricated one. Same reasoning `summarizeDiagnosticsDiscovery`'s own `identify`
+          // parameter being optional already encodes for "no pod to match against".
+          discovery = summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), harnessRunStore.listLineages());
+        } catch {
+          // Stays all-zero — `unparsedLineageKeys`/`parsedLineages` both 0 keeps the report's own
+          // arithmetic invariant (`unparsedLineageKeys === totalLineageKeys - parsedLineages`) true
+          // rather than mixing a real count with two fabricated zeroes.
+        }
+
+        notFound = buildDiagnosticsNotFoundReport(
+          { reason: { kind: 'resolutionFailed', message: e instanceof Error ? e.message : String(e) }, pod, openReviewPanels, discovery },
+          now,
+        );
+      }
+
+      // The one place either report reaches the channel — every branch above set exactly one of
+      // `record`/`notFound`, and none of them may skip past this.
+      runDiagnosticsChannel.clear();
+      if (record) {
+        const report = buildAttemptDiagnosticsReport(record, now);
+        runDiagnosticsChannel.appendLine(renderAttemptDiagnosticsText(report));
+        runDiagnosticsChannel.show(true);
+        // The interesting cases are long — offered, never forced, so a quick
+        // glance at the channel above never waits on this prompt.
+        const choice = await vscode.window.showInformationMessage('Verdict: run diagnostics ready.', 'Save as JSON…');
+        if (choice === 'Save as JSON…') {
+          const uri = await vscode.window.showSaveDialog({
+            filters: { JSON: ['json'] },
+            defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
+          });
+          if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
+        }
+      } else {
+        runDiagnosticsChannel.appendLine(renderDiagnosticsNotFoundText(notFound!));
+        runDiagnosticsChannel.show(true);
+        void vscode.window.showInformationMessage(`Verdict: ${hintForNotFound(notFound!.reason)} See the "Verdict: Run diagnostics" channel for detail.`);
       }
     },
   };
@@ -783,6 +1053,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     notifier,
   );
   notifier.start();
+  // Task 14.7: one summary notification for whatever the activation sweep
+  // above closed as interrupted — never one toast per target, and never
+  // ahead of `notifier` existing to raise it.
+  void interruptedSweep.then((count) => notifier.runsInterrupted(count));
 
   // F5 with the debug env vars set (see .vscode/launch.json): skip
   // onboarding entirely and land on a populated dashboard. Fire and
