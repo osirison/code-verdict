@@ -58,7 +58,7 @@ The repo cannot prove a keybinding fires; only the Extension Development Host ca
 - [x] 7.1 `docs/ARCHITECTURE.md:200` — "Every keybinding stays scoped to `when: verdict.reviewFocus`, so single letters never steal typing elsewhere" is now wrong twice. Replace it with the two-layer rule: the editor layer publishes only modifier chords and scopes triage to the triage screen; the webview layer owns the plain keys and is the only layer that can see where the cursor is.
 - [x] 7.2 `spec/README.md` §12 — the key caps in the overlay description and the header line "shortcuts apply when the review tab has focus".
 - [x] 7.3 `spec/specs/Code Verdict - developer handoff.md:171` — "`A` accept … Bind under `when: verdict.reviewFocus`".
-- [ ] 7.4 A journal entry under `~/fedora/journal/code-verdict/` on why every two- and three-key modifier family was unusable and what the two-layer split buys.
+- [x] 7.4 A journal entry under `~/fedora/journal/code-verdict/` on why every two- and three-key modifier family was unusable and what the two-layer split buys.
 
 ## 8. Correct the overlay's unimplemented rows (droppable)
 

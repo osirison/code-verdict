@@ -1611,6 +1611,30 @@ describe('the triage keyboard map is scoped to the triage screen and to not-typi
     }
   });
 
+  it('is inert on the loading first paint, which carries no marker at all', () => {
+    // renderReviewFlowLoadingHtml builds its own #flow-body without going
+    // through renderReviewFlowBody, so there is no marker to read. Absent must
+    // fail closed, not open.
+    const posted: unknown[] = [];
+    const virtualConsole = new VirtualConsole();
+    const html = renderReviewFlowLoadingHtml({ refLabel: '!2841', projectPath: 'core' }, 'nonce123');
+    expect(html).not.toContain('<span hidden data-flow-screen=');
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously',
+      virtualConsole,
+      beforeParse(window) {
+        (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+          postMessage: (message: unknown) => posted.push(message),
+        });
+      },
+    });
+    posted.length = 0;
+    dom.window.document.body.dispatchEvent(
+      new dom.window.KeyboardEvent('keydown', { key: 'j', bubbles: true }),
+    );
+    expect(moves(posted)).toEqual([]);
+  });
+
   it('goes inert when a region patch moves the page off triage', () => {
     // The regression the container-attribute version would have shipped.
     const { dom, posted } = flowPage('triage');
