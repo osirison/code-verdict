@@ -6,9 +6,9 @@ Defines what the product binds to the keyboard and what has to be true before a 
 
 ### Requirement: A published shortcut carries a modifier the editor does not otherwise use
 
-Every keyboard shortcut the extension publishes to the editor SHALL require a modifier combination that the editor does not bind by default on any supported platform. No published shortcut SHALL be a bare key, and no published shortcut SHALL be a key plus Shift alone, because both are keys a reviewer types.
+Every keyboard shortcut the extension publishes to the editor SHALL require a modifier combination chosen because the editor's own defaults leave it substantially free on every supported platform. No published shortcut SHALL be a bare key, and no published shortcut SHALL be a key plus Shift alone, because both are keys a reviewer types.
 
-The modifier combination SHALL be identical for every triage action, so the map can be learned once. Where a chosen chord does collide with an editor default, the collision SHALL be disclosed in the change record together with the conditions under which it applies.
+The modifier combination SHALL be identical for every triage action, so the map can be learned once. An individual chord within that combination MAY collide with an editor default only where that default's own conditions make it rarely reachable; every such collision SHALL be disclosed in the change record together with the conditions under which it applies and the reason it was accepted.
 
 The reviewer SHALL be able to rebind any of these shortcuts through the editor's own keyboard-shortcut settings; the extension SHALL NOT introduce a separate setting for this.
 
@@ -16,7 +16,7 @@ The reviewer SHALL be able to rebind any of these shortcuts through the editor's
 
 - **WHEN** the extension's keyboard shortcuts are listed
 - **THEN** accept, accept comment-only, reject, skip, next, previous, undo, the four severity jumps and keyboard help each require the same modifier combination
-- **AND** that combination is one the editor leaves unbound on Windows, on Linux and on macOS
+- **AND** every one of those chords is unbound by the editor on Windows, on Linux and on macOS, except any that the change record discloses and justifies
 - **AND** the macOS form uses the platform's own primary modifier rather than repeating the Windows form
 
 #### Scenario: Nothing is published on a typing key
@@ -67,7 +67,7 @@ A triage shortcut SHALL do nothing unless the triage screen is showing. Keyboard
 
 ### Requirement: Typing never reaches a triage action
 
-While the reviewer's cursor is in a text field, a keystroke SHALL be delivered to that field and SHALL NOT reach any triage action. This applies to every editable on a review screen, including the extra-instructions field, the ask-the-agent field, the summary and the final note.
+While the reviewer's cursor is in a text field, a keystroke that does not carry the published modifier SHALL be delivered to that field and SHALL NOT reach any triage action. This applies to every editable on a review screen, including the extra-instructions field, the ask-the-agent field, the summary and the final note.
 
 A shortcut that carries the published modifier SHALL still work from inside a text field, so a reviewer who is composing a note can still triage without moving their hands to the mouse.
 
