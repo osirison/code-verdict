@@ -40,6 +40,9 @@ const handlers = vi.hoisted(() => ({
 /** `VerdictStatusBar`'s segments, in creation order (verdict, agent, keys, …) — see statusBar.test.ts's own `segments()`. */
 const statusBarItems = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
+/** Hoisted so tests can read what was published to `setContext` — the triage keys' arming condition. */
+const executeCommand = vi.hoisted(() => vi.fn((..._args: unknown[]) => Promise.resolve(undefined)));
+
 const panel = vi.hoisted(() => ({
   title: '',
   active: true,
@@ -101,7 +104,7 @@ vi.mock('vscode', () => ({
     workspaceFolders: [],
     onDidChangeConfiguration: () => ({ dispose: vi.fn() }),
   },
-  commands: { executeCommand: vi.fn(() => Promise.resolve(undefined)) },
+  commands: { executeCommand },
   env: {
     clipboard: { writeText: vi.fn(() => Promise.resolve(undefined)) },
     openExternal: vi.fn(),
@@ -388,6 +391,7 @@ beforeEach(() => {
   world.submitCalls = [];
   world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
   statusBarItems.length = 0;
+  executeCommand.mockClear();
   world.changeRequests = [changeRequest(), changeRequest(REF_B, 'Change B')];
   world.loadAgentSelection.mockReset().mockResolvedValue({
     agents: [BUILTIN_AGENT_DESCRIPTOR],
@@ -1061,5 +1065,204 @@ describe("recording a verdict reaches every screen that shows the review's progr
     expect(verdictSegment.text).toContain('1 left');
 
     statusBar.dispose();
+  });
+});
+
+// ---- triage-only messages are refused once `this.review` outlives triage ------
+
+describe('triage-only messages are refused off the triage screen (this.review outlives triage)', () => {
+  it('a verdict, undo, move and severity jump on the summary screen change nothing', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h.post({ type: 'generateSummary' });
+    // Flush point (D9): the whole editor window losing focus.
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+    expect(h.stored()?.review.verdicts['i2']?.verdict).toBe('rejected');
+    // The summary screen's counts are computed from live state on every
+    // render, so this line is the baseline the guarded attempts must not move.
+    expect(panel.webview.html).toContain('1 accepted, 1 rejected, 0 skipped');
+
+    const htmlBefore = panel.webview.html;
+    panel.webview.postMessage.mockClear();
+
+    // Selection is i2, the last decided finding (both items are severity
+    // 'major' in this fixture) — delta:-1 and severity:'major' would both
+    // move it to i1 if either message reached the switch.
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    await h.post({ type: 'undo', itemId: 'i1' });
+    await h.post({ type: 'move', delta: -1 });
+    await h.post({ type: 'jumpSeverity', severity: 'major' });
+
+    // None of the four reached the switch: no repaint at all, patched or full
+    // (`setHtml` always carries a fresh nonce, so even a no-op render would
+    // have changed this string).
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(htmlBefore);
+
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+    expect(h.stored()?.review.verdicts['i2']?.verdict).toBe('rejected');
+
+    // A harmless, unguarded message forces a fresh render off live state: if
+    // the blocked verdict/undo had actually landed this would now read
+    // "2 accepted, 0 rejected".
+    await h.post({ type: 'dismissNotices' });
+    expect(panel.webview.html).toContain('1 accepted, 1 rejected, 0 skipped');
+
+    // And the selection the blocked move/jumpSeverity tried to change is
+    // still i2, not i1: back on triage, the deck still shows i2 selected.
+    await h.post({ type: 'backToTriage' });
+    expect(panel.webview.html).toContain('data-item="i2"');
+  });
+
+  it('the same four are refused on the agent screen, where newRun keeps this.review from the retained triage', async () => {
+    const seed = retainedRecord(['i1', 'i2']);
+    seed.review.verdicts = { i1: { verdict: 'accepted', applyFix: false } };
+    const h = await harness(seed);
+    await h.open();
+    // "Run a new review" over a retained result: the pickers open, but the
+    // result stays retained until a new run actually succeeds (#newRun).
+    await h.post({ type: 'newRun' });
+
+    const htmlBefore = panel.webview.html;
+    panel.webview.postMessage.mockClear();
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    await h.post({ type: 'undo', itemId: 'i1' });
+    await h.post({ type: 'move', delta: -1 });
+    await h.post({ type: 'jumpSeverity', severity: 'major' });
+
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(htmlBefore);
+
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('the same four are refused on the done screen, after a successful submit', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h.post({ type: 'generateSummary' });
+    await h.post({ type: 'submit' });
+    expect(h.stored()?.submittedAt).toBeDefined();
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+
+    const htmlBefore = panel.webview.html;
+    panel.webview.postMessage.mockClear();
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    await h.post({ type: 'undo', itemId: 'i1' });
+    await h.post({ type: 'move', delta: -1 });
+    await h.post({ type: 'jumpSeverity', severity: 'major' });
+
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.webview.html).toBe(htmlBefore);
+
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i1']?.verdict).toBe('accepted');
+  });
+
+  it('on the triage screen itself, all four still take effect — the guard is scoped, not a kill switch', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    await h.post({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'undo', itemId: 'i1' });
+    await h.post({ type: 'move', delta: 1 });
+    await h.post({ type: 'jumpSeverity', severity: 'major' });
+
+    const patches = panel.webview.postMessage.mock.calls
+      .map((call) => call[0] as { type: string })
+      .filter((message) => message.type === 'verdict:regions');
+    expect(patches).toHaveLength(4);
+
+    // undo really cleared the recorded verdict back to undecided.
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i1']).toBeUndefined();
+  });
+
+  it('refuses the palette path the same way: codeVerdict.acceptItem on the summary screen changes nothing', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h.post({ type: 'generateSummary' });
+    handlers.windowState?.({ focused: false });
+    expect(h.stored()?.review.verdicts['i2']?.verdict).toBe('rejected');
+
+    // `codeVerdict.acceptItem` has no screen condition of its own — it is a
+    // palette entry, reachable however the reviewer got here.
+    const { ReviewFlowPanel } = await import('./reviewFlow.js');
+    const dispatched = ReviewFlowPanel.handleCommand('codeVerdict.acceptItem');
+
+    expect(dispatched).toBe(true);
+    handlers.windowState?.({ focused: false });
+    // The command built a message for i2 (the last decided finding, still
+    // selected) — but it never reached the switch: still rejected.
+    expect(h.stored()?.review.verdicts['i2']?.verdict).toBe('rejected');
+    expect(panel.webview.html).toContain('1 accepted, 1 rejected, 0 skipped');
+  });
+});
+
+// ---- the context key that arms the triage chords ------------------------------
+
+describe('verdict.reviewTriageFocus follows the screen as well as the focus', () => {
+  /** The last value published for a context key, or undefined if it was never set. */
+  const published = (key: string): unknown => {
+    const calls = executeCommand.mock.calls.filter((call) => call[0] === 'setContext' && call[1] === key);
+    return calls.at(-1)?.[2];
+  };
+
+  it('is true on the triage screen and false on every other screen of the review', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    expect(published('verdict.reviewTriageFocus')).toBe(true);
+    // Its sibling is the inverse here: the context area belongs to the agent screen.
+    expect(published('verdict.reviewContextFocus')).toBe(false);
+
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await h.post({ type: 'generateSummary' });
+    expect(published('verdict.reviewTriageFocus')).toBe(false);
+
+    await h.post({ type: 'backToTriage' });
+    expect(published('verdict.reviewTriageFocus')).toBe(true);
+
+    await h.post({ type: 'newRun' });
+    expect(published('verdict.reviewTriageFocus')).toBe(false);
+    expect(published('verdict.reviewContextFocus')).toBe(true);
+  });
+
+  it('goes false when the tab stops being the active one, without the screen changing', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    expect(published('verdict.reviewTriageFocus')).toBe(true);
+
+    // The reason the key cannot be screen alone: the reviewer is still on
+    // triage, but their keystrokes are going somewhere else entirely — the
+    // file in-diff mode opened beside the review, for instance.
+    handlers.viewState?.({ webviewPanel: { active: false, visible: true } });
+    expect(published('verdict.reviewTriageFocus')).toBe(false);
+    expect(published('verdict.reviewFocus')).toBe(false);
+
+    handlers.viewState?.({ webviewPanel: { active: true, visible: true } });
+    expect(published('verdict.reviewTriageFocus')).toBe(true);
+  });
+
+  it('goes false when the route is left, so a departed panel cannot arm the keys', async () => {
+    const h = await harness(retainedRecord(['i1', 'i2']));
+    await h.open();
+    expect(published('verdict.reviewTriageFocus')).toBe(true);
+
+    handlers.dispose?.();
+    expect(published('verdict.reviewTriageFocus')).toBe(false);
+    expect(published('verdict.reviewFocus')).toBe(false);
   });
 });

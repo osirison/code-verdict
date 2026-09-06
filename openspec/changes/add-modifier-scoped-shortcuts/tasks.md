@@ -5,15 +5,15 @@ Lands first and stands alone: it closes the summary-screen corruption without to
 - [x] 1.1 In `ReviewFlowPanel.onMessage` (`src/ui/reviewFlow.ts:1241-1272`), refuse `verdict`, `undo`, `move` and `jumpSeverity` unless `this.screen === 'triage'`. Refuse by returning — do not clear or rewrite `this.review`, so the retained-review invariants from `background-review-runs` are untouched.
 - [x] 1.2 The same four cases in `ChangesetReviewPanel.onMessage` (`src/ui/changesetReview.ts:901-915` and the `undo`/`move`/`jumpSeverity` cases beside it).
 - [x] 1.3 Leave `select` and `setMode` unguarded, and say why in a comment: the sidebar tree reaches a finding through `ReviewFlowPanel.selectItem`, which has its own existence check, and mode is a triage-screen control already.
-- [ ] 1.4 Tests in `src/ui/reviewFlow.test.ts`: with a fully triaged review on the `summary` screen, `dispatchCommand('codeVerdict.acceptItem')` leaves every verdict as it was; the same for `undoVerdict`, `nextItem` and `jumpSeverity`, including that `selectedId` does not move. Repeat on `agent`, `running` and `done`. On `triage`, each one still works.
-- [ ] 1.5 The same set in `src/ui/changesetReview.test.ts`.
+- [x] 1.4 Tests in `src/ui/reviewFlow.test.ts`: with a fully triaged review on the `summary` screen, `dispatchCommand('codeVerdict.acceptItem')` leaves every verdict as it was; the same for `undoVerdict`, `nextItem` and `jumpSeverity`, including that `selectedId` does not move. Repeat on `agent`, `running` and `done`. On `triage`, each one still works.
+- [x] 1.5 The same set in `src/ui/changesetReview.test.ts`.
 
 ## 2. A triage-screen context key (D2, host half)
 
 - [x] 2.1 Add `verdict.reviewTriageFocus` = `reviewFocusActive && screen === 'triage'` to `setReviewFocus` (`src/ui/reviewFlow.ts:340-352`) and to the render tail that re-publishes `verdict.reviewContextFocus` (`:1934-1937`). Both sites, for the same reason the sibling key needs both: focus and screen change independently.
 - [x] 2.2 The same two sites in `src/ui/changesetReview.ts:281-288` and `:1385-1389`.
 - [x] 2.3 Confirm both keys are still cleared on `route.onLeave` (`src/ui/reviewFlow.ts:305`) — `setReviewFocus(false)` must publish the new key as false too, not just the two existing ones.
-- [ ] 2.4 Tests: entering triage publishes `verdict.reviewTriageFocus` true; a screen transition away from triage publishes it false; leaving the route publishes it false; the panel becoming inactive publishes it false.
+- [x] 2.4 Tests: entering triage publishes `verdict.reviewTriageFocus` true; a screen transition away from triage publishes it false; leaving the route publishes it false; the panel becoming inactive publishes it false.
 
 ## 3. The screen marker the webview key handler reads (D2, DOM half)
 

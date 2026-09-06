@@ -219,7 +219,7 @@ function fakeRuns(): ReviewRunManager {
   } as unknown as ReviewRunManager;
 }
 
-async function openPanel() {
+async function openPanel(seed: ChangesetDraft = retainedChangesetRecord()) {
   const activePod = pod();
   const podStore = { activePod, list: () => [activePod] } as unknown as PodStore;
   const { AppStore } = await import('../app/appStore.js');
@@ -229,7 +229,7 @@ async function openPanel() {
     reviewHistory: { list: () => [] } as never,
     baseSeconds: () => 60,
   });
-  const workspaceState = memoryKv({ [changesetDraftKeyFor(CHANGESET_ID)]: retainedChangesetRecord() });
+  const workspaceState = memoryKv({ [changesetDraftKeyFor(CHANGESET_ID)]: seed });
   const globalState = memoryKv({
     'codeVerdict.manualChangesets': {
       'pod-1': [{ id: CHANGESET_ID, name: 'Tenant limits', members: MEMBER_REFS }],
@@ -345,5 +345,165 @@ describe('the changeset review screen patches in place (tasks 7.2, 7.7)', () => 
     expect(panel.state.htmlLog.at(-1)).toContain('Rate limit window is per instance');
     // Restored from memory — no reload-triggered refetch.
     expect(world.calls).toEqual(callsBefore);
+  });
+});
+
+// ---- triage-only messages are refused once `this.review` outlives triage ------
+
+describe('triage-only messages are refused off the triage screen (this.review outlives triage)', () => {
+  it('a verdict, undo, move and severity jump on the summary screen change nothing', async () => {
+    await openPanel();
+    // i1 is severity 'major', i2 is severity 'minor' (retainedChangesetRecord).
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'generateSummary' });
+    await flush();
+    // The summary screen's counts are computed from live state on every
+    // render, so this line is the baseline the guarded attempts must not move.
+    expect(panel.state.htmlLog.at(-1)).toContain('1 accepted, 1 rejected, 0 skipped');
+
+    const htmlLogBefore = panel.state.htmlLog.length;
+    panel.webview.postMessage.mockClear();
+
+    // Selection is i2, the last decided finding — delta:-1 and severity:'major'
+    // would both move it to i1 (the only major item) if either message
+    // reached the switch.
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    panel.state.messageHandler?.({ type: 'undo', itemId: 'i1' });
+    panel.state.messageHandler?.({ type: 'move', delta: -1 });
+    panel.state.messageHandler?.({ type: 'jumpSeverity', severity: 'major' });
+    await flush();
+
+    // None of the four reached the switch: no repaint at all, patched or
+    // full — a full assignment always carries a fresh nonce, so even a no-op
+    // render would have grown the log.
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.state.htmlLog.length).toBe(htmlLogBefore);
+
+    // A harmless, unguarded message forces a fresh render off live state: if
+    // the blocked verdict/undo had actually landed this would now read
+    // "2 accepted, 0 rejected".
+    panel.state.messageHandler?.({ type: 'dismissNotices' });
+    await flush();
+    expect(panel.state.htmlLog.at(-1)).toContain('1 accepted, 1 rejected, 0 skipped');
+
+    // And the selection the blocked move/jumpSeverity tried to change is
+    // still i2, not i1: back on triage, both remain decided and the deck
+    // still shows i2 selected.
+    panel.state.messageHandler?.({ type: 'backToTriage' });
+    await flush();
+    const html = panel.state.htmlLog.at(-1) ?? '';
+    expect(html).toContain('2 of 2 triaged');
+    expect(html).toContain('data-item="i2"');
+  });
+
+  it('the same four are refused on the agent screen, where newRun keeps this.review from the retained triage', async () => {
+    await openPanel();
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await flush();
+    // "Run a new review" over a retained result: the pickers open, but the
+    // result stays retained until a new run actually succeeds.
+    panel.state.messageHandler?.({ type: 'newRun' });
+    await flush();
+
+    const htmlLogBefore = panel.state.htmlLog.length;
+    panel.webview.postMessage.mockClear();
+
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    panel.state.messageHandler?.({ type: 'undo', itemId: 'i1' });
+    panel.state.messageHandler?.({ type: 'move', delta: -1 });
+    panel.state.messageHandler?.({ type: 'jumpSeverity', severity: 'minor' });
+    await flush();
+
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.state.htmlLog.length).toBe(htmlLogBefore);
+  });
+
+  it('the same four are refused on the done screen', async () => {
+    const base = retainedChangesetRecord();
+    const submitted: ChangesetDraft = {
+      ...base,
+      review: {
+        ...base.review,
+        verdicts: {
+          i1: { verdict: 'accepted', applyFix: false },
+          i2: { verdict: 'rejected', applyFix: false },
+        },
+      },
+      // Set by a successful submit — screenForRetained selects 'done' over
+      // 'triage' whenever this is present.
+      submittedAt: '2026-09-01T11:00:00.000Z',
+    };
+    await openPanel(submitted);
+
+    const htmlLogBefore = panel.state.htmlLog.length;
+    panel.webview.postMessage.mockClear();
+
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'rejected' });
+    panel.state.messageHandler?.({ type: 'undo', itemId: 'i1' });
+    panel.state.messageHandler?.({ type: 'move', delta: -1 });
+    panel.state.messageHandler?.({ type: 'jumpSeverity', severity: 'minor' });
+    await flush();
+
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.state.htmlLog.length).toBe(htmlLogBefore);
+  });
+
+  it('on the triage screen itself, all four still take effect — the guard is scoped, not a kill switch', async () => {
+    await openPanel();
+    panel.state.messageHandler?.({ type: 'verdictReady' });
+    await flush();
+    panel.webview.postMessage.mockClear();
+
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'undo', itemId: 'i1' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'move', delta: 1 });
+    await flush();
+    panel.state.messageHandler?.({ type: 'jumpSeverity', severity: 'major' });
+    await flush();
+
+    const patches = panel.webview.postMessage.mock.calls
+      .map((call) => call[0] as { type: string; regions?: Record<string, string> })
+      .filter((message) => message.type === 'verdict:regions');
+    expect(patches).toHaveLength(4);
+    // undo really cleared i1's verdict, and the severity jump really landed
+    // on i1 (the only major item, undecided again after the undo).
+    expect(patches.at(-1)?.regions?.['flow-body']).toContain('0 of 2 triaged');
+    expect(patches.at(-1)?.regions?.['flow-body']).toContain('Rate limit window is per instance');
+  });
+
+  it('refuses the palette path the same way: codeVerdict.acceptItem on the summary screen changes nothing', async () => {
+    await openPanel();
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'verdict', itemId: 'i2', verdict: 'rejected' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'generateSummary' });
+    await flush();
+    expect(panel.state.htmlLog.at(-1)).toContain('1 accepted, 1 rejected, 0 skipped');
+
+    const htmlLogBefore = panel.state.htmlLog.length;
+    panel.webview.postMessage.mockClear();
+
+    // `codeVerdict.acceptItem` has no screen condition of its own — it is a
+    // palette entry, reachable however the reviewer got here.
+    const { ChangesetReviewPanel } = await import('./changesetReview.js');
+    const dispatched = ChangesetReviewPanel.handleCommand('codeVerdict.acceptItem');
+    await flush();
+
+    expect(dispatched).toBe(true);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(panel.state.htmlLog.length).toBe(htmlLogBefore);
+
+    // A harmless, unguarded message forces a fresh render off live state: if
+    // the command's verdict had actually landed this would now read
+    // "2 accepted, 0 rejected".
+    panel.state.messageHandler?.({ type: 'dismissNotices' });
+    await flush();
+    expect(panel.state.htmlLog.at(-1)).toContain('1 accepted, 1 rejected, 0 skipped');
   });
 });
