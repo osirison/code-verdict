@@ -79,7 +79,7 @@ import { SEVERITY_ORDER } from '../domain/criteria';
 import { getProvider } from '../platform/registry';
 import { isScmError } from '../platform/errors';
 import type { ChangeRequest, ChangeRequestDiff, ChangeRequestRef, WorkItem } from '../platform/types';
-import { flowCommandMessage } from './flowCommands';
+import { flowCommandMessage, isTriageOnlyMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, SubmitProgressView, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowErrorHtml, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { AppSurface, type AppRoute } from './appSurface';
@@ -348,6 +348,11 @@ export class ReviewFlowPanel {
       'setContext',
       'verdict.reviewContextFocus',
       this.reviewFocusActive && this.cr !== undefined && this.screen === 'agent',
+    );
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewTriageFocus',
+      this.reviewFocusActive && this.screen === 'triage',
     );
   }
 
@@ -1068,6 +1073,9 @@ export class ReviewFlowPanel {
   }
 
   private async handleMessage(m: FlowMessage): Promise<void> {
+    // Refused here rather than at the keyboard map, so the palette entries and
+    // any future caller are refused the same way a keystroke is.
+    if (isTriageOnlyMessage(m) && this.screen !== 'triage') return;
     const pod = this.pod();
     switch (m.type) {
       case 'toggleAgentOpen':
@@ -1934,6 +1942,13 @@ export class ReviewFlowPanel {
       'setContext',
       'verdict.reviewContextFocus',
       this.reviewFocusActive && this.cr !== undefined && this.screen === 'agent',
+    );
+    // Published from here as well as from setReviewFocus, because focus and
+    // screen change independently and the triage keys depend on both.
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewTriageFocus',
+      this.reviewFocusActive && this.screen === 'triage',
     );
     // Patch the region in place rather than replacing the whole document
     // (#39) — render() runs on every screen transition (triage, summary,

@@ -1813,8 +1813,16 @@ document.addEventListener('keydown', (ev) => {
   // swap through #app-route. Without the guard, j/k and 1-4 would post
   // move/jumpSeverity from every other screen and swallow those keys there.
   if (!document.querySelector('.route-flow')) return;
-  if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
-  if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // never hijack Cmd/Ctrl chords
+  // The triage keys mean nothing on the run-config, running, submitting,
+  // clean, summary or done screens, which all render inside this same
+  // container. The marker comes from renderReviewFlowBody, so a region patch
+  // carries it as well as a full render.
+  if (document.querySelector('[data-flow-screen]')?.dataset.flowScreen !== 'triage') return;
+  // Matches the overlay's guard (theme.ts): a <select> and an editable region
+  // are typing surfaces too, not just <input> and <textarea>.
+  const t = ev.target;
+  if (t instanceof HTMLElement && t.closest('input, textarea, select, [contenteditable]')) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // the chords belong to the editor layer
   const map = { a: () => verdict('accepted', !ev.shiftKey && acceptCanApplyFix()), r: () => verdict('rejected', false), s: () => verdict('skipped', false), j: () => post({ type: 'move', delta: 1 }), k: () => post({ type: 'move', delta: -1 }), u: () => { const id = itemId(); if (id) post({ type: 'undo', itemId: id }); } };
   const jump = { '1': 'blocker', '2': 'major', '3': 'minor', '4': 'nit' };
   const key = ev.key.toLowerCase();
@@ -1836,7 +1844,13 @@ document.addEventListener('keydown', (ev) => {
 export const REVIEW_FLOW_ROUTE: RouteAssets = { className: 'route-flow', css: CSS, script: SCRIPT };
 
 export function renderReviewFlowBody(s: FlowViewState, agentLabel: string): string {
-  return s.screen === 'agent'
+  // The screen this region was rendered for, stamped inside the region rather
+  // than on its container. `postRegions({'flow-body': ...})` replaces
+  // `#flow-body`'s *contents*, so an attribute on the container would be
+  // written once by the full render and then go stale on every patch — leaving
+  // the plain triage keys armed after the reviewer left triage. `hidden` keeps
+  // the marker out of layout entirely.
+  return `<span hidden data-flow-screen="${s.screen}"></span>` + (s.screen === 'agent'
     ? renderRunReview(s)
     : s.screen === 'running'
       ? renderRunning(s)
@@ -1852,7 +1866,7 @@ export function renderReviewFlowBody(s: FlowViewState, agentLabel: string): stri
             ? renderClean(s)
             : s.screen === 'summary'
               ? renderSummary(s)
-              : renderDone(s);
+              : renderDone(s));
 }
 
 /** The breadcrumb's current-crumb text — shared so the region patch can update it without a full page's worth of markup. */

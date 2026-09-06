@@ -197,8 +197,27 @@ reviews entry point, comment-thread actions) is an **internal id** in `INTERNAL_
 in the palette. Never repurpose a specified command for a screen it does not name — the palette is
 part of the product surface, not a convenience registry.
 
-Every keybinding stays scoped to `when: verdict.reviewFocus`, so single letters never steal typing
-elsewhere.
+The keyboard map lives at two layers, and each owns what only it can see.
+
+The **editor layer** (`contributes.keybindings`) publishes chords only — `ctrl+shift+alt+<key>`,
+`cmd+shift+alt+<key>` on macOS — because a keybinding cannot tell where the caret is: VS Code
+re-dispatches a webview's keydown to the workbench, and `verdict.reviewFocus` says the review tab is
+active, not that the reviewer has stopped typing. Never publish a bare or Shift-only key here. The
+triage entries additionally carry `verdict.reviewTriageFocus`, so they are dead on the run-config,
+running, summary and done screens; keyboard help deliberately is not, because that is where a lost
+reviewer needs it.
+
+The **webview layer** (the review flow's own keydown handler) owns the plain letters, and is the only
+layer that can: it reads `ev.target` synchronously, so it stands down inside an `input`, `textarea`,
+`select` or editable region, and it reads the screen from the `data-flow-screen` marker
+`renderReviewFlowBody` emits. That marker goes inside the region, never on `#flow-body` — a region
+patch replaces the container's contents, so an attribute on the container goes stale on the first
+patch.
+
+Neither layer is trusted alone for correctness: `verdict`, `undo`, `move` and `jumpSeverity` are
+refused in both panels' message handlers unless the triage screen is showing
+(`isTriageOnlyMessage`), because the palette reaches the same code with no screen condition and
+`this.review` outlives the triage screen.
 
 ## The sidebar is a state machine
 

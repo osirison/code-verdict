@@ -1513,3 +1513,112 @@ describe('an unchanged diff is not re-derived across an unrelated redraw', () =>
       .toBe(diffMarkupOf(renderReviewFlowBody(stateA, 'HVE Core / PR Review')));
   });
 });
+
+// ---- the triage keys are armed by the screen, not merely by the route ----------
+
+describe('the triage keyboard map is scoped to the triage screen and to not-typing', () => {
+  /**
+   * The screen marker has to come from `renderReviewFlowBody`, not from the
+   * `#flow-body` container: `postRegions({'flow-body': ...})` replaces the
+   * container's *contents*, so an attribute on the container itself is written
+   * once by the full render and then goes stale on every patch — leaving the
+   * plain keys armed after the reviewer has left triage.
+   */
+  const SCREENS: FlowScreen[] = ['agent', 'running', 'submitting', 'triage', 'clean', 'summary', 'done'];
+
+  it('every screen stamps its own marker, so a patch carries it as well as a full render', () => {
+    for (const screen of SCREENS) {
+      const body = renderReviewFlowBody({ ...state, screen }, 'HVE Core / PR Review');
+      expect(body).toContain(`<span hidden data-flow-screen="${screen}"></span>`);
+    }
+    // And the full page, which wraps the same body.
+    expect(renderReviewFlowHtml(state, 'HVE Core / PR Review', 'nonce123'))
+      .toContain('<span hidden data-flow-screen="triage"></span>');
+  });
+
+  function flowPage(screen: FlowScreen = 'triage'): { dom: JSDOM; posted: unknown[] } {
+    const posted: unknown[] = [];
+    const virtualConsole = new VirtualConsole();
+    const dom = new JSDOM(renderReviewFlowHtml({ ...state, screen }, 'HVE Core / PR Review', 'nonce123'), {
+      runScripts: 'dangerously',
+      virtualConsole,
+      beforeParse(window) {
+        (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+          postMessage: (message: unknown) => posted.push(message),
+        });
+      },
+    });
+    posted.length = 0;
+    return { dom, posted };
+  }
+
+  const moves = (posted: unknown[]): unknown[] =>
+    posted.filter((m) => (m as { type?: string }).type === 'move');
+
+  function press(dom: JSDOM, key: string, target?: Element, init: KeyboardEventInit = {}): void {
+    (target ?? dom.window.document.body).dispatchEvent(
+      new dom.window.KeyboardEvent('keydown', { key, bubbles: true, ...init }),
+    );
+  }
+
+  it('moves the selection on the triage screen', () => {
+    const { dom, posted } = flowPage('triage');
+    press(dom, 'j');
+    expect(moves(posted)).toEqual([{ type: 'move', delta: 1 }]);
+  });
+
+  it('one keypress is one action', () => {
+    // The bare keys were bound at the editor level too, and VS Code
+    // re-dispatches a webview's keydown to the workbench regardless of the
+    // webview having handled it. Removing those bindings leaves this handler
+    // as the only one that answers a plain key.
+    const { dom, posted } = flowPage('triage');
+    press(dom, 'j');
+    expect(moves(posted)).toHaveLength(1);
+  });
+
+  it('does nothing on any screen but triage', () => {
+    for (const screen of SCREENS.filter((s) => s !== 'triage')) {
+      const { dom, posted } = flowPage(screen);
+      press(dom, 'j');
+      press(dom, '1');
+      expect(posted.filter((m) => ['move', 'jumpSeverity'].includes((m as { type?: string }).type ?? '')))
+        .toEqual([]);
+    }
+  });
+
+  it('stands down while the cursor is in anything typed into', () => {
+    for (const markup of [
+      '<textarea id="probe"></textarea>',
+      '<input id="probe">',
+      '<select id="probe"><option>a</option></select>',
+      '<div id="probe" contenteditable="true"></div>',
+    ]) {
+      const { dom, posted } = flowPage('triage');
+      const host = dom.window.document.createElement('div');
+      host.innerHTML = markup;
+      dom.window.document.body.appendChild(host);
+      press(dom, 'j', dom.window.document.getElementById('probe')!);
+      expect(moves(posted)).toEqual([]);
+    }
+  });
+
+  it('leaves the published chords to the editor layer', () => {
+    for (const init of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }]) {
+      const { dom, posted } = flowPage('triage');
+      press(dom, 'j', undefined, init);
+      expect(moves(posted)).toEqual([]);
+    }
+  });
+
+  it('goes inert when a region patch moves the page off triage', () => {
+    // The regression the container-attribute version would have shipped.
+    const { dom, posted } = flowPage('triage');
+    press(dom, 'j');
+    expect(moves(posted)).toHaveLength(1);
+
+    patchFlow(dom, { 'flow-body': renderReviewFlowBody({ ...state, screen: 'summary' }, 'HVE Core / PR Review') });
+    press(dom, 'j');
+    expect(moves(posted)).toHaveLength(1);
+  });
+});

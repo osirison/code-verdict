@@ -15,7 +15,7 @@ interface PackageJson {
   description: string;
   contributes: {
     commands: Array<{ command: string; title: string }>;
-    keybindings: Array<{ command: string; key: string; args?: unknown; when?: string }>;
+    keybindings: Array<{ command: string; key: string; mac?: string; args?: unknown; when?: string }>;
     views: Record<string, Array<{ id: string; name: string; type?: string }>>;
     menus: Record<string, Array<{ command: string; when?: string }>>;
     viewsWelcome: Array<{ view: string; contents: string }>;
@@ -72,32 +72,81 @@ describe('package.json contributions', () => {
     }
   });
 
-  it('binds every key the triage map promises — A ⇧A R S J K U 1-4 ?', () => {
-    const bound = new Map(pkg.contributes.keybindings.map((kb) => [`${kb.key}${kb.args ? `:${String(kb.args)}` : ''}`, kb.command]));
+  it('publishes nothing on a key a reviewer types', () => {
+    // The defect this map was rebound to fix: a bare or Shift-only binding is
+    // matched even while the cursor is in one of the review's own text fields,
+    // because VS Code re-dispatches a webview's keydown to the workbench and
+    // `verdict.reviewFocus` tracks whether the tab is active, not where the
+    // caret is. Every published entry must carry a real modifier.
+    for (const kb of [...pkg.contributes.keybindings]) {
+      for (const key of [kb.key, kb.mac].filter((k): k is string => typeof k === 'string')) {
+        expect(key).toMatch(/^(ctrl|cmd|alt)\+/);
+        expect(key).not.toMatch(/^shift\+/);
+      }
+    }
+  });
+
+  it('binds the triage map on ctrl+shift+alt / cmd+shift+alt — the one family VS Code leaves free', () => {
+    const bound = new Map(
+      pkg.contributes.keybindings.map((kb) => [`${kb.key}${kb.args ? `:${String(kb.args)}` : ''}`, kb]),
+    );
     expect([...bound.keys()].sort()).toEqual(
       [
-        '1:blocker',
-        '2:major',
-        '3:minor',
-        '4:nit',
-        'a',
+        'ctrl+shift+alt+1:blocker',
+        'ctrl+shift+alt+2:major',
+        'ctrl+shift+alt+3:minor',
+        'ctrl+shift+alt+4:nit',
+        'ctrl+shift+alt+a',
+        'ctrl+shift+alt+j',
+        'ctrl+shift+alt+k',
+        'ctrl+shift+alt+m',
+        'ctrl+shift+alt+r',
+        'ctrl+shift+alt+s',
+        'ctrl+shift+alt+u',
+        'ctrl+shift+alt+/',
         'ctrl+/',
         'ctrl+enter',
-        'j',
-        'k',
-        'r',
-        's',
-        'shift+/',
-        'shift+a',
-        'u',
       ].sort(),
     );
-    // `A` applies the suggested fix; `⇧A` accepts comment-only (handoff §6).
-    expect(bound.get('a')).toBe('codeVerdict.acceptItem');
-    expect(bound.get('shift+a')).toBe(INTERNAL_COMMANDS.acceptCommentOnly);
-    expect(bound.get('u')).toBe(INTERNAL_COMMANDS.undoVerdict);
-    expect(bound.get('shift+/')).toBe(INTERNAL_COMMANDS.keyboardHelp);
-    expect(bound.get('ctrl+/')).toBe(INTERNAL_COMMANDS.addContext);
+    expect(bound.get('ctrl+shift+alt+a')?.command).toBe('codeVerdict.acceptItem');
+    // `M`, not `C`: ctrl+shift+alt+c is copyRelativeFilePath on Linux and macOS.
+    expect(bound.get('ctrl+shift+alt+m')?.command).toBe(INTERNAL_COMMANDS.acceptCommentOnly);
+    expect(bound.get('ctrl+shift+alt+u')?.command).toBe(INTERNAL_COMMANDS.undoVerdict);
+    expect(bound.get('ctrl+shift+alt+/')?.command).toBe(INTERNAL_COMMANDS.keyboardHelp);
+    expect(bound.get('ctrl+/')?.command).toBe(INTERNAL_COMMANDS.addContext);
+  });
+
+  it('uses the cmd form on macOS, where the ctrl form collides', () => {
+    // ctrl+shift+alt+j and ctrl+shift+alt+r are real macOS defaults
+    // (notebook joinAbove, the sessions picker); the cmd form is what avoids
+    // them. Every rebound entry must therefore carry a mac variant.
+    for (const kb of pkg.contributes.keybindings) {
+      if (!kb.key.startsWith('ctrl+shift+alt+')) continue;
+      expect(kb.mac).toBe(kb.key.replace(/^ctrl\+/, 'cmd+'));
+    }
+  });
+
+  it('arms the triage keys only while the triage screen is showing', () => {
+    const triageOnly = new Set<string>([
+      'codeVerdict.acceptItem',
+      'codeVerdict.rejectItem',
+      'codeVerdict.skipItem',
+      'codeVerdict.nextItem',
+      'codeVerdict.prevItem',
+      'codeVerdict.askAgent',
+      INTERNAL_COMMANDS.acceptCommentOnly,
+      INTERNAL_COMMANDS.undoVerdict,
+      INTERNAL_COMMANDS.jumpSeverity,
+    ]);
+    for (const kb of pkg.contributes.keybindings) {
+      if (triageOnly.has(kb.command)) {
+        expect(kb.when).toBe('verdict.reviewFocus && verdict.reviewTriageFocus');
+      }
+    }
+    // Help is the exception: a reviewer who is lost needs it most on the
+    // screens where nothing else works.
+    const help = pkg.contributes.keybindings.find((kb) => kb.command === INTERNAL_COMMANDS.keyboardHelp);
+    expect(help?.when).toBe('verdict.reviewFocus');
   });
 
   it('scopes add context to the active single-review context area', () => {

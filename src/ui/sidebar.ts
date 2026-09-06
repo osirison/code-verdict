@@ -422,7 +422,7 @@ export class VerdictStatusBar {
     this.runs = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 85);
     this.runs.command = INTERNAL_COMMANDS.showActiveRuns;
     this.keys.text = '$(keyboard) ? keys';
-    this.keys.tooltip = 'Verdict keyboard map';
+    this.keys.tooltip = 'Verdict keyboard map \u2014 ? here, or \u2303\u21e7\u2325/ (\u2318\u21e7\u2325/ on macOS) from inside a text field';
     this.keys.command = INTERNAL_COMMANDS.keyboardHelp;
     this.agent.command = COMMANDS.selectAgent;
     this.bell.command = INTERNAL_COMMANDS.showNotifications;

@@ -744,7 +744,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(INTERNAL_COMMANDS.keyboardHelp, () => {
       if (!AppSurface.postToActive({ type: 'verdict:showKeys' })) {
         void vscode.window.showInformationMessage(
-          'Verdict keys — A accept · ⇧A comment-only · R reject · S skip · J/K move · 1–4 severity · U undo. Open any Verdict screen for the full map.',
+          'Verdict keys — \u2303\u21e7\u2325 (\u2318\u21e7\u2325 on macOS) plus A accept · M comment-only · R reject · S skip · J/K move · 1–4 severity · U undo. The plain letters also work on the triage screen when you are not typing. Open any Verdict screen for the full map.',
         );
       }
     }),

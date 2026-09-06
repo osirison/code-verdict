@@ -395,14 +395,21 @@ review criteria — the next run uses them."
 Triggered by `?` anywhere, dismissed by `Esc` or a scrim click. Absolutely positioned over the whole
 window (`inset: 0`, z-index 40, `rgba(0,0,0,.58)` scrim, 36px padding). Panel: 720px, `--bg3`,
 1px `--line2`, 8px radius, `0 20px 60px rgba(0,0,0,.6)`, `animation: tin .18s ease-out`. Header
-"Keyboard" + "shortcuts apply when the review tab has focus" + an "Esc" affordance. Body is a
-2-column grid of four groups; each shortcut is a min-74px key cap (11px/500 JetBrains Mono, `--bg2`,
-1px `--line2`, 4px radius, centered) plus a 12px label and an optional 10.5px note.
+"Keyboard" + "triage keys apply on the triage screen — the plain letters work there too, unless you
+are typing" + an "Esc" affordance. Body is a 2-column grid; each shortcut is a min-74px key cap
+(11px/500 JetBrains Mono, `--bg2`, 1px `--line2`, 4px radius, centered) plus a 12px label and an
+optional 10.5px note.
 
-Groups: **Triage** — A accept (applies the suggested fix when there is one), ⇧A accept comment-only,
-R reject, S skip, J/K next/previous, 1–4 jump to severity, U undo. **Agent** — ⌘↩ ask, E explain,
-F show fix, ⇧F find similar. **Navigation** — ⌘1/⌘2/⌘3 mode, O open in editor, G then D dashboard,
-G then P posted reviews, ⌘↵ generate summary. **Everywhere** — ? help, ⌘⇧P palette, Esc close.
+The overlay lists only shortcuts that exist. Caps are written in the notation of the reviewer's
+platform, `⌃⇧⌥` on Windows and Linux and `⌘⇧⌥` on macOS, supplied by the extension host.
+
+Groups: **Triage** — ⌃⇧⌥A accept (applies the suggested fix when there is one), ⌃⇧⌥M accept
+comment-only, ⌃⇧⌥R reject, ⌃⇧⌥S skip, ⌃⇧⌥J/K next/previous, ⌃⇧⌥1–4 jump to severity, ⌃⇧⌥U undo.
+**Agent** — ⌃↩ ask. **Everywhere** — ? help (or ⌃⇧⌥/ while typing), ⌃⇧P palette, Esc close.
+
+The plain letters `A ⇧A R S J K U 1–4` remain live on the triage screen while the cursor is outside
+a text field, so the triage loop stays one key per finding; the chord is what works from inside one.
+Nothing is published to the editor on a bare or Shift-only key.
 
 ### 13. Notifications (toasts)
 

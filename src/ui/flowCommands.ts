@@ -13,6 +13,25 @@ export interface ReviewCommandTarget {
   handle(command: string, arg?: unknown): boolean;
 }
 
+/**
+ * The messages that only mean something while findings are on screen.
+ *
+ * `this.review` outlives the triage screen — it is cleared on load and when a
+ * change request has no record, never on a screen transition — so an accept
+ * arriving while the reviewer is composing the final note overwrites a verdict
+ * they already recorded. Scoping the keyboard map is not enough on its own:
+ * `acceptItem`, `rejectItem`, `nextItem` and `prevItem` are palette entries and
+ * carry no screen condition. Both panels refuse these four unless the triage
+ * screen is showing, whatever route they arrived by.
+ *
+ * `select` and `setMode` are deliberately absent. The sidebar tree reaches a
+ * finding through `ReviewFlowPanel.selectItem`, which checks the finding exists,
+ * and mode is a triage-screen control already.
+ */
+export function isTriageOnlyMessage(m: FlowMessage): boolean {
+  return m.type === 'verdict' || m.type === 'undo' || m.type === 'move' || m.type === 'jumpSeverity';
+}
+
 /** Resolve the active review at invocation time so a retained controller cannot receive the command. */
 export function routeToActiveReviewCommand(
   command: string,

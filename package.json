@@ -396,66 +396,78 @@
     "keybindings": [
       {
         "command": "codeVerdict.acceptItem",
-        "key": "a",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+a",
+        "mac": "cmd+shift+alt+a",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.acceptCommentOnly",
-        "key": "shift+a",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+m",
+        "mac": "cmd+shift+alt+m",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.rejectItem",
-        "key": "r",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+r",
+        "mac": "cmd+shift+alt+r",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.skipItem",
-        "key": "s",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+s",
+        "mac": "cmd+shift+alt+s",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.nextItem",
-        "key": "j",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+j",
+        "mac": "cmd+shift+alt+j",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.prevItem",
-        "key": "k",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+k",
+        "mac": "cmd+shift+alt+k",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.undoVerdict",
-        "key": "u",
-        "when": "verdict.reviewFocus"
+        "key": "ctrl+shift+alt+u",
+        "mac": "cmd+shift+alt+u",
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.jumpSeverity",
-        "key": "1",
+        "key": "ctrl+shift+alt+1",
+        "mac": "cmd+shift+alt+1",
         "args": "blocker",
-        "when": "verdict.reviewFocus"
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.jumpSeverity",
-        "key": "2",
+        "key": "ctrl+shift+alt+2",
+        "mac": "cmd+shift+alt+2",
         "args": "major",
-        "when": "verdict.reviewFocus"
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.jumpSeverity",
-        "key": "3",
+        "key": "ctrl+shift+alt+3",
+        "mac": "cmd+shift+alt+3",
         "args": "minor",
-        "when": "verdict.reviewFocus"
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.jumpSeverity",
-        "key": "4",
+        "key": "ctrl+shift+alt+4",
+        "mac": "cmd+shift+alt+4",
         "args": "nit",
-        "when": "verdict.reviewFocus"
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       },
       {
         "command": "codeVerdict.internal.keyboardHelp",
-        "key": "shift+/",
+        "key": "ctrl+shift+alt+/",
+        "mac": "cmd+shift+alt+/",
         "when": "verdict.reviewFocus"
       },
       {
@@ -468,7 +480,7 @@
         "command": "codeVerdict.askAgent",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "verdict.reviewFocus"
+        "when": "verdict.reviewFocus && verdict.reviewTriageFocus"
       }
     ],
     "menus": {

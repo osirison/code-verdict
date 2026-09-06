@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { renderPage } from './theme';
 
-const page = (embedded?: boolean): string =>
-  renderPage({ title: 'Verdict: Test', nonce: 'nonce123', css: '', body: '<p>body</p>', embedded });
+const page = (embedded?: boolean, isMac = false): string =>
+  renderPage({ title: 'Verdict: Test', nonce: 'nonce123', css: '', body: '<p>body</p>', embedded, isMac });
 
 describe('keyboard overlay (spec §12)', () => {
   it('ships the overlay hidden on every full-page screen', () => {
@@ -15,18 +15,53 @@ describe('keyboard overlay (spec §12)', () => {
     expect(html).toContain('tabindex="-1"');
   });
 
-  it('renders the four groups and their headline shortcuts', () => {
+  it('renders the groups and their headline shortcuts', () => {
     const html = page();
-    for (const group of ['Triage', 'Agent', 'Navigation', 'Everywhere']) {
+    for (const group of ['Triage', 'Agent', 'Everywhere']) {
       expect(html).toContain(`<div class="section-label">${group}</div>`);
     }
     // One representative per group, plus the spec's A-key note.
     expect(html).toContain('applies the suggested fix when there is one');
-    expect(html).toContain('⇧A');
-    expect(html).toContain('⌘↩');
-    expect(html).toContain('G then D');
-    expect(html).toContain('⌘⇧P');
-    expect(html).toContain('shortcuts apply when the review tab has focus');
+    expect(html).toContain('⌃⇧⌥A');
+    expect(html).toContain('⌃⇧⌥M');
+    expect(html).toContain('⌃↩');
+    expect(html).toContain('⌃⇧P');
+    // The note now says where the triage keys apply, not merely that the tab
+    // must be focused — the screen is half of what arms them.
+    expect(html).toContain('triage keys apply on the triage screen');
+  });
+
+  it('writes the chords in the notation of the reviewer\'s platform', () => {
+    const mac = page(false, true);
+    expect(mac).toContain('⌘⇧⌥A');
+    expect(mac).toContain('⌘⇧⌥1–4');
+    expect(mac).toContain('⌘↩');
+    expect(mac).toContain('⌘⇧P');
+    expect(mac).not.toContain('⌃⇧⌥A');
+
+    const other = page(false, false);
+    expect(other).toContain('⌃⇧⌥A');
+    expect(other).toContain('⌃⇧⌥1–4');
+    expect(other).not.toContain('⌘⇧⌥A');
+  });
+
+  it('advertises no shortcut that does nothing', () => {
+    // These were in the overlay for a long time with no key handler anywhere:
+    // the presets, the mode switch, the open-in-editor button and the G-chords
+    // are all click-only, and ⌘↵ generate summary was never bound at all.
+    const html = page();
+    for (const phantom of ['G then D', 'G then P', 'Show fix', 'Find similar', 'Explain', 'Open in editor', '⌘1 ⌘2 ⌘3', 'Generate summary']) {
+      expect(html).not.toContain(phantom);
+    }
+  });
+
+  it('still opens on the plain ? key, which is what keeps help cheap', () => {
+    // The bare `?` handler lives in the webview, where it can see the focused
+    // element; only the editor-level shift+/ binding was capable of firing
+    // from outside the document, and that is the one the chord replaced.
+    const html = page();
+    expect(html).toContain("ev.key !== '?'");
+    expect(html).toContain('⌃⇧⌥/');
   });
 
   it('opens on ? and the status bar message, closes on Esc and the scrim', () => {

@@ -280,53 +280,54 @@ const KEYS_CSS = `
 .keys-hint { font-size: 10.5px; color: var(--fg-dimmer); }
 `;
 
-const KEYS_GROUPS: ReadonlyArray<{
+/**
+ * The overlay is the only place a reviewer learns the map, so it must list
+ * shortcuts that exist and nothing else. Every row here is bound: the triage
+ * chords in `contributes.keybindings`, the plain letters in the review flow's
+ * own keydown handler, `?` and `Esc` in KEYS_SCRIPT below, and the palette by
+ * VS Code itself.
+ *
+ * Platform-dependent because the chords differ: the extension host knows the
+ * answer from `process.platform` and passes it in, rather than the webview
+ * guessing from a deprecated `navigator` field.
+ */
+function keysGroups(isMac: boolean): ReadonlyArray<{
   group: string;
   rows: ReadonlyArray<{ cap: string; label: string; hint?: string }>;
-}> = [
-  {
-    group: 'Triage',
-    rows: [
-      { cap: 'A', label: 'Accept', hint: 'applies the suggested fix when there is one' },
-      { cap: '⇧A', label: 'Accept comment-only' },
-      { cap: 'R', label: 'Reject' },
-      { cap: 'S', label: 'Skip' },
-      { cap: 'J / K', label: 'Next / previous' },
-      { cap: '1–4', label: 'Jump to severity' },
-      { cap: 'U', label: 'Undo' },
-    ],
-  },
-  {
-    group: 'Agent',
-    rows: [
-      { cap: '⌘↩', label: 'Ask' },
-      { cap: 'E', label: 'Explain' },
-      { cap: 'F', label: 'Show fix' },
-      { cap: '⇧F', label: 'Find similar' },
-    ],
-  },
-  {
-    group: 'Navigation',
-    rows: [
-      { cap: '⌘1 ⌘2 ⌘3', label: 'Mode' },
-      { cap: 'O', label: 'Open in editor' },
-      { cap: 'G then D', label: 'Dashboard' },
-      { cap: 'G then P', label: 'Posted reviews' },
-      { cap: '⌘↵', label: 'Generate summary' },
-    ],
-  },
-  {
-    group: 'Everywhere',
-    rows: [
-      { cap: '?', label: 'Help' },
-      { cap: '⌘⇧P', label: 'Palette' },
-      { cap: 'Esc', label: 'Close' },
-    ],
-  },
-];
+}> {
+  const mod = isMac ? '\u2318\u21e7\u2325' : '\u2303\u21e7\u2325';
+  const enter = isMac ? '\u2318\u21a9' : '\u2303\u21a9';
+  const palette = isMac ? '\u2318\u21e7P' : '\u2303\u21e7P';
+  return [
+    {
+      group: 'Triage',
+      rows: [
+        { cap: `${mod}A`, label: 'Accept', hint: 'applies the suggested fix when there is one' },
+        { cap: `${mod}M`, label: 'Accept comment-only' },
+        { cap: `${mod}R`, label: 'Reject' },
+        { cap: `${mod}S`, label: 'Skip' },
+        { cap: `${mod}J / K`, label: 'Next / previous' },
+        { cap: `${mod}1\u20134`, label: 'Jump to severity' },
+        { cap: `${mod}U`, label: 'Undo' },
+      ],
+    },
+    {
+      group: 'Agent',
+      rows: [{ cap: enter, label: 'Ask', hint: 'from the ask box' }],
+    },
+    {
+      group: 'Everywhere',
+      rows: [
+        { cap: '?', label: 'Help', hint: `or ${mod}/ while typing` },
+        { cap: palette, label: 'Palette' },
+        { cap: 'Esc', label: 'Close' },
+      ],
+    },
+  ];
+}
 
-function renderKeysOverlay(): string {
-  const groups = KEYS_GROUPS.map(
+function renderKeysOverlay(isMac: boolean): string {
+  const groups = keysGroups(isMac).map(
     ({ group, rows }) => `<section class="keys-group"><div class="section-label">${escapeHtml(group)}</div>${rows
       .map(
         (row) => `<div class="keys-row"><span class="keys-cap">${escapeHtml(row.cap)}</span><span class="keys-label">${escapeHtml(row.label)}</span>${row.hint ? `<span class="keys-hint">${escapeHtml(row.hint)}</span>` : ''}</div>`,
@@ -335,7 +336,7 @@ function renderKeysOverlay(): string {
   ).join('');
   return `<div class="keys-overlay" id="verdict-keys" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
     <div class="keys-panel" id="verdict-keys-panel" tabindex="-1">
-      <header class="keys-head"><span class="keys-title">Keyboard</span><span class="keys-note">shortcuts apply when the review tab has focus</span><span class="kbd">Esc</span></header>
+      <header class="keys-head"><span class="keys-title">Keyboard</span><span class="keys-note">triage keys apply on the triage screen \u2014 the plain letters work there too, unless you are typing</span><span class="kbd">Esc</span></header>
       <div class="keys-grid">${groups}</div>
     </div>
   </div>`;
@@ -621,6 +622,12 @@ export interface CodiconAssets {
 export function renderPage(opts: {
   title: string;
   nonce: string;
+  /**
+   * Which modifier notation the keyboard overlay uses. Defaults to the
+   * extension host's own platform; passed explicitly only by tests, so the
+   * webview never has to guess it.
+   */
+  isMac?: boolean;
   css: string;
   body: string;
   script?: string;
@@ -668,7 +675,7 @@ export function renderPage(opts: {
   const routeKeyAttr = opts.routeKey ? ` data-route-key="${escapeHtml(opts.routeKey)}"` : '';
   const body = opts.embedded
     ? opts.body
-    : `<main class="verdict-app"><div id="app-breadcrumb">${CRUMB_START}${crumbContent}${CRUMB_END}</div><div class="app-content" id="app-route"${routeKeyAttr}>${ROUTE_START}${routeContent}${ROUTE_END}</div></main>${renderKeysOverlay()}`;
+    : `<main class="verdict-app"><div id="app-breadcrumb">${CRUMB_START}${crumbContent}${CRUMB_END}</div><div class="app-content" id="app-route"${routeKeyAttr}>${ROUTE_START}${routeContent}${ROUTE_END}</div></main>${renderKeysOverlay(opts.isMac ?? process.platform === 'darwin')}`;
   const keysScript = opts.embedded ? '' : KEYS_SCRIPT;
   const regionsScript = opts.embedded ? (opts.regions ? REGIONS_SCRIPT : '') : REGIONS_SCRIPT;
   const backScript = opts.embedded ? '' : APP_BACK_SCRIPT;
