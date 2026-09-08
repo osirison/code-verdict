@@ -287,9 +287,12 @@ const KEYS_CSS = `
  * own keydown handler, `?` and `Esc` in KEYS_SCRIPT below, and the palette by
  * VS Code itself.
  *
- * Platform-dependent because the chords differ: the extension host knows the
- * answer from `process.platform` and passes it in, rather than the webview
- * guessing from a deprecated `navigator` field.
+ * Platform-dependent because the chords differ. The host's `process.platform`
+ * is the starting guess, but it is not authoritative: under Remote — SSH,
+ * Containers, WSL, Codespaces — the extension host runs on the remote machine
+ * while VS Code resolves the `mac` keybinding variant against the client. A
+ * macOS reviewer on a Linux host really does press `cmd`, so the overlay is
+ * rendered with both notations and KEYS_SCRIPT picks on the client side.
  */
 function keysGroups(isMac: boolean): ReadonlyArray<{
   group: string;
@@ -333,15 +336,28 @@ function keysGroups(isMac: boolean): ReadonlyArray<{
   ];
 }
 
+/**
+ * Every piece of text whose wording depends on the platform carries the other
+ * platform's wording in `data-alt`, so the client can swap the two without a
+ * round trip to the host. Text that reads the same on both carries nothing,
+ * which keeps the swap list to the rows that actually differ.
+ */
+const altAttr = (here: string | undefined, there: string | undefined): string =>
+  here !== undefined && there !== undefined && here !== there ? ` data-alt="${escapeHtml(there)}"` : '';
+
 function renderKeysOverlay(isMac: boolean): string {
+  const other = keysGroups(!isMac);
   const groups = keysGroups(isMac).map(
-    ({ group, rows }) => `<section class="keys-group"><div class="section-label">${escapeHtml(group)}</div>${rows
+    ({ group, rows }, gi) => `<section class="keys-group"><div class="section-label">${escapeHtml(group)}</div>${rows
       .map(
-        (row) => `<div class="keys-row"><span class="keys-cap">${escapeHtml(row.cap)}</span><span class="keys-label">${escapeHtml(row.label)}</span>${row.hint ? `<span class="keys-hint">${escapeHtml(row.hint)}</span>` : ''}</div>`,
+        (row, ri) => {
+          const alt = other[gi]?.rows[ri];
+          return `<div class="keys-row"><span class="keys-cap"${altAttr(row.cap, alt?.cap)}>${escapeHtml(row.cap)}</span><span class="keys-label">${escapeHtml(row.label)}</span>${row.hint ? `<span class="keys-hint"${altAttr(row.hint, alt?.hint)}>${escapeHtml(row.hint)}</span>` : ''}</div>`;
+        },
       )
       .join('')}</section>`,
   ).join('');
-  return `<div class="keys-overlay" id="verdict-keys" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+  return `<div class="keys-overlay" id="verdict-keys" hidden data-mac="${isMac}" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
     <div class="keys-panel" id="verdict-keys-panel" tabindex="-1">
       <header class="keys-head"><span class="keys-title">Keyboard</span><span class="keys-note">triage keys apply on the triage screen \u2014 the plain letters work there too, unless you are typing</span><span class="kbd">Esc</span></header>
       <div class="keys-grid">${groups}</div>
@@ -359,6 +375,21 @@ const KEYS_SCRIPT = `
 ;(() => {
   const overlay = document.getElementById('verdict-keys');
   if (!overlay) return;
+  // The host guessed the notation from its own platform, which is the remote
+  // machine under SSH, Containers, WSL or Codespaces. This script runs in the
+  // client UI, which is the same process that resolved the mac keybinding
+  // variant, so it is the one that knows. userAgentData first, userAgent as
+  // the fallback; the deprecated platform field on navigator is not read.
+  const ua = navigator.userAgentData;
+  const clientMac = /mac/i.test((ua && ua.platform) || navigator.userAgent || '');
+  if (clientMac !== (overlay.dataset.mac === 'true')) {
+    overlay.querySelectorAll('[data-alt]').forEach((el) => {
+      const shown = el.textContent;
+      el.textContent = el.dataset.alt;
+      el.dataset.alt = shown;
+    });
+    overlay.dataset.mac = String(clientMac);
+  }
   const show = () => { overlay.hidden = false; document.getElementById('verdict-keys-panel')?.focus(); };
   const hide = () => { overlay.hidden = true; };
   window.verdictKeysShow = show;

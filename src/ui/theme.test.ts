@@ -36,17 +36,37 @@ describe('keyboard overlay (spec §12)', () => {
   });
 
   it('writes the chords in the notation of the reviewer\'s platform', () => {
+    // Both notations are in the markup — the other one sits in `data-alt` so
+    // the client can swap under Remote — so these assert what is *shown*.
+    const shown = (html: string, cap: string): boolean => html.includes(`>${cap}</span>`);
+
     const mac = page(false, true);
-    expect(mac).toContain('⌘⇧⌥A');
-    expect(mac).toContain('⌘⇧⌥1–4');
-    expect(mac).toContain('⌘↩');
-    expect(mac).toContain('⌘⇧P');
-    expect(mac).not.toContain('⌃⇧⌥A');
+    expect(shown(mac, '⌘⇧⌥A')).toBe(true);
+    expect(shown(mac, '⌘⇧⌥1–4')).toBe(true);
+    expect(shown(mac, '⌘↩')).toBe(true);
+    expect(shown(mac, '⌘⇧P')).toBe(true);
+    expect(shown(mac, '⌃⇧⌥A')).toBe(false);
+    expect(mac).toContain('data-alt="⌃⇧⌥A"');
 
     const other = page(false, false);
-    expect(other).toContain('⌃⇧⌥A');
-    expect(other).toContain('⌃⇧⌥1–4');
-    expect(other).not.toContain('⌘⇧⌥A');
+    expect(shown(other, '⌃⇧⌥A')).toBe(true);
+    expect(shown(other, '⌃⇧⌥1–4')).toBe(true);
+    expect(shown(other, '⌘⇧⌥A')).toBe(false);
+    expect(other).toContain('data-alt="⌘⇧⌥A"');
+  });
+
+  it('lets the client correct the notation, because the host may be a remote machine', () => {
+    // Under SSH / Containers / WSL / Codespaces the extension host's platform
+    // is the remote's, while VS Code resolves the `mac` keybinding variant
+    // against the client. The overlay stamps the host's guess and the webview
+    // script — which runs on the client — swaps every `data-alt` when the two disagree.
+    const html = page(false, false);
+    expect(html).toContain('data-mac="false"');
+    expect(html).toContain('navigator.userAgentData');
+    expect(html).toContain("overlay.dataset.mac === 'true'");
+    expect(html).toContain('[data-alt]');
+    // The deprecated field stays out of it.
+    expect(html).not.toContain('navigator.platform');
   });
 
   it('advertises no shortcut that does nothing', () => {

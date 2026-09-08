@@ -82,11 +82,13 @@ Recorded here because the reasoning is the deliverable, not the conclusion. Veri
 
 `ctrl+shift+alt+a` is `workbench.action.openAgentsWindow`, whose `when` matches only with accessibility mode on. An extension keybinding registers above every core default, so Verdict wins while `verdict.reviewFocus` is true and only then. Accepted for the mnemonic; `ctrl+shift+alt+y` is the zero-collision alternative if that judgement is revisited. Accept-comment-only takes `m` because the mnemonic choice, `c`, is `copyRelativeFilePath` on Linux and macOS.
 
-### D5. The overlay learns the platform from the host
+### D5. The host guesses the platform; the client gets the last word
 
-The overlay's key caps are a module constant (`src/ui/theme.ts:288-325`) and now have to render `⌃⇧⌥A` or `⌘⇧⌥A` depending on the platform. The webview cannot be trusted to work this out — the CSP permits script but `navigator.platform` is deprecated and the extension host already knows the answer from `process.platform`.
+The overlay's key caps are a module constant (`src/ui/theme.ts:288-325`) and now have to render `⌃⇧⌥A` or `⌘⇧⌥A` depending on the platform. `KEYS_GROUPS` becomes a function of a platform flag, passed through the existing render-options object that `renderPage` already takes.
 
-`KEYS_GROUPS` becomes a function of a platform flag, passed through the existing render-options object that `renderPage` already takes. No new plumbing.
+The host fills that flag from `process.platform`, and that is a guess rather than an answer. Under Remote — SSH, Containers, WSL, Codespaces — the extension host runs on the remote machine while VS Code resolves the `mac` keybinding variant against the client, so a macOS reviewer on a Linux host presses `cmd` and would be shown `⌃⇧⌥`. Nothing in the extension API reports the client's OS.
+
+So the overlay ships **both** notations: every element whose wording differs carries the other platform's text in `data-alt`, and `KEYS_SCRIPT` — which runs in the client UI, the same process that resolved the keybinding — swaps them when it disagrees with the stamped `data-mac`. It reads `navigator.userAgentData.platform` with `navigator.userAgent` as the fallback; the deprecated `navigator.platform` is not read. Non-remote is the common case and renders correctly with no swap at all.
 
 The overlay's own bare-`?` handler (`KEYS_SCRIPT`, `src/ui/theme.ts:346-372`) **stays**, for the same reason the plain triage keys stay: it runs inside the document, on the capture phase, already refuses when the target is an `input`, `textarea`, `select` or editable region, and fires only when a Verdict webview holds focus. It is the editor-level `shift+/` binding that was capable of firing from outside the webview, and that is the one the chord replaces. So `?` continues to open the overlay, and `ctrl+shift+alt+/` is what works from a text field.
 
