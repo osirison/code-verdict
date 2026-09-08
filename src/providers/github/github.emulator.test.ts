@@ -371,6 +371,47 @@ describe('listing', () => {
   });
 });
 
+/**
+ * What one change-request diff costs after task 5.1 added the merge-base
+ * lookup, measured rather than asserted in prose. Both halves matter: three
+ * requests, and what the third one costs the second time it is made.
+ */
+describe('the cost of one change-request diff', () => {
+  const MERGE_BASE_SHA = '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091';
+  const HEAD_SHA = '9f2c1ab4e5d6708192a3b4c5d6e7f8091a2b3c4d';
+
+  it('costs three requests: the pull, its files, and the comparison the merge base comes from', async () => {
+    const log: RequestLog = { paths: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.getChangeRequestDiff(CR);
+
+    expect(log.paths).toEqual([
+      '/repos/acme/core/pulls/2841',
+      '/repos/acme/core/pulls/2841/files',
+      `/repos/acme/core/compare/${MERGE_BASE_SHA}...${HEAD_SHA}`,
+    ]);
+  });
+
+  it('answers the second call entirely from 304s, so the added request is issued but not charged', async () => {
+    // GitHub does not charge a 304 against the rate limit, and `GitHubHttp`
+    // sends every GET conditionally. The compare response is a new URL the
+    // first time and a validator hit after that — which is what makes the
+    // added call cost a round trip rather than a request from the budget.
+    const log: RequestLog = { paths: [], statuses: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.getChangeRequestDiff(CR);
+    expect(log.statuses).toEqual([200, 200, 200]);
+
+    log.paths.length = 0;
+    log.statuses!.length = 0;
+    await conn.getChangeRequestDiff(CR);
+    expect(log.paths).toHaveLength(3);
+    expect(log.statuses).toEqual([304, 304, 304]);
+  });
+});
+
 describe('source resolution', () => {
   it('reports a well-formed but invisible repository as notVisible, adding nothing', async () => {
     await expect(connect().resolveSource('acme/nope')).resolves.toEqual({
@@ -419,6 +460,13 @@ describe('auth modes are declared per host', () => {
       threadResolution: true,
       groupHierarchy: true,
       batchedReview: true,
+      // The two forge-only detail reads, and nothing else. The five pinned
+      // investigation operations this used to declare are gone from every
+      // provider: a change is read from a local object store, never computed by
+      // a forge. GitHub's `repositorySearch` was already honestly `false` here,
+      // because its code search indexes only a repository's default branch and
+      // cannot be pinned to a revision — the same gap from the other end.
+      detailRetrieval: { changeRequestDetails: { supported: true }, issueDetails: { supported: true }, pagination: { maxPageSize: 100 } },
     });
   });
 });

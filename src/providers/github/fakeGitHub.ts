@@ -27,6 +27,7 @@
  * fixture-local hash rather than GitHub's own — only its shape is copied.
  */
 import type { FetchLike, FetchResponseLike } from './http';
+import { linesFromUnifiedDiff } from './mappers';
 
 export interface RequestLog {
   /** Every path requested, in order. GraphQL appears as `/graphql`. */
@@ -54,17 +55,218 @@ export interface FakeGitHubOptions {
   refuseVerdict?: boolean;
   /** Extra headers on every response — used to drive rate-limit mapping. */
   headers?: Record<string, string>;
+  /** Every review-investigation route (compare/contents/commits) fails with the neutral rate-limited error, reset-header form (task 4.7). */
+  investigationRateLimited?: boolean;
+  /**
+   * A target branch that moves while the review is in flight (task 5.6).
+   * `tip` is served as the pull's `base.sha`, and Compare answers for the
+   * moved pair with the same `merge_base_commit` it answers for the original
+   * one — because the merge base did not move.
+   *
+   * Mutable on purpose. A branch advancing mid-review is only observable
+   * through one `Connection` making two calls, so the test advances `tip`
+   * between them; a plain string option could only describe two different
+   * worlds, never a move within one.
+   */
+  targetBranch?: { tip: string };
+}
+
+// ---- git over HTTPS ------------------------------------------------------------------
+
+/**
+ * Whether GitHub's git-over-HTTPS endpoints would accept this `Authorization`
+ * header value for this token.
+ *
+ * **The live failure this exists to catch.** On 2026-09-09 a review of
+ * `osirison/code-verdict!66` stopped with "A local object store could not
+ * serve this change (The object source would not authorize this fetch with the
+ * credential this connection has for it.)". The descriptor `getObjectSource`
+ * composed carried `Authorization: Bearer <token>` — right for the REST API,
+ * wrong for git. GitHub's smart HTTP transport ignores a bearer token, git
+ * falls through to askpass, prompting is disabled by design D7, and the fetch
+ * dies at the challenge.
+ *
+ * Nothing in this suite could have caught it. Task 2.6 proved the credential
+ * never *leaks*; the descriptor tests proved the header is *present*; this
+ * fake accepted any header at all, because it never looked at one. A wrong
+ * form therefore passed every test in the repository and failed only against
+ * the real forge, in front of a user. This function is the missing assertion:
+ * the fake now rejects what the forge rejects.
+ *
+ * **Measured, 2026-09-09**, against `https://github.com/osirison/code-verdict.git`
+ * with a real `gho_` token, fetching a bare commit id with the value supplied
+ * as `http.extraHeader` exactly as `fetchCommit` supplies it:
+ *
+ *     Authorization: Bearer <token>                        -> exit 128, git falls through to askpass
+ *     Authorization: Basic base64("x-access-token:<token>") -> exit 0, fetch succeeds
+ *     Authorization: Basic base64("<token>:x-oauth-basic")  -> exit 0, fetch succeeds
+ *
+ * Both Basic forms are accepted here because both were measured to work:
+ * GitHub authenticates on whichever half of the pair holds the token. The
+ * provider sends the first, which is the form GitHub documents for HTTPS git
+ * access — `git clone https://x-access-token:TOKEN@github.com/owner/repo.git`
+ * (docs.github.com, "Authenticating as a GitHub App installation", read
+ * 2026-09-11).
+ *
+ * **What a fake like this is worth, and what it is not.** It holds one line:
+ * the descriptor cannot go back to the form that was measured to fail without
+ * a test failing first. It is not a statement that everything it accepts
+ * works. It encodes three measurements taken on one day against one host; it
+ * knows nothing about GitHub Enterprise Server, which is a separate
+ * deployment this project also connects to and nobody has measured; and GitHub
+ * can change what it accepts without anything here going red. A fake can only
+ * hold a line that was measured once — moving that line takes another
+ * measurement against the real forge, not an edit to this file.
+ *
+ * There is no route for this in the `FetchLike` below, and adding one would be
+ * worse than nothing: git speaks a wire protocol over a socket, a `FetchLike`
+ * cannot carry it, and a route the git binary can never reach would be dead
+ * code shaped like coverage. The rule lives here, where the rest of GitHub's
+ * behaviour is modelled, and the remote in `../objectSourceGitFetch.test.ts`
+ * applies it to a real `git fetch`.
+ */
+export function gitHubAcceptsGitAuthorization(headerValue: string | undefined, token: string): boolean {
+  const credentials = basicCredentials(headerValue);
+  if (credentials === undefined) return false;
+  // Both halves non-empty and the token on one of them. `Basic` alone is not
+  // the property: a well-formed header carrying the wrong secret is a rejected
+  // fetch too, and a fake that waved it through would accept `Basic garbage`.
+  const { username, secret } = credentials;
+  if (username === '' || secret === '') return false;
+  return username === token || secret === token;
+}
+
+/** RFC 7617 `Basic` credentials, or `undefined` for any other scheme — `Bearer` included, which is the whole point. */
+function basicCredentials(headerValue: string | undefined): { readonly username: string; readonly secret: string } | undefined {
+  const match = /^Basic ([A-Za-z0-9+/]+={0,2})$/.exec(headerValue ?? '');
+  if (match === null) return undefined;
+  const decoded = Buffer.from(match[1] as string, 'base64').toString('utf8');
+  const separator = decoded.indexOf(':');
+  if (separator === -1) return undefined;
+  return { username: decoded.slice(0, separator), secret: decoded.slice(separator + 1) };
 }
 
 const ORG = { login: 'acme', name: 'Acme Engineering' };
 
 const REPOS = [
   { full_name: 'acme/core', name: 'core', html_url: 'https://github.com/acme/core' },
-  { full_name: 'acme/auth-service', name: 'auth-service', html_url: 'https://github.com/acme/auth-service' },
+  // The one repository here that reports its own `clone_url`, so
+  // `getObjectSource` (`add-local-git-investigation` task 2.4) is exercised on
+  // both paths: this repository takes the platform's own value, and the two
+  // that omit it fall back to `html_url` + `.git`. GitHub's construction makes
+  // the two agree, which is why the fallback is safe at all.
+  {
+    full_name: 'acme/auth-service',
+    name: 'auth-service',
+    html_url: 'https://github.com/acme/auth-service',
+    clone_url: 'https://github.com/acme/auth-service.git',
+  },
   { full_name: 'acme/api-gateway', name: 'api-gateway', html_url: 'https://github.com/acme/api-gateway' },
 ];
 
 const HEAD_SHA = '9f2c1ab4e5d6708192a3b4c5d6e7f8091a2b3c4d';
+/**
+ * Reuses the same literal already seeded as `main`'s workflow-run `head_sha`
+ * below — both represent the current tip of `main`.
+ *
+ * It is also #2841's merge base, and that is not a coincidence to work around:
+ * the branch was cut from this commit and has not been rebased, so the tip of
+ * `main` and the merge base are the same commit until `main` moves. That is
+ * why `merge_base_commit` below reports this value for the moved pair as well,
+ * and why every existing expectation of `baseSha` here still holds once
+ * `getChangeRequestDiff` reports the merge base (task 5.1).
+ */
+const BASE_SHA = '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091';
+/**
+ * Where `main` gets to when a commit lands on it mid-review, for
+ * `FakeGitHubOptions.targetBranch` (task 5.6). Exported so a test names the
+ * commit it advanced to rather than re-declaring a hex literal that a mistype
+ * would turn into a 404 read as "the fixture does not have that".
+ */
+export const ADVANCED_TARGET_BRANCH_SHA = '5e8a1c3f7b9d0246a8c0e2f4b6d8091a3c5e7f92';
+/** Strictly older than #2841's own base/head — proves a pinned read never substitutes the branch tip (task 3.7). */
+const PRIOR_BASE_SHA = 'prior-base-1';
+const PRIOR_HEAD_SHA = 'prior-head-1';
+const PRIOR_FILE_DIFF = '@@ -1,1 +1,1 @@\n-old\n+older\n';
+
+/**
+ * A third comparison pair: the response GitHub returns for a change it
+ * enumerated but declined to compute the diff of (task 1.4 of
+ * `add-local-git-investigation`).
+ *
+ * Exported, unlike the two pairs above, which every test re-declares as its
+ * own 40-hex literal. A later stage that mistyped one of those characters gets
+ * a 404 from this fake and reads it as "the fixture does not have that", which
+ * is exactly the kind of silent mismatch a shared constant removes. The two
+ * older pairs stay as they are; there is no reason to repeat the pattern.
+ *
+ * Shape captured from `GET /repos/osirison/code-verdict/compare/…` on
+ * 2026-09-10 for a 207-file, all-TypeScript comparison: 69 entries came back
+ * with a real `patch`, and 137 came back enumerated — full `filename`,
+ * `status`, `previous_filename` where it applied — with the `patch` key absent
+ * and `additions`, `deletions` and `changes` all zero. Nothing in the response
+ * says which of the two happened to a given entry; the counters are identical
+ * to a genuinely binary file's.
+ *
+ * `changes` is carried here and nowhere else in this file on purpose. It is
+ * part of the shape on the wire, and it is the third of the three zeroes that
+ * make a declined entry indistinguishable from binary content — but `GhFile`
+ * declares only `additions` and `deletions`, so no mapper reads it. It is here
+ * to keep the fixture honest about the payload, not because code depends on it.
+ */
+export const DECLINED_COMPARE_BASE_SHA = '3b1f0c7d5a9e2648b0c1d2e3f4a5b6c7d8e9f001';
+export const DECLINED_COMPARE_HEAD_SHA = 'c4a2e6b8d0f1357924a6b8c0d2e4f6081a3c5e72';
+
+/** Nine declined entries and three rendered ones — the mixed response, not a wholly-suppressed one. */
+const DECLINED_COMPARE_FILES = [
+  { filename: 'src/app/harnessAttempt.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/app/harnessInventory.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/app/harnessToolDispatcher.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/domain/harnessCoverage.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/platform/types.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/app/harnessLocalSource.ts', status: 'added', additions: 0, deletions: 0, changes: 0 },
+  { filename: 'src/app/legacyDiffCapture.ts', status: 'removed', additions: 0, deletions: 0, changes: 0 },
+  // A rename GitHub still describes fully while declining to render either side of it.
+  {
+    filename: 'src/app/harnessRuntime.ts',
+    previous_filename: 'src/app/runtime.ts',
+    status: 'renamed',
+    additions: 0,
+    deletions: 0,
+    changes: 0,
+  },
+  { filename: 'src/providers/gitlab/mappers.ts', status: 'modified', additions: 0, deletions: 0, changes: 0 },
+  // The part of the same response GitHub did render, so a test can tell "this
+  // comparison was declined in part" from "this comparison was not served".
+  {
+    filename: 'src/domain/harnessPolicy.ts',
+    status: 'modified',
+    patch: '@@ -80,6 +80,8 @@\n context\n+  localGitFetchTimeoutMs: 120_000,\n+  localGitReadTimeoutMs: 30_000,\n',
+    additions: 2,
+    deletions: 0,
+    changes: 2,
+  },
+  {
+    filename: 'README.md',
+    status: 'modified',
+    patch: '@@ -1,1 +1,1 @@\n-Judge the AI\n+Judge the AI, then ship it\n',
+    additions: 1,
+    deletions: 1,
+    changes: 2,
+  },
+  {
+    filename: 'openspec/changes/add-local-git-investigation/proposal.md',
+    status: 'added',
+    patch: '@@ -0,0 +1,2 @@\n+## Why\n+The forge is the wrong authority for this question.\n',
+    additions: 2,
+    deletions: 0,
+    changes: 2,
+  },
+];
+
+const LINKED_ISSUE_COMMENTS = [
+  { id: 70101, user: { login: 'dana' }, body: 'This needs the retry envelope from #2841.', created_at: '2026-08-18T09:00:00Z' },
+];
 
 const PULLS: Record<string, unknown[]> = {
   'acme/core': [
@@ -76,12 +278,13 @@ const PULLS: Record<string, unknown[]> = {
       merged_at: null,
       draft: false,
       head: { ref: 'feat/rate-limit', sha: HEAD_SHA },
-      base: { ref: 'main' },
+      base: { ref: 'main', sha: BASE_SHA },
       user: { login: 'dana' },
       requested_reviewers: [{ login: 'you' }],
       html_url: 'https://github.com/acme/core/pull/2841',
       updated_at: '2026-08-20T10:00:00Z',
       changed_files: 4,
+      labels: [{ name: 'rate-limiting' }],
     },
   ],
   'acme/auth-service': [
@@ -134,15 +337,23 @@ const FILES = [
     filename: 'src/limiter.ts',
     status: 'modified',
     patch: '@@ -10,6 +10,12 @@\n context\n+const a = 1\n+const b = 2\n',
+    additions: 2,
+    deletions: 0,
   },
-  { filename: 'src/added.ts', status: 'added', patch: '@@ -0,0 +1,3 @@\n+new file\n' },
-  { filename: 'src/gone.ts', status: 'removed', patch: '@@ -1,3 +0,0 @@\n-old file\n' },
+  { filename: 'src/added.ts', status: 'added', patch: '@@ -0,0 +1,3 @@\n+new file\n', additions: 1, deletions: 0 },
+  { filename: 'src/gone.ts', status: 'removed', patch: '@@ -1,3 +0,0 @@\n-old file\n', additions: 0, deletions: 1 },
   {
     filename: 'src/renamed-new.ts',
     previous_filename: 'src/renamed-old.ts',
     status: 'renamed',
     patch: '@@ -1,1 +1,1 @@\n-a\n+b\n',
+    additions: 1,
+    deletions: 1,
   },
+  // Binary: git counts no line changes it cannot diff, so both counts are 0 (task 4.6/4.7 binary-vs-tooLarge heuristic).
+  { filename: 'assets/logo.png', status: 'modified', additions: 0, deletions: 0 },
+  // Too large: GitHub still counts the change but withholds the patch text.
+  { filename: 'package-lock.json', status: 'modified', additions: 4000, deletions: 3000 },
 ];
 
 /**
@@ -296,6 +507,21 @@ function repoRoute(path: string): { repoId: string; tail: string } | undefined {
   };
 }
 
+/**
+ * Serves the pull with `base.sha` moved to where the target branch is now.
+ *
+ * Overlaid per request rather than written into `PULLS`, which is module-level
+ * and shared by every fake this file hands out: mutating it would leak one
+ * test's advanced branch into every other test in the process. A pull whose
+ * fixture carries no `base.sha` at all (#812) is left exactly as it is.
+ */
+function withTargetBranchTip(pull: unknown, targetBranch: { tip: string } | undefined): unknown {
+  if (!targetBranch) return pull;
+  const base = (pull as { base?: { sha?: string } }).base;
+  if (base?.sha === undefined) return pull;
+  return { ...(pull as Record<string, unknown>), base: { ...base, sha: targetBranch.tip } };
+}
+
 export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike {
   // Thread state is per fake, and mutable: the shared contract suite now
   // replies to a thread and resolves it, then asserts the next listThreads
@@ -339,6 +565,19 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
     }
     if (!known) return error(404, 'Not Found', extraHeaders);
 
+    // Task 4.7: every review-investigation route fails with the neutral
+    // rate-limited error in its RESET-header form (`x-ratelimit-remaining: 0`
+    // + `x-ratelimit-reset`), distinct from the `retry-after` form other
+    // fake-fetch tests already exercise.
+    const isInvestigationRoute = /^\/(compare|contents)\//.test(tail) || /^\/pulls\/\d+\/commits$/.test(tail);
+    if (options.investigationRateLimited && isInvestigationRoute && method === 'GET') {
+      return error(403, 'API rate limit exceeded', {
+        ...extraHeaders,
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 45),
+      });
+    }
+
     if (tail === '/pulls' && method === 'GET') return json(PULLS[repoId] ?? [], extraHeaders);
     if (tail === '/issues' && method === 'GET') return json(ISSUES[repoId] ?? [], extraHeaders);
     if (tail === '/actions/runs' && method === 'GET') {
@@ -349,6 +588,61 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
       return json({ total_count: (WORKFLOW_RUNS[repoId] ?? []).length, workflow_runs: runs }, extraHeaders);
     }
 
+    const compareMatch = tail.match(/^\/compare\/(.+)$/);
+    if (compareMatch && method === 'GET') {
+      const basehead = decodeURIComponent(compareMatch[1] as string);
+      const [from, to] = basehead.split('...');
+      // Every real compare response carries `merge_base_commit`, whatever it
+      // did with `files` — it is a scalar the truncation never reaches. For
+      // the pinned snapshot pairs below the `from` commit is an ancestor of
+      // `to`, so it is its own merge base; that is the truthful value, not a
+      // convenience.
+      if (to === HEAD_SHA && (from === BASE_SHA || from === options.targetBranch?.tip)) {
+        // `main` may have moved to `targetBranch.tip`; the merge base did not.
+        return json({ files: FILES, merge_base_commit: { sha: BASE_SHA } }, extraHeaders);
+      }
+      if (from === PRIOR_BASE_SHA && to === PRIOR_HEAD_SHA) {
+        return json(
+          {
+            files: [{ filename: 'src/legacy/old.ts', status: 'modified', patch: PRIOR_FILE_DIFF, additions: 1, deletions: 1 }],
+            merge_base_commit: { sha: PRIOR_BASE_SHA },
+          },
+          extraHeaders,
+        );
+      }
+      if (from === DECLINED_COMPARE_BASE_SHA && to === DECLINED_COMPARE_HEAD_SHA) {
+        return json({ files: DECLINED_COMPARE_FILES, merge_base_commit: { sha: DECLINED_COMPARE_BASE_SHA } }, extraHeaders);
+      }
+      return error(404, 'Not Found', extraHeaders);
+    }
+
+    const contentsMatch = tail.match(/^\/contents\/(.+)$/);
+    if (contentsMatch && method === 'GET') {
+      const filePath = decodeURIComponent(contentsMatch[1] as string);
+      const ref = url.searchParams.get('ref');
+      if (ref !== BASE_SHA && ref !== HEAD_SHA && ref !== PRIOR_BASE_SHA && ref !== PRIOR_HEAD_SHA) {
+        return error(404, `No commit found for the ref ${ref}`, extraHeaders);
+      }
+      if (filePath === 'assets/logo.png') {
+        const content = Buffer.from([0, 1, 2, 3, 0]).toString('base64');
+        return json({ type: 'file', size: 5, encoding: 'base64', content }, extraHeaders);
+      }
+      if (filePath === 'src/limiter.ts' && (ref === BASE_SHA || ref === HEAD_SHA)) {
+        const text = linesFromUnifiedDiff(FILES[0]?.patch ?? '').join('\n');
+        return json({ type: 'file', size: text.length, encoding: 'base64', content: Buffer.from(text, 'utf8').toString('base64') }, extraHeaders);
+      }
+      if (filePath === 'src/legacy/old.ts' && ref === PRIOR_HEAD_SHA) {
+        const text = linesFromUnifiedDiff(PRIOR_FILE_DIFF).join('\n');
+        return json({ type: 'file', size: text.length, encoding: 'base64', content: Buffer.from(text, 'utf8').toString('base64') }, extraHeaders);
+      }
+      return error(404, 'Not Found', extraHeaders);
+    }
+
+    if (tail === '/issues/1180' && method === 'GET') {
+      return json((ISSUES['acme/core'] ?? []).find((issue) => (issue as { number: number }).number === 1180), extraHeaders);
+    }
+    if (tail === '/issues/1180/comments' && method === 'GET') return json(LINKED_ISSUE_COMMENTS, extraHeaders);
+
     const pullMatch = tail.match(/^\/pulls\/(\d+)(.*)$/);
     if (pullMatch) {
       const number = Number(pullMatch[1]);
@@ -356,9 +650,15 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
       const pull = (PULLS[repoId] ?? []).find((p) => (p as { number: number }).number === number);
 
       if (rest === '' && method === 'GET') {
-        return pull ? json(pull, extraHeaders) : error(404, 'Not Found', extraHeaders);
+        return pull ? json(withTargetBranchTip(pull, options.targetBranch), extraHeaders) : error(404, 'Not Found', extraHeaders);
       }
       if (rest === '/files' && method === 'GET') return json(FILES, extraHeaders);
+      if (rest === '/commits' && method === 'GET') {
+        return json(
+          [{ sha: HEAD_SHA, commit: { message: 'Refactor rate limiter', author: { name: 'dana' } } }],
+          extraHeaders,
+        );
+      }
 
       // A batched review's own comments, in creation order.
       if (/^\/reviews\/\d+\/comments$/.test(rest) && method === 'GET') {
@@ -496,6 +796,49 @@ function graphqlResponse(body: string, threads: FakeThreadNode[]): unknown {
       });
     }
     return { data: { addPullRequestReviewThreadReply: { comment: { id } } } };
+  }
+  // Task 4.6/4.7: the single-PR rollup query `getChangeRequestDetails` sends
+  // (`pullRequest(number: ...) { commits { ... statusCheckRollup } }`) —
+  // checked before the plural `pullRequests(states: OPEN...)` list query
+  // below, since both queries contain `statusCheckRollup`.
+  if (/pullRequest\(number:/.test(query) && /statusCheckRollup/.test(query)) {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            commits: {
+              nodes: [{
+                commit: {
+                  statusCheckRollup: {
+                    state: 'SUCCESS',
+                    contexts: {
+                      nodes: [
+                        {
+                          __typename: 'CheckRun',
+                          databaseId: 93178061854,
+                          name: 'ci',
+                          conclusion: 'SUCCESS',
+                          status: 'COMPLETED',
+                          permalink: 'https://github.com/acme/core/actions/runs/1/job/1',
+                          summary: '12 tests passed, 0 failed',
+                        },
+                        {
+                          __typename: 'StatusContext',
+                          context: 'license/cla',
+                          state: 'SUCCESS',
+                          targetUrl: 'https://cla.example/acme/core/2841',
+                          description: 'All committers have signed the CLA.',
+                        },
+                      ],
+                    },
+                  },
+                },
+              }],
+            },
+          },
+        },
+      },
+    };
   }
   if (/statusCheckRollup/.test(query)) {
     const repoId = `${parsed.variables?.owner as string}/${parsed.variables?.repo as string}`;

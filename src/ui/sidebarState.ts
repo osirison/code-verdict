@@ -2,7 +2,8 @@ import { deriveStats, repoIdsOf, repoLabel, type PodData } from '../app/podQuery
 import type { Pod } from '../domain/types';
 import { getProvider, tryGetProvider } from '../platform/registry';
 import { NEUTRAL_VOCABULARY } from '../platform/provider';
-import type { SidebarViewState } from './sidebarHtml';
+import type { RunRecord } from '../app/reviewRunManager';
+import type { SidebarActiveRun, SidebarViewState } from './sidebarHtml';
 import { repoCountOf } from './vocab';
 
 export function toSidebarViewState(data: PodData, pods: readonly Pod[]): SidebarViewState {
@@ -45,4 +46,25 @@ export function toSidebarViewState(data: PodData, pods: readonly Pod[]): Sidebar
     })),
     waitingOnYou: deriveStats(data).waitingOnYou,
   };
+}
+
+/**
+ * The sidebar's compact active-run list, straight off each record's own
+ * `RunProjection` (task 14.3, design.md D14) — never a second, sidebar-local
+ * read of `RunRecord`. Every field here is copied, not recomputed: the
+ * lifecycle, current action, elapsed time, and progress mode/units are
+ * exactly what the active review screen itself renders from, so the two
+ * surfaces cannot describe the same run differently.
+ */
+export function toSidebarActiveRuns(records: readonly RunRecord[]): SidebarActiveRun[] {
+  return records.map((record) => ({
+    key: record.key,
+    label: record.input.refLabel,
+    lifecycle: record.projection.lifecycle,
+    currentAction: record.projection.currentAction,
+    elapsedMs: record.projection.elapsedMs,
+    progressMode: record.projection.progressMode,
+    progressUnits: record.projection.progressUnits,
+    attention: record.projection.attention,
+  }));
 }

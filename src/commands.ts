@@ -1,5 +1,5 @@
 /**
- * The 21 `Verdict:` commands, as specified in
+ * The 22 `Verdict:` commands, as specified in
  * `spec/specs/Code Verdict - naming & commands.md`. package.json must
  * contribute exactly this set — enforced by commands.test.ts.
  */
@@ -25,6 +25,7 @@ export const COMMANDS = {
   refresh: 'codeVerdict.refresh',
   signIn: 'codeVerdict.signIn',
   showApiTrace: 'codeVerdict.showApiTrace',
+  showRunDiagnostics: 'codeVerdict.showRunDiagnostics',
 } as const;
 
 export type CommandId = (typeof COMMANDS)[keyof typeof COMMANDS];

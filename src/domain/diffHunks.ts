@@ -9,6 +9,22 @@ export interface HunkLine {
   text: string;
   oldLine?: number;
   newLine?: number;
+  /**
+   * 1-based index of this line inside the patch text itself, counting every
+   * physical line including the `@@` headers and the metadata lines the parse
+   * skips. `oldLine`/`newLine` say where a line sits in the *file*; this says
+   * where it sits in the *patch*, which is the only coordinate a caller
+   * holding the patch string can slice by.
+   *
+   * Added for `../app/harnessSynthesisVerification.ts`'s evidence excerpt: it
+   * must cut a window of the exact patch bytes around a citation's file lines,
+   * and a citation's range is in file lines. Without this, that module would
+   * have to re-walk the patch with its own copy of the header regex and the
+   * skip rules below — two parsers that could disagree about which line is
+   * which. Optional so every existing `HunkLine` literal (the UI's fixtures)
+   * stays valid unchanged; it is always set by `parseHunks` itself.
+   */
+  patchLine?: number;
 }
 
 export interface Hunk {
@@ -39,7 +55,21 @@ function parseHunksUncached(diff: string): Hunk[] {
   let oldLine = 0;
   let newLine = 0;
 
-  for (const raw of diff.split('\n')) {
+  // Split on either ending. `HEADER` is anchored at both ends, so a diff whose
+  // lines end `\r\n` left a trailing `\r` on the header line, the match failed,
+  // and every hunk in the file was silently dropped — no anchors, no line
+  // numbers, an empty result indistinguishable from a diff with no hunks. The
+  // same trailing `\r` would otherwise be baked into `HunkLine.text`, which
+  // matters here because citation validation compares exact content.
+  // `patchLine` counts every physical line of this split, including the ones
+  // the body of the loop skips (metadata, `\ No newline`, blanks), because it
+  // is a position in the patch string, not a position in `hunk.lines`. A
+  // caller slicing the patch by these numbers must see the same line count
+  // this split produces — it does: `\r\n` and `\n` are both one separator
+  // here and one `\n` there, so the two agree line for line.
+  let patchLine = 0;
+  for (const raw of diff.split(/\r?\n/)) {
+    patchLine += 1;
     const header = raw.match(HEADER);
     if (header) {
       current = {
@@ -60,13 +90,13 @@ function parseHunksUncached(diff: string): Hunk[] {
     // counting it would shift every anchor after it by one.
     if (raw.startsWith('\\')) continue;
     if (raw.startsWith('+')) {
-      current.lines.push({ kind: 'add', text: raw.slice(1), newLine });
+      current.lines.push({ kind: 'add', text: raw.slice(1), newLine, patchLine });
       newLine += 1;
     } else if (raw.startsWith('-')) {
-      current.lines.push({ kind: 'del', text: raw.slice(1), oldLine });
+      current.lines.push({ kind: 'del', text: raw.slice(1), oldLine, patchLine });
       oldLine += 1;
     } else {
-      current.lines.push({ kind: 'context', text: raw.slice(1), oldLine, newLine });
+      current.lines.push({ kind: 'context', text: raw.slice(1), oldLine, newLine, patchLine });
       oldLine += 1;
       newLine += 1;
     }

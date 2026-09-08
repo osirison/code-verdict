@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { ConnectionConfig } from '../../platform/provider';
 import { loadSpecFixtures } from '../../testing/specFixtures';
 import { mapGitLabError } from './errors';
-import { buildCommentBody, buildPosition, toReviewThread } from './mappers';
-import type { GlDiscussion } from './mappers';
+import { buildCommentBody, buildPosition, toChangeRequestDiff, toReviewThread } from './mappers';
+import type { GlDiscussion, GlMergeRequestChanges } from './mappers';
 import { createGitLabProvider } from './gitlabProvider';
 import { makeFakeGitLabFetch } from './fakeGitLab';
 
@@ -74,6 +74,42 @@ describe('outbound payloads reproduce the postDiscussionRequest fixture', () => 
     expect(() => buildPosition({ filePath: 'a.ts', line: 1, refs: { commit_id: 'gh-shaped' } })).toThrow(
       /diff_refs/,
     );
+  });
+});
+
+/**
+ * Task 5.2. GitLab's `getChangeRequestDiff` needs no change to report the
+ * merge base — it always has. This is what stops that from being an accident
+ * somebody later "tidies" into `start_sha`, which sits in the same object and
+ * is the same commit whenever the target branch has not moved.
+ *
+ * The literals below are three distinct commits, which the spec fixture is
+ * not: there `base_sha === start_sha`, the ordinary case, and reading either
+ * one gives the same answer.
+ */
+describe('toChangeRequestDiff pins the base revision to the merge base', () => {
+  const MERGE_BASE = 'aa11bb22cc33dd44ee55ff6677889900aabbcc11';
+  /** Where the target branch got to after the merge base — two commits landed on `main`. */
+  const TARGET_BRANCH_COMMIT = 'bb22cc33dd44ee55ff6677889900aabbccdd2222';
+  const HEAD = 'cc33dd44ee55ff6677889900aabbccddee113333';
+  const crRef = { repoId: '9101', number: '2841' };
+  const changes: GlMergeRequestChanges = {
+    diff_refs: { base_sha: MERGE_BASE, start_sha: TARGET_BRANCH_COMMIT, head_sha: HEAD },
+    changes: [],
+  };
+
+  it('reads base_sha, the merge base, and never start_sha', () => {
+    const diff = toChangeRequestDiff(crRef, changes);
+    expect(diff.baseSha).toBe(MERGE_BASE);
+    expect(diff.baseSha).not.toBe(TARGET_BRANCH_COMMIT);
+    expect(diff.headSha).toBe(HEAD);
+  });
+
+  it('still carries the whole triple to anchoring, start_sha included', () => {
+    // start_sha is not surplus — a positioned comment needs all three to
+    // round-trip, which is why it is in the payload at all and why the
+    // temptation to read it as the base exists in the first place.
+    expect(toChangeRequestDiff(crRef, changes).anchorRefs).toEqual(changes.diff_refs);
   });
 });
 

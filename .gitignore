@@ -5,3 +5,6 @@ coverage/
 .vscode-test/
 media/codicons/
 .worktrees/
+
+# Output-channel logs written by the extension development host.
+logs/

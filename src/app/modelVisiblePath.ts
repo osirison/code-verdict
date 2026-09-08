@@ -44,9 +44,22 @@ export function labelledWorkspaceRoots(
   }));
 }
 
+/**
+ * Backslashes to forward slashes, drop a leading `./` — the one normalization
+ * step every path-accepting surface needs, shared so `attachments.ts` and
+ * `contextAttachmentPicker.ts`'s reference resolver do not each carry their
+ * own copy of it. They deliberately stop here rather than calling
+ * `normalizeModelVisiblePath`: that function's extra slash-collapsing step is
+ * specific to paths this module hands to the model, not to paths already
+ * received from elsewhere.
+ */
+export function normalizePathSlashes(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
 /** Normalize only representation, never resolve `..` supplied by an untrusted response. */
 export function normalizeModelVisiblePath(path: string): string {
-  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/');
+  return normalizePathSlashes(path).replace(/\/{2,}/g, '/');
 }
 
 /** Root qualification is present only when the workspace actually has multiple roots. */

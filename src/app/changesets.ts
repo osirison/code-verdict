@@ -25,7 +25,8 @@ export interface ChangesetDetectionOptions {
 
 export const DEFAULT_TRAILER = 'Part-of:';
 
-function escapeRegExp(text: string): string {
+/** Escapes every regex metacharacter so `text` matches only itself — shared with `harnessRiskFloors.ts`'s glob compiler rather than a second escaping convention. */
+export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 

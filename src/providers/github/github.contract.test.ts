@@ -1,12 +1,20 @@
 import { describeProviderContract } from '../../platform/contract/providerContract';
 import type { ConnectionConfig } from '../../platform/provider';
 import { createGitHubProvider } from './githubProvider';
-import { makeFakeGitHubFetch } from './fakeGitHub';
+import { ADVANCED_TARGET_BRANCH_SHA, makeFakeGitHubFetch } from './fakeGitHub';
 
 const CONFIG: ConnectionConfig = {
   instanceUrl: 'https://github.com',
   credential: { kind: 'token', token: 'ghp-test' },
 };
+
+/**
+ * #2841 was cut from this commit and has not been rebased, so it is both the
+ * tip `main` starts at in the fake and the pull's merge base — the two values
+ * only diverge once a commit lands on `main`, which is exactly what
+ * `makeMovingTargetBranchConnection` below does.
+ */
+const MERGE_BASE_SHA = '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091';
 
 describeProviderContract('github (REST + GraphQL against fake fetch)', {
   capabilities: createGitHubProvider().capabilities,
@@ -32,4 +40,18 @@ describeProviderContract('github (REST + GraphQL against fake fetch)', {
   threadMutationsPersist: true,
   crRef: { repoId: 'acme/core', number: '2841' },
   anchor: { filePath: 'src/limiter.ts', line: 12 },
+  makeRateLimitedDetailConnection: () =>
+    createGitHubProvider(makeFakeGitHubFetch({ investigationRateLimited: true })).connect(CONFIG),
+  // `main` gets a commit while the review is in flight: the pull's `base.sha`
+  // moves, its `merge_base_commit` does not.
+  makeMovingTargetBranchConnection: () => {
+    const targetBranch = { tip: MERGE_BASE_SHA };
+    return {
+      conn: createGitHubProvider(makeFakeGitHubFetch({ targetBranch })).connect(CONFIG),
+      advanceTargetBranch: () => {
+        targetBranch.tip = ADVANCED_TARGET_BRANCH_SHA;
+        return targetBranch.tip;
+      },
+    };
+  },
 });

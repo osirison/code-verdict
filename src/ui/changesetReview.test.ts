@@ -273,6 +273,16 @@ beforeEach(async () => {
   panel.webview.postMessage.mockClear();
 });
 
+describe('ChangesetReviewPanel.isOpen: codeVerdict.showRunDiagnostics\'s side-effect-free "is a panel open" count', () => {
+  it('is false with no panel open, true once one is', async () => {
+    const { ChangesetReviewPanel } = await import('./changesetReview.js');
+    expect(ChangesetReviewPanel.isOpen()).toBe(false);
+
+    await openPanel();
+    expect(ChangesetReviewPanel.isOpen()).toBe(true);
+  });
+});
+
 describe('the changeset review screen patches in place (tasks 7.2, 7.7)', () => {
   it('opens on a loading paint, then the retained triage, both as full documents before the page is armed', async () => {
     await openPanel();

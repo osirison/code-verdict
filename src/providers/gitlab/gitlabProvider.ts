@@ -6,6 +6,7 @@
 import type {
   Connection,
   ConnectionConfig,
+  Credential,
   ProviderCapabilities,
   ScmProvider,
   Vocabulary,
@@ -13,11 +14,17 @@ import type {
 } from '../../platform/provider';
 import type {
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   CommentOutcome,
   ConnectionStatus,
+  CurrentHeadResult,
+  IssueDetailRequest,
+  IssueDetailResult,
+  ObjectSourceResult,
   Repository,
   ReviewSubmission,
   ReviewThread,
@@ -26,12 +33,14 @@ import type {
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
-import { bearerToken } from '../../platform/provider';
+import { basicAuthorizationHeaderValue, credentialSecret } from '../../platform/provider';
+import { isFetchableObjectSourceUrl } from '../../platform/types';
 import { ScmError, isScmError, toScmError } from '../../platform/errors';
 import { parseSourceInput } from './sourceInput';
 import type { FetchLike } from './http';
 import { GitLabHttp, encodeRepoId } from './http';
 import type {
+  GlCommit,
   GlDiscussion,
   GlGroup,
   GlIssue,
@@ -44,15 +53,21 @@ import type {
 import {
   buildCommentBody,
   buildPosition,
+  nonSystemNotes,
   toChangeRequest,
   toChangeRequestDiff,
   toCiRun,
   toCiStatus,
+  toNormalizedDetail,
+  toNormalizedDetailFromIssue,
   toRepoGroup,
   toRepository,
   toReviewThread,
   toWorkItem,
 } from './mappers';
+
+/** Declared review-investigation page bounds (design.md D7, task 4.3) \u2014 self-imposed, since GitLab returns each of these payloads in one call rather than paginating them itself. */
+const INVESTIGATION_MANIFEST_PAGE = 100;
 
 const CAPABILITIES: ProviderCapabilities = {
   suggestions: true,
@@ -64,6 +79,20 @@ const CAPABILITIES: ProviderCapabilities = {
   groupHierarchy: true,
   // Batched review would use the draft-notes API — not in v1.
   batchedReview: false,
+  // D7: the two detail reads, and nothing else. Five more used to be declared
+  // here — manifests, diff reads, file reads, repository search and diff search
+  // — read from the Compare API and the repository-search endpoint. They are
+  // gone with the rest of the provider investigation path: anything answerable
+  // from two commits is answered by git against a local object store, so no
+  // forge is asked for it. GitLab could answer a revision-pinned search where
+  // GitHub could not, and it still loses the operation, because the point is
+  // not which forge is better at it — it is that a second route to a diff is
+  // how the fallback comes back.
+  detailRetrieval: {
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: INVESTIGATION_MANIFEST_PAGE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -103,8 +132,92 @@ interface GlTokenInfo {
   expires_at?: string | null;
 }
 
+/**
+ * The username GitLab wants in the Basic pair for git over HTTPS, per
+ * credential kind. The token is always the password half — GitLab never reads
+ * one out of the username half, which is one real difference from GitHub.
+ *
+ * `oauth2` is what GitLab documents for an OAuth access token
+ * (`https://oauth2:<token>@gitlab.example.com/…`, docs.gitlab.com, "OAuth 2.0
+ * identity provider API", read 2026-09-11), and it is required rather than
+ * merely conventional on releases whose `Gitlab::Auth` reaches the OAuth check
+ * with the login in hand — older releases took `oauth_access_token_check(login,
+ * password)` and required exactly this value, while master today takes only the
+ * password. A self-managed instance can be any release, so this is the value
+ * that works on all of them.
+ *
+ * A personal access token deliberately does NOT use `oauth2`. GitLab's own
+ * documentation says the username "can be any string value" and "must not be
+ * an empty string" (docs.gitlab.com, "Personal access tokens", read
+ * 2026-09-11), so any sentinel is correct — and choosing one that is not
+ * `oauth2` means the request never enters the OAuth branch at all on the older
+ * releases described above. What that branch does with a password that is not
+ * an OAuth token is inferred from reading the chain rather than measured, and a
+ * username that avoids it is a fact that needs no inference. `gitlab-ci-token`
+ * is avoided for the same reason from the other direction: it is GitLab's
+ * reserved login for CI job tokens.
+ */
+const GIT_HTTPS_USERNAME: { readonly token: string; readonly session: string } = {
+  token: 'private-token',
+  session: 'oauth2',
+};
+
+/**
+ * The complete `Authorization` value a `git fetch` against this connection's
+ * project should carry, or `undefined` when there is no credential to send.
+ *
+ * **The live failure this replaces.** Until 2026-09-09 this composed
+ * `Bearer ${token}`, the same scheme `http.ts` uses for the REST API, and a
+ * review stopped with "The object source would not authorize this fetch with
+ * the credential this connection has for it." The measurement that pinned it
+ * was taken against GitHub (`../github/githubProvider.ts` records the table),
+ * and the diagnosis applies here for the same reason: a forge's REST API and a
+ * forge's git transport are different servers with different authentication,
+ * and git over HTTPS is HTTP Basic on both platforms.
+ *
+ * This side was not measured against a running GitLab — none was available —
+ * so it is composed from GitLab's own documentation and source, cited above
+ * `GIT_HTTPS_USERNAME`, and held by a real fetch through
+ * `../objectSourceGitFetch.test.ts` against the rule `./fakeGitLab.ts` states.
+ * That is weaker evidence than the GitHub table and is labelled as such rather
+ * than dressed up.
+ *
+ * Unlike GitHub, the two credential kinds do not send the same value: what
+ * GitLab does with the username depends on what the token is. `none` sends no
+ * header at all rather than an empty pair, so that "no credential" is
+ * indistinguishable from never having been asked for one.
+ *
+ * The `session` branch is not reachable through onboarding today —
+ * `authModesFor` offers `token` only, because this provider has no editor
+ * session to ask for — and it is written and tested anyway: `Credential` is a
+ * union every provider answers in full, and the alternative is a provider that
+ * silently sends the wrong username on the day one appears.
+ */
+function gitAuthorizationHeaderValue(credential: Credential): string | undefined {
+  switch (credential.kind) {
+    case 'token':
+      return credential.token === '' ? undefined : basicAuthorizationHeaderValue(GIT_HTTPS_USERNAME.token, credential.token);
+    case 'session':
+      return credential.accessToken === '' ? undefined : basicAuthorizationHeaderValue(GIT_HTTPS_USERNAME.session, credential.accessToken);
+    case 'none':
+      return undefined;
+  }
+}
+
 export class GitLabConnection implements Connection {
-  constructor(private readonly http: GitLabHttp) {}
+  constructor(
+    private readonly http: GitLabHttp,
+    /**
+     * The pod's credential, held for one purpose only: composing the
+     * `Authorization` header value in `getObjectSource`'s descriptor
+     * (`add-local-git-investigation` task 2.4), so a source that fetches git
+     * objects itself can authenticate as this connection does. Every API call
+     * this class makes still authenticates through `http`, which holds its own
+     * copy; this one never reaches a URL, a log line or an error string
+     * (`src/providers/objectSourceCredential.test.ts`).
+     */
+    private readonly credential: Credential,
+  ) {}
 
   async testConnection(): Promise<ConnectionStatus> {
     let user: GlUser;
@@ -410,7 +523,120 @@ export class GitLabConnection implements Connection {
   private mrPath(ref: ChangeRequestRef): string {
     return `/projects/${encodeRepoId(ref.repoId)}/merge_requests/${ref.number}`;
   }
+
+  // ---- forge-only detail retrieval (design.md D7) -------------------------
+  //
+  // Everything that used to sit above these two — the Compare-API manifest,
+  // diff read, file read, repository search and diff search — was removed with
+  // the provider investigation path. What is left is what is not in the
+  // repository: the merge request's own detail, and a linked issue's.
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    const { snapshot } = request;
+    const path = `/projects/${encodeRepoId(snapshot.repoId)}/merge_requests/${request.number}`;
+    let mr: GlMergeRequest;
+    try {
+      mr = await this.http.get<GlMergeRequest>(path);
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') return { snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+      throw e;
+    }
+    const [discussions, commits] = await Promise.all([
+      this.http.getAll<GlDiscussion>(`${path}/discussions`),
+      this.http.getAll<GlCommit>(`${path}/commits`),
+    ]);
+    const discussion = discussions.filter((d) => !d.individual_note).flatMap(nonSystemNotes);
+    return { snapshot, state: 'complete', value: toNormalizedDetail(mr, discussion, commits) };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    const { snapshot } = request;
+    const path = `/projects/${encodeRepoId(request.issueRepoId)}/issues/${request.issueNumber}`;
+    let issue: GlIssue;
+    try {
+      issue = await this.http.get<GlIssue>(path);
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+      }
+      throw e;
+    }
+    const discussions = await this.http.getAll<GlDiscussion>(`${path}/discussions`);
+    const discussion = discussions.filter((d) => !d.individual_note).flatMap(nonSystemNotes);
+    return { snapshot, state: 'complete', value: toNormalizedDetailFromIssue(issue, discussion) };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    try {
+      const mr = await this.http.get<GlMergeRequest>(this.mrPath(ref));
+      return { repoId: ref.repoId, state: 'resolved', headSha: mr.sha };
+    } catch (e) {
+      if (isScmError(e) && e.kind === 'notFound') return { repoId: ref.repoId, state: 'notFound' };
+      throw e;
+    }
+  }
+
+  /**
+   * Where a source that computes diffs itself may fetch this project's git
+   * objects (`add-local-git-investigation` design.md D2/D8, task 2.4).
+   *
+   * The project has to be read, not composed: a GitLab `repoId` is the
+   * numeric project id, and no clone URL can be built from a number. The
+   * instance's own `http_url_to_repo` is the answer, with `web_url` + `.git`
+   * as the fallback for a response that omits it.
+   *
+   * The ref hint is `refs/merge-requests/{iid}/head`: the ref GitLab keeps for
+   * a merge request's head even after a force-push leaves that commit
+   * unreachable from any branch. Composing it is this provider's job and it
+   * stays here — the descriptor hands it over as an opaque string, and nothing
+   * above the provider boundary learns that such a ref exists (design.md D8).
+   *
+   * Every failure answers `unavailable` rather than throwing: the caller's
+   * question is "can objects be obtained", and the answer to no is that this
+   * project cannot be reviewed and the reason says why. There is no forge
+   * fallback behind it any more — this provider serves no investigation — so an
+   * unavailable descriptor ends the attempt rather than routing it somewhere
+   * else. The reason names the neutral error kind only, never GitLab's own
+   * message, which is a channel a credential could ride out on.
+   */
+  async getObjectSource(ref: ChangeRequestRef): Promise<ObjectSourceResult> {
+    let project: GlProject;
+    try {
+      project = await this.http.get<GlProject>(`/projects/${encodeRepoId(ref.repoId)}`);
+    } catch (e) {
+      return { state: 'unavailable', reason: `The project's object location could not be read (${toScmError(e).kind}).` };
+    }
+    const fetchUrl = project.http_url_to_repo ?? `${project.web_url}.git`;
+    if (!isFetchableObjectSourceUrl(fetchUrl)) {
+      return { state: 'unavailable', reason: 'The project reports no ordinary HTTP or HTTPS clone location.' };
+    }
+    // The branch this merge request targets, which is what the merge base is
+    // computed against locally. It is a fact about the merge request rather
+    // than about the repository's objects, so it is one of the few things this
+    // connection is still asked for.
+    let target: string | undefined;
+    try {
+      target = (await this.http.get<GlMergeRequest>(this.mrPath(ref))).target_branch;
+    } catch {
+      // Left absent rather than guessed: a default-branch fallback would look
+      // right almost always and quietly review the wrong pair of commits for a
+      // merge request that targets a release branch.
+      target = undefined;
+    }
+    const authorization = gitAuthorizationHeaderValue(this.credential);
+    return {
+      state: 'available',
+      descriptor: {
+        fetchUrl,
+        ...(authorization === undefined ? {} : { authorizationHeaderValue: authorization }),
+        refHint: `refs/merge-requests/${ref.number}/head`,
+        ...(target === undefined ? {} : { mergeTargetRef: `refs/heads/${target}` }),
+      },
+    };
+  }
 }
+
+
 
 export function createGitLabProvider(fetchImpl?: FetchLike): ScmProvider {
   return {
@@ -423,7 +649,8 @@ export function createGitLabProvider(fetchImpl?: FetchLike): ScmProvider {
     authModesFor: () => ['token'],
     connect(config: ConnectionConfig): Connection {
       return new GitLabConnection(
-        new GitLabHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl),
+        new GitLabHttp(config.instanceUrl, credentialSecret(config.credential), fetchImpl),
+        config.credential,
       );
     },
   };

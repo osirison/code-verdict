@@ -71,3 +71,21 @@ describe('parseHunks and diffStats — memoization (D10)', () => {
     expect(diffStats(splitHeader)).toEqual({ added: 0, removed: 0 });
   });
 });
+
+describe('line endings', () => {
+  const BODY = ['@@ -1,2 +1,2 @@', '-old', '+new', ' same'];
+
+  it('parses a diff whose lines end with a carriage return exactly as one that does not', () => {
+    const lf = parseHunks(`${BODY.join('\n')}\n`);
+    const crlf = parseHunks(`${BODY.join('\r\n')}\r\n`);
+    expect(lf.length).toBe(1);
+    expect(crlf).toEqual(lf);
+  });
+
+  it('leaves no carriage return in line text, which citation validation compares exactly', () => {
+    const [hunk] = parseHunks(`${BODY.join('\r\n')}\r\n`);
+    expect(hunk).toBeDefined();
+    for (const line of hunk?.lines ?? []) expect(line.text).not.toContain('\r');
+  });
+});
+
