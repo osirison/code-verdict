@@ -29,7 +29,7 @@ describe('keyboard overlay (spec §12)', () => {
     // The ask chord is bound at both layers and does two different things
     // (design D6). The overlay names both, or the editor-level one is invisible.
     expect(html).toContain('sends what you typed, from the ask box');
-    expect(html).toContain('the selected finding, from anywhere else');
+    expect(html).toContain('the selected finding, from elsewhere on triage');
     // The note now says where the triage keys apply, not merely that the tab
     // must be focused — the screen is half of what arms them.
     expect(html).toContain('triage keys apply on the triage screen');

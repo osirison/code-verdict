@@ -319,7 +319,7 @@ function keysGroups(isMac: boolean): ReadonlyArray<{
       // selected finding. Listing only the first left the second undocumented.
       rows: [
         { cap: enter, label: 'Ask', hint: 'sends what you typed, from the ask box' },
-        { cap: enter, label: 'Explain', hint: 'the selected finding, from anywhere else' },
+        { cap: enter, label: 'Explain', hint: 'the selected finding, from elsewhere on triage' },
       ],
     },
     {

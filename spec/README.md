@@ -405,7 +405,7 @@ platform, `⌃⇧⌥` on Windows and Linux and `⌘⇧⌥` on macOS, supplied by
 
 Groups: **Triage** — ⌃⇧⌥A accept (applies the suggested fix when there is one), ⌃⇧⌥M accept
 comment-only, ⌃⇧⌥R reject, ⌃⇧⌥S skip, ⌃⇧⌥J/K next/previous, ⌃⇧⌥1–4 jump to severity, ⌃⇧⌥U undo.
-**Agent** — ⌃↩ ask (sends what you typed, from the ask box), ⌃↩ explain (the selected finding, from anywhere else): one chord bound at both layers, so both results are listed. **Everywhere** — ? help (or ⌃⇧⌥/ while typing), ⌃⇧P palette, Esc close.
+**Agent** — ⌃↩ ask (sends what you typed, from the ask box), ⌃↩ explain (the selected finding, from elsewhere on triage): one chord bound at both layers, so both results are listed. **Everywhere** — ? help (or ⌃⇧⌥/ while typing), ⌃⇧P palette, Esc close.
 
 The plain letters `A ⇧A R S J K U 1–4` remain live on the triage screen while the cursor is outside
 a text field, so the triage loop stays one key per finding; the chord is what works from inside one.
