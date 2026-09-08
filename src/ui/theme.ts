@@ -313,7 +313,14 @@ function keysGroups(isMac: boolean): ReadonlyArray<{
     },
     {
       group: 'Agent',
-      rows: [{ cap: enter, label: 'Ask', hint: 'from the ask box' }],
+      // One chord, two results, because it is bound at both layers (design D6):
+      // the webview's own `#ask` handler sends the typed question, and the
+      // editor-level `codeVerdict.askAgent` asks the `explain` preset about the
+      // selected finding. Listing only the first left the second undocumented.
+      rows: [
+        { cap: enter, label: 'Ask', hint: 'sends what you typed, from the ask box' },
+        { cap: enter, label: 'Explain', hint: 'the selected finding, from anywhere else' },
+      ],
     },
     {
       group: 'Everywhere',

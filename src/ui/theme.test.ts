@@ -26,6 +26,10 @@ describe('keyboard overlay (spec §12)', () => {
     expect(html).toContain('⌃⇧⌥M');
     expect(html).toContain('⌃↩');
     expect(html).toContain('⌃⇧P');
+    // The ask chord is bound at both layers and does two different things
+    // (design D6). The overlay names both, or the editor-level one is invisible.
+    expect(html).toContain('sends what you typed, from the ask box');
+    expect(html).toContain('the selected finding, from anywhere else');
     // The note now says where the triage keys apply, not merely that the tab
     // must be focused — the screen is half of what arms them.
     expect(html).toContain('triage keys apply on the triage screen');
@@ -50,8 +54,13 @@ describe('keyboard overlay (spec §12)', () => {
     // the presets, the mode switch, the open-in-editor button and the G-chords
     // are all click-only, and ⌘↵ generate summary was never bound at all.
     const html = page();
-    for (const phantom of ['G then D', 'G then P', 'Show fix', 'Find similar', 'Explain', 'Open in editor', '⌘1 ⌘2 ⌘3', 'Generate summary']) {
+    for (const phantom of ['G then D', 'G then P', 'Show fix', 'Find similar', 'Open in editor', '⌘1 ⌘2 ⌘3', 'Generate summary']) {
       expect(html).not.toContain(phantom);
+    }
+    // Explain is listed, but on the chord that reaches it — `codeVerdict.askAgent`
+    // — never on the bare `E` that nothing has ever handled.
+    for (const cap of ['E', '⇧F', 'F', 'O']) {
+      expect(html).not.toContain(`<span class="keys-cap">${cap}</span>`);
     }
   });
 

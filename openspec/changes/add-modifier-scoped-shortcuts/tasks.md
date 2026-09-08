@@ -65,6 +65,6 @@ The repo cannot prove a keybinding fires; only the Extension Development Host ca
 Separate on purpose, per proposal.md — it can be cut without affecting anything above.
 
 - [x] 8.1 `src/ui/theme.ts:290-325` advertises eight shortcuts with no key handler anywhere: `E` explain, `F` show fix, `⇧F` find similar, `O` open in editor, `⌘1/⌘2/⌘3` mode, `G then D` dashboard, `G then P` posted reviews, and `⌘↵` generate summary. Each is click-only (`src/ui/reviewFlowHtml.ts:1763-1809`). Remove the rows.
-- [x] 8.2 Keep `⌘↩` Ask, which is real (`codeVerdict.askAgent` plus the `#ask` handler at `src/ui/reviewFlowHtml.ts:1747`), and keep the Everywhere group's palette and Esc rows.
+- [x] 8.2 Keep `⌘↩`, which is real, and list **both** things it does, because it is bound at both layers with different payloads (design.md — D6): the `#ask` handler at `src/ui/reviewFlowHtml.ts:1747` sends the typed question from the ask box, and `codeVerdict.askAgent` asks the `explain` preset about the selected finding. One row named only the first. Keep the Everywhere group's palette and Esc rows.
 - [x] 8.3 Update `src/ui/theme.test.ts` — it asserts the overlay renders four groups; the Agent and Navigation groups shrink or disappear.
 - [x] 8.4 Update `spec/README.md` §12's group listing to match, so the design document and the shipped overlay agree.
