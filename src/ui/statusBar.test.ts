@@ -95,6 +95,11 @@ describe('status bar segments (spec §14)', () => {
     expect(agent.visible).toBe(true);
     expect(keys.text).toBe('$(keyboard) ? keys');
     expect(keys.command).toBe('codeVerdict.internal.keyboardHelp');
+    // `?` still opens the overlay — it lives in the webview, which can see the
+    // focused element — so the label stays. The tooltip is where the chord that
+    // also works from inside a text field is taught.
+    expect(keys.tooltip).toContain('⌃⇧⌥/');
+    expect(keys.tooltip).toContain('⌘⇧⌥/');
     expect(keys.visible).toBe(true);
 
     bar.setActiveReview({ ...review, counts: { accepted: 8, rejected: 0, skipped: 0, undecided: 0 } });

@@ -186,6 +186,47 @@ describe('every screen\'s script armed at once (tasks 8.1, 8.3)', () => {
     // dashboard panel from a screen that is not even loaded.
     expect(posted.filter((m) => (m as { type: string }).type === 'move')).toHaveLength(0);
   });
+
+  /**
+   * The positive counterpart, in the union rather than in the review flow's own
+   * document: seven route scripts are live at once here, so this is what proves
+   * none of the other six swallows the key first. The route markup is written by
+   * hand because building a whole `FlowViewState` in this file would duplicate
+   * `reviewFlowHtml.test.ts`; that the real renderer emits this marker for every
+   * screen is pinned there, in "every screen stamps its own marker".
+   */
+  function loadShellRoute(routeMarkup: string): { dom: JSDOM; posted: unknown[] } {
+    const posted: unknown[] = [];
+    const virtualConsole = new VirtualConsole();
+    const dom = new JSDOM(
+      renderShellDocument({ title: 'Verdict', nonce: 'nonce123', regions: { crumb: '', route: routeMarkup } }),
+      {
+        runScripts: 'dangerously',
+        virtualConsole,
+        beforeParse(window) {
+          (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+            postMessage: (message: unknown) => posted.push(message),
+          });
+        },
+      },
+    );
+    posted.length = 0;
+    return { dom, posted };
+  }
+
+  it('the review flow\'s keyboard map still answers on the triage screen, and only there', () => {
+    const onTriage = loadShellRoute('<div class="route-flow"><span hidden data-flow-screen="triage"></span></div>');
+    onTriage.dom.window.document.body.dispatchEvent(
+      new onTriage.dom.window.KeyboardEvent('keydown', { key: 'j', bubbles: true }),
+    );
+    expect(onTriage.posted.filter((m) => (m as { type: string }).type === 'move')).toHaveLength(1);
+
+    const onSummary = loadShellRoute('<div class="route-flow"><span hidden data-flow-screen="summary"></span></div>');
+    onSummary.dom.window.document.body.dispatchEvent(
+      new onSummary.dom.window.KeyboardEvent('keydown', { key: 'j', bubbles: true }),
+    );
+    expect(onSummary.posted.filter((m) => (m as { type: string }).type === 'move')).toHaveLength(0);
+  });
 });
 
 describe('the first-paint size bound (task 8.7)', () => {

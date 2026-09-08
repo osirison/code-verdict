@@ -167,8 +167,12 @@ Timeout at 90s per request with the partial-results path above. Surface the requ
 Three modes over one state (`Split`, `Queue`, `In diff`) — a verdict in any mode updates all of
 them, plus the sidebar tree, progress bar, status bar and summary.
 
-- Verdicts: `A` accept (applies suggestion when present), `⇧A` accept comment-only, `R` reject,
-  `S` skip, `J/K` move, `U` undo, `?` help. Bind under `when: verdict.reviewFocus`.
+- Verdicts: accept (applies suggestion when present), accept comment-only, reject, skip, move,
+  undo, help. Published to the editor as `ctrl+shift+alt+A/M/R/S/J/K/U/1–4/` and `/`
+  (`cmd+shift+alt+…` on macOS) under `when: verdict.reviewFocus && verdict.reviewTriageFocus`; help
+  under `verdict.reviewFocus` alone. Never publish a bare or Shift-only key: it is matched while the
+  reviewer types in the review's own fields. The plain letters `A ⇧A R S J K U 1–4 ?` stay live in
+  the webview's own handler, which can see the focused element and the current screen.
 - Auto-advance to the next undecided item is a setting (`codeVerdict.autoAdvance`), on by default.
 - Deep dive: four preset follow-ups (explain / fix / similar / why flagged) plus freeform. Answers
   append to a per-item thread and persist with the review.

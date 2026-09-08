@@ -83,7 +83,7 @@ import {
   pickContextAttachment,
 } from './contextAttachmentPicker';
 import { changesetDetectionOptions } from './changesetOptions';
-import { flowCommandMessage } from './flowCommands';
+import { flowCommandMessage, isTriageOnlyMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
 import { livenessView } from './runLiveness';
@@ -285,6 +285,11 @@ export class ChangesetReviewPanel {
       'setContext',
       'verdict.reviewContextFocus',
       this.reviewFocusActive && this.screen === 'agent',
+    );
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewTriageFocus',
+      this.reviewFocusActive && this.screen === 'triage',
     );
   }
 
@@ -784,6 +789,9 @@ export class ChangesetReviewPanel {
   }
 
   private async onMessage(message: FlowMessage): Promise<void> {
+    // Refused here rather than at the keyboard map, so the palette entries and
+    // any future caller are refused the same way a keystroke is.
+    if (isTriageOnlyMessage(message) && this.screen !== 'triage') return;
     const pod = this.pod();
     switch (message.type) {
       case 'toggleAgentOpen': this.agentOpen = !this.agentOpen; break;
@@ -1386,6 +1394,13 @@ export class ChangesetReviewPanel {
       'setContext',
       'verdict.reviewContextFocus',
       this.reviewFocusActive && this.screen === 'agent',
+    );
+    // Published from here as well as from setReviewFocus, because focus and
+    // screen change independently and the triage keys depend on both.
+    void vscode.commands.executeCommand(
+      'setContext',
+      'verdict.reviewTriageFocus',
+      this.reviewFocusActive && this.screen === 'triage',
     );
     // Patch the region in place rather than replacing the whole document
     // (task 7.2) — every state change on this screen funnels through render(),
