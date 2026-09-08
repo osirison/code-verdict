@@ -33,7 +33,7 @@ Lands first and stands alone: it closes the summary-screen corruption without to
 
 ## 5. What the product says about its own keys (D5)
 
-- [x] 5.1 Make `KEYS_GROUPS` (`src/ui/theme.ts:288-325`) a function of a platform flag rather than a module constant, and pass the flag through the render-options object `renderPage` already takes. The host supplies it from `process.platform === 'darwin'`; the webview must not guess.
+- [x] 5.1 Make `KEYS_GROUPS` (`src/ui/theme.ts:288-325`) a function of a platform flag rather than a module constant, and pass the flag through the render-options object `renderPage` already takes. The host supplies it from `process.platform === 'darwin'`, which is the remote machine under Remote-SSH and friends, so the markup carries both notations and the webview corrects the stamped guess against the client (design.md — D5).
 - [x] 5.2 Rewrite the Triage group's caps to the new chords, rendered `⌃⇧⌥A` on Windows/Linux and `⌘⇧⌥A` on macOS. Note against the accept row that the plain letters still work on the triage screen when the cursor is not in a text field — that is the whole reason the fast path was kept, and an overlay that hides it makes the change look worse than it is.
 - [x] 5.3 `src/ui/sidebar.ts:424`: the `$(keyboard) ? keys` label stays correct — the webview's bare-`?` handler is kept (design.md — D5), so `?` still opens the overlay. Leave the label and the click-through alone; add the new chord to the tooltip so the reviewer learns the form that also works from inside a text field.
 - [x] 5.4 `src/extension.ts:744-751`: the fallback information message lists `A ⇧A R S J/K 1–4 U`. Rewrite it to the current chords.

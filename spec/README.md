@@ -401,7 +401,9 @@ are typing" + an "Esc" affordance. Body is a 2-column grid; each shortcut is a m
 optional 10.5px note.
 
 The overlay lists only shortcuts that exist. Caps are written in the notation of the reviewer's
-platform, `⌃⇧⌥` on Windows and Linux and `⌘⇧⌥` on macOS, supplied by the extension host.
+platform, `⌃⇧⌥` on Windows and Linux and `⌘⇧⌥` on macOS. The extension host stamps its own
+platform's notation and carries the other in `data-alt`; the overlay script, which runs on the
+client, swaps them when the two disagree — which is what a Remote window does.
 
 Groups: **Triage** — ⌃⇧⌥A accept (applies the suggested fix when there is one), ⌃⇧⌥M accept
 comment-only, ⌃⇧⌥R reject, ⌃⇧⌥S skip, ⌃⇧⌥J/K next/previous, ⌃⇧⌥1–4 jump to severity, ⌃⇧⌥U undo.
