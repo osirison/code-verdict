@@ -694,6 +694,7 @@ function buildHarnessAttempt(
         budget: info.budget,
         coverage: info.coverage,
         unresolved: info.unresolved,
+        retry: info.retry,
       },
       policy,
     );
