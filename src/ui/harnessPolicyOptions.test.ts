@@ -4,14 +4,43 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { evaluateCompletion, type CompletionEvaluationInput } from '../app/harnessCompletion';
 import { createChangedFileInventory } from '../app/harnessInventory';
 import { DEFAULT_RISK_COVERAGE_RULES } from '../app/harnessRiskFloors';
-import { DEFAULT_HARNESS_POLICY } from '../domain/harnessPolicy';
+import {
+  renderAttemptConfiguration,
+  type ResolvedHarnessPolicy,
+  type ResolvedHarnessSetting,
+} from '../app/harnessPolicyTrace';
+import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
+import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 import type { ChangedFileEntry, InvestigationSnapshotRef } from '../platform/types';
 
-const settings = vi.hoisted(() => ({ values: {} as Record<string, unknown> }));
+/**
+ * Two records, because the real `WorkspaceConfiguration` has two answers and the difference is the
+ * whole point of the provenance reader.
+ *
+ * `values` is what `get` returns — in a running extension that is never `undefined` for a
+ * `codeVerdict.harness.*` key, because every one of them declares a `default` in `package.json`, so
+ * an untouched setting comes back as the shipped number. `userValues` is what `inspect` reports for
+ * the layers a reviewer actually edits. A test that wants "the reviewer set this" must put the value
+ * in both (`setUserSetting` below); a test that wants "nobody set this" leaves `userValues` empty
+ * while `values` still answers, exactly as production does.
+ */
+const settings = vi.hoisted(() => ({ values: {} as Record<string, unknown>, userValues: {} as Record<string, unknown> }));
 
 vi.mock('vscode', () => ({
   workspace: {
-    getConfiguration: () => ({ get: (key: string) => settings.values[key] }),
+    getConfiguration: () => ({
+      get: (key: string) => settings.values[key],
+      // Only the three layers `suppliedValue` reads. The language-scoped layers a real `inspect`
+      // also returns are deliberately absent: none of these settings is language-scoped, and the
+      // reader ignores them.
+      inspect: (key: string) => ({
+        defaultValue: undefined,
+        globalValue: settings.userValues[key],
+        workspaceValue: undefined,
+        workspaceFolderValue: undefined,
+      }),
+    }),
   },
 }));
 
@@ -26,6 +55,7 @@ import {
   normalizeHarnessPolicySettings,
   readHarnessCoverageRules,
   readHarnessPolicy,
+  readResolvedHarnessPolicy,
 } from './harnessPolicyOptions';
 
 describe('harness policy settings — funnel into normalizeHarnessPolicy, never re-validate', () => {
@@ -249,5 +279,253 @@ describe('the harness settings table and the panel controls name the same settin
     const settings = HARNESS_POLICY_SETTINGS.map((mapping) => mapping.settingKey).slice().sort();
     const controls = HARNESS_NUMBER_FIELDS.map((field) => field.key).slice().sort();
     expect(controls).toEqual(settings);
+  });
+});
+
+// ---- Provenance: which values ran, and where each of them came from ----------------
+
+/**
+ * The block an attempt writes into the agent trace before it runs
+ * (`../app/harnessPolicyTrace.ts`) is only worth anything if the origin it prints is true. This is
+ * where that is established, because this is the module that reads the configuration.
+ *
+ * The trap these tests exist to hold shut: `config.get` folds an unset key into `package.json`'s
+ * declared default, so in a running extension it returns `192` for a `maxPromptKilobytesPerTurn`
+ * nobody has ever touched — indistinguishable from one a reviewer typed. Provenance derived from
+ * `get` would report every setting as reviewer-set and answer "did my change take effect" wrongly,
+ * in a durable log, with total confidence. `inspect` is the only API that separates the layers.
+ */
+
+/** A setting the reviewer actually put in settings.json: present in both the effective view and the user layer, exactly as the real API reports one. */
+function setUserSetting(settingKey: string, value: unknown): void {
+  settings.values[`harness.${settingKey}`] = value;
+  settings.userValues[`harness.${settingKey}`] = value;
+}
+
+/** What `config.get` returns in a running extension for a configuration nobody has edited: every declared default, and no user layer at all. */
+function shippedDefaultsOnly(): void {
+  settings.values = {};
+  settings.userValues = {};
+  for (const settingKey of HARNESS_SETTING_KEYS) {
+    settings.values[`harness.${settingKey}`] = manifestProperties[`codeVerdict.harness.${settingKey}`]?.default;
+  }
+}
+
+function settingNamed(resolved: ResolvedHarnessPolicy, settingKey: string): ResolvedHarnessSetting {
+  const found = resolved.settings.find((setting) => setting.settingKey === settingKey);
+  expect(found, `no line for ${settingKey}`).toBeDefined();
+  return found!;
+}
+
+describe('resolved harness settings carry where each value came from', () => {
+  beforeEach(() => {
+    settings.values = {};
+    settings.userValues = {};
+  });
+
+  it('reports the shipped default as a default even though config.get hands back the very same number', () => {
+    shippedDefaultsOnly();
+    const resolved = readResolvedHarnessPolicy();
+    for (const setting of resolved.settings) expect(setting.origin).toBe('default');
+    expect(settingNamed(resolved, 'maxPromptKilobytesPerTurn').value).toBe(192);
+  });
+
+  it('distinguishes "the reviewer set it to exactly the default" from "the reviewer set nothing" — the fact a stale-settings suspicion turns on', () => {
+    shippedDefaultsOnly();
+    setUserSetting('maxPromptKilobytesPerTurn', 192);
+    const resolved = readResolvedHarnessPolicy();
+    const set = settingNamed(resolved, 'maxPromptKilobytesPerTurn');
+    expect(set.origin).toBe('setting');
+    expect(set.value).toBe(192);
+    // The number is identical to the default's; only the origin tells them apart.
+    expect(settingNamed(resolved, 'maxModelTurnsPerAttempt').origin).toBe('default');
+  });
+
+  it('reports a reviewer-set value in the reviewer’s own unit, under the reviewer’s own key', () => {
+    shippedDefaultsOnly();
+    setUserSetting('maxPromptKilobytesPerTurn', 96);
+    setUserSetting('maxElapsedSecondsPerAttempt', 600);
+    const resolved = readResolvedHarnessPolicy();
+    expect(settingNamed(resolved, 'maxPromptKilobytesPerTurn')).toEqual({
+      settingKey: 'maxPromptKilobytesPerTurn',
+      value: 96,
+      origin: 'setting',
+    });
+    // The policy stores bytes and milliseconds; the block states kilobytes and seconds, because that
+    // is what the reviewer typed and what they will grep for.
+    expect(resolved.policy.maxPromptBytesPerTurn).toBe(96 * 1024);
+    expect(settingNamed(resolved, 'maxElapsedSecondsPerAttempt').value).toBe(600);
+    expect(resolved.policy.maxElapsedMsPerAttempt).toBe(600_000);
+  });
+
+  it('reports a value normalization discarded as rejected, naming what was supplied and what ran instead', () => {
+    shippedDefaultsOnly();
+    setUserSetting('maxModelTurnsPerAttempt', -5);
+    setUserSetting('retainedCheckpointsPerLineage', 0);
+    setUserSetting('requireInspectionMinRisk', 'nonsense');
+    setUserSetting('scopeInvestigationToChangedFiles', 'yes please');
+    const resolved = readResolvedHarnessPolicy();
+
+    expect(settingNamed(resolved, 'maxModelTurnsPerAttempt')).toEqual({
+      settingKey: 'maxModelTurnsPerAttempt',
+      value: 64,
+      origin: 'rejected',
+      supplied: -5,
+    });
+    expect(settingNamed(resolved, 'retainedCheckpointsPerLineage')).toEqual({
+      settingKey: 'retainedCheckpointsPerLineage',
+      value: 3,
+      origin: 'rejected',
+      supplied: 0,
+    });
+    expect(settingNamed(resolved, 'requireInspectionMinRisk')).toEqual({
+      settingKey: 'requireInspectionMinRisk',
+      value: 'medium',
+      origin: 'rejected',
+      supplied: 'nonsense',
+    });
+    expect(settingNamed(resolved, 'scopeInvestigationToChangedFiles')).toEqual({
+      settingKey: 'scopeInvestigationToChangedFiles',
+      value: false,
+      origin: 'rejected',
+      supplied: 'yes please',
+    });
+  });
+
+  it('reports a fractional value as rejected too — floored, not defaulted — and the line states both numbers rather than guessing which happened', () => {
+    shippedDefaultsOnly();
+    setUserSetting('checkpointCadenceToolCalls', 10.5);
+    const resolved = readResolvedHarnessPolicy();
+    expect(settingNamed(resolved, 'checkpointCadenceToolCalls')).toEqual({
+      settingKey: 'checkpointCadenceToolCalls',
+      value: 10,
+      origin: 'rejected',
+      supplied: 10.5,
+    });
+    const lines = renderAttemptConfiguration({ snapshot: traceSnapshot(), settings: resolved.settings });
+    expect(lines).toContain(
+      '[run-doc-1#1] policy checkpointCadenceToolCalls=10 — REJECTED: settings.json supplied 10.5, not used; the attempt runs on 10',
+    );
+  });
+
+  it('emits exactly one entry per codeVerdict.harness.* key, in settings-panel order — a new setting cannot be silently omitted from the block', () => {
+    shippedDefaultsOnly();
+    const resolved = readResolvedHarnessPolicy();
+    expect(resolved.settings.map((setting) => setting.settingKey)).toEqual([...HARNESS_SETTING_KEYS]);
+  });
+
+  it('resolves the identical policy readHarnessPolicy does — provenance is added beside the funnel, never a second validation path', () => {
+    shippedDefaultsOnly();
+    setUserSetting('maxPromptKilobytesPerTurn', 96);
+    setUserSetting('highRiskReservePercent', 250);
+    expect(readResolvedHarnessPolicy().policy).toEqual(readHarnessPolicy());
+  });
+});
+
+/**
+ * The rendered block itself, pinned — it is the deliverable, so it is asserted whole rather than by
+ * a handful of `toContain`s that would let a reordering or a dropped line through.
+ */
+const traceSnapshot = (): ReviewRunSnapshot => ({
+  schemaVersion: '1',
+  runId: 'run-doc-1',
+  lineageId: 'lineage-doc-1',
+  attempt: 1,
+  createdAt: '2026-09-12T09:00:00.000Z',
+  targetKind: 'cr',
+  members: [
+    {
+      memberId: 'acme/widgets!42',
+      providerId: 'github',
+      instanceUrl: 'https://github.com',
+      ref: { repoId: 'acme/widgets', number: '42' },
+      baseSha: '1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d',
+      baseRevisionKind: 'mergeBase',
+      headSha: 'f0e9d8c7b6a5948372f0e9d8c7b6a5948372f0e9',
+      investigationSource: { kind: 'localGit', contractVersion: '1', capabilitySignature: 'cap-sig' },
+      providerCapabilitySignature: 'provider-sig',
+      rootAgentsPolicy: { present: false },
+      context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+    },
+  ],
+  agentId: 'agent:builtin/default',
+  agentInstructions: 'You are a code review agent. Review ONLY the diffs below.',
+  agentInstructionsDigest: 'agent-digest',
+  personaLabel: 'Built-in reviewer',
+  modelId: 'copilot:gpt-4o',
+  modelCapability: { vendor: 'copilot', family: 'gpt-4o', maxInputTokens: 128_000 },
+  effort: 'none',
+  effortInstructionDigest: 'effort-digest',
+  criteria: DEFAULT_CRITERIA,
+  extraInstructionsDigest: 'extra-digest',
+  toolContractVersion: '1',
+  harnessPolicyVersion: HARNESS_POLICY_VERSION,
+});
+
+describe('the block as a reviewer reads it', () => {
+  beforeEach(() => {
+    settings.values = {};
+    settings.userValues = {};
+  });
+
+  const HEAD = [
+    '===== attempt run-doc-1#1 resolved configuration =====',
+    '[run-doc-1#1] lineage=lineage-doc-1 target=cr agent=agent:builtin/default effort=none',
+    '[run-doc-1#1] model=copilot:gpt-4o vendor=copilot family=gpt-4o maxInputTokens=128000',
+    `[run-doc-1#1] contracts policyVersion=${HARNESS_POLICY_VERSION} toolContractVersion=1 snapshotSchema=1`,
+    '[run-doc-1#1] member acme/widgets!42 source=localGit base=1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d (mergeBase) head=f0e9d8c7b6a5948372f0e9d8c7b6a5948372f0e9',
+  ];
+  const TAIL = ['===== end resolved configuration for run-doc-1#1 ====='];
+
+  it('a default configuration: fifteen values, every one of them shipped, nothing attributable to settings.json', () => {
+    shippedDefaultsOnly();
+    const lines = renderAttemptConfiguration({ snapshot: traceSnapshot(), settings: readResolvedHarnessPolicy().settings });
+    expect(lines).toEqual([
+      ...HEAD,
+      '[run-doc-1#1] policy 15 setting(s): 0 from settings.json, 15 shipped default',
+      '[run-doc-1#1] policy maxElapsedSecondsPerAttempt=1800 (shipped default)',
+      '[run-doc-1#1] policy maxModelTurnsPerAttempt=64 (shipped default)',
+      '[run-doc-1#1] policy maxToolRequestsPerAttempt=256 (shipped default)',
+      '[run-doc-1#1] policy maxPromptKilobytesPerTurn=192 (shipped default)',
+      '[run-doc-1#1] policy maxEvidenceMegabytesPerAttempt=8 (shipped default)',
+      '[run-doc-1#1] policy highRiskReservePercent=20 (shipped default)',
+      '[run-doc-1#1] policy verificationReservePercent=15 (shipped default)',
+      '[run-doc-1#1] policy transientRetriesPerOperation=3 (shipped default)',
+      '[run-doc-1#1] policy checkpointCadenceToolCalls=10 (shipped default)',
+      '[run-doc-1#1] policy retainedCheckpointsPerLineage=3 (shipped default)',
+      '[run-doc-1#1] policy maxActivityEventsPerAttempt=1000 (shipped default)',
+      '[run-doc-1#1] policy terminalAttemptHistoryCount=5 (shipped default)',
+      '[run-doc-1#1] policy terminalAttemptHistoryMaxAgeDays=30 (shipped default)',
+      '[run-doc-1#1] policy requireInspectionMinRisk=medium (shipped default)',
+      '[run-doc-1#1] policy scopeInvestigationToChangedFiles=false (shipped default)',
+      ...TAIL,
+    ]);
+  });
+
+  it('two settings changed — one taken, one discarded — and the block says which is which without the reviewer opening settings.json', () => {
+    shippedDefaultsOnly();
+    setUserSetting('maxPromptKilobytesPerTurn', 96);
+    setUserSetting('maxModelTurnsPerAttempt', -5);
+    const lines = renderAttemptConfiguration({ snapshot: traceSnapshot(), settings: readResolvedHarnessPolicy().settings });
+    expect(lines).toEqual([
+      ...HEAD,
+      '[run-doc-1#1] policy 15 setting(s): 1 from settings.json, 13 shipped default, 1 REJECTED',
+      '[run-doc-1#1] policy maxElapsedSecondsPerAttempt=1800 (shipped default)',
+      '[run-doc-1#1] policy maxModelTurnsPerAttempt=64 — REJECTED: settings.json supplied -5, not used; the attempt runs on 64',
+      '[run-doc-1#1] policy maxToolRequestsPerAttempt=256 (shipped default)',
+      '[run-doc-1#1] policy maxPromptKilobytesPerTurn=96 (settings.json)',
+      '[run-doc-1#1] policy maxEvidenceMegabytesPerAttempt=8 (shipped default)',
+      '[run-doc-1#1] policy highRiskReservePercent=20 (shipped default)',
+      '[run-doc-1#1] policy verificationReservePercent=15 (shipped default)',
+      '[run-doc-1#1] policy transientRetriesPerOperation=3 (shipped default)',
+      '[run-doc-1#1] policy checkpointCadenceToolCalls=10 (shipped default)',
+      '[run-doc-1#1] policy retainedCheckpointsPerLineage=3 (shipped default)',
+      '[run-doc-1#1] policy maxActivityEventsPerAttempt=1000 (shipped default)',
+      '[run-doc-1#1] policy terminalAttemptHistoryCount=5 (shipped default)',
+      '[run-doc-1#1] policy terminalAttemptHistoryMaxAgeDays=30 (shipped default)',
+      '[run-doc-1#1] policy requireInspectionMinRisk=medium (shipped default)',
+      '[run-doc-1#1] policy scopeInvestigationToChangedFiles=false (shipped default)',
+      ...TAIL,
+    ]);
   });
 });

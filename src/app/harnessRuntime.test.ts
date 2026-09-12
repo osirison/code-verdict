@@ -9,6 +9,7 @@ import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { CONTRADICTION_CHECK_MARKER } from './harnessSynthesisVerification';
 import { createReviewHarnessFactory, type HarnessRuntimeDeps } from './harnessRuntime';
+import type { ResolvedHarnessPolicy } from './harnessPolicyTrace';
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
 import { DEFAULT_RISK_COVERAGE_RULES, type RiskCoverageRules } from './harnessRiskFloors';
 import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from './agents';
@@ -687,6 +688,104 @@ describe('policy and risk-coverage rules reach the harness fresh per attempt (ta
     await attempt2.run();
     expect(policyReads).toBe(2);
     expect(coverageReads).toBe(2);
+  });
+});
+
+/**
+ * "Can you log what parameters the review is running with, to make sure the changes are being
+ * picked up." Through the real factory, because the point is that a live attempt writes it — the
+ * rendering itself is covered in `harnessPolicyTrace.test.ts` and the provenance in
+ * `../ui/harnessPolicyOptions.test.ts`.
+ */
+describe('an attempt states what it is running on, once, before it runs', () => {
+  function traceSink(): { lines: string[]; appendLine: (line: string) => void } {
+    const lines: string[] = [];
+    return { lines, appendLine: (line: string) => lines.push(line) };
+  }
+
+  const RESOLVED: ResolvedHarnessPolicy = {
+    policy: DEFAULT_HARNESS_POLICY,
+    settings: [
+      { settingKey: 'maxPromptKilobytesPerTurn', value: 96, origin: 'setting' },
+      { settingKey: 'maxModelTurnsPerAttempt', value: 64, origin: 'rejected', supplied: -5 },
+    ],
+  };
+
+  it('writes one configuration block per attempt — not one per model turn — carrying the resolved policy, the model, and the member’s pinned revisions', async () => {
+    const sink = traceSink();
+    let turns = 0;
+    const scripted = scriptedRunTurn();
+    const factory = createReviewHarnessFactory({
+      ...deps,
+      trace: sink,
+      resolvedPolicy: RESOLVED,
+      runTurn: async (modelId, prompt) => {
+        turns += 1;
+        return scripted(modelId, prompt as unknown as string);
+      },
+    });
+    await factory.create(runInput(), noopRunOptions({ runId: 'run-cfg-1', lineageId: 'lineage-cfg-1', attempt: 1 })).run();
+
+    // The attempt really did take several model turns, or "once per attempt" would be proven by an
+    // attempt that only ever had one.
+    expect(turns).toBeGreaterThan(1);
+    expect(sink.lines.filter((line) => line.includes('resolved configuration ====='))).toHaveLength(1);
+    expect(sink.lines.filter((line) => line.includes('end resolved configuration for'))).toHaveLength(1);
+
+    const text = sink.lines.join('\n');
+    expect(text).toContain('[run-cfg-1#1] policy maxPromptKilobytesPerTurn=96 (settings.json)');
+    expect(text).toContain(
+      '[run-cfg-1#1] policy maxModelTurnsPerAttempt=64 — REJECTED: settings.json supplied -5, not used; the attempt runs on 64',
+    );
+    expect(text).toContain(`[run-cfg-1#1] member ${MEMBER_ID} `);
+    expect(text).toContain(`base=${BASE_SHA} `);
+    expect(text).toContain(`head=${HEAD_SHA}`);
+    expect(text).toContain('model=lm:test/test-model vendor=test family=test-model');
+    // Every line is stamped by the shared time-of-day formatter, like every other writer into this
+    // sink.
+    for (const line of sink.lines) expect(line).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3} /);
+  });
+
+  it('reads deps.resolvedPolicy exactly once per attempt built, and prefers it over the provenance-free deps.policy', async () => {
+    const sink = traceSink();
+    let reads = 0;
+    const factory = createReviewHarnessFactory({
+      ...deps,
+      trace: sink,
+      // A policy that would be used if `resolvedPolicy` were ignored — and whose turn ceiling is
+      // low enough that the scripted review could not finish on it, so precedence is proven by the
+      // run completing, not only by the line that was written.
+      policy: { ...DEFAULT_HARNESS_POLICY, maxModelTurnsPerAttempt: 1 },
+      get resolvedPolicy() {
+        reads += 1;
+        return RESOLVED;
+      },
+    });
+    const outcome = await factory.create(runInput(), noopRunOptions({ runId: 'run-cfg-2', lineageId: 'lineage-cfg-2', attempt: 1 })).run();
+
+    expect(reads).toBe(1);
+    expect(outcome.outcome.completeness).toBe('complete');
+    expect(sink.lines.join('\n')).toContain('[run-cfg-2#1] policy maxPromptKilobytesPerTurn=96 (settings.json)');
+  });
+
+  it('a host that wired no settings reader gets a block that says so, rather than one that implies everything is a default', async () => {
+    const sink = traceSink();
+    const factory = createReviewHarnessFactory({ ...deps, trace: sink, runTurn: scriptedRunTurn() });
+    await factory.create(runInput(), noopRunOptions({ runId: 'run-cfg-3', lineageId: 'lineage-cfg-3', attempt: 1 })).run();
+
+    const text = sink.lines.join('\n');
+    expect(text).toContain(
+      '[run-cfg-3#1] policy: this host wired no settings reader, so no value below can be attributed to settings.json',
+    );
+    expect(text).not.toContain('shipped default');
+  });
+
+  it('writes nothing when no trace sink is wired, and a review still runs', async () => {
+    const factory = createReviewHarnessFactory({ ...deps, resolvedPolicy: RESOLVED, runTurn: scriptedRunTurn() });
+    const outcome = await factory
+      .create(runInput(), noopRunOptions({ runId: 'run-cfg-4', lineageId: 'lineage-cfg-4', attempt: 1 }))
+      .run();
+    expect(outcome.outcome.completeness).toBe('complete');
   });
 });
 

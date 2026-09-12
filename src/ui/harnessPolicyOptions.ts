@@ -36,11 +36,21 @@
  * configure an incoherent rule (say, "high" without "medium"). Its own
  * fallback is the shipped default, same discipline as every numeric field —
  * a reviewer remains free to choose `low` explicitly for full coverage.
+ *
+ * **This module also answers "where did each value come from".**
+ * `readResolvedHarnessPolicy` at the bottom returns the same values plus the
+ * origin of each one, which is what an attempt writes into the agent trace
+ * before it runs (`../app/harnessPolicyTrace.ts`). It is here and nowhere else
+ * because `WorkspaceConfiguration.inspect` is the only API that separates a
+ * value a reviewer set from `package.json`'s declared default, and `get` —
+ * which every other reader in this file uses — folds the two together by
+ * design. See `suppliedValue`'s own doc comment.
  */
 import * as vscode from 'vscode';
 import { isRiskLevel, RISK_LEVELS, type RiskLevel } from '../domain/harnessCoverage';
 import { DEFAULT_HARNESS_POLICY, normalizeHarnessPolicy, type HarnessPolicy } from '../domain/harnessPolicy';
 import { DEFAULT_RISK_COVERAGE_RULES, risksAtLeast, type RiskCoverageRules } from '../app/harnessRiskFloors';
+import type { ResolvedHarnessPolicy, ResolvedHarnessSetting } from '../app/harnessPolicyTrace';
 
 export type { RiskLevel };
 
@@ -180,3 +190,117 @@ export function readRequireInspectionMinRisk(): RiskLevel {
 
 /** `risksAtLeast('low')` is exactly `RISK_LEVELS` — restated here only so a test can assert the two never quietly diverge. */
 export const FULL_RISK_COVERAGE: readonly RiskLevel[] = RISK_LEVELS;
+
+/**
+ * The same values `readHarnessPolicy`/`readHarnessCoverageRules` resolve, plus **where each one
+ * came from** — the record `harnessRuntime.ts` writes into the agent trace at attempt start
+ * (`../app/harnessPolicyTrace.ts`).
+ *
+ * ## `inspect`, not `get`, and that is the whole trick
+ *
+ * Every `codeVerdict.harness.*` key declares a `default` in `package.json`, so `config.get` never
+ * returns `undefined` in a running extension: an untouched `maxPromptKilobytesPerTurn` comes back as
+ * `192`, byte-identical to what a reviewer who typed `192` gets. Provenance derived from those
+ * values would report every single setting as reviewer-set and answer the reviewer's question
+ * wrongly — confidently, and in a durable log. `WorkspaceConfiguration.inspect` is the only API that
+ * separates the layers, so `suppliedValue` below reads it and takes the most specific *user* layer
+ * (`workspaceFolderValue`, then `workspaceValue`, then `globalValue`), leaving `undefined` to mean
+ * exactly one thing: nobody set this.
+ *
+ * Language-scoped layers (`globalLanguageValue` and friends) are ignored deliberately. None of these
+ * settings is language-scoped — they configure a review run, not an editor behaviour for a file
+ * type — and reading them would let a `[typescript]` block silently become the answer to "where did
+ * this value come from" for a value no review ever used.
+ *
+ * ## The effective value still comes from `get`
+ *
+ * `resolveHarnessPolicySettings` takes both records and funnels `effective` — the `get` values —
+ * through the existing `normalizeHarnessPolicySettings`, unchanged. `inspect` is used only to
+ * classify. That keeps behaviour exactly as it was: a default contributed by another extension
+ * through `configurationDefaults` still wins the way it always did, and still reads as a default
+ * here, which is honest — it is one, just not ours.
+ */
+export function suppliedValue(config: vscode.WorkspaceConfiguration, key: string): unknown {
+  const inspected = config.inspect<unknown>(key);
+  if (!inspected) return undefined;
+  return inspected.workspaceFolderValue ?? inspected.workspaceValue ?? inspected.globalValue;
+}
+
+/**
+ * Classifies one setting from the two values already in hand — no third source of truth, and no
+ * second validation path.
+ *
+ * `resolved` is what the attempt actually runs on, converted back into the setting's own unit
+ * (`harnessPolicyToSettingValues` for the numbers, the policy field itself for the boolean, the
+ * normalized enum for the risk level). So the comparison is like-for-like and needs no knowledge of
+ * what `normalizeHarnessPolicy` did:
+ *
+ * - nothing supplied → `default`;
+ * - supplied and identical to what ran → `setting`, which is the answer a reviewer who set a value
+ *   equal to the default needs and could not previously get;
+ * - supplied and different from what ran → `rejected`. That covers both ways normalization can
+ *   discard a value — an unusable one falling back to its default, and a fractional one being
+ *   floored — and the rendered line names both numbers rather than guessing which happened
+ *   (`../app/harnessPolicyTrace.ts`'s `settingLine`).
+ */
+function classify(settingKey: string, resolved: number | boolean | string, supplied: unknown): ResolvedHarnessSetting {
+  if (supplied === undefined) return { settingKey, value: resolved, origin: 'default' };
+  if (supplied === resolved) return { settingKey, value: resolved, origin: 'setting' };
+  return { settingKey, value: resolved, origin: 'rejected', supplied };
+}
+
+/**
+ * Pure half of `readResolvedHarnessPolicy`: `effective` is what `config.get` returned (keyed by
+ * `settingKey`), `supplied` is the user-layer-only view from `config.inspect`. Emits one entry per
+ * key in `HARNESS_SETTING_KEYS` order — the numeric table first, in settings-panel order, then the
+ * boolean, then the risk enum — so a reviewer reads the block in the order the settings UI shows
+ * them.
+ *
+ * `requireInspectionMinRisk` is here even though the harness receives it as a derived
+ * `RiskCoverageRules` through its own getter: the reviewer sets a level, so the level is what the
+ * block must state. The derived rule set stays `readHarnessCoverageRules`'s job and is unaffected.
+ */
+export function resolveHarnessPolicySettings(
+  effective: Partial<Record<string, unknown>>,
+  supplied: Partial<Record<string, unknown>>,
+): ResolvedHarnessPolicy {
+  const policy = normalizeHarnessPolicySettings(effective);
+  const inSettingUnits = harnessPolicyToSettingValues(policy);
+  const settings: ResolvedHarnessSetting[] = HARNESS_POLICY_SETTINGS.map(({ settingKey }) =>
+    classify(settingKey, inSettingUnits[settingKey], supplied[settingKey]),
+  );
+  settings.push(
+    classify(
+      REQUIRE_INSPECTION_MIN_RISK_SETTING,
+      normalizeRequireInspectionMinRisk(effective[REQUIRE_INSPECTION_MIN_RISK_SETTING]),
+      supplied[REQUIRE_INSPECTION_MIN_RISK_SETTING],
+    ),
+  );
+  settings.push(
+    classify(
+      SCOPE_INVESTIGATION_TO_CHANGED_FILES_SETTING,
+      policy.scopeInvestigationToChangedFiles,
+      supplied[SCOPE_INVESTIGATION_TO_CHANGED_FILES_SETTING],
+    ),
+  );
+  return { policy, settings };
+}
+
+/**
+ * The reader production wiring hands the harness runtime (`extension.ts`), as a getter — one
+ * configuration read per attempt built, producing the policy and its provenance together so the two
+ * can never describe different configurations (`ResolvedHarnessPolicy`'s own doc comment).
+ *
+ * Supersedes `readHarnessPolicy` for the runtime; `readHarnessPolicy` stays for the settings panel,
+ * which needs the values and not where they came from.
+ */
+export function readResolvedHarnessPolicy(): ResolvedHarnessPolicy {
+  const config = vscode.workspace.getConfiguration('codeVerdict');
+  const effective: Record<string, unknown> = {};
+  const supplied: Record<string, unknown> = {};
+  for (const settingKey of HARNESS_SETTING_KEYS) {
+    effective[settingKey] = config.get<unknown>(`harness.${settingKey}`);
+    supplied[settingKey] = suppliedValue(config, `harness.${settingKey}`);
+  }
+  return resolveHarnessPolicySettings(effective, supplied);
+}

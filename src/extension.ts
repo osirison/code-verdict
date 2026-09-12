@@ -58,7 +58,7 @@ import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
 import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
-import { readHarnessCoverageRules, readHarnessPolicy } from './ui/harnessPolicyOptions';
+import { readHarnessCoverageRules, readResolvedHarnessPolicy } from './ui/harnessPolicyOptions';
 import { objectCacheRoot } from './localgit/objectCache';
 import { createObjectCache, type ObjectCache } from './localgit/objectAcquisition';
 
@@ -452,14 +452,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the ordinary tool calls, so a real diff is exactly what it wants.
     investigationSource: ({ providerId }) => (providerId === SAMPLE_DATA_PROVIDER_ID ? createDemoInvestigationSource() : undefined),
     // Getters, not values read once at activation: `harnessRuntime.ts`'s own
-    // `HarnessRuntimeDeps.policy`/`riskCoverageRules` doc comment says these
-    // are read fresh per attempt built, so a setting changed in the settings
-    // panel applies to the reviewer's next run without a window reload.
-    get policy() {
-      return readHarnessPolicy();
+    // `HarnessRuntimeDeps.resolvedPolicy`/`riskCoverageRules` doc comment says
+    // these are read fresh per attempt built, so a setting changed in the
+    // settings panel applies to the reviewer's next run without a window
+    // reload.
+    //
+    // `resolvedPolicy`, not the older provenance-free `policy`: one
+    // configuration read hands back the values AND where each of them came
+    // from, and the attempt writes both into the agent trace before it runs
+    // (`app/harnessPolicyTrace.ts`). Two getters would be two reads of a live
+    // configuration during one assembly, which is how a trace block ends up
+    // naming limits the attempt is not running on.
+    get resolvedPolicy() {
+      return readResolvedHarnessPolicy();
     },
     get riskCoverageRules() {
       return readHarnessCoverageRules();
+    },
+    // A getter, and it has to be: `installAgentTraceFile` above re-points the
+    // shared sink at `agent-trace.log` during activation, so a sink captured
+    // into this object literal would be the bare output channel — and the
+    // configuration block, the one thing a reviewer reads back after a run has
+    // ended, would be the only line missing from the file.
+    get trace() {
+      return sharedAgentTraceSink();
     },
   };
 

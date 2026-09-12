@@ -42,6 +42,37 @@ channel still writes what the channel shows into VS Code's log directory, which
 is outside the extension's control, so "live-only" means "not written by Code
 Verdict", not "never touches a disk".
 
+## Check what the run was configured with before anything else
+
+Every attempt writes one block into the agent trace before its first model
+call, naming each `codeVerdict.harness.*` value it resolved and where that
+value came from:
+
+    grep 'resolved configuration' 'logs/Code Verdict: Agent Trace.log'
+    grep '] policy ' 'logs/Code Verdict: Agent Trace.log'
+
+Three forms, and the difference between the first two is the point:
+
+    [run-x#1] policy maxPromptKilobytesPerTurn=192 (shipped default)
+    [run-x#1] policy maxPromptKilobytesPerTurn=96 (settings.json)
+    [run-x#1] policy maxModelTurnsPerAttempt=64 — REJECTED: settings.json supplied -5, not used; the attempt runs on 64
+
+`(shipped default)` on a setting you edited means the edit is not reaching the
+run — a different settings scope, a typo in the key, or a stale window.
+`REJECTED` means the value was read and discarded by normalization, which is
+the case that was previously invisible: `normalizeHarnessPolicy` replaces an
+unusable value with the default silently.
+
+Only the settable surface is in the block. Provider page sizes, the backoff
+curve and `globalConcurrency` are not reviewer-settable and are deliberately
+absent.
+
+The same block carries the attempt's other resolved facts on the lines above
+the policy ones — the model and vendor that will answer, the investigation
+source actually selected per member, and the base/head the member is pinned
+to. Grep the run tag (`[run-x#1]`) to read all of it together; two concurrent
+attempts interleave in one file, which is why every line carries that tag.
+
 ## The trace no longer has a line per streamed token
 
 `AgentTrace.fragment` writes at most two kinds of line per request: the first

@@ -64,6 +64,12 @@ import {
 } from './harnessAttempt';
 import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createDemoModelSeam } from './harnessDemoParticipant';
+import {
+  writeAttemptConfiguration,
+  type ResolvedHarnessPolicy,
+  type ResolvedHarnessSetting,
+} from './harnessPolicyTrace';
+import type { AgentTraceSink } from './agentTrace';
 import { decideResume, ResumeIncompatibleError } from './harnessResume';
 import { createLiveModelSeam, type EnforcedPrompt } from './harnessModelSeam';
 import type { HarnessRunStore } from './harnessRunStore';
@@ -126,6 +132,39 @@ export interface HarnessRuntimeDeps {
    * own doc comment).
    */
   readonly policy?: HarnessPolicy;
+  /**
+   * The same policy **and where each settable value came from**, resolved together from one
+   * configuration read — production wiring (`extension.ts`) passes a getter over
+   * `readResolvedHarnessPolicy()` (`../ui/harnessPolicyOptions.ts`) and sets this instead of
+   * `policy` above.
+   *
+   * Takes precedence over `policy` when both are set. `policy` remains for every caller that only
+   * has a `HarnessPolicy` to give — the harness's own test suite, which constructs one directly and
+   * has no settings.json behind it — and an attempt built from it writes a configuration block that
+   * says plainly that no provenance was available, rather than inventing an origin for a value
+   * nobody configured (`harnessPolicyTrace.ts`'s `renderAttemptConfiguration`).
+   *
+   * One dep carrying both, not two beside each other: in production these are live getters read
+   * once per attempt built, and two reads during one assembly can observe two different
+   * configurations — the hazard `harnessRuntime.test.ts`'s "reads deps.policy... exactly once per
+   * attempt built" test exists for. A trace block naming limits the attempt is not running on would
+   * be worse than no block at all.
+   */
+  readonly resolvedPolicy?: ResolvedHarnessPolicy;
+  /**
+   * Where the attempt's resolved-configuration block goes (`harnessPolicyTrace.ts`).
+   *
+   * The durable agent-trace sink: production wiring passes a **getter** over
+   * `sharedAgentTraceSink()` (`./lmAgent.ts`), never a value captured at activation — the tee into
+   * `agent-trace.log` is installed during activation (`installAgentTraceFile`) and a captured sink
+   * would be the bare output channel, so the one block a reviewer reads back after the fact would
+   * be the one thing missing from the file.
+   *
+   * Injected rather than imported because `lmAgent.ts` imports `vscode` and this module must stay
+   * loadable outside the extension host, exactly like `runTurn`/`countTokens` above. Absent, the
+   * attempt simply writes no block.
+   */
+  readonly trace?: AgentTraceSink;
   /** Same freshness contract as `policy` above; production wiring passes a getter over `readHarnessCoverageRules()`. */
   readonly riskCoverageRules?: RiskCoverageRules;
   /**
@@ -177,6 +216,24 @@ export interface HarnessRuntimeDeps {
 
 function memberIdFor(ref: ChangeRequestRef): string {
   return `${ref.repoId}!${ref.number}`;
+}
+
+/** The policy one attempt runs on, plus the provenance of every settable value in it — `settings` is `undefined` when the host wired no settings reader. */
+interface AttemptPolicy {
+  readonly policy: HarnessPolicy;
+  readonly settings: readonly ResolvedHarnessSetting[] | undefined;
+}
+
+/**
+ * Reads the attempt's policy from the deps **exactly once**, whichever form the host supplied it in
+ * (`HarnessRuntimeDeps.resolvedPolicy`'s own doc comment for why that matters and why
+ * `resolvedPolicy` wins). Every caller threads the returned object through the rest of the build
+ * rather than reaching for `deps.policy` a second time.
+ */
+function attemptPolicyFor(deps: HarnessRuntimeDeps): AttemptPolicy {
+  const resolved = deps.resolvedPolicy;
+  if (resolved) return { policy: resolved.policy, settings: resolved.settings };
+  return { policy: deps.policy ?? DEFAULT_HARNESS_POLICY, settings: undefined };
 }
 
 /**
@@ -547,9 +604,12 @@ async function buildCandidateAssembly(
 /**
  * Builds the live `HarnessAttempt` from an already-written snapshot — the second half both
  * `assembleAttempt` and `resume` share once they have one, with `resumeSeed` threaded through only
- * on the resume path. `policy` is the same already-resolved value `buildCandidateAssembly` used for
- * this attempt (see its own doc comment for why it is not read a second time from `deps.policy`
- * here).
+ * on the resume path. `attemptPolicy` holds the same already-resolved value `buildCandidateAssembly`
+ * used for this attempt (see its own doc comment for why it is not read a second time from
+ * `deps.policy` here), alongside the provenance of every settable value in it.
+ *
+ * This is also where the attempt states, once, what it is actually running on — see
+ * `writeAttemptConfiguration` below.
  */
 function buildHarnessAttempt(
   deps: HarnessRuntimeDeps,
@@ -557,12 +617,22 @@ function buildHarnessAttempt(
   assembly: CandidateAssembly,
   demo: boolean,
   resumeSeed: HarnessAttemptOptions['resumeSeed'],
-  policy: HarnessPolicy,
+  attemptPolicy: AttemptPolicy,
 ): HarnessAttempt {
   const now = deps.now ?? (() => Date.now());
   const startedAt = now();
+  const policy = attemptPolicy.policy;
   const riskCoverageRules = deps.riskCoverageRules ?? DEFAULT_RISK_COVERAGE_RULES;
   const { pod, revalidatedMembers, snapshot } = assembly;
+
+  // The answer to "are my settings being picked up?", written where the run is, before the run.
+  // Here rather than in `assembleAttempt`/`assembleResumeAttempt` because both paths funnel through
+  // this function exactly once per attempt — a fresh attempt, a resumed one, and a demo one each get
+  // one block, and no turn can produce a second. Everything it names was settled during assembly and
+  // is in hand at this point: the policy and where each value came from, the model that will answer,
+  // the source that was actually selected for each member, and the revisions those members are
+  // pinned to.
+  writeAttemptConfiguration(deps.trace, now, { snapshot, settings: attemptPolicy.settings });
 
   const modelSeam = demo
     ? createDemoModelSeam(snapshot)
@@ -679,15 +749,15 @@ async function assembleAttempt(deps: HarnessRuntimeDeps, input: RunInput, option
   // Read exactly once for this attempt build (task 17.1/17.2's freshness contract) and threaded
   // through both halves below, never re-read from `deps.policy` a second time — see
   // `buildCandidateAssembly`'s own doc comment.
-  const policy = deps.policy ?? DEFAULT_HARNESS_POLICY;
-  const assembly = await buildCandidateAssembly(deps, input, options, demo, policy);
+  const attemptPolicy = attemptPolicyFor(deps);
+  const assembly = await buildCandidateAssembly(deps, input, options, demo, attemptPolicy.policy);
   try {
     // Written before the first checkpoint can fire — `harnessResume.ts`'s compatibility checks and
     // the activation sweep (`sweepInterruptedRuns`) both need a stored snapshot to check a checkpoint
     // against. Written for an attempt that will end before bootstrap too (task 9.3): that attempt
     // still writes a terminal checkpoint, and a checkpoint without its snapshot is unreadable.
     await deps.harnessRunStore.writeSnapshot(assembly.snapshot);
-    return releasingLeases(buildHarnessAttempt(deps, options, assembly, demo, undefined, policy), assembly);
+    return releasingLeases(buildHarnessAttempt(deps, options, assembly, demo, undefined, attemptPolicy), assembly);
   } catch (error) {
     // Nothing will run, so nothing needs the object stores held.
     releaseSelectionLeases(assembly.selections);
@@ -746,8 +816,8 @@ async function assembleResumeAttempt(deps: HarnessRuntimeDeps, input: RunInput, 
   }
 
   // Read exactly once for this attempt build, same discipline as `assembleAttempt`.
-  const policy = deps.policy ?? DEFAULT_HARNESS_POLICY;
-  const assembly = await buildCandidateAssembly(deps, input, options, false, policy);
+  const attemptPolicy = attemptPolicyFor(deps);
+  const assembly = await buildCandidateAssembly(deps, input, options, false, attemptPolicy.policy);
 
   // Task 9.10, and the reason this refuses here rather than starting an attempt
   // that ends before bootstrap the way a fresh one does: an attempt in this
@@ -779,7 +849,7 @@ async function assembleResumeAttempt(deps: HarnessRuntimeDeps, input: RunInput, 
 
   try {
     await deps.harnessRunStore.writeSnapshot(assembly.snapshot);
-    return releasingLeases(buildHarnessAttempt(deps, options, assembly, false, { payload: decision.payload, startAction: decision.startAction }, policy), assembly);
+    return releasingLeases(buildHarnessAttempt(deps, options, assembly, false, { payload: decision.payload, startAction: decision.startAction }, attemptPolicy), assembly);
   } catch (error) {
     releaseSelectionLeases(assembly.selections);
     throw error;
