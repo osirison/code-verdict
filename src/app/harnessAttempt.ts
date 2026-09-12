@@ -390,8 +390,17 @@ export const defaultSynthesisVerification: SynthesisVerificationRunner = async (
  * `harnessCheckpoint.ts`'s `closeCheckpointAsTerminal`, used by
  * `harnessResume.ts` to close a lost attempt as `interrupted` from its last
  * persisted checkpoint after an extension restart.
+ *
+ * `attemptFailed` is the opposite case: it *is* produced by this module's own
+ * `fireCheckpoint`, from `run()`'s top-level catch-all
+ * (`finalizeEscapedError` below) — the one other way `run()` itself can end,
+ * when an error escapes every phase runner instead of resolving through the
+ * normal `runCompleting` -> `runPersisting` funnel (a model-turn transport
+ * failure such as a provider timeout is the motivating case; see that
+ * function's own doc comment). Never produced anywhere `runPersisting`/
+ * `finalizeBootstrapFailure` already ran to completion for this attempt.
  */
-export const CHECKPOINT_REASONS = ['phaseBoundary', 'toolCadence', 'modelSuggested', 'attemptInterrupted'] as const;
+export const CHECKPOINT_REASONS = ['phaseBoundary', 'toolCadence', 'modelSuggested', 'attemptInterrupted', 'attemptFailed'] as const;
 
 export type CheckpointReason = (typeof CHECKPOINT_REASONS)[number];
 
@@ -957,6 +966,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   let passesStale = false;
   /** The contradiction pass's exclusions (task 10.6's collaborator's `output.contradicted`), captured here so `fireCheckpoint`/`runPersisting` can hand them to the checkpoint collaborator and `HarnessAttemptOutcome` instead of dropping them at this closure's boundary. */
   let latestContradicted: readonly ContradictedFindingRecord[] = [];
+  /**
+   * Set the moment `runPersisting`/`finalizeBootstrapFailure` succeeds in writing this attempt's
+   * one terminal checkpoint — read by `finalizeEscapedError` (`run()`'s catch-all) so an error that
+   * escapes *after* that point (e.g. from `onPersist`) can never write a second, competing terminal
+   * checkpoint over an attempt that already correctly closed itself.
+   */
+  let terminalCheckpointWritten = false;
   /**
    * Task 9.6's production trigger for `DispatchControl.resumedAfterWait`/`onResuming`. Keys are
    * `waitKeyFor(request)` for every logical tool-call operation `retryOptions.onEnterWaiting`
@@ -2892,6 +2908,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // event (see `reportCheckpoint`'s doc comment) — this is the checkpoint that must land in
     // `HarnessRunStore` as terminal.
     await reportCheckpoint(mintId('ckpt'), 'persisting', 'phaseBoundary');
+    terminalCheckpointWritten = true;
     const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, conclusion, cancelled: cancelledNow, contradicted: latestContradicted };
     await onPersist?.(attemptOutcome, activityLog);
     const consumption = budget.consumption();
@@ -2932,6 +2949,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // Reported after the terminal fact, same as `runPersisting` — a bootstrap failure must also
     // land terminal in `HarnessRunStore` rather than leaving the lineage looking merely stalled.
     await reportCheckpoint(mintId('ckpt'), 'bootstrap', 'phaseBoundary');
+    terminalCheckpointWritten = true;
     const outcome: CompletionOutcome = {
       kind: 'failed',
       completeness: 'none',
@@ -2960,31 +2978,94 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     };
   }
 
+  /**
+   * `run()`'s catch-all — the second of two fixes for a `HarnessAttempt` that dies in-process on
+   * an escaping error. Every phase runner (`runBootstrap`/`runPlanning`/`runInvestigating`/
+   * `runVerifying`/`runCompleting`/`runPersisting`) is expected to resolve, but one throw is
+   * already known to reach here today: `runHarnessTurn` throwing anything other than
+   * `PromptCeilingExceededError` (`runPhaseLoop`'s own catch, above, only absorbs that one) —
+   * the exact shape of a model transport failure such as a provider read that never produces its
+   * first token and times out. Left unhandled, that throw unwound `run()` with no terminal
+   * checkpoint ever written: `HarnessRunStore`'s lineage record was left stuck at its last live,
+   * nonterminal checkpoint, indistinguishable from a run that was merely still going, until the
+   * next extension activation's `sweepInterruptedRuns` finally noticed — if it ever came, which it
+   * does not for a window that stays open.
+   *
+   * This function only makes the lineage's own persisted history honest; it changes nothing about
+   * what escapes `run()` or what the caller does with it (`ReviewRunManager.executeAttempt`'s own
+   * catch already settles its in-memory `RunRecord` as `failed` from any rethrow — that behavior
+   * is untouched). It:
+   *
+   * 1. Skips entirely once `terminalCheckpointWritten` is already true — `runPersisting`/
+   *    `finalizeBootstrapFailure` already ran to completion and wrote this attempt's one real
+   *    terminal checkpoint (a normal success, failure, or cancellation); a later throw (e.g. from
+   *    `onPersist`) must never overwrite that correct record with this best-effort one.
+   * 2. Appends the same public `terminalResult` fact those two paths append, with `lifecycle:
+   *    'failed'` and a `limitations` entry naming the error — `completeness` follows this
+   *    module's own convention (`classifyOutcome`'s partial-vs-none split): `partial` only when a
+   *    validated finding actually survived to be triaged, `none` otherwise. Never `complete`,
+   *    which only a real `runCompleting`/`runPersisting` pass may report.
+   * 3. Reports ONE checkpoint for that terminal state (`'attemptFailed'`, the reason this catch-all
+   *    owns — see `CHECKPOINT_REASONS`'s own doc comment), wrapped so that a persistence failure
+   *    here — the write itself throwing — is recorded as a `toolFailed` activity fact (this
+   *    module's only diagnostic seam; the file header's "no `vscode` import" note is why there is
+   *    no separate trace channel to reach for) and otherwise swallowed, never allowed to replace
+   *    the original error `run()` is about to rethrow.
+   */
+  async function finalizeEscapedError(error: unknown): Promise<void> {
+    if (terminalCheckpointWritten) return;
+    const message = error instanceof Error ? error.message : String(error);
+    const survivedFindings = candidateTracker.triageFindings();
+    appendActivity(
+      {
+        kind: 'terminalResult',
+        lifecycle: 'failed',
+        completeness: survivedFindings.length > 0 ? 'partial' : 'none',
+        limitations: [{ code: 'attemptFailed', message: `An unhandled error ended this attempt: ${message}` }],
+      },
+      currentPhase,
+    );
+    try {
+      await reportCheckpoint(mintId('ckpt'), currentPhase, 'attemptFailed');
+      terminalCheckpointWritten = true;
+    } catch (writeError) {
+      const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+      appendActivity({ kind: 'toolFailed', tool: 'checkpointWrite', reason: `Writing this attempt's terminal checkpoint failed: ${writeMessage}` }, currentPhase);
+    }
+  }
+
   async function run(): Promise<HarnessAttemptResult> {
-    // The work the caller did before this attempt existed, replayed into this
-    // attempt's own log as its first events (`HarnessAttemptOptions.preludeActivity`,
-    // `add-local-git-investigation` task 10.2). Before the preflight check
-    // below, so an attempt that never starts still shows the fetch it was
-    // waiting on — which is exactly the run whose reviewer most needs to see it.
-    for (const fact of options.preludeActivity ?? []) appendActivity(fact, 'bootstrap');
+    try {
+      // The work the caller did before this attempt existed, replayed into this
+      // attempt's own log as its first events (`HarnessAttemptOptions.preludeActivity`,
+      // `add-local-git-investigation` task 10.2). Before the preflight check
+      // below, so an attempt that never starts still shows the fetch it was
+      // waiting on — which is exactly the run whose reviewer most needs to see it.
+      for (const fact of options.preludeActivity ?? []) appendActivity(fact, 'bootstrap');
 
-    // Checked before `runBootstrap`, which is where the first provider fetch
-    // and the first activity of a real attempt happen: an attempt that has no
-    // source to read the change with must not go and read parts of it anyway.
-    if (options.preflightFailure) return finalizeBootstrapFailure(options.preflightFailure);
+      // Checked before `runBootstrap`, which is where the first provider fetch
+      // and the first activity of a real attempt happen: an attempt that has no
+      // source to read the change with must not go and read parts of it anyway.
+      if (options.preflightFailure) return await finalizeBootstrapFailure(options.preflightFailure);
 
-    const bootstrapOutcome = await runBootstrap();
-    if (!bootstrapOutcome.ok) return finalizeBootstrapFailure(bootstrapOutcome.limitation);
+      const bootstrapOutcome = await runBootstrap();
+      if (!bootstrapOutcome.ok) return await finalizeBootstrapFailure(bootstrapOutcome.limitation);
 
-    computeSmallFlag();
+      computeSmallFlag();
 
-    if (!isCancelled()) await runPlanning();
-    if (plan === undefined) extraLimitations.push({ code: 'noPlan', message: 'No plan was ever created for this attempt.' });
-    if (!isCancelled() && plan !== undefined) await runInvestigating();
-    if (!isCancelled()) await runVerifying();
+      if (!isCancelled()) await runPlanning();
+      if (plan === undefined) extraLimitations.push({ code: 'noPlan', message: 'No plan was ever created for this attempt.' });
+      if (!isCancelled() && plan !== undefined) await runInvestigating();
+      if (!isCancelled()) await runVerifying();
 
-    const evaluation = await runCompleting();
-    return runPersisting(evaluation);
+      const evaluation = await runCompleting();
+      return await runPersisting(evaluation);
+    } catch (error) {
+      // The catch-all itself: see `finalizeEscapedError`'s own doc comment. The original error
+      // always propagates, whether or not the terminal checkpoint it triggers could be written.
+      await finalizeEscapedError(error);
+      throw error;
+    }
   }
 
   return { run };

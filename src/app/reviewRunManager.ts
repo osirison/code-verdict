@@ -1971,6 +1971,15 @@ function acceptedFindingCount(candidates: readonly { readonly state: string; rea
  * any legacy one-shot record with no `lineageId` at all — falls back to
  * exactly the crude behavior this function always had: reported as
  * `interrupted` with no resume offer, restart its only path forward.
+ *
+ * An entry whose lineage's latest checkpoint is *already terminal* is the
+ * remaining case: the in-process attempt settled (succeeded, failed, or
+ * cancelled) — including via `harnessAttempt.ts`'s own catch-all for an
+ * error that escaped mid-attempt — before this leftover marker could be
+ * cleared, most likely because the extension host stopped right after. Such
+ * an entry is skipped entirely, not recorded as `interrupted`: the lineage
+ * already carries its own truthful terminal record, and this sweep must
+ * never fight it with a second, misleading "stalled and unresumable" one.
  */
 export async function sweepInterruptedRuns(globalState: KeyValueStore, options: SweepInterruptedOptions = {}): Promise<number> {
   const inFlight = new InFlightRunStore(globalState);
@@ -1991,7 +2000,16 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
     if (harnessRunStore && entry.runId && entry.lineageId) {
       const lineageId = entry.lineageId as LineageId;
       const latest = harnessRunStore.latestCheckpoint(lineageId);
-      if (latest && !isTerminalLifecycle(latest.projection.lifecycle)) {
+      // A lineage whose latest checkpoint is already terminal settled in-process — a normal
+      // completion, or `HarnessAttempt.run()`'s own catch-all for an error that escaped
+      // mid-attempt (`harnessAttempt.ts`'s `finalizeEscapedError`) — before this leftover
+      // in-flight marker could be cleared, most likely because the extension host itself stopped
+      // right after. Recording it as `interrupted` below would silently overwrite that
+      // already-truthful terminal record with a misleading "stalled and unresumable" one, so this
+      // entry is skipped entirely: nothing to close, nothing to record, straight to clearing the
+      // leftover marker with every other entry once the loop ends.
+      if (latest && isTerminalLifecycle(latest.projection.lifecycle)) continue;
+      if (latest) {
         const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
         if (closed) {
           await harnessRunStore.writeCheckpoint(closed, policy);

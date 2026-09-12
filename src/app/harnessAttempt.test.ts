@@ -20,6 +20,9 @@ import { sha256Hex } from './contentDigest';
 import type { Attachment } from './reviewContext';
 import { DEFAULT_RISK_FLOOR_RULES } from './harnessRiskFloors';
 import type { DispatcherRetryResumingInfo, DispatcherRetryWaitInfo, HostToolResult } from './harnessToolDispatcher';
+import { createHarnessRunStore } from './harnessRunStore';
+import { computeSnapshotDigest, type CheckpointBuildInput } from './harnessCheckpoint';
+import type { KeyValueStore } from './storage';
 import { normalizeHarnessPolicy, HARNESS_POLICY_VERSION, type HarnessPolicy } from '../domain/harnessPolicy';
 import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
@@ -2474,5 +2477,177 @@ describe('HarnessAttempt.run (a prompt that cannot be made to fit the per-turn c
     // In production the condition is *also* a limitation: `renderModelPrompt` fires `onOverrun`
     // before `sealPrompt` refuses, so `recordPromptOverrun` has already pushed
     // `promptBudgetNoRoom`. This seam throws directly, which is what isolates the catch.
+  });
+});
+
+/**
+ * `run()`'s own catch-all (`finalizeEscapedError`): the second of two fixes for a real harness run
+ * that died silently — a model call's transport failure (`lmAgent.ts`'s `AgentRunError`, thrown out
+ * of `streamText` when a provider read never produces its first token) escaped every phase runner
+ * because `runPhaseLoop`'s own catch only absorbs `PromptCeilingExceededError`, and nothing else in
+ * `run()` ever wrote a terminal checkpoint for the attempt that died — `HarnessRunStore`'s lineage
+ * record was left stuck at its last live, nonterminal checkpoint.
+ *
+ * A minimal in-memory `KeyValueStore`, not `reviewRunManager.test.ts`'s own (that one lives in a
+ * different module and is private to it).
+ */
+function memoryStore(): KeyValueStore {
+  const map = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => map.get(key) as T | undefined,
+    update: async (key: string, value: unknown) => {
+      map.set(key, value);
+    },
+  };
+}
+
+/**
+ * Wires a real `HarnessRunStore` the same way production's `harnessRuntime.ts` does (its own
+ * `onCheckpoint`, minus the lease-refresh concern this file's fixtures have no lease for) — so a
+ * test can assert on the actual persisted `PersistedCheckpoint`/`TerminalAttemptMarker`, not a
+ * hand-simulated stand-in for either.
+ */
+function wireOnCheckpoint(harnessRunStore: ReturnType<typeof createHarnessRunStore>, snapshot: ReviewRunSnapshot, policy: HarnessPolicy) {
+  return async (info: CheckpointInfo): Promise<void> => {
+    const input: CheckpointBuildInput = {
+      checkpointId: info.checkpointId,
+      runId: info.runId,
+      lineageId: info.lineageId,
+      attempt: info.attempt,
+      phase: info.phase,
+      reason: info.reason,
+      occurredAt: info.occurredAt,
+      elapsedMs: info.elapsedMs,
+      snapshotDigest: computeSnapshotDigest(snapshot),
+      activityEvents: info.activityLog.events,
+      evidenceSources: info.evidenceSources,
+      candidates: info.candidates,
+      contradicted: info.contradicted,
+      budget: info.budget,
+      coverage: info.coverage,
+      unresolved: info.unresolved,
+    };
+    await harnessRunStore.buildAndWriteCheckpoint(input, policy);
+  };
+}
+
+/**
+ * Mirrors the shape of a model transport failure (`lmAgent.ts`'s `AgentRunError`): `runHarnessTurn`
+ * (`harnessTurn.ts`) never wraps `askModel`'s own throw in a `try`/`catch` of its own, so a plain
+ * `Error` thrown here reproduces the exact escape path a real timed-out provider call takes,
+ * without needing the real (`vscode`-dependent) `lmAgent.ts` seam this module's own header
+ * documents as deliberately out of reach.
+ */
+function transportFailureModelSeam(phaseToThrow: RunPhase, message: string): HarnessModelSeam {
+  return {
+    modelId: 'test-model',
+    async askModel({ phase }) {
+      if (phase === 'planning') return PLAN_TURN;
+      if (phase === phaseToThrow) throw new Error(message);
+      throw new Error(`transportFailureModelSeam: phase "${phase}" unexpectedly asked (only "planning" and "${phaseToThrow}" are scripted).`);
+    },
+  };
+}
+
+describe("HarnessAttempt.run's catch-all (an error escaping every phase runner still closes the attempt terminal)", () => {
+  it('an error escaping mid-investigation writes exactly one terminal checkpoint (lifecycle "failed", reason "attemptFailed") with a TerminalAttemptMarker, and the original error still propagates unchanged', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = transportFailureModelSeam('investigating', 'model timed out waiting for the first token');
+    const snapshot = testSnapshot();
+    const policy = testPolicy();
+    const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+    await harnessRunStore.writeSnapshot(snapshot);
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [member(connection)],
+      modelSeam: seam,
+      policy,
+      onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+    });
+
+    await expect(attempt.run()).rejects.toThrow('model timed out waiting for the first token');
+
+    const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+    expect(latest?.projection.lifecycle).toBe('failed');
+    expect(latest?.reason).toBe('attemptFailed');
+    expect(latest?.projection.limitations.some((l) => l.code === 'attemptFailed' && l.message.includes('model timed out waiting for the first token'))).toBe(true);
+
+    const record = harnessRunStore.readLineage(snapshot.lineageId);
+    expect(record?.terminalAttempts).toContainEqual(expect.objectContaining({ attempt: 1, lifecycle: 'failed' }));
+    // Exactly one terminal checkpoint for this attempt — bootstrap's own live `phaseBoundary`
+    // checkpoints stay nonterminal; the catch-all's is the only one that ever turns terminal.
+    const terminalCheckpoints = (record?.checkpoints ?? []).filter((c) => c.attempt === 1 && c.projection.lifecycle === 'failed');
+    expect(terminalCheckpoints).toHaveLength(1);
+  });
+
+  it("a persistence failure inside the catch-all's own checkpoint write does not mask the original error", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = transportFailureModelSeam('investigating', 'original transport failure');
+    const captured: CheckpointInfo[] = [];
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        captured.push(info);
+        // The checkpoint's own activity fact is appended (and so visible in `info`) before this
+        // rejects — `finalizeEscapedError` builds it, then calls `onCheckpoint`, in that order.
+        if (info.reason === 'attemptFailed') throw new Error('disk full: could not write checkpoint');
+      },
+    });
+
+    // The ORIGINAL error, never the persistence failure, is what `run()` rejects with.
+    await expect(attempt.run()).rejects.toThrow('original transport failure');
+
+    const failedCheckpoint = captured.find((c) => c.reason === 'attemptFailed');
+    expect(failedCheckpoint).toBeDefined();
+    const terminalFact = failedCheckpoint?.activityLog.events.find((e) => e.kind === 'terminalResult');
+    expect(terminalFact).toMatchObject({ lifecycle: 'failed' });
+  });
+
+  it('a cancelled attempt that already wrote its real terminal checkpoint is never given a second one by the catch-all, even when something throws right after', async () => {
+    const cancellation = fakeCancellationToken();
+    const connection = reviewConnection({
+      files: ['file1.ts'],
+      readDiff: async (request) => {
+        cancellation.cancel();
+        return diffPageResult(request.path);
+      },
+    });
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const checkpoints: CheckpointInfo[] = [];
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      cancellation: cancellation.token,
+      onCheckpoint: (info) => {
+        checkpoints.push(info);
+      },
+      // Fires only after `runPersisting` has already appended the terminal fact and reported the
+      // one real terminal checkpoint for this (cancelled) attempt — exactly the race the guard
+      // must survive: an error arriving *after* the attempt truthfully closed itself.
+      onPersist: () => {
+        throw new Error('a failure arriving after the attempt already settled');
+      },
+    });
+
+    await expect(attempt.run()).rejects.toThrow('a failure arriving after the attempt already settled');
+
+    const terminalCheckpoints = checkpoints.filter((c) => c.activityLog.events.at(-1)?.kind === 'terminalResult');
+    expect(terminalCheckpoints).toHaveLength(1);
+    const [only] = terminalCheckpoints;
+    expect(only?.reason).toBe('phaseBoundary'); // `runPersisting`'s own reason — never the catch-all's `attemptFailed`.
+    expect((only?.activityLog.events.at(-1) as { lifecycle?: string } | undefined)?.lifecycle).toBe('cancelled');
   });
 });
