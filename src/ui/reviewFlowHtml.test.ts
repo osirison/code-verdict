@@ -388,10 +388,10 @@ describe('in-diff triage fidelity (spec §5)', () => {
       withheldInlineItemIds: ['finding-1'],
     }, 'HVE Core / PR Review');
 
-    expect(body).toContain('1 accepted finding no longer has matching code on a current added line');
+    expect(body).toContain('1 accepted finding no longer has matching code on a line currently in the diff');
     expect(body).toContain('it will be withheld from inline submission and included in the summary');
     expect(body).toContain('Line comments to post (0)');
-    expect(body).toContain('No accepted finding has a current added-line anchor for inline submission.');
+    expect(body).toContain('No accepted finding has a current diff-line anchor for inline submission.');
   });
 });
 

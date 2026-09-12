@@ -56,7 +56,7 @@ import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunMana
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
-import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import { diffAnchorCandidates, diffStats, parseHunks } from '../domain/diffHunks';
 import {
   effortForModel,
   effortLabel,
@@ -724,11 +724,15 @@ export class ReviewFlowPanel {
 
   // ---- staleness (handoff §6) --------------------------------------------------
 
-  /** The lines a finding can legitimately sit on: current additions only. */
+  /**
+   * The lines a finding can legitimately sit on: every line the diff makes
+   * addressable — additions and context on the new side, removals on the old
+   * side (see `diffAnchorCandidates`) — not just this file's fresh additions.
+   */
   private anchorCandidates(diff: ChangeRequestDiff, file: string): AnchorCandidate[] | undefined {
     const changed = diff.files.find((f) => f.newPath === this.providerFilePath(file));
     if (!changed) return undefined;
-    return addedLines(changed.diff);
+    return diffAnchorCandidates(changed.diff);
   }
 
   private markMoved(diff: ChangeRequestDiff): Set<string> {
@@ -1393,7 +1397,16 @@ export class ReviewFlowPanel {
               return item;
             }
             const resolved = resolveAnchor(candidates, item);
-            if (resolved.state === 'lost') lost += 1;
+            // `item.line` is always new-side numbering. A resolution on the
+            // old side means the flagged text now only exists as a deletion —
+            // nothing in the *current* file to move this finding's line to —
+            // so for re-anchoring purposes that is a loss, not a move;
+            // rewriting `item.line` from an old-side number would silently
+            // corrupt it into the wrong file's coordinate space.
+            if (resolved.state === 'lost' || resolved.side === 'old') {
+              lost += 1;
+              return item;
+            }
             if (resolved.state !== 'moved') return item;
             moved += 1;
             const delta = resolved.line - item.line;
@@ -1589,7 +1602,10 @@ export class ReviewFlowPanel {
     const voice = vscode.workspace
       .getConfiguration('codeVerdict')
       .get<AgentVoice>('agentVoice', 'terse');
-    return composeSummary(this.review, this.agentLabel(), voice);
+    // Anchor resolution, not just verdicts: a headline claiming "posted
+    // inline" for an item that will actually be withheld is exactly the
+    // report the reviewer must never see.
+    return composeSummary(this.review, this.agentLabel(), voice, this.commentDraftComposition()?.withheld);
   }
 
   private commentDraftComposition() {
@@ -1753,8 +1769,15 @@ export class ReviewFlowPanel {
         && !this.postedIndividually
         && result.summaryPosted
         && result.comments.every((outcome) => outcome.ok);
+      // From what actually posted, never from the verdict tally: an accepted
+      // item that could not be anchored (or whose file left the diff) never
+      // reached `performSubmit` at all, and `counts.accepted` cannot see that.
+      const notPostedInline = counts.accepted - this.postedCount;
       this.doneSentence = [
-        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
+        `${this.postedCount} inline ${this.postedCount === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
+        notPostedInline > 0
+          ? `${notPostedInline} accepted ${notPostedInline === 1 ? 'finding' : 'findings'} could not be anchored to the diff — see the summary.`
+          : '',
         // Deliberately not phrased as an error: everything the user wrote did
         // land, and there is nothing for them to retry.
         verdictRefused ? `The request for changes was not applied: ${result.requestChangesError?.message ?? 'refused'}.` : '',

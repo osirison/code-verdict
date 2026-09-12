@@ -551,6 +551,54 @@ describe('draft writes carry the retained result forward', () => {
   });
 });
 
+describe('the done screen reports actual posted outcomes, never the verdict tally (mandate C)', () => {
+  it('names the true posted/withheld split when an accepted finding could not be anchored', async () => {
+    const mixedReview: Review = {
+      repoId: REF.repoId,
+      crNumber: REF.number,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      modelId: 'lm:acme/turbo',
+      criteria: DEFAULT_CRITERIA,
+      headSha: 'aaaa',
+      items: [
+        { id: 'i1', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'Finding i1', body: 'Body', code: 'const a = 1;' },
+        // Not in `DIFF.files` at all — `anchorCandidates` returns undefined
+        // for it however wide the candidate universe grows, so it is
+        // withheld regardless of the anchoring fix, exactly like the real
+        // incident's findings never reached `performSubmit`.
+        { id: 'i2', file: 'src/missing.ts', anchored: true, line: 5, severity: 'major', category: 'security', confidence: 90, title: 'Finding i2', body: 'Body', code: 'notInTheDiff();' },
+      ],
+      verdicts: {},
+      summary: '',
+    };
+    const seed = retainedFromRun({
+      review: mixedReview,
+      ranAt: RAN_AT,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      agentLabel: 'Security Reviewer',
+      modelId: 'lm:acme/turbo',
+    });
+    const h = await harness(seed);
+    await h.open();
+    await h.post({ type: 'verdict', itemId: 'i1', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'i2', verdict: 'accepted' });
+    await h.post({ type: 'generateSummary' });
+    await h.post({ type: 'submit' });
+
+    // Two accepted, only one ever reached the platform — the done screen
+    // must say "1 posted", never "2 inline comments posted".
+    expect(panel.webview.html).toContain('1 inline comment posted');
+    expect(panel.webview.html).not.toContain('2 inline comments posted');
+    expect(panel.webview.html).toContain('1 accepted finding could not be anchored to the diff');
+
+    const entries = h.deps.globalState.get<Array<{ postedComments?: number; counts: { accepted: number } }>>(
+      'codeVerdict.submittedReviews',
+    );
+    expect(entries?.[0]?.postedComments).toBe(1);
+    expect(entries?.[0]?.counts.accepted).toBe(2);
+  });
+});
+
 // ---- 4.6 — coalescing, flush points, and the two drop mechanisms ---------------
 
 describe('coalesced draft writes', () => {

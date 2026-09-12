@@ -3,6 +3,19 @@
  * positioned comments (suggestion attached when applyFix), rejected and
  * skipped items never leave the machine. Partial failure retries only the
  * remainder — never re-posts what already landed.
+ *
+ * Anchoring policy (mandate A): a finding's recorded line is the PRIMARY
+ * anchor. Text matching (`resolveAnchor`) runs first and wins whenever it
+ * finds the code anywhere in the diff — verifying it in place, or re-locating
+ * it after drift — because a finding that genuinely moved must follow the
+ * move, not post against a stale line. Only when text matching finds the
+ * code nowhere at all does the recorded line fall back to being trusted on
+ * its own, restricted to a line the diff's new side actually carries: `code`
+ * is documented as "the offending hunk", not guaranteed to be one line, and a
+ * multi-line or paraphrased quote can never trim-equal any single candidate
+ * — that failure says nothing about whether the location is right. A finding
+ * is withheld only when neither its code nor its own recorded line can be
+ * placed in the current diff at all.
  */
 import type { Connection } from '../platform/provider';
 import type { AnchorRefs, ChangeRequestRef, ReviewCommentDraft, SubmitProgressFn, SubmitResult } from '../platform/types';
@@ -29,27 +42,64 @@ export function composeCommentDrafts(
   for (const item of review.items) {
     if (review.verdicts[item.id]?.verdict !== 'accepted' || !isReviewItemAnchored(item)) continue;
     const candidates = candidatesFor(item.file);
-    const resolved = candidates ? resolveAnchor(candidates, item) : undefined;
-    if (!candidates || !resolved || resolved.state === 'lost') {
+    if (!candidates) {
       withheld.push(item);
       continue;
     }
+    const textMatch = resolveAnchor(candidates, item);
+    // Mandate A: the finding's recorded line is the PRIMARY anchor; text
+    // matching only verifies it or re-locates it on drift. Text matching
+    // still runs first and wins whenever it finds anything — a finding whose
+    // code drifted to a different line after new commits must follow that
+    // drift, not blindly trust a now-wrong line number. Only when text
+    // matching finds the code NOWHERE in the diff does the recorded line
+    // fall back to being trusted on its own: `item.code` is documented as
+    // "the offending hunk", not guaranteed single-line, and a multi-line or
+    // paraphrased quote can never trim-equal any one candidate line however
+    // exactly the finding's location is right — the real 2026-09-12 incident
+    // (5 findings on `panel.rs`, all independently confirmed to sit on lines
+    // the diff already carries as additions) fits exactly this shape: the
+    // recorded line was always addressable, so text-match strictness, not a
+    // narrow candidate set, was withholding them. The fallback is restricted
+    // to the new side — an old-side match with no text to justify it would
+    // be coordinate-space guessing, so a deletion still requires a real
+    // text match.
+    const recordedLineIsNewSide = candidates.some(
+      (c) => c.line === item.line && (c.side ?? 'new') === 'new',
+    );
+    const verified = textMatch.state !== 'lost';
+    if (!verified && !recordedLineIsNewSide) {
+      withheld.push(item);
+      continue;
+    }
+    const anchorLine = verified ? textMatch.line : item.line;
+    // A resolved side of `undefined` means the candidates carried no side
+    // markers at all (e.g. `documentCandidates`, or a test double) — treat
+    // that the same as 'new', the only side such a haystack could mean.
+    const side = verified ? textMatch.side ?? 'new' : 'new';
     const endLine = item.endLine === undefined
       ? undefined
-      : resolved.line + (item.endLine - item.line);
+      : anchorLine + (item.endLine - item.line);
     if (endLine !== undefined) {
-      const addedLineNumbers = new Set(candidates.map((candidate) => candidate.line));
-      const rangeLength = endLine - resolved.line + 1;
-      let rangeIsAdded = rangeLength > 0 && rangeLength <= addedLineNumbers.size;
-      if (rangeIsAdded) {
-        for (let line = resolved.line; line <= endLine; line += 1) {
-          if (!addedLineNumbers.has(line)) {
-            rangeIsAdded = false;
+      // Every line of a multi-line range must be addressable on the SAME
+      // side the start line resolved to — GitHub takes one `side` for the
+      // whole range. Not "added": a range sitting on unchanged context, or
+      // wholly inside a deletion, is exactly as postable as one on fresh
+      // additions.
+      const sameSideLines = new Set(
+        candidates.filter((c) => (c.side ?? 'new') === side).map((c) => c.line),
+      );
+      const rangeLength = endLine - anchorLine + 1;
+      let rangeIsAddressable = rangeLength > 0 && rangeLength <= sameSideLines.size;
+      if (rangeIsAddressable) {
+        for (let line = anchorLine; line <= endLine; line += 1) {
+          if (!sameSideLines.has(line)) {
+            rangeIsAddressable = false;
             break;
           }
         }
       }
-      if (!rangeIsAdded) {
+      if (!rangeIsAddressable) {
         withheld.push(item);
         continue;
       }
@@ -63,11 +113,16 @@ export function composeCommentDrafts(
       body: `${headline}\n\n${item.body}`,
       anchor: {
         filePath: providerRelativePath(item.file, workspaceRootLabel),
-        line: resolved.line,
+        line: anchorLine,
         endLine,
+        side: verified ? textMatch.side : 'new',
         refs: anchorRefs,
       },
-      suggestion: applyFix && item.suggestion ? item.suggestion : undefined,
+      // A suggestion replaces a line's content — meaningless on the old side
+      // (nothing left there to replace), and withheld on an unverified
+      // anchor too: the content a fix is meant to change was never confirmed
+      // to still be what the finding thinks it is.
+      suggestion: applyFix && item.suggestion && side === 'new' && verified ? item.suggestion : undefined,
       footer: `<sub>Flagged by ${agentLabel} (${item.confidence}% confidence), accepted by @${you} via Code Verdict.</sub>`,
     });
   }
@@ -105,7 +160,7 @@ export function composeSummaryBody(
   const withoutCurrentAnchor = withheldInline
     .map((item) => [
       `### ${summaryFindingLocation(item)} - ${item.title}`,
-      '> Withheld from inline submission because its code does not match a current added line.',
+      '> Withheld from inline submission because neither its code nor its reported line matches anything currently in the diff.',
       item.body,
     ].join('\n\n'))
     .join('\n\n');

@@ -276,7 +276,7 @@ export interface FlowViewState {
   filesRead: number;
   // summary
   summaryText: string;
-  /** Accepted changed-file findings that cannot be proven on a current added line. */
+  /** Accepted changed-file findings that cannot be proven on a line currently in the diff. */
   withheldInlineItemIds?: readonly string[];
   finalNote: string;
   postThread: boolean;
@@ -1839,7 +1839,7 @@ function renderSummary(s: FlowViewState): string {
       <h1>${s.changeset ? `Submit review across ${s.changeset.memberCount} ${e(s.vocabulary.changeRequestNounPlural)}` : `Submit review to ${e(s.vocabulary.platformName)}`}</h1>
       <p class="lede">${s.items.length} findings triaged — ${s.counts.accepted} accepted, ${s.counts.rejected} rejected, ${s.counts.skipped} skipped.</p>
       <p class="lede">${summaryAccepted.length} accepted ${summaryAccepted.length === 1 ? 'finding will' : 'findings will'} go to the summary rather than inline.</p>
-      ${withheldInline.length === 0 ? '' : `<p class="lede">${withheldInline.length} accepted ${withheldInline.length === 1 ? 'finding no longer has' : 'findings no longer have'} matching code on a current added line; ${withheldInline.length === 1 ? 'it will be' : 'they will be'} withheld from inline submission and included in the summary.</p>`}
+      ${withheldInline.length === 0 ? '' : `<p class="lede">${withheldInline.length} accepted ${withheldInline.length === 1 ? 'finding no longer has' : 'findings no longer have'} matching code on a line currently in the diff; ${withheldInline.length === 1 ? 'it will be' : 'they will be'} withheld from inline submission and included in the summary.</p>`}
     </div>
     <div class="tally-blocks">
       <div class="tally tally-acc"><b>${s.counts.accepted}</b>accepted</div>
@@ -1857,7 +1857,7 @@ function renderSummary(s: FlowViewState): string {
         inlineAccepted.length === 0
           ? `<div class="empty-comments">${accepted.length === 0
               ? 'Accepted items become inline comments here — nothing is accepted yet.'
-              : 'No accepted finding has a current added-line anchor for inline submission.'}</div>`
+              : 'No accepted finding has a current diff-line anchor for inline submission.'}</div>`
           : inlineAccepted
               .map(
                 (v) => `<div class="comment-row">

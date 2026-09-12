@@ -53,7 +53,7 @@ import { CoalescedDraftWriter } from '../app/draftWriter';
 import type { ChangesetRunMember, ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
-import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import { addedLines, diffAnchorCandidates, diffStats, parseHunks } from '../domain/diffHunks';
 import {
   effortForModel,
   effortLabel,
@@ -1061,7 +1061,8 @@ export class ChangesetReviewPanel {
   private generateSummary(): string {
     if (!this.review) return '';
     const voice = vscode.workspace.getConfiguration('codeVerdict').get<AgentVoice>('agentVoice', 'terse');
-    return composeSummary(this.review, this.agentLabel(), voice);
+    // Anchor resolution, not just verdicts — see composeSummary's doc comment.
+    return composeSummary(this.review, this.agentLabel(), voice, this.withheldInlineItems());
   }
 
   private async ask(item: Review['items'][number], preset: AskPreset, text?: string): Promise<void> {
@@ -1124,7 +1125,7 @@ export class ChangesetReviewPanel {
         const changed = member.diff.files.find((candidate) => (
           modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
         ));
-        return changed ? addedLines(changed.diff) : undefined;
+        return changed ? diffAnchorCandidates(changed.diff) : undefined;
       },
       projectLabel: member.projectPath,
       workspaceRootLabel: member.workspaceRootLabel,
@@ -1190,6 +1191,10 @@ export class ChangesetReviewPanel {
         agentLabel: this.agentLabel(),
         submittedAt,
         counts,
+        // Actual outcomes, not the verdict tally: an accepted item withheld
+        // for want of a current diff anchor is counted by `counts.accepted`
+        // but never reached `submitReview`, so it must not be counted here.
+        postedComments: memberItems.filter((item) => result.state.postedCommentKeys.includes(item.id)).length,
         threads: Object.fromEntries(memberItems.flatMap((item) => {
           const threadId = result.state.threadIds[item.id];
           return threadId ? [[item.id, threadId]] : [];
@@ -1224,7 +1229,10 @@ export class ChangesetReviewPanel {
       );
     }
     const counts = verdictCounts(this.review);
-    this.doneSentence = `${counts.accepted} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}. ${counts.rejected} dismissed findings stayed local.`;
+    const withheldClause = result.withheldCount > 0
+      ? ` ${result.withheldCount} accepted ${result.withheldCount === 1 ? 'finding' : 'findings'} could not be anchored to the diff — see the summary.`
+      : '';
+    this.doneSentence = `${result.state.postedCommentKeys.length} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}.${withheldClause} ${counts.rejected} dismissed findings stayed local.`;
     this.submitError = undefined;
     this.screen = 'done';
     this.deps.onSubmitted?.();

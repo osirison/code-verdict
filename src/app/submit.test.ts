@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { parseAgentReviewResponse } from '../domain/agentResponse';
 import { resolveAnchor } from '../domain/anchor';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { diffAnchorCandidates } from '../domain/diffHunks';
 import { createReview, setVerdict } from '../domain/reviewState';
 import type { Review } from '../domain/types';
 import { loadSpecFixtures } from '../testing/specFixtures';
@@ -153,7 +154,7 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(composed.drafts).toEqual([]);
     expect(composed.withheld.map((item) => item.id)).toEqual(['hallucinated']);
     expect(composeSummaryBody('Review summary.', '', review, composed.withheld)).toContain(
-      'Withheld from inline submission because its code does not match a current added line.',
+      'Withheld from inline submission because neither its code nor its reported line matches anything currently in the diff.',
     );
   });
 
@@ -239,6 +240,154 @@ describe('composeCommentDrafts (spec §7)', () => {
       storedLineCandidates(review),
       'api',
     ).drafts[0]?.anchor.filePath).toBe('src/diff.ts');
+  });
+});
+
+// A hunk that rewrites part of a function, leaving several statements as
+// unchanged context around two real additions. Widening the candidate
+// universe past added-only lines is what makes a finding on any of these
+// context lines anchorable at all — a categorical bug confirmed by reading
+// `anchorCandidates`, independent of whether it is what withheld any one
+// real finding.
+const REWRITE_DIFF = [
+  '@@ -10,7 +10,9 @@ impl Panel {',
+  ' fn shared() {}',
+  '+fn resolve_click_space() -> bool {',
+  '     let a = 1;',
+  '     if a == 1 {',
+  '         return true;',
+  '     }',
+  '+    false',
+  ' }',
+].join('\n');
+
+function itemAt(id: string, line: number, code: string): Record<string, unknown> {
+  return { id, file: 'src/panel.rs', line, severity: 'major', category: 'craftsmanship', confidence: 90, title: id, body: 'Body', code };
+}
+
+describe('mandate A: a finding on a context or removed line anchors inline', () => {
+  const candidatesFor = () => diffAnchorCandidates(REWRITE_DIFF);
+
+  it('anchors five findings that all sit on context lines around a rewritten hunk — none withheld', () => {
+    // New-file line numbers of the five context lines in REWRITE_DIFF: the
+    // function above the rewrite (10), the three untouched statements inside
+    // it (12, 13, 14), and the closing brace (17).
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [
+        itemAt('above', 10, 'fn shared() {}'),
+        itemAt('assign', 12, '    let a = 1;'),
+        itemAt('condition', 13, '    if a == 1 {'),
+        itemAt('return', 14, '        return true;'),
+        itemAt('brace', 17, '}'),
+      ],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    for (const item of response.items) review = setVerdict(review, item.id, 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts.map((d) => [d.key, d.anchor.line, d.anchor.side])).toEqual([
+      ['above', 10, 'new'],
+      ['assign', 12, 'new'],
+      ['condition', 13, 'new'],
+      ['return', 14, 'new'],
+      ['brace', 17, 'new'],
+    ]);
+  });
+
+  it('anchors a finding about a removed statement on the old side, side LEFT', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'removed', file: 'src/legacy.rs', line: 61, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Removed without replacement', body: 'Body', code: "logger.error('refresh failed')",
+        suggestion: { old: 'x', new: 'y' },
+      }],
+    }, { diffPaths: ['src/legacy.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'removed', 'accepted', true);
+
+    const diff = [
+      '@@ -60,4 +60,3 @@ export class TokenStore {',
+      '   async refresh() {',
+      "-    logger.error('refresh failed')",
+      '     throw new RefreshError()',
+      '   }',
+    ].join('\n');
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => diffAnchorCandidates(diff));
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 61, side: 'old' });
+    // A suggestion fence replaces a line's content — meaningless on a
+    // deletion, since there is no live line left to replace.
+    expect(composed.drafts[0]?.suggestion).toBeUndefined();
+  });
+
+  it('withholds a multi-line range that reaches past what the diff shows', () => {
+    // The hunk's new side ends at line 17; a range that claims to run to 20
+    // has three lines the diff carries no text for at all, so the whole
+    // comment is withheld rather than posted against a guessed range.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'overreach', file: 'src/panel.rs', line: 14, endLine: 20, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Overreaching range', body: 'Body', code: '        return true;',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'overreach', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['overreach']);
+  });
+
+  it('anchors on the recorded line when its code matches nowhere at all — the recorded line is the PRIMARY anchor', () => {
+    // Reproduces the confirmed shape of the 2026-09-12 incident: the finding's
+    // recorded line (11) is genuinely an added line in the diff — trim-match
+    // would find it instantly for a one-line quote — but `code` here is the
+    // multi-line hunk the field is documented to carry, which can never
+    // trim-equal any single candidate line. Withholding this finding would be
+    // wrong: its location was never in question, only the text comparison.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'multiline-code', file: 'src/panel.rs', line: 11, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Multi-line quote', body: 'Body',
+        code: 'fn resolve_click_space() -> bool {\n    false\n}',
+        suggestion: { old: 'x', new: 'y' },
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'multiline-code', 'accepted', true);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 11, side: 'new' });
+    // Unverified — the fix's target text was never confirmed — so no
+    // suggestion fence is offered even though the finding carried one.
+    expect(composed.drafts[0]?.suggestion).toBeUndefined();
+  });
+
+  it('still withholds when the code matches nothing AND the recorded line is not addressable either', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'nowhere', file: 'src/panel.rs', line: 500, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Nowhere near the hunk', body: 'Body', code: 'fn resolve_click_space() -> bool {\n    false\n}',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'nowhere', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['nowhere']);
   });
 });
 

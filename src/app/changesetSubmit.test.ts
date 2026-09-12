@@ -213,4 +213,24 @@ describe('changeset submission', () => {
     expect(repoASummary).not.toMatch(/Attachment-only B|Lost anchored B/);
     expect(repoBSummary).not.toMatch(/Attachment-only A|Lost anchored A/);
   });
+
+  it('reports withheldCount so completion is never blind to what anchor resolution dropped (mandate C)', async () => {
+    // Every comment for this member's one item is withheld by
+    // `candidatesFor` returning nothing that matches — `complete` still
+    // becomes true (nothing was attempted, nothing is pending), but a caller
+    // reading only `complete` must not conclude the finding was posted.
+    const plans = buildChangesetSubmitPlans(review, [
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, candidatesFor: () => [] },
+    ], 'Agent', 'you', 'Summary.', false, false);
+    expect(plans[0]?.withheld.map((item) => item.id)).toEqual(['gateway']);
+
+    const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
+      comments: submission.comments.map((c) => ({ key: c.key, ok: true })),
+      summaryPosted: true,
+    }));
+    const connection = { submitReview } as unknown as Connection;
+    const result = await performChangesetSubmit(connection, plans);
+    expect(result.complete).toBe(true);
+    expect(result.withheldCount).toBe(1);
+  });
 });

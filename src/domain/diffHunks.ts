@@ -114,6 +114,34 @@ export function addedLines(diff: string): Array<{ line: number; text: string }> 
 }
 
 /**
+ * Every line a finding can legitimately anchor to in this diff: additions and
+ * unchanged context, numbered on the new (resulting) file — the space every
+ * `ReviewItem.line` is recorded in — plus removed lines, numbered on the old
+ * file, for a finding that is about a deletion rather than a line that still
+ * exists. Supersedes `addedLines` as the anchor candidate universe: an
+ * addition is not the only line a comment can land on, GitHub accepts a
+ * comment on any line inside a diff hunk on either side, and a finding whose
+ * flagged statement sits on a context line (very common in a hunk that
+ * rewrites only part of a function) was previously unable to anchor at all,
+ * however exactly its recorded line and code matched the file.
+ */
+export function diffAnchorCandidates(
+  diff: string,
+): Array<{ line: number; text: string; side: 'old' | 'new' }> {
+  const candidates: Array<{ line: number; text: string; side: 'old' | 'new' }> = [];
+  for (const hunk of parseHunks(diff)) {
+    for (const l of hunk.lines) {
+      if ((l.kind === 'add' || l.kind === 'context') && l.newLine !== undefined) {
+        candidates.push({ line: l.newLine, text: l.text, side: 'new' });
+      } else if (l.kind === 'del' && l.oldLine !== undefined) {
+        candidates.push({ line: l.oldLine, text: l.text, side: 'old' });
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
  * Length-prefixes each diff before joining, so two different splits of the
  * same characters across files can never share a key — a bare join would
  * let `['a', 'bc']` and `['ab', 'c']` collide.

@@ -844,14 +844,38 @@ export class GitHubConnection implements Connection {
       commit_id: commitIdOf(submission.comments[0]?.anchor),
     });
 
-    const threadIds = await this.threadIdsForReview(ref, review?.id, submission.comments.length);
+    const { threadIds, confirmedCount } = await this.threadIdsForReview(
+      ref, review?.id, submission.comments.length,
+    );
 
     return {
-      comments: submission.comments.map((comment, index) => ({
-        key: comment.key,
-        ok: true,
-        threadId: threadIds[index],
-      })),
+      comments: submission.comments.map((comment, index) => {
+        // `confirmedCount` is how many comments the review's own comments
+        // endpoint actually lists — undefined when that lookup itself failed
+        // (network, GraphQL down), in which case there is nothing to compare
+        // against and the historical "the POST succeeded, trust it" behaviour
+        // holds. But when the lookup succeeded and came back short, GitHub
+        // silently dropped part of the batch without failing the POST at all
+        // — the endpoint's atomicity is not actually guaranteed for every
+        // position — and claiming `ok: true` for a comment nobody can prove
+        // exists is exactly the false success this exists to rule out.
+        // Matched by index into creation order, per `threadIdsForReview`'s own
+        // doc comment; the endpoint is documented all-or-nothing, so a real
+        // mismatch should be rare and it is unclear which submitted comment(s)
+        // a partial drop would correspond to. Reporting the numeric tail
+        // (rather than guessing which middle entry vanished) risks flagging an
+        // early comment that did land as failed, which would duplicate it if
+        // the retry re-posts it standalone — accepted here as the safer
+        // failure mode than the blanket `ok: true` this replaces.
+        if (confirmedCount !== undefined && index >= confirmedCount) {
+          return {
+            key: comment.key,
+            ok: false,
+            error: new ScmError('unknown', 'GitHub did not confirm this comment was created in the review'),
+          };
+        }
+        return { key: comment.key, ok: true, threadId: threadIds[index] };
+      }),
       // Only the user's own summary counts as posted. A verdict-only review
       // carries canned text because GitHub demands a body — reporting that as
       // "your summary landed" would be a lie the UI then repeats.
@@ -953,23 +977,37 @@ export class GitHubConnection implements Connection {
    * Thread ids for the comments a batched review just created, in the order
    * they were submitted. GitHub returns them from the review's own comments
    * endpoint in creation order, which is the order they were sent.
+   *
+   * `confirmedCount` is `posted.length` — how many comments that endpoint
+   * actually lists under the review — whenever the lookup itself succeeds,
+   * regardless of whether the GraphQL thread-id resolution nested inside it
+   * also succeeded (that failure is independently degraded, never wrong: an
+   * absent thread id just makes the panel fall back to "threads you
+   * started"). It is `undefined` only when the comments-listing call itself
+   * threw, i.e. this function genuinely does not know how many landed —
+   * `submitAsOneReview` must not read a short `threadIds` array as a
+   * dropped-comment signal in that case, only when the count is a real,
+   * fetched number smaller than `expected`.
    */
   private async threadIdsForReview(
     ref: ChangeRequestRef,
     reviewId: number | undefined,
     expected: number,
-  ): Promise<Array<string | undefined>> {
-    if (reviewId === undefined || expected === 0) return [];
+  ): Promise<{ threadIds: Array<string | undefined>; confirmedCount?: number }> {
+    if (reviewId === undefined || expected === 0) return { threadIds: [] };
     try {
       const posted = await this.http.getAll<{ id: number }>(
         `${this.prPath(ref)}/reviews/${reviewId}/comments`,
       );
       const byCommentId = await this.threadIdsByCommentId(ref);
-      return posted.slice(0, expected).map((comment) => byCommentId.get(comment.id));
+      return {
+        threadIds: posted.slice(0, expected).map((comment) => byCommentId.get(comment.id)),
+        confirmedCount: posted.length,
+      };
     } catch {
       // Degraded, never wrong: an absent thread id makes the panel fall back to
       // "threads you started" rather than matching against a bogus id.
-      return [];
+      return { threadIds: [] };
     }
   }
 

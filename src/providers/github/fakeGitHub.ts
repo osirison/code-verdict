@@ -55,6 +55,13 @@ export interface FakeGitHubOptions {
   refuseVerdict?: boolean;
   /** Extra headers on every response — used to drive rate-limit mapping. */
   headers?: Record<string, string>;
+  /**
+   * Truncates the fixed 3-comment list `GET /reviews/{id}/comments` answers
+   * with, to fewer than a batched submit actually sent — simulating GitHub
+   * accepting a batched review POST but silently creating fewer comment
+   * threads than were in the request body.
+   */
+  reviewCommentsReturned?: number;
   /** Every review-investigation route (compare/contents/commits) fails with the neutral rate-limited error, reset-header form (task 4.7). */
   investigationRateLimited?: boolean;
   /**
@@ -662,7 +669,16 @@ export function makeFakeGitHubFetch(options: FakeGitHubOptions = {}): FetchLike 
 
       // A batched review's own comments, in creation order.
       if (/^\/reviews\/\d+\/comments$/.test(rest) && method === 'GET') {
-        return json([{ id: 8001 }, { id: 8002 }, { id: 8003 }], extraHeaders);
+        const created = [{ id: 8001 }, { id: 8002 }, { id: 8003 }];
+        // Simulates GitHub silently dropping part of a batched review without
+        // failing the POST that created it (task 5.x defect #4) — the client
+        // never sees a rejection, only a shorter list here than it submitted.
+        return json(
+          options.reviewCommentsReturned === undefined
+            ? created
+            : created.slice(0, options.reviewCommentsReturned),
+          extraHeaders,
+        );
       }
 
       if (rest === '/reviews' && method === 'POST') {

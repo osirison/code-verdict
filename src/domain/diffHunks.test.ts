@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addedLines, diffStats, parseHunks } from './diffHunks';
+import { addedLines, diffAnchorCandidates, diffStats, parseHunks } from './diffHunks';
 
 const DIFF = [
   '@@ -60,6 +60,6 @@ export class TokenStore {',
@@ -38,6 +38,42 @@ describe('parseHunks', () => {
   it('handles single-line hunks without explicit counts', () => {
     const hunks = parseHunks('@@ -5 +5 @@\n-a\n+b\n');
     expect(hunks[0]).toMatchObject({ oldStart: 5, oldCount: 1, newStart: 5, newCount: 1 });
+  });
+});
+
+describe('diffAnchorCandidates', () => {
+  it('includes context and added lines on the new side, and removed lines on the old side', () => {
+    const candidates = diffAnchorCandidates(DIFF);
+    const newSide = candidates.filter((c) => c.side === 'new');
+    const oldSide = candidates.filter((c) => c.side === 'old');
+
+    // Every context and added line across both hunks: 6 in the first hunk
+    // (3 context either side of the change, 1 addition, 2 trailing context),
+    // 3 additions in the second — none of them reachable before this widened
+    // the candidate universe past `addedLines`.
+    expect(newSide).toHaveLength(9);
+    expect(oldSide).toHaveLength(3);
+
+    // The context line right before the change is now addressable — it was
+    // never in `addedLines` at all.
+    expect(newSide).toContainEqual({
+      line: 62, text: '    if (!res.ok) {', side: 'new',
+    });
+    // The removed statement, numbered on the OLD file — a finding about this
+    // deletion anchors here, not on line 63 of the new file (which is a
+    // different statement entirely).
+    expect(oldSide).toContainEqual({
+      line: 63, text: "      logger.error('refresh failed')", side: 'old',
+    });
+    // The addition that replaced it shares the number 63 but is a different
+    // line in a different space — proof the two are never treated as one.
+    expect(newSide).toContainEqual({
+      line: 63, text: '      logger.error(`refresh failed ${this.refreshToken}`)', side: 'new',
+    });
+  });
+
+  it('produces nothing for a diff with no hunks', () => {
+    expect(diffAnchorCandidates('no hunks here')).toEqual([]);
   });
 });
 

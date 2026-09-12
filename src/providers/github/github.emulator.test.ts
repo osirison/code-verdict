@@ -940,6 +940,37 @@ describe('threadId is a thread id, in both submit paths', () => {
   });
 });
 
+describe('a batched review that silently drops part of the batch (defect #4)', () => {
+  it('never reports ok:true for a comment GitHub did not confirm creating', async () => {
+    const { conn, anchor } = await draft({ reviewCommentsReturned: 2 });
+    const result = await conn.submitReview(CR, {
+      comments: [
+        { key: 'a', body: 'x', anchor },
+        { key: 'b', body: 'y', anchor },
+        { key: 'c', body: 'z', anchor },
+      ],
+      summary: 's',
+    });
+    // The POST itself succeeded (no throw, no fallback triggered) — only the
+    // confirmed-count check catches the drop.
+    expect(result.comments.map((c) => [c.key, c.ok])).toEqual([
+      ['a', true],
+      ['b', true],
+      ['c', false],
+    ]);
+    expect(result.comments[2]?.error?.message).toMatch(/did not confirm/);
+  });
+
+  it('reports every comment ok when GitHub confirms the full batch', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }, { key: 'b', body: 'y', anchor }],
+      summary: 's',
+    });
+    expect(result.comments.every((c) => c.ok)).toBe(true);
+  });
+});
+
 
 describe('conditional requests — the poll that costs nothing', () => {
   /** A response with header lookup as case-insensitive as a real one. */
