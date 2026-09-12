@@ -3206,36 +3206,54 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
    * does not for a window that stays open.
    *
    * This function only makes the lineage's own persisted history honest; it changes nothing about
-   * what escapes `run()` or what the caller does with it (`ReviewRunManager.executeAttempt`'s own
-   * catch already settles its in-memory `RunRecord` as `failed` from any rethrow — that behavior
-   * is untouched). It:
+   * what escapes `run()` or what the caller does with it. `ReviewRunManager.executeAttempt`'s own
+   * catch settles its in-memory `RunRecord` independently, from the rethrow and its own record
+   * state (`asRunFailure`/the `current.lifecycle === 'cancelling'` check) — untouched by this
+   * function, and already agreeing with the persisted lifecycle this function now writes: both
+   * sides key off cancellation state rather than the error's shape, so a cancellation that reaches
+   * either as a plain, non-`cancelled`-shaped error still settles `'cancelled'` on both. It:
    *
    * 1. Skips entirely once `terminalCheckpointWritten` is already true — `runPersisting`/
    *    `finalizeBootstrapFailure` already ran to completion and wrote this attempt's one real
    *    terminal checkpoint (a normal success, failure, or cancellation); a later throw (e.g. from
    *    `onPersist`) must never overwrite that correct record with this best-effort one.
-   * 2. Appends the same public `terminalResult` fact those two paths append, with `lifecycle:
-   *    'failed'` and a `limitations` entry naming the error — `completeness` follows this
-   *    module's own convention (`classifyOutcome`'s partial-vs-none split): `partial` only when a
-   *    validated finding actually survived to be triaged, `none` otherwise. Never `complete`,
-   *    which only a real `runCompleting`/`runPersisting` pass may report.
+   * 2. Appends the same public `terminalResult` fact those two paths append. The lifecycle is
+   *    decided from this attempt's own cancellation STATE (`isCancelled()`), never from the
+   *    escaping error's shape: a reviewer's cancellation can reach here already shaped as an
+   *    ordinary failure — `askModelRetried`'s `'cancelled'` `RetryOutcome` rethrows whatever the
+   *    *last real attempt* in that round trip actually failed with (its own doc comment), which for
+   *    a stall that was mid-retry when cancellation fired is a plain timeout, `cancelled` field and
+   *    all absent. Consulting the shape instead of the state would misfile exactly that case as
+   *    `'failed'`. When cancelled, this mirrors `runPersisting`'s own cancellation close
+   *    (`cancelledNow` branch) exactly: `lifecycle: 'cancelled'`, `completeness` from the same
+   *    partial-vs-none split (`partial` only when a validated finding actually survived to be
+   *    triaged, `none` otherwise), and the identical single `{code: 'cancelled', ...}` limitation —
+   *    never the error's own message, which is not the public reason a cancelled run ended. When
+   *    not cancelled, `lifecycle: 'failed'` with a `limitations` entry naming the error, exactly as
+   *    before this fix. Neither branch ever reports `complete`, which only a real
+   *    `runCompleting`/`runPersisting` pass may report.
    * 3. Reports ONE checkpoint for that terminal state (`'attemptFailed'`, the reason this catch-all
-   *    owns — see `CHECKPOINT_REASONS`'s own doc comment), wrapped so that a persistence failure
-   *    here — the write itself throwing — is recorded as a `toolFailed` activity fact (this
-   *    module's only diagnostic seam; the file header's "no `vscode` import" note is why there is
-   *    no separate trace channel to reach for) and otherwise swallowed, never allowed to replace
-   *    the original error `run()` is about to rethrow.
+   *    owns — see `CHECKPOINT_REASONS`'s own doc comment, unaffected by which lifecycle was
+   *    written — the reason names which code path wrote the checkpoint, not what it says),
+   *    wrapped so that a persistence failure here — the write itself throwing — is recorded as a
+   *    `toolFailed` activity fact (this module's only diagnostic seam; the file header's "no
+   *    `vscode` import" note is why there is no separate trace channel to reach for) and otherwise
+   *    swallowed, never allowed to replace the original error `run()` is about to rethrow.
    */
   async function finalizeEscapedError(error: unknown): Promise<void> {
     if (terminalCheckpointWritten) return;
-    const message = error instanceof Error ? error.message : String(error);
+    const cancelledNow = isCancelled();
     const survivedFindings = candidateTracker.triageFindings();
+    const completeness = survivedFindings.length > 0 ? 'partial' : 'none';
+    const limitations: Limitation[] = cancelledNow
+      ? [{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }]
+      : [{ code: 'attemptFailed', message: `An unhandled error ended this attempt: ${error instanceof Error ? error.message : String(error)}` }];
     appendActivity(
       {
         kind: 'terminalResult',
-        lifecycle: 'failed',
-        completeness: survivedFindings.length > 0 ? 'partial' : 'none',
-        limitations: [{ code: 'attemptFailed', message: `An unhandled error ended this attempt: ${message}` }],
+        lifecycle: cancelledNow ? 'cancelled' : 'failed',
+        completeness,
+        limitations,
       },
       currentPhase,
     );

@@ -1977,10 +1977,36 @@ function acceptedFindingCount(candidates: readonly { readonly state: string; rea
  * cancelled) — including via `harnessAttempt.ts`'s own catch-all for an
  * error that escaped mid-attempt — before this leftover marker could be
  * cleared, most likely because the extension host stopped right after. Such
- * an entry is skipped entirely, not recorded as `interrupted`: the lineage
+ * an entry is never closed or re-recorded as `interrupted`: the lineage
  * already carries its own truthful terminal record, and this sweep must
  * never fight it with a second, misleading "stalled and unresumable" one.
+ * It is still given a `ReviewRunStore` row, though — this sweep is the only
+ * place that will ever record one for it (nothing else revisits a leftover
+ * `InFlightRun` once its marker is cleared below), so recording nothing here
+ * would silently drop the run from the dashboard, indistinguishable from it
+ * never having happened. `truthfulTerminalRow` derives that row from the
+ * checkpoint's own already-terminal lifecycle/limitations and its own
+ * candidates' accepted finding count, in the same three buckets
+ * `ReviewRunManager.completeAttempt`'s live settle path uses (`'clean'`/
+ * `'findings'` for `succeeded`, `'partial'` for `failed`/`cancelled`) — the
+ * identical shape a live settle would have produced for this lineage, had
+ * the extension host not stopped before it could run. `resumable`/
+ * `resumeReasons` are never set for it: those name a live resume *offer*,
+ * which a lineage that already finished has nothing left to offer.
  */
+function truthfulTerminalRow(
+  lifecycle: RunLifecycle,
+  findingCount: number,
+  limitations: readonly Limitation[],
+): Pick<ReviewRun, 'outcome' | 'limitations'> {
+  if (lifecycle === 'succeeded') return { outcome: findingCount > 0 ? 'findings' : 'clean' };
+  if (lifecycle === 'interrupted') return { outcome: 'interrupted' };
+  // 'failed' or 'cancelled': `completeAttempt`/`recordPartialHistory`'s own `'partial'` bucket,
+  // regardless of finding count — unlike that live path (which skips the row entirely at zero
+  // findings), this sweep still records it: see this function's own doc comment above for why.
+  return { outcome: 'partial', limitations };
+}
+
 export async function sweepInterruptedRuns(globalState: KeyValueStore, options: SweepInterruptedOptions = {}): Promise<number> {
   const inFlight = new InFlightRunStore(globalState);
   const leftover = inFlight.list();
@@ -2004,11 +2030,27 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
       // completion, or `HarnessAttempt.run()`'s own catch-all for an error that escaped
       // mid-attempt (`harnessAttempt.ts`'s `finalizeEscapedError`) — before this leftover
       // in-flight marker could be cleared, most likely because the extension host itself stopped
-      // right after. Recording it as `interrupted` below would silently overwrite that
-      // already-truthful terminal record with a misleading "stalled and unresumable" one, so this
-      // entry is skipped entirely: nothing to close, nothing to record, straight to clearing the
-      // leftover marker with every other entry once the loop ends.
-      if (latest && isTerminalLifecycle(latest.projection.lifecycle)) continue;
+      // right after. It is never re-closed or recorded as `interrupted`: that would silently
+      // overwrite the already-truthful terminal checkpoint with a misleading "stalled and
+      // unresumable" one. It still gets its own truthful `ReviewRunStore` row, from
+      // `truthfulTerminalRow` above (see that function's own doc comment for why this must record
+      // rather than skip) — then straight to clearing the leftover marker with every other entry
+      // once the loop ends, never through `closeAttemptAsInterrupted` or the generic `interrupted`
+      // row built below, both of which are for a genuinely nonterminal checkpoint only.
+      if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
+        const findingCount = acceptedFindingCount(latest.candidates);
+        const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
+        await runs.record({
+          repoId: entry.repoId,
+          crNumber: entry.crNumber,
+          outcome,
+          findingCount,
+          agentLabel: '',
+          ranAt: entry.startedAt,
+          ...(limitations !== undefined ? { limitations } : {}),
+        });
+        continue;
+      }
       if (latest) {
         const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
         if (closed) {

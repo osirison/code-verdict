@@ -2014,7 +2014,7 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
 
   /** A genuinely terminal checkpoint: `nonterminalActivityEvents()` plus the same `terminalResult`
    * fact `harnessAttempt.ts`'s `runPersisting`/`finalizeEscapedError` append. */
-  function terminalActivityEvents() {
+  function terminalActivityEvents(lifecycle: 'failed' | 'cancelled') {
     let log = createActivityLog(SWEEP_RUN_ID, SWEEP_LINEAGE_ID, 1);
     log = appendActivityEvent(
       log,
@@ -2023,35 +2023,60 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     );
     log = appendActivityEvent(
       log,
-      { kind: 'terminalResult', lifecycle: 'failed', completeness: 'none', limitations: [{ code: 'attemptFailed', message: 'An unhandled error ended this attempt.' }] },
+      {
+        kind: 'terminalResult',
+        lifecycle,
+        completeness: 'none',
+        limitations: [
+          lifecycle === 'failed'
+            ? { code: 'attemptFailed', message: 'An unhandled error ended this attempt.' }
+            : { code: 'cancelled', message: 'The reviewer cancelled the run before completion.' },
+        ],
+      },
       { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
     );
     return log.events;
   }
 
-  it('a leftover entry whose lineage already settled terminal in-process (the attempt-level catch-all\'s own checkpoint, say) is never re-recorded as interrupted', async () => {
-    const globalState = memoryStore();
-    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
-    const snapshot = sweepSnapshot();
-    await harnessRunStore.writeSnapshot(snapshot);
-    const built = buildCheckpoint(sweepCheckpointInput(snapshot, { reason: 'attemptFailed', activityEvents: terminalActivityEvents() }), DEFAULT_HARNESS_POLICY);
-    expect(built.projection.lifecycle).toBe('failed'); // sanity: genuinely terminal already
-    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
-    await addInFlightEntry(globalState);
+  it.each(['failed', 'cancelled'] as const)(
+    "a leftover entry whose lineage already settled terminal in-process (%s) is never re-recorded as interrupted, but still gets a truthful dashboard row",
+    async (lifecycle) => {
+      const globalState = memoryStore();
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+      const snapshot = sweepSnapshot();
+      await harnessRunStore.writeSnapshot(snapshot);
+      const built = buildCheckpoint(
+        sweepCheckpointInput(snapshot, { reason: 'attemptFailed', activityEvents: terminalActivityEvents(lifecycle) }),
+        DEFAULT_HARNESS_POLICY,
+      );
+      expect(built.projection.lifecycle).toBe(lifecycle); // sanity: genuinely terminal already
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+      await addInFlightEntry(globalState);
 
-    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+      const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
 
-    // The leftover in-flight marker is still cleared...
-    expect(swept).toBe(1);
-    expect(new InFlightRunStore(globalState).list()).toEqual([]);
-    // ...but no misleading `interrupted` row is written over the attempt's own truthful `failed`
-    // record, and the stored checkpoint itself is untouched (still `failed`, not re-closed as
-    // `interrupted`).
-    expect(new ReviewRunStore(globalState).list()).toEqual([]);
-    const untouched = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
-    expect(untouched?.projection.lifecycle).toBe('failed');
-    expect(untouched?.checkpointId).toBe(built.checkpointId);
-  });
+      // The leftover in-flight marker is still cleared...
+      expect(swept).toBe(1);
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+      // ...the stored checkpoint itself is untouched (still its own real lifecycle, not re-closed
+      // as `interrupted`)...
+      const untouched = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
+      expect(untouched?.projection.lifecycle).toBe(lifecycle);
+      expect(untouched?.checkpointId).toBe(built.checkpointId);
+      // ...but the dashboard is not left silent either: a truthful `'partial'` row, mirroring
+      // `ReviewRunManager.completeAttempt`'s own settle-path shape for a failed/cancelled result,
+      // replaces the old wrong-but-present `'interrupted'` row this guard used to skip entirely.
+      expect(new ReviewRunStore(globalState).list()).toEqual([
+        expect.objectContaining({
+          repoId: 'repo-1',
+          crNumber: '42',
+          outcome: 'partial',
+          findingCount: 0,
+          limitations: built.projection.limitations,
+        }),
+      ]);
+    },
+  );
 
   // ---- Task 14.6: ReviewRunManager.resumeRun's own admission/identity lookup ----------
 

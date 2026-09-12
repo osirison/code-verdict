@@ -2743,20 +2743,92 @@ describe('Fix 1: a model round trip consumes the transient retry budget instead 
     expect(controlResult.activityLog.events.some((e) => (e.kind === 'toolCompleted' || e.kind === 'toolFailed') && e.tool === 'modelTurn')).toBe(false);
   });
 
-  it("a 'caller' cancellation reason is never retried, even though timedOut-shaped errors otherwise are", async () => {
+  it("a 'caller' cancellation reason is never retried, even though timedOut-shaped errors otherwise are, and — fired from a REAL cancellation token — the persisted checkpoint closes as 'cancelled', never 'failed'", async () => {
     const connection = reviewConnection({ files: ['file1.ts'] });
-    const seam = investigatingStallSeam(Number.POSITIVE_INFINITY, 'caller');
+    const cancellation = fakeCancellationToken();
+    let investigatingCalls = 0;
+    const seam: HarnessModelSeam = {
+      modelId: 'test-model',
+      async askModel({ phase }) {
+        if (phase === 'planning') return PLAN_TURN;
+        if (phase !== 'investigating') throw new Error(`unexpected phase "${phase}"`);
+        investigatingCalls += 1;
+        // The reviewer's own cancellation fires from inside the same call that reports it — the
+        // exact race `finalizeEscapedError`'s fix targets: the token is already cancelled by the
+        // time this throw reaches `run()`'s catch-all, however the error itself is shaped.
+        cancellation.cancel();
+        throw fakeAgentRunError('model stalled (caller)', false, 'caller');
+      },
+    };
+    const snapshot = testSnapshot();
+    const policy = testPolicy();
+    const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+    await harnessRunStore.writeSnapshot(snapshot);
     const attempt = createHarnessAttempt({
       ...baseOptions(),
-      snapshot: testSnapshot(),
+      snapshot,
       members: [member(connection)],
       modelSeam: seam,
-      policy: testPolicy(),
+      policy,
+      cancellation: cancellation.token,
+      onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
       retry: { sleep: async () => { throw new Error('must never sleep — a caller cancellation is not retryable'); } },
     });
 
     await expect(attempt.run()).rejects.toThrow('model stalled (caller)');
-    expect(seam.investigatingCalls).toBe(1); // exactly one attempt, never retried
+    expect(investigatingCalls).toBe(1); // exactly one attempt, never retried
+
+    const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+    expect(latest?.projection.lifecycle).toBe('cancelled');
+    expect(latest?.reason).toBe('attemptFailed'); // still the catch-all's own reason — only the lifecycle it reports changes
+    expect(latest?.projection.limitations).toEqual([{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }]);
+  });
+
+  it("a cancellation firing during the backoff wait between two model-call retries also closes the persisted checkpoint as 'cancelled' — even though the error the retry loop actually rethrows is an ordinary (non-cancelled-shaped) stall, never the reviewer's own cancellation error", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const cancellation = fakeCancellationToken();
+    let investigatingCalls = 0;
+    const seam: HarnessModelSeam = {
+      modelId: 'test-model',
+      async askModel({ phase }) {
+        if (phase === 'planning') return PLAN_TURN;
+        if (phase !== 'investigating') throw new Error(`unexpected phase "${phase}"`);
+        investigatingCalls += 1;
+        // A retryable stall (never a caller-cancellation shape) — `askModelRetried`'s
+        // `'cancelled'` `RetryOutcome` branch rethrows exactly this `lastAttemptError`, so the
+        // error `run()`'s catch-all actually sees carries no `cancelled` flag at all.
+        throw fakeAgentRunError('model stalled (firstOutput)', true, 'firstOutput');
+      },
+    };
+    const snapshot = testSnapshot();
+    const policy = testPolicy();
+    const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [member(connection)],
+      modelSeam: seam,
+      policy,
+      cancellation: cancellation.token,
+      onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      retry: {
+        // The reviewer cancels mid-backoff-wait, between the first stall and what would have been
+        // its retry — `cancellableWait`'s own race (`harnessRetry.ts`) resolves `'cancelled'` from
+        // this, never reaching a second `askModel` call.
+        sleep: async () => {
+          cancellation.cancel();
+        },
+      },
+    });
+
+    await expect(attempt.run()).rejects.toThrow('model stalled (firstOutput)');
+    expect(investigatingCalls).toBe(1); // the retry never actually re-asked; cancellation won the race
+
+    const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+    expect(latest?.projection.lifecycle).toBe('cancelled');
+    expect(latest?.reason).toBe('attemptFailed');
+    expect(latest?.projection.limitations).toEqual([{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }]);
   });
 
   it("a 'ceiling' timeout reason is never retried — the model was answering, just too slowly, and a retry cannot fix that", async () => {
