@@ -101,6 +101,60 @@ describe('runWithRetry (task 9.5)', () => {
     expect(calls).toBe(1);
   });
 
+  // ---- `options.isRetryable`: the one sanctioned classifier override (see this file's own header) ----
+
+  it('retries a plain Error (never an ScmError kind) when a custom isRetryable classifier accepts it', async () => {
+    let calls = 0;
+    class FakeStallError extends Error {}
+    const outcome = await runWithRetry(
+      async () => {
+        calls += 1;
+        if (calls === 1) throw new FakeStallError('stalled');
+        return 'recovered';
+      },
+      baseOptions({ isRetryable: (error) => error instanceof FakeStallError }),
+    );
+    expect(outcome).toEqual({ kind: 'ok', value: 'recovered', attempts: 2 });
+    expect(calls).toBe(2);
+  });
+
+  it('a custom isRetryable classifier fully replaces the default — a network ScmError it rejects is never retried', async () => {
+    let calls = 0;
+    const outcome = await runWithRetry(
+      async () => {
+        calls += 1;
+        throw NETWORK_ERROR();
+      },
+      baseOptions({ isRetryable: () => false }),
+    );
+    expect(outcome.kind).toBe('nonRetryable');
+    expect(calls).toBe(1);
+  });
+
+  it('a custom isRetryable classifier still respects the idempotence gate', async () => {
+    let calls = 0;
+    class FakeStallError extends Error {}
+    const outcome = await runWithRetry(
+      async () => {
+        calls += 1;
+        throw new FakeStallError('stalled');
+      },
+      baseOptions({ idempotent: false, isRetryable: () => true }),
+    );
+    expect(outcome.kind).toBe('nonRetryable');
+    expect(calls).toBe(1);
+  });
+
+  it('omitting isRetryable keeps the exact default behavior (a network ScmError is still retried)', async () => {
+    let calls = 0;
+    const outcome = await runWithRetry(async () => {
+      calls += 1;
+      if (calls === 1) throw NETWORK_ERROR();
+      return 'recovered';
+    }, baseOptions());
+    expect(outcome).toEqual({ kind: 'ok', value: 'recovered', attempts: 2 });
+  });
+
   it('exhausts after exactly 1 + transientRetriesPerOperation attempts and reports the last error', async () => {
     let calls = 0;
     const lastError = NETWORK_ERROR();

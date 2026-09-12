@@ -269,6 +269,8 @@ At admission, investigation budget is partitioned into ordinary work, unvisited/
 
 Transient network, rate-limit, and provider failures use bounded retry. Provider `Retry-After` or reset metadata takes precedence; otherwise exponential backoff with jitter applies under the elapsed-time budget. Protocol repair has a separate limit and never retries tool side effects. `submitCandidateFinding` and read tools are idempotent by request identifier.
 
+A model round trip that stalls — produces no output at all within its first-output window, or goes silent mid-reply past its inactivity window — uses this same bounded retry, classified through an explicit caller-supplied predicate rather than the provider-failure taxonomy above (a model timeout is this host's own timer firing, not provider HTTP reality). A model that keeps producing output but exceeds the whole run-window ceiling, and a reviewer-initiated cancellation, are never retried: the former is answering too slowly for a cause a retry cannot fix, the latter is the outcome that was asked for. Every retry of a round trip is absorbed under the turn's single model-turn budget reservation, exactly as a retried tool call is absorbed under its own single reservation.
+
 A long backoff moves the run to `waiting`, checkpoints it, and releases its global execution slot. When eligible, it returns through `resuming` without losing target ownership or queue fairness. Budget exhaustion emits a limitation and proceeds only to allowed validation and persistence work.
 
 Alternative rejected: one token budget shared by all work. It permits early low-risk exploration to consume the resources needed for untouched high-risk files and verification.

@@ -4,15 +4,27 @@
  * design.md D12, spec `agentic-review-harness` "Budgets and retries degrade
  * truthfully").
  *
- * This module introduces no second retryability taxonomy: `runWithRetry`
- * only ever retries a *thrown* error, and only when `isRetryableScmError`
- * (`../platform/errors`) says the wrapped `ScmError` is transient. A typed
- * provider result state (`unavailable`, `notFound`, `binary`, ...) is a
- * truthful domain outcome already (design.md D3.4) and is never inspected
- * here for retryability — `../app/harnessToolDispatcher.ts`'s handlers pass
- * this module only the raw provider call, so a resolved (non-throwing)
- * promise always short-circuits straight to `{kind: 'ok'}` regardless of
- * what result state it carries.
+ * This module introduces no second retryability taxonomy of its own:
+ * `runWithRetry` only ever retries a *thrown* error, and only when its
+ * classifier says so. The default classifier is `isRetryableScmError`
+ * (`../platform/errors`) over the error `toScmError` wraps it as — every
+ * provider tool call goes through this default, unmodified. A typed provider
+ * result state (`unavailable`, `notFound`, `binary`, ...) is a truthful
+ * domain outcome already (design.md D3.4) and is never inspected here for
+ * retryability — `../app/harnessToolDispatcher.ts`'s handlers pass this
+ * module only the raw provider call, so a resolved (non-throwing) promise
+ * always short-circuits straight to `{kind: 'ok'}` regardless of what result
+ * state it carries.
+ *
+ * `options.isRetryable`, added for a caller whose retryable failure is not
+ * `ScmError` shaped at all (`../app/harnessAttempt.ts`'s `askModelRetried`,
+ * classifying `../app/lmAgent.ts`'s `AgentRunError` timeouts, design.md D12
+ * amended alongside it), is the one sanctioned escape hatch — a caller-
+ * supplied classifier this module runs verbatim instead of its own default,
+ * never a second implicit taxonomy this module invents or maintains itself.
+ * Only one classifier ever runs per call: a caller that passes
+ * `isRetryable` opts all the way out of the `ScmError` default for that
+ * call, rather than the two being merged or chained.
  *
  * **9.5 idempotence.** `options.idempotent` is supplied by the caller, not
  * inferred here — `harnessToolDispatcher.ts` passes
@@ -131,6 +143,12 @@ export interface RunWithRetryOptions {
   /** The attempt's own elapsed-time clock at the moment this call started (`HostToolRequest.elapsedMs`) — not a wall-clock reading. */
   readonly elapsedMsAtStart: number;
   readonly cancellation?: AgentCancellationToken;
+  /**
+   * Overrides the default `(error) => isRetryableScmError(toScmError(error))` classifier — see this
+   * file's own header for why this exists and what it does and does not change about the module's
+   * "no second taxonomy" claim. Runs instead of the default, never alongside it.
+   */
+  readonly isRetryable?: (error: unknown) => boolean;
   /** Deterministic injection point, matching `BudgetTrackerOptions`' pattern. Defaults to real time/randomness/timers. */
   readonly now?: () => number;
   readonly random?: () => number;
@@ -197,6 +215,7 @@ export async function runWithRetry<T>(fn: () => Promise<T>, options: RunWithRetr
   const random = options.random ?? Math.random;
   const sleep = options.sleep ?? defaultSleep;
   const longDelayThresholdMs = options.longDelayThresholdMs ?? options.policy.backoffMaxMs;
+  const isRetryable = options.isRetryable ?? ((error: unknown) => isRetryableScmError(toScmError(error)));
   const maxAttempts = 1 + Math.max(0, options.policy.transientRetriesPerOperation);
   const startedAt = now();
   let attempts = 0;
@@ -211,7 +230,7 @@ export async function runWithRetry<T>(fn: () => Promise<T>, options: RunWithRetr
       return { kind: 'ok', value, attempts };
     } catch (error) {
       if (options.cancellation?.isCancellationRequested) return { kind: 'cancelled', attempts };
-      if (!options.idempotent || !isRetryableScmError(toScmError(error))) {
+      if (!options.idempotent || !isRetryable(error)) {
         return { kind: 'nonRetryable', error, attempts };
       }
       if (attempts >= maxAttempts) return { kind: 'exhausted', error, attempts };

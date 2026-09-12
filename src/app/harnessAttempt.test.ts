@@ -2526,6 +2526,11 @@ function wireOnCheckpoint(harnessRunStore: ReturnType<typeof createHarnessRunSto
       budget: info.budget,
       coverage: info.coverage,
       unresolved: info.unresolved,
+      // Fix 1: forwards `CheckpointInfo.retry` (model-turn transient-retry counter) into
+      // `CheckpointBuildInput.retry`, exactly the one-line addition production's own
+      // `harnessRuntime.ts` still needs (see `CheckpointInfo.retry`'s own doc comment) — this test
+      // helper proves the seam end to end without touching that protected-for-this-fix file.
+      retry: info.retry,
     };
     await harnessRunStore.buildAndWriteCheckpoint(input, policy);
   };
@@ -2649,5 +2654,245 @@ describe("HarnessAttempt.run's catch-all (an error escaping every phase runner s
     const [only] = terminalCheckpoints;
     expect(only?.reason).toBe('phaseBoundary'); // `runPersisting`'s own reason — never the catch-all's `attemptFailed`.
     expect((only?.activityLog.events.at(-1) as { lifecycle?: string } | undefined)?.lifecycle).toBe('cancelled');
+  });
+});
+
+// ---- Fix 1: a model round trip consumes the transient retry budget instead of killing the attempt ----
+
+/**
+ * Mirrors the exact shape `lmAgent.ts`'s `AgentRunError` throws for a timed-out request —
+ * `name === 'AgentRunError'` plus `timedOut`/`timeoutReason` — never the real class, for the same
+ * reason `transportFailureModelSeam` above gives: this module stays free of any runtime import from
+ * `lmAgent.ts` (`vscode`-dependent), and `harnessAttempt.ts`'s own `isRetryableModelTimeout` is a
+ * structural check for exactly this reason too.
+ */
+function fakeAgentRunError(message: string, timedOut: boolean, timeoutReason: 'firstOutput' | 'inactivity' | 'ceiling' | 'caller'): Error {
+  const error = new Error(message);
+  error.name = 'AgentRunError';
+  return Object.assign(error, { timedOut, timeoutReason, requestId: 'req-1', cancelled: timeoutReason === 'caller' });
+}
+
+/**
+ * A minimal, fully-scripted seam for these tests: `planning` and `verifying` always answer once
+ * with a bare stop, `investigating` throws `fakeAgentRunError(reason)` for the first `stallCount`
+ * calls (every call, when `stallCount` is `Infinity`) and a bare stop thereafter. `investigatingCalls`
+ * counts every raw `askModel` invocation for `investigating`, retried ones included — the signal
+ * these tests read to prove a stall was actually retried (or, for the non-retryable reasons, that it
+ * was not).
+ */
+function investigatingStallSeam(stallCount: number, reason: 'firstOutput' | 'inactivity' | 'ceiling' | 'caller'): HarnessModelSeam & { readonly investigatingCalls: number } {
+  let investigatingCalls = 0;
+  return {
+    modelId: 'test-model',
+    get investigatingCalls() {
+      return investigatingCalls;
+    },
+    async askModel({ phase }) {
+      if (phase === 'planning') return PLAN_TURN;
+      if (phase === 'verifying') return STOP_TURN;
+      if (phase !== 'investigating') throw new Error(`investigatingStallSeam: phase "${phase}" unexpectedly asked.`);
+      investigatingCalls += 1;
+      if (investigatingCalls <= stallCount) throw fakeAgentRunError(`model stalled (${reason})`, reason !== 'caller', reason);
+      return STOP_TURN;
+    },
+  };
+}
+
+describe('Fix 1: a model round trip consumes the transient retry budget instead of killing the attempt', () => {
+  it('a firstOutput stall is retried and the turn succeeds, without costing an extra model-turn budget reservation, and the retry is recorded as its own activity fact', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const stalledSeam = investigatingStallSeam(1, 'firstOutput');
+    const controlSeam = investigatingStallSeam(0, 'firstOutput'); // never actually stalls
+
+    const stalledAttempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: stalledSeam,
+      policy: testPolicy(),
+      retry: { sleep: async () => {} },
+    });
+    const stalledResult = await stalledAttempt.run();
+
+    const controlAttempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(reviewConnection({ files: ['file1.ts'] }))],
+      modelSeam: controlSeam,
+      policy: testPolicy(),
+    });
+    const controlResult = await controlAttempt.run();
+
+    // One extra raw call for the retried attempt (the stall itself, plus the successful re-ask) —
+    // never a whole extra phase-loop iteration.
+    expect(stalledSeam.investigatingCalls).toBe(controlSeam.investigatingCalls + 1);
+    // The budget convention this fix mirrors (`harnessToolDispatcher.ts`'s own reserve-once-retry-
+    // underneath convention): identical model-turn consumption whether or not a call inside one of
+    // those turns needed to be retried.
+    expect(stalledResult.turnsUsed).toBe(controlResult.turnsUsed);
+
+    // The retry itself is visible, not silent: one extra `modelTurn` activity fact, carrying the
+    // same `retryWaitMs`/`retryCount` fields `harnessToolDispatcher.ts`'s own tool retries attach.
+    const retryFact = stalledResult.activityLog.events.find(
+      (e) => (e.kind === 'toolCompleted' || e.kind === 'toolFailed') && e.tool === 'modelTurn' && e.retryCount === 1,
+    );
+    expect(retryFact).toBeDefined();
+    expect(retryFact?.kind).toBe('toolCompleted'); // the retry succeeded
+    expect((retryFact as { retryWaitMs?: number }).retryWaitMs).toBeGreaterThanOrEqual(0);
+    // The control run has no such fact at all.
+    expect(controlResult.activityLog.events.some((e) => (e.kind === 'toolCompleted' || e.kind === 'toolFailed') && e.tool === 'modelTurn')).toBe(false);
+  });
+
+  it("a 'caller' cancellation reason is never retried, even though timedOut-shaped errors otherwise are", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = investigatingStallSeam(Number.POSITIVE_INFINITY, 'caller');
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      retry: { sleep: async () => { throw new Error('must never sleep — a caller cancellation is not retryable'); } },
+    });
+
+    await expect(attempt.run()).rejects.toThrow('model stalled (caller)');
+    expect(seam.investigatingCalls).toBe(1); // exactly one attempt, never retried
+  });
+
+  it("a 'ceiling' timeout reason is never retried — the model was answering, just too slowly, and a retry cannot fix that", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = investigatingStallSeam(Number.POSITIVE_INFINITY, 'ceiling');
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      retry: { sleep: async () => { throw new Error('must never sleep — a ceiling timeout is not retryable'); } },
+    });
+
+    await expect(attempt.run()).rejects.toThrow('model stalled (ceiling)');
+    expect(seam.investigatingCalls).toBe(1);
+  });
+
+  it("an inactivity stall whose retry would spend more of the attempt's own elapsed-time budget than remains fails on the very first attempt, never sleeping through a doomed retry", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = investigatingStallSeam(Number.POSITIVE_INFINITY, 'inactivity');
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      // A cap so tight that ordinary turn admission (a few dozen `clock()` ticks in) still fits
+      // under it, but the *computed backoff delay* for even a first retry does not — projecting
+      // `elapsedMsAtStart + delayMs` over `maxElapsedMsPerAttempt` on the very first stall, per
+      // D12's elapsed-time budget (`runWithRetry`'s own `elapsedBudgetExceeded` outcome).
+      policy: testPolicy({ maxElapsedMsPerAttempt: 100, backoffInitialMs: 200, backoffMaxMs: 200, backoffJitter: false }),
+      retry: {
+        sleep: async () => {
+          throw new Error('must never sleep once the projected elapsed time already exceeds the budget');
+        },
+      },
+    });
+
+    // If `elapsedMsAtStart` were ever sourced from wall time instead of the attempt's own clock
+    // (`HarnessAttemptOptions.clock`), or if the elapsed-budget check were skipped, this would
+    // instead sleep (throwing the assertion above) or exhaust after 4 attempts — either failure
+    // mode surfaces as a different rejection than the one asserted below.
+    await expect(attempt.run()).rejects.toThrow('model stalled (inactivity)');
+    expect(seam.investigatingCalls).toBe(1);
+  });
+
+  it(
+    'firstOutput timeouts x(retries+1) exhaust the retry budget and the attempt fails: Fix 2\'s terminal checkpoint and ' +
+      "TerminalAttemptMarker are written, and the exhausted retries are visible in the persisted checkpoint's own retry state and activity",
+    async () => {
+      const connection = reviewConnection({ files: ['file1.ts'] });
+      const seam = investigatingStallSeam(Number.POSITIVE_INFINITY, 'firstOutput'); // never recovers
+      const snapshot = testSnapshot();
+      const policy = testPolicy(); // transientRetriesPerOperation: 3 (default)
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+        retry: { sleep: async () => {} },
+      });
+
+      // The original stall error, unchanged — this fix's retries are exhausted, not swallowed, and
+      // Fix 2's catch-all is what turns the escape into a truthful terminal checkpoint below.
+      await expect(attempt.run()).rejects.toThrow('model stalled (firstOutput)');
+      // 1 + transientRetriesPerOperation(3) raw attempts, all of them stalls.
+      expect(seam.investigatingCalls).toBe(4);
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('failed');
+      expect(latest?.reason).toBe('attemptFailed');
+      expect(latest?.projection.limitations.some((l) => l.code === 'attemptFailed' && l.message.includes('model stalled (firstOutput)'))).toBe(true);
+      // The retries are visible in the persisted checkpoint's own dedicated retry state — Fix 1's
+      // `CheckpointInfo.retry` forwarded end to end by `wireOnCheckpoint` (production's own
+      // `harnessRuntime.ts` needs the identical one-line addition; see `CheckpointInfo.retry`'s own
+      // doc comment).
+      expect(latest?.retry).toEqual({ waiting: false, transientAttempts: 3 });
+      // And in the persisted activity itself: one `modelTurn` `toolFailed` fact carrying the retry
+      // count/wait time, never silent.
+      expect(latest?.activity.some((e) => e.kind === 'toolFailed' && e.tool === 'modelTurn' && e.retryCount === 3)).toBe(true);
+
+      const record = harnessRunStore.readLineage(snapshot.lineageId);
+      expect(record?.terminalAttempts).toContainEqual(expect.objectContaining({ attempt: 1, lifecycle: 'failed' }));
+      const terminalCheckpoints = (record?.checkpoints ?? []).filter((c) => c.attempt === 1 && c.projection.lifecycle === 'failed');
+      expect(terminalCheckpoints).toHaveLength(1);
+    },
+  );
+
+  it("the contradiction-check pass's own direct askModel call is wrapped through the same retry — the one other direct askModel call site this module has", async () => {
+    const path = 'file1.ts';
+    const connection = reviewConnection({ files: [path] });
+    const scriptSeam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(path)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+
+    let verifyingCalls = 0;
+    // `runVerifying` calls `runSynthesisVerification()` *before* `runPhaseLoop('verifying', ...)`
+    // ever asks the model (see `runVerifying`'s own doc comment on ordering) — so the very first
+    // `'verifying'` ask is always `verificationThatAsksModel()`'s own direct call below, never the
+    // ordinary phase loop's turn. Stalling exactly that one call proves this module's other direct
+    // `askModel` call site (`runSynthesisVerification`'s `modelSeam.askModel` override, which the
+    // real `runContradictionChecks` also calls through) is wrapped identically to `runPhaseLoop`'s.
+    const stallingSeam: HarnessModelSeam = {
+      modelId: scriptSeam.modelId,
+      async askModel(input) {
+        if (input.phase === 'verifying') {
+          verifyingCalls += 1;
+          if (verifyingCalls === 1) throw fakeAgentRunError('model stalled (firstOutput)', true, 'firstOutput');
+        }
+        return scriptSeam.askModel(input);
+      },
+    };
+
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: verificationThatAsksModel() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: stallingSeam,
+      policy: testPolicy(),
+      retry: { sleep: async () => {} },
+    });
+
+    const result = await attempt.run();
+    expect(verifyingCalls).toBeGreaterThanOrEqual(1); // the stall actually fired
+    // Recovered — never escaped as a `nonRetryable`/`exhausted` throw.
+    expect(result.lifecycle).not.toBe('failed');
+    const retryFact = result.activityLog.events.find(
+      (e) => (e.kind === 'toolCompleted' || e.kind === 'toolFailed') && e.tool === 'modelTurn' && e.retryCount === 1,
+    );
+    expect(retryFact).toBeDefined();
   });
 });

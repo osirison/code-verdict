@@ -69,6 +69,7 @@ import {
 } from '../domain/types';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import type {
+  ActivityCallMetadata,
   ActivityEvent,
   AttentionState,
   CoverageProgress,
@@ -185,6 +186,49 @@ function parseLimitations(raw: unknown): readonly Limitation[] | undefined {
   return parseArray(raw, parseLimitation);
 }
 
+/** Mirrors `harnessActivityLog.ts`'s own `sanitizeOptionalNonNegativeFinite` — present-but-invalid fails the field's own event closed (this module's house style, see file header), `undefined` is a legitimate absence. */
+function parseOptionalNonNegativeFinite(raw: unknown): { ok: false } | { ok: true; value: number | undefined } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? { ok: true, value: raw } : { ok: false };
+}
+
+/**
+ * A `toolCompleted`/`toolFailed` event's optional `ActivityCallMetadata` (`../domain/
+ * harnessActivity.ts`) — `durationMs`/`memberId`/`bytesSent`/`bytesReceived`/`resultState`/
+ * `retryWaitMs`/`retryCount`, every one host-computed diagnostics, never model text. Reconstructs
+ * exactly what `harnessActivityLog.ts`'s own `sanitizeCallMetadata` already validated on the way
+ * in — this parser was missing it entirely until this fix, so every one of these fields silently
+ * vanished on any real read-back (`readLineage`/`latestCheckpoint`/`checkpointsFor`) even though the
+ * live, never-persisted `CheckpointInfo` always carried them; a diagnostics report built from a
+ * reloaded checkpoint (the one case that matters most — after the extension activation this whole
+ * change's own incident needed) silently lost every call's duration/byte counts/retry accounting.
+ * Same validation rules as the write side: a numeric field present-but-negative-or-non-finite, a
+ * present-but-blank `memberId`, or a `resultState` outside its short-token shape fails the whole
+ * event closed (`undefined`), matching this module's own "never partially trusted" rule.
+ */
+function parseCallMetadata(raw: Record<string, unknown>): { ok: false } | { ok: true; value: ActivityCallMetadata } {
+  const durationMs = parseOptionalNonNegativeFinite(raw.durationMs);
+  const bytesSent = parseOptionalNonNegativeFinite(raw.bytesSent);
+  const bytesReceived = parseOptionalNonNegativeFinite(raw.bytesReceived);
+  const retryWaitMs = parseOptionalNonNegativeFinite(raw.retryWaitMs);
+  const retryCount = parseOptionalNonNegativeFinite(raw.retryCount);
+  if (!durationMs.ok || !bytesSent.ok || !bytesReceived.ok || !retryWaitMs.ok || !retryCount.ok) return { ok: false };
+  if (raw.memberId !== undefined && (typeof raw.memberId !== 'string' || raw.memberId.trim() === '')) return { ok: false };
+  if (raw.resultState !== undefined && (typeof raw.resultState !== 'string' || !/^[A-Za-z][A-Za-z0-9]*$/.test(raw.resultState))) return { ok: false };
+  return {
+    ok: true,
+    value: {
+      ...(durationMs.value !== undefined ? { durationMs: durationMs.value } : {}),
+      ...(raw.memberId !== undefined ? { memberId: raw.memberId as string } : {}),
+      ...(bytesSent.value !== undefined ? { bytesSent: bytesSent.value } : {}),
+      ...(bytesReceived.value !== undefined ? { bytesReceived: bytesReceived.value } : {}),
+      ...(raw.resultState !== undefined ? { resultState: raw.resultState as string } : {}),
+      ...(retryWaitMs.value !== undefined ? { retryWaitMs: retryWaitMs.value } : {}),
+      ...(retryCount.value !== undefined ? { retryCount: retryCount.value } : {}),
+    },
+  };
+}
+
 function parsePlanItem(raw: unknown): PlanItem | undefined {
   if (!isRecord(raw)) return undefined;
   const state = parsePlanItemState(raw.state);
@@ -244,11 +288,15 @@ export function parseActivityEvent(raw: unknown, expected: { runId: RunId; linea
     }
     case 'toolCompleted': {
       if (typeof raw.tool !== 'string' || typeof raw.summary !== 'string' || !optionalString(raw.target)) return undefined;
-      return { ...base, kind: raw.kind, tool: raw.tool, summary: raw.summary, target: raw.target };
+      const metadata = parseCallMetadata(raw);
+      if (!metadata.ok) return undefined;
+      return { ...base, kind: raw.kind, tool: raw.tool, summary: raw.summary, target: raw.target, ...metadata.value };
     }
     case 'toolFailed': {
       if (typeof raw.tool !== 'string' || typeof raw.reason !== 'string' || !optionalString(raw.target)) return undefined;
-      return { ...base, kind: raw.kind, tool: raw.tool, reason: raw.reason, target: raw.target };
+      const metadata = parseCallMetadata(raw);
+      if (!metadata.ok) return undefined;
+      return { ...base, kind: raw.kind, tool: raw.tool, reason: raw.reason, target: raw.target, ...metadata.value };
     }
     case 'coverageChanged': {
       const coverage = parseCoverageProgress(raw.coverage);

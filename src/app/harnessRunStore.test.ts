@@ -263,6 +263,38 @@ describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, dige
     expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1);
   });
 
+  it(
+    "a toolCompleted/toolFailed event's ActivityCallMetadata (durationMs, memberId, bytesSent/Received, " +
+      'resultState, retryWaitMs, retryCount) survives a real JSON checkpoint round-trip — this parser used to ' +
+      'drop the whole metadata bag on every read, silently, even though the write side already validated it',
+    async () => {
+      const backing = jsonMemoryStore();
+      const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+      let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.', durationMs: 42, memberId: 'm1', bytesReceived: 128, resultState: 'complete' },
+        { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolFailed', tool: 'modelTurn', reason: 'Still failing after 3 transient retry(ies).', durationMs: 99, bytesSent: 500, bytesReceived: 0, retryWaitMs: 3000, retryCount: 3 },
+        { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
+      );
+
+      const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+      await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+      const readBack = runStore.latestCheckpoint('lineage-1');
+      expect(readBack?.activity).toEqual(built.activity);
+      const completed = readBack?.activity.find((e) => e.kind === 'toolCompleted');
+      expect(completed).toMatchObject({ durationMs: 42, memberId: 'm1', bytesReceived: 128, resultState: 'complete' });
+      const failed = readBack?.activity.find((e) => e.kind === 'toolFailed');
+      expect(failed).toMatchObject({ durationMs: 99, bytesSent: 500, bytesReceived: 0, retryWaitMs: 3000, retryCount: 3 });
+    },
+  );
+
   it('a member-scoped plan item\'s memberId survives a real JSON checkpoint round-trip, and a shared item stays without one (task 13.3)', async () => {
     const backing = jsonMemoryStore();
     const runStore = createHarnessRunStore(backing, { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
@@ -590,6 +622,17 @@ describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and un
     ['truncated: lineage record missing its terminalAttempts field', (r: ReturnType<typeof validLineage>) => { delete (r as unknown as Record<string, unknown>).terminalAttempts; }],
     // malformed: a field present with a value of the wrong overall shape (not an array where one is required).
     ['malformed: checkpoints is not an array', (r: ReturnType<typeof validLineage>) => { (r as unknown as Record<string, unknown>).checkpoints = 'not-an-array'; }],
+    // wrong-typed: a toolFailed event's own optional ActivityCallMetadata (Fix 1's parseCallMetadata) — a
+    // present-but-negative retryCount fails the whole event, and so the whole record, closed rather than
+    // being silently dropped down to just the required fields.
+    [
+      'wrong-typed: a toolFailed event carries a negative retryCount',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'toolFailed', tool: 'modelTurn', reason: 'stalled', retryCount: -1 },
+        ];
+      },
+    ],
   ])('%s makes the whole lineage record fail closed (undefined), not partially trusted', async (_label, corrupt) => {
     const backing = jsonMemoryStore();
     const record = validLineage();

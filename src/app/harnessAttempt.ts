@@ -96,6 +96,9 @@
  */
 import { randomBytes } from 'node:crypto';
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
+import type { AgentTimeoutReason } from './agentTrace';
+import { runWithRetry, retryBackoffPolicyFrom } from './harnessRetry';
+import type { RetryState } from './harnessCheckpoint';
 import {
   INVESTIGATION_MAP_OFF_MANIFEST_SHOWN,
   type InvestigationMapFile,
@@ -445,6 +448,20 @@ export interface CheckpointInfo {
   readonly budget: BudgetConsumption;
   readonly coverage: readonly MemberCoverage[];
   readonly unresolved: UnresolvedWork;
+  /**
+   * Fix 1's live attempt-level counter (`modelRetryTransientAttempts`) — model-turn retries only
+   * (see that field's own doc comment for why tool-call retries stay unwired here, as before).
+   * `harnessCheckpoint.ts`'s `CheckpointBuildInput.retry` already accepts this shape
+   * (`INITIAL_RETRY_STATE` was its only value until now); a caller building a `PersistedCheckpoint`
+   * from this `CheckpointInfo` need only forward it to make `PersistedCheckpoint.retry` truthful for
+   * model-turn retries. Production wiring (`harnessRuntime.ts`'s `onCheckpoint` closure, which lists
+   * `buildAndWriteCheckpoint`'s input fields explicitly rather than spreading this object) is left
+   * for that module's own owner to add — see this fix's own final report for the exact line.
+   * Optional, matching `CheckpointBuildInput.retry`'s own convention (`buildCheckpoint` defaults a
+   * missing one to `INITIAL_RETRY_STATE`) — `reportCheckpoint` always supplies it for a real
+   * attempt; a hand-built test fixture predating this fix is not forced to.
+   */
+  readonly retry?: RetryState;
 }
 
 export type OnCheckpoint = (info: CheckpointInfo) => void | Promise<void>;
@@ -886,6 +903,35 @@ function scopedForNudge(evaluation: CompletionEvaluation, clauses: ReadonlySet<C
   };
 }
 
+/**
+ * Fix 1's retry classifier, passed to `askModelRetried`'s `runWithRetry` call as `isRetryable`.
+ *
+ * A *structural* check against `./lmAgent.ts`'s `AgentRunError` shape — deliberately never
+ * `error instanceof AgentRunError`, which would require importing that class as a runtime value.
+ * `lmAgent.ts` is the one module in this codebase that imports the real `vscode` package, so this
+ * module (like `harnessToolDispatcher.ts`/`harnessTurn.ts` before it — see their own headers)
+ * imports only its *types* from there (`AgentCancellationToken`, `ModelTurnTiming`); a value import
+ * would load `vscode` transitively into every test that exercises `createHarnessAttempt`, none of
+ * which mock it (`lmAgent.test.ts` is the one file that does). Mirrors `AgentCancellationToken`'s
+ * own doc comment in `lmAgent.ts`: "Declared structurally rather than imported as a type so a
+ * caller can hand in a real one and a test can hand in an object literal" — same reasoning, applied
+ * to a runtime check instead of a type.
+ *
+ * `name === 'AgentRunError'` (always set by that class's constructor) plus the exact `timedOut`/
+ * `timeoutReason` shape its two timeout-throwing branches use is enough to identify it without the
+ * class reference: only `'firstOutput'` (no output at all) and `'inactivity'` (output, then
+ * silence) qualify — see `AgentTimeoutReason` (`./agentTrace.ts`, imported type-only) for the full
+ * set. `'ceiling'` also sets `timedOut: true` but is deliberately excluded (the model kept
+ * answering, just past the whole run-window ceiling — retrying only doubles the wait for a cause a
+ * retry cannot fix); `'caller'` never reaches the `timedOut` check because that branch throws with
+ * `timedOut: false` (the reviewer's own cancellation, not a failure).
+ */
+function isRetryableModelTimeout(error: unknown): boolean {
+  if (!(error instanceof Error) || error.name !== 'AgentRunError') return false;
+  const record = error as { timedOut?: unknown; timeoutReason?: AgentTimeoutReason };
+  return record.timedOut === true && (record.timeoutReason === 'firstOutput' || record.timeoutReason === 'inactivity');
+}
+
 // ---- The orchestrator ---------------------------------------------------------------
 
 /**
@@ -899,6 +945,8 @@ function scopedForNudge(evaluation: CompletionEvaluation, clauses: ReadonlySet<C
  */
 export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAttempt {
   const policy = options.policy ?? DEFAULT_HARNESS_POLICY;
+  /** Fix 1 (a model round trip consumes the transient retry budget instead of killing the attempt): the same policy subset `harnessToolDispatcher.ts` derives for its own provider-call retries, reused here for a model round trip's own bounded retry — one policy, two retry-wrapped seams, never a second set of numbers to keep in sync. */
+  const modelRetryBackoffPolicy = retryBackoffPolicyFrom(policy);
   const riskFloorRules = options.riskFloorRules ?? DEFAULT_RISK_FLOOR_RULES;
   const riskCoverageRules = options.riskCoverageRules ?? DEFAULT_RISK_COVERAGE_RULES;
   const snapshot = options.snapshot;
@@ -973,6 +1021,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
    * checkpoint over an attempt that already correctly closed itself.
    */
   let terminalCheckpointWritten = false;
+  /**
+   * Fix 1's attempt-level retry counter — the one `harnessCheckpoint.ts`'s own header says does not
+   * exist yet ("No attempt-level retry counter exists yet to read... wiring one through is
+   * integration work"). Scoped to model-turn retries only (tool-call transient attempts stay
+   * unwired, exactly as before this fix — out of its scope): every inline backoff wait
+   * `askModelRetried` actually takes, across every `planning`/`investigating`/`verifying`/
+   * `verifying`-contradiction-check round trip this attempt makes, in lineage order. `waiting` in
+   * the `RetryState` this feeds `reportCheckpoint` is always `false` — a model round trip's own
+   * long-delay classification (9.6's `'wait'` outcome) is treated as a failure here, never an actual
+   * paused/resumed state (see `askModelRetried`'s own doc comment), so there is never a real
+   * "waiting on a model retry" state to report.
+   */
+  let modelRetryTransientAttempts = 0;
   /**
    * Task 9.6's production trigger for `DispatchControl.resumedAfterWait`/`onResuming`. Keys are
    * `waitKeyFor(request)` for every logical tool-call operation `retryOptions.onEnterWaiting`
@@ -1054,6 +1115,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       budget: budget.consumption(),
       coverage,
       unresolved: { unresolvedFetches: 0, unresolvedCandidates: candidateTracker.unresolvedCount() },
+      retry: { waiting: false, transientAttempts: modelRetryTransientAttempts },
     };
     await onCheckpoint(info);
   }
@@ -1304,6 +1366,150 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         : { kind: 'toolFailed', tool: 'modelTurn', reason: summary, durationMs: timing.durationMs, bytesSent: timing.promptBytes, bytesReceived: timing.replyBytes },
       phase,
     );
+  }
+
+  /**
+   * Fix 1 (the incident this closes): a real harness run's second model call
+   * (`lm:ollama-models/glm-5.3`, cloud-proxied) produced zero output for 300s;
+   * `lmAgent.ts`'s `streamText` threw `AgentRunError(timedOut: true, timeoutReason: 'firstOutput')`;
+   * nothing between there and `run()`'s own catch-all retried it or even slowed it down — Ollama's
+   * access log showed exactly two POSTs despite `transientRetriesPerOperation: 3`, because model
+   * turns never entered `harnessRetry.ts`'s bounded-retry loop at all; only provider tool calls did
+   * (`harnessToolDispatcher.ts`'s `executeWithRetry`). This wraps every real model round trip
+   * (`options.modelSeam.askModel`) in the same bounded transient retry, so a stall consumes the
+   * budget instead of killing the attempt on the first one.
+   *
+   * **Seam.** Wraps the `askModel` closure `runPhaseLoop` builds for `runHarnessTurn` (below) and
+   * `runSynthesisVerification`'s own `modelSeam.askModel` override for the contradiction-check
+   * pass — every direct `options.modelSeam.askModel` call site in this module. `runHarnessTurn`
+   * itself is never touched: it retries each round trip independently, repair turns (D5 rule 5)
+   * included, and `runPhaseLoop`'s existing `PromptCeilingExceededError` handling (a prompt-ceiling
+   * error is a budget statement, never a stall) stays exactly as it was — that error is thrown by
+   * the seam's own prompt renderer before a request is ever sent, so it never reaches `call()` here
+   * at all. `harnessBootstrapBudget.ts`'s bootstrap-fit check calls only `countTokens`, never
+   * `askModel` — no model round trip happens there, so nothing to wrap.
+   *
+   * **Retry set.** Only what `isRetryableModelTimeout` (below) accepts: a thrown `AgentRunError`
+   * (`./lmAgent.ts`) with `timedOut === true` and `timeoutReason` `'firstOutput'` (never started
+   * answering) or `'inactivity'` (went silent mid-reply) — the two "no output"/"stalled output"
+   * reasons a fresh attempt can plausibly fix. `'ceiling'` (the model was answering, just too slowly
+   * — a retry only doubles the worst-case wait for a cause retrying cannot help) and `'caller'` (the
+   * reviewer's own cancellation, `timedOut: false` besides) are never retried; neither is any
+   * non-`AgentRunError` throw (a bad-contract `AgentResponseError`/`SyntaxError`, an unavailable
+   * model). All of those are `nonRetryable` after exactly one attempt — the same single-attempt
+   * behavior this fix replaces *only* for the two stall reasons above, never widened beyond them.
+   *
+   * **Taxonomy.** `harnessRetry.ts`'s own header says it "introduces no second retryability
+   * taxonomy": `runWithRetry` only ever retried a *thrown error classified through `ScmError`*. An
+   * `AgentRunError` is not an `ScmError` — `../platform/errors.ts`'s own header says providers "map
+   * their HTTP reality onto these kinds", and a model stall is this host's own timer firing, not
+   * provider HTTP reality, so mapping it into `toScmError` would corrupt what `ScmErrorKind` means.
+   * Instead this passes `isRetryable: isRetryableModelTimeout` — `runWithRetry`'s new, explicit
+   * classifier override (header/tests/design.md D12 amended alongside it) — so the module still
+   * invents no taxonomy of its own; it retries exactly the one classifier a caller hands it, exactly
+   * as it already did with its own default.
+   *
+   * **Budget.** No new model-turn reservation: `runPhaseLoop`'s `budget.beginTurn` already reserves
+   * one `modelTurns` unit per phase-loop iteration, *before* this wrapper's closure is ever
+   * invoked — every repair ask and every retry of every repair ask happens underneath that one
+   * reservation, exactly mirroring `harnessToolDispatcher.ts`'s own convention (`dispatch` reserves
+   * one `toolCalls` unit once, then `executeWithRetry` retries underneath it without a second
+   * reservation per attempt). A timed-out-and-retried turn is counted the way a timed-out-and-
+   * retried tool call already is: once.
+   *
+   * **Idempotence.** `idempotent: true`, always — a model round trip resends the identical rendered
+   * prompt and asks again; it is a re-issuable read of "what does the model say to this text", never
+   * a side effect a retry could duplicate (submitting a finding, posting a review). Unlike
+   * `HostToolDefinition.idempotent`, there is no per-call choice to thread through: every
+   * `askModel` call this module makes is this same kind of call.
+   *
+   * **Every `RetryOutcome` kind, explicitly:**
+   * - `'ok'`: the round trip's own text, returned.
+   * - `'nonRetryable'` / `'exhausted'`: the underlying error, rethrown unchanged — it escapes exactly
+   *   as it did before this fix (through `runHarnessTurn`, through `runPhaseLoop`'s catch, which
+   *   only absorbs `PromptCeilingExceededError`), and Fix 2's `finalizeEscapedError` writes the
+   *   terminal `'failed'` checkpoint from it.
+   * - `'elapsedBudgetExceeded'`: a public note that another retry would cross this attempt's own
+   *   elapsed-time budget, then the underlying error, rethrown — same escape path.
+   * - `'wait'`: with this policy's defaults a model-turn delay cannot exceed `backoffMaxMs` (the
+   *   default `longDelayThresholdMs`), so this should never fire in production — handled
+   *   defensively anyway, as a failure carrying a limitation, never a silent hang: this host has no
+   *   pause/resume machinery for a model round trip the way `harnessToolDispatcher.ts`'s 9.6 does
+   *   for a tool call (there is no `DispatchControl`-shaped re-issue for "the model's next turn"),
+   *   so a long delay here is reported and the underlying error is rethrown, same escape path again.
+   * - `'cancelled'`: the reviewer's own cancellation firing mid-backoff-wait, which carries no
+   *   `error` of its own (`RetryOutcome`'s shape) — rethrows whatever the *last* real attempt in this
+   *   round trip actually failed with, tracked locally, since that is the truthful proximate cause;
+   *   a placeholder message only when no attempt ever ran (cancelled before the first try).
+   *
+   * **Diagnostics.** Every raw attempt already gets its own `modelTurn` `toolCompleted`/`toolFailed`
+   * fact "for free" — `onTiming` fires on every exit path of every real call `lmAgent.ts` makes,
+   * retried or not, so a retried round trip already shows each stall as its own activity line. What
+   * did not exist before is a *retry* fact: when `retryStats.retryCount > 0`, one more `modelTurn`
+   * fact is appended for the round trip as a whole, carrying `retryWaitMs`/`retryCount` — the same
+   * two fields `harnessToolDispatcher.ts`'s own retries already attach to a `HostToolResult`
+   * (`ActivityCallMetadata`'s existing fields; no new activity kind). `modelRetryTransientAttempts`
+   * (this closure's own running total) feeds `reportCheckpoint`'s `retry: RetryState` the same way —
+   * see that field's own doc comment for why `waiting` stays `false`.
+   */
+  async function askModelRetried(phase: RunPhase, call: () => Promise<string>): Promise<string> {
+    const retryStats = { retryWaitMs: 0, retryCount: 0 };
+    let lastAttemptError: unknown;
+    const outcome = await runWithRetry(
+      async () => {
+        try {
+          return await call();
+        } catch (error) {
+          lastAttemptError = error;
+          throw error;
+        }
+      },
+      {
+        idempotent: true,
+        policy: modelRetryBackoffPolicy,
+        elapsedMsAtStart: clock(),
+        cancellation,
+        isRetryable: isRetryableModelTimeout,
+        now: options.retry?.now,
+        random: options.retry?.random,
+        sleep: options.retry?.sleep,
+        longDelayThresholdMs: options.retry?.longDelayThresholdMs,
+        hooks: {
+          onRetryWait: (info) => {
+            retryStats.retryWaitMs += info.delayMs;
+            retryStats.retryCount += 1;
+            modelRetryTransientAttempts += 1;
+          },
+        },
+      },
+    );
+    if (retryStats.retryCount > 0) {
+      appendActivity(
+        outcome.kind === 'ok'
+          ? { kind: 'toolCompleted', tool: 'modelTurn', summary: `Recovered after ${retryStats.retryCount} transient retry(ies).`, retryWaitMs: retryStats.retryWaitMs, retryCount: retryStats.retryCount }
+          : { kind: 'toolFailed', tool: 'modelTurn', reason: `Still failing after ${retryStats.retryCount} transient retry(ies).`, retryWaitMs: retryStats.retryWaitMs, retryCount: retryStats.retryCount },
+        phase,
+      );
+    }
+    switch (outcome.kind) {
+      case 'ok':
+        return outcome.value;
+      case 'nonRetryable':
+      case 'exhausted':
+        throw outcome.error;
+      case 'elapsedBudgetExceeded':
+        appendActivity({ kind: 'toolFailed', tool: 'modelTurn', reason: 'Retrying this stalled model turn again would exceed this attempt\'s own elapsed-time budget.' }, phase);
+        throw outcome.error;
+      case 'wait':
+        appendActivity({ kind: 'toolFailed', tool: 'modelTurn', reason: 'A stalled model turn needed a longer retry wait than a model round trip can hold open; this host has no pause/resume path for one.' }, phase);
+        throw outcome.error;
+      case 'cancelled':
+        throw lastAttemptError ?? new Error('The attempt was cancelled before a stalled model turn could be retried.');
+      default: {
+        const exhaustive: never = outcome;
+        throw new Error(`askModelRetried: unhandled RetryOutcome kind ${JSON.stringify(exhaustive)}`);
+      }
+    }
   }
 
   /**
@@ -1696,9 +1902,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       // `runPhaseLoop`, so without this its prompts would be the one model call in the attempt
       // whose ceiling breach nobody heard about. Same reasoning as `onModelTurnTiming` below,
       // which exists because that call's duration went missing for the same structural reason.
+      // Fix 1: also the one other direct `askModel` call site this module has (bootstrap fit never
+      // calls `askModel` at all — see `askModelRetried`'s own doc comment) — wrapped through the
+      // same bounded retry so a stalled contradiction-check turn is retried, not fatal.
       modelSeam: {
         ...options.modelSeam,
-        askModel: (input) => options.modelSeam.askModel({ ...input, onPromptOverrun: input.onPromptOverrun ?? ((overrun) => recordPromptOverrun(overrun)) }),
+        askModel: (input) =>
+          askModelRetried(input.phase, () => options.modelSeam.askModel({ ...input, onPromptOverrun: input.onPromptOverrun ?? ((overrun) => recordPromptOverrun(overrun)) })),
       },
       ledger,
       findings: before,
@@ -2372,17 +2582,21 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       if (!reserved.ok) return reserved.code === 'cancelled' ? 'cancelled' : 'budgetExhausted';
 
       const toolResultsForThisAsk = lastTurnResults;
+      // Fix 1: every repair ask (D5 rule 5) is its own round trip, retried independently — see
+      // `askModelRetried`'s own doc comment.
       const askModel: PhaseAskModel = (repairInstruction) =>
-        options.modelSeam.askModel({
-          phase,
-          repairInstruction,
-          toolResults: toolResultsForThisAsk,
-          envelope: fittedEnvelope,
-          investigation: investigationMap(),
-          submissions: submissionsSummary(),
-          onTiming: (timing) => recordModelTurnTiming(phase, timing),
-          onPromptOverrun: (overrun) => recordPromptOverrun(overrun),
-        });
+        askModelRetried(phase, () =>
+          options.modelSeam.askModel({
+            phase,
+            repairInstruction,
+            toolResults: toolResultsForThisAsk,
+            envelope: fittedEnvelope,
+            investigation: investigationMap(),
+            submissions: submissionsSummary(),
+            onTiming: (timing) => recordModelTurnTiming(phase, timing),
+            onPromptOverrun: (overrun) => recordPromptOverrun(overrun),
+          }),
+        );
       // The one failure that is not the model's and not a provider's: the prompt this turn would
       // have sent is over `maxPromptBytesPerTurn` and nothing could be dropped out of it, because
       // none of what is over is optional. `runBootstrap` already refuses an attempt whose framing
