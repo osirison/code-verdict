@@ -1163,6 +1163,38 @@ describe('the in-flight record and the interrupted sweep', () => {
     expect(new InFlightRunStore(globalState).list()).toEqual([]);
   });
 
+  it('does not clobber a richer row a faster new run already recorded for the same target', async () => {
+    const globalState = memoryStore();
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!2841',
+      podId: 'pod-a',
+      refLabel: '!2841',
+      repoId: 'repo-1',
+      crNumber: '2841',
+      startedAt: '2026-08-28T09:00:00.000Z',
+    });
+    // A new run on the same target started after the crash, completed, and
+    // recorded its own richer row before the sweep's loop reached this
+    // leftover entry — the race `ReviewRunStore.recordIfFresher` exists for.
+    await new ReviewRunStore(globalState).record({
+      repoId: 'repo-1',
+      crNumber: '2841',
+      outcome: 'findings',
+      findingCount: 5,
+      agentLabel: 'Default review',
+      ranAt: '2026-08-28T09:30:00.000Z',
+    });
+
+    const swept = await sweepInterruptedRuns(globalState);
+
+    expect(swept).toBe(1);
+    expect(new ReviewRunStore(globalState).list()).toEqual([
+      { repoId: 'repo-1', crNumber: '2841', outcome: 'findings', findingCount: 5, agentLabel: 'Default review', ranAt: '2026-08-28T09:30:00.000Z' },
+    ]);
+    // The stale marker is still cleared — the guard protects only the dashboard row.
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
+  });
+
   it('sweeps nothing when every run finished cleanly', async () => {
     const globalState = memoryStore();
     expect(await sweepInterruptedRuns(globalState)).toBe(0);
@@ -2077,6 +2109,40 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
       ]);
     },
   );
+
+  it('a richer row a faster new run already recorded for the target survives the terminal-checkpoint branch too', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(
+      sweepCheckpointInput(snapshot, { reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed') }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState); // startedAt: '2026-01-01T00:05:00.000Z'
+    // A new run on the same target started after the crash, completed, and recorded its own
+    // richer row before the sweep's loop reached this leftover entry.
+    await new ReviewRunStore(globalState).record({
+      repoId: 'repo-1',
+      crNumber: '42',
+      outcome: 'findings',
+      findingCount: 5,
+      agentLabel: 'Default review',
+      ranAt: '2026-01-01T00:30:00.000Z',
+    });
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    expect(new ReviewRunStore(globalState).list()).toEqual([
+      { repoId: 'repo-1', crNumber: '42', outcome: 'findings', findingCount: 5, agentLabel: 'Default review', ranAt: '2026-01-01T00:30:00.000Z' },
+    ]);
+    // The stale marker is still cleared — the guard protects only the dashboard row, and
+    // the stored checkpoint itself is left exactly as the terminal-checkpoint branch made it.
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
+    expect(harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID)?.checkpointId).toBe(built.checkpointId);
+  });
 
   // ---- Task 14.6: ReviewRunManager.resumeRun's own admission/identity lookup ----------
 

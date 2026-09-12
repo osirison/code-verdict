@@ -2040,7 +2040,10 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
       if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
         const findingCount = acceptedFindingCount(latest.candidates);
         const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
-        await runs.record({
+        // `recordIfFresher`, not `record`: a fast new run on this same target can already have
+        // completed and recorded its own richer row while this loop was awaiting an earlier
+        // entry — see that method's own doc comment (`reviewRuns.ts`) for the race.
+        await runs.recordIfFresher({
           repoId: entry.repoId,
           crNumber: entry.crNumber,
           outcome,
@@ -2063,7 +2066,10 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
         }
       }
     }
-    await runs.record({
+    // `recordIfFresher` here too: the same race applies to this branch — a stale marker's
+    // `interrupted` write is exactly the kind of crash-derived data a genuinely newer run's
+    // row must never be clobbered by.
+    await runs.recordIfFresher({
       repoId: entry.repoId,
       crNumber: entry.crNumber,
       outcome: 'interrupted',

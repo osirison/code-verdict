@@ -108,6 +108,31 @@ export class ReviewRunStore {
   }
 
   /**
+   * `record()`, but only when no row already stored for this ref is at least
+   * as fresh as `run` itself — compared by `ranAt`, the same field `list()`/
+   * `byRef()` already expose as "when did this happen". Plain `record()`
+   * trusts its caller to be reporting the newest event on the ref, which
+   * `ReviewRunManager`'s live settle path always is (it stamps `ranAt` from
+   * the clock at the moment it writes, for the ref it just finished). The
+   * activation sweep (`reviewRunManager.ts`'s `sweepInterruptedRuns`) cannot
+   * make that promise: it derives `ranAt` from a leftover in-flight marker's
+   * own `startedAt`, captured before a crash, and its write can land well
+   * after a *newer* run on the same target — one that started after the
+   * crash and has already recorded its own richer row — because the sweep's
+   * loop runs one leftover entry at a time with awaits in between. Skipping
+   * the write when the stored row is already this fresh or fresher is what
+   * keeps that race from clobbering the newer row with stale, crash-derived
+   * data. Ties keep the stored row: a marker's `startedAt` can never postdate
+   * a settle that raced ahead of it, so an equal `ranAt` only happens when
+   * the stored row already *is* this same event.
+   */
+  async recordIfFresher(run: ReviewRun): Promise<void> {
+    const existing = this.list().find((r) => r.repoId === run.repoId && r.crNumber === run.crNumber);
+    if (existing && existing.ranAt >= run.ranAt) return;
+    await this.record(run);
+  }
+
+  /**
    * Keyed the same way `submittedRefs()` is, so the dashboard can ask both
    * questions about one row with one lookup each.
    */
