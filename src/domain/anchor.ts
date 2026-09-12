@@ -21,6 +21,14 @@ export interface AnchorCandidate {
   line: number;
   text: string;
   side?: 'old' | 'new';
+  /**
+   * The paired old-file line number, present only when this candidate is an
+   * unchanged context line (`diffAnchorCandidates` is the only producer that
+   * ever sets it). An added line has nothing to pair with on the old side,
+   * so this stays undefined there — and for an old-side (removed) candidate
+   * it would be redundant with `line` itself, so it is never set either.
+   */
+  oldLine?: number;
 }
 
 export type AnchorState =
@@ -37,6 +45,8 @@ export interface AnchorResolution {
   line: number;
   /** Which side `line` is numbered on. Absent when `state` is `lost`. */
   side?: 'old' | 'new';
+  /** The matched candidate's paired old-file line — see `AnchorCandidate.oldLine`. Absent when `state` is `lost`, or when the match carried no pairing. */
+  oldLine?: number;
 }
 
 /**
@@ -62,7 +72,7 @@ function resolveOnSide(
 ): AnchorResolution | undefined {
   const code = anchor.code;
   const exact = candidates.find((c) => c.line === anchor.line && same(c.text, code));
-  if (exact) return { state: 'exact', line: anchor.line, side: exact.side };
+  if (exact) return { state: 'exact', line: anchor.line, side: exact.side, oldLine: exact.oldLine };
   let best: AnchorCandidate | undefined;
   for (const candidate of candidates) {
     if (!same(candidate.text, code)) continue;
@@ -73,7 +83,7 @@ function resolveOnSide(
       best = candidate;
     }
   }
-  return best ? { state: 'moved', line: best.line, side: best.side } : undefined;
+  return best ? { state: 'moved', line: best.line, side: best.side, oldLine: best.oldLine } : undefined;
 }
 
 /**

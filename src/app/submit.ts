@@ -13,8 +13,12 @@
  * its own, restricted to a line the diff's new side actually carries: `code`
  * is documented as "the offending hunk", not guaranteed to be one line, and a
  * multi-line or paraphrased quote can never trim-equal any single candidate
- * — that failure says nothing about whether the location is right. A finding
- * is withheld only when neither its code nor its own recorded line can be
+ * — that failure says nothing about whether the location is right. The
+ * fallback still requires `code` to be non-empty: it exists to excuse a text
+ * match that could not be made, not to excuse having no text to match at
+ * all, so a finding with an empty or missing `code` field is withheld
+ * exactly as it always was, whatever its recorded line says. A finding is
+ * withheld only when neither its code nor its own recorded line can be
  * placed in the current diff at all.
  */
 import type { Connection } from '../platform/provider';
@@ -63,12 +67,16 @@ export function composeCommentDrafts(
     // narrow candidate set, was withholding them. The fallback is restricted
     // to the new side — an old-side match with no text to justify it would
     // be coordinate-space guessing, so a deletion still requires a real
-    // text match.
-    const recordedLineIsNewSide = candidates.some(
+    // text match. And it only ever excuses a failed *comparison*: an empty
+    // or missing `code` never had any text to compare, so `resolveAnchor`
+    // already reports it `lost` unconditionally — this fallback must not
+    // then trust the bare line number anyway, or a finding with zero
+    // supporting evidence posts verbatim on say-so alone.
+    const recordedCandidate = candidates.find(
       (c) => c.line === item.line && (c.side ?? 'new') === 'new',
     );
     const verified = textMatch.state !== 'lost';
-    if (!verified && !recordedLineIsNewSide) {
+    if (!verified && (item.code.trim() === '' || !recordedCandidate)) {
       withheld.push(item);
       continue;
     }
@@ -77,6 +85,12 @@ export function composeCommentDrafts(
     // markers at all (e.g. `documentCandidates`, or a test double) — treat
     // that the same as 'new', the only side such a haystack could mean.
     const side = verified ? textMatch.side ?? 'new' : 'new';
+    // The candidate's paired old-side line number, present only for a
+    // context line (GitLab's position API rejects an unchanged line's
+    // position unless it carries both coordinates — see
+    // `gitlab/mappers.ts#buildPosition`). An addition or a deletion has no
+    // pairing to offer, so this stays undefined for both.
+    const oldLine = verified ? textMatch.oldLine : recordedCandidate?.oldLine;
     const endLine = item.endLine === undefined
       ? undefined
       : anchorLine + (item.endLine - item.line);
@@ -116,6 +130,7 @@ export function composeCommentDrafts(
         line: anchorLine,
         endLine,
         side: verified ? textMatch.side : 'new',
+        oldLine,
         refs: anchorRefs,
       },
       // A suggestion replaces a line's content — meaningless on the old side

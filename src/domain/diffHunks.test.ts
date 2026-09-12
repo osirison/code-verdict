@@ -55,9 +55,12 @@ describe('diffAnchorCandidates', () => {
     expect(oldSide).toHaveLength(3);
 
     // The context line right before the change is now addressable — it was
-    // never in `addedLines` at all.
+    // never in `addedLines` at all. It also carries its paired old-file line
+    // number (unchanged content shifts neither counter relative to the
+    // other, so old and new agree here) — GitLab's position API needs both
+    // coordinates for a context line.
     expect(newSide).toContainEqual({
-      line: 62, text: '    if (!res.ok) {', side: 'new',
+      line: 62, text: '    if (!res.ok) {', side: 'new', oldLine: 62,
     });
     // The removed statement, numbered on the OLD file — a finding about this
     // deletion anchors here, not on line 63 of the new file (which is a
@@ -67,9 +70,13 @@ describe('diffAnchorCandidates', () => {
     });
     // The addition that replaced it shares the number 63 but is a different
     // line in a different space — proof the two are never treated as one.
-    expect(newSide).toContainEqual({
+    // Unlike the context line above, an addition has nothing on the old side
+    // to pair with, so it carries no `oldLine` at all.
+    const replacement = newSide.find((c) => c.line === 63);
+    expect(replacement).toMatchObject({
       line: 63, text: '      logger.error(`refresh failed ${this.refreshToken}`)', side: 'new',
     });
+    expect(replacement?.oldLine).toBeUndefined();
   });
 
   it('produces nothing for a diff with no hunks', () => {

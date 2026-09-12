@@ -297,6 +297,30 @@ describe('mandate A: a finding on a context or removed line anchors inline', () 
     ]);
   });
 
+  it('carries a context anchor\'s paired old-file line, and leaves it off a plain addition', () => {
+    // GitLab's position API needs BOTH coordinates for an unchanged line
+    // (`gitlab/mappers.ts#buildPosition`); this is where that pairing must
+    // survive the anchoring pipeline into the drafted comment. Line 12
+    // ('let a = 1;') is context — new 12 pairs with old 11 in REWRITE_DIFF.
+    // Line 11 ('fn resolve_click_space...') is a pure addition and must
+    // carry no old-side number at all.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [
+        itemAt('context-line', 12, '    let a = 1;'),
+        itemAt('added-line', 11, 'fn resolve_click_space() -> bool {'),
+      ],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    for (const item of response.items) review = setVerdict(review, item.id, 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts.find((d) => d.key === 'context-line')?.anchor).toMatchObject({ line: 12, oldLine: 11 });
+    expect(composed.drafts.find((d) => d.key === 'added-line')?.anchor.oldLine).toBeUndefined();
+  });
+
   it('anchors a finding about a removed statement on the old side, side LEFT', () => {
     const { response } = parseAgentReviewResponse({
       schemaVersion: '1',
@@ -373,6 +397,29 @@ describe('mandate A: a finding on a context or removed line anchors inline', () 
     expect(composed.drafts[0]?.suggestion).toBeUndefined();
   });
 
+  it('carries the recorded line\'s paired old-file number through the fallback too, when it lands on context', () => {
+    // Same shape as the incident reproduction above, but the recorded line
+    // (12) is a context line rather than a plain addition — its `oldLine`
+    // pairing must survive the unverified fallback exactly as it does the
+    // verified path, or a GitLab comment built from this draft would be
+    // missing the coordinate its position API requires.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'multiline-context', file: 'src/panel.rs', line: 12, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Multi-line quote on context', body: 'Body',
+        code: 'fn resolve_click_space() -> bool {\n    false\n}',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'multiline-context', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 12, side: 'new', oldLine: 11 });
+  });
+
   it('still withholds when the code matches nothing AND the recorded line is not addressable either', () => {
     const { response } = parseAgentReviewResponse({
       schemaVersion: '1',
@@ -388,6 +435,32 @@ describe('mandate A: a finding on a context or removed line anchors inline', () 
     const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
     expect(composed.drafts).toEqual([]);
     expect(composed.withheld.map((i) => i.id)).toEqual(['nowhere']);
+  });
+
+  it.each([
+    ['an empty-string code field', { code: '' }],
+    ['an omitted code field', {}],
+  ] as const)('withholds a finding with %s even when its recorded line is addressable', (_label, codeField) => {
+    // Line 11 is genuinely an added line in REWRITE_DIFF — exactly the shape
+    // the recorded-line fallback exists to rescue — but the fallback's
+    // justification is "evidence existed but could not be text-matched", not
+    // "there was no evidence at all". `resolveAnchor` already reports empty
+    // code as unconditionally `lost`; this finding must not then fall
+    // through to trusting the bare line number anyway.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'no-evidence', file: 'src/panel.rs', line: 11, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'No supporting code', body: 'Body', ...codeField,
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'no-evidence', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['no-evidence']);
   });
 });
 

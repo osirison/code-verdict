@@ -60,6 +60,31 @@ describe('outbound payloads reproduce the postDiscussionRequest fixture', () => 
     expect(position).toEqual(reference.position);
   });
 
+  describe('buildPosition — the three shapes a diff line can take', () => {
+    const mr = fixtures.gitlabMergeRequest as { diff_refs: Record<string, string> };
+    const refs = mr.diff_refs;
+
+    it('sends new_line only for an added line', () => {
+      const position = buildPosition({ filePath: 'src/auth/token.ts', line: 63, side: 'new', refs });
+      expect(position).toMatchObject({ new_line: 63 });
+      expect(position).not.toHaveProperty('old_line');
+    });
+
+    it('sends old_line only for a removed line', () => {
+      const position = buildPosition({ filePath: 'src/auth/token.ts', line: 61, side: 'old', refs });
+      expect(position).toMatchObject({ old_line: 61 });
+      expect(position).not.toHaveProperty('new_line');
+    });
+
+    it('sends BOTH old_line and new_line for an unchanged context line', () => {
+      // GitLab's diff-position API requires both coordinates for a context
+      // line — new-side-only, which is all a plain addition needs, is
+      // rejected or mis-resolved here.
+      const position = buildPosition({ filePath: 'src/auth/token.ts', line: 63, side: 'new', oldLine: 60, refs });
+      expect(position).toMatchObject({ new_line: 63, old_line: 60 });
+    });
+  });
+
   it('extends the suggestion span for multi-line anchors', () => {
     const body = buildCommentBody({
       key: 'itm_01H9Z5',

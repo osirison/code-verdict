@@ -138,6 +138,13 @@ export interface DiffAnchor {
   line: number;
   endLine?: number;
   side?: 'old' | 'new';
+  /**
+   * `line`'s paired old-file line number, present only when this anchor is
+   * an unchanged context line. GitLab's position API requires both
+   * coordinates for a context line (`gitlab/mappers.ts#buildPosition`);
+   * GitHub takes a single coordinate per side and ignores this field.
+   */
+  oldLine?: number;
   refs: AnchorRefs;
 }
 

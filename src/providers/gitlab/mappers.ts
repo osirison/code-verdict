@@ -353,6 +353,16 @@ export function buildCommentBody(draft: ReviewCommentDraft): string {
 /**
  * `position` must carry the same diff_refs the agent read — if head_sha
  * moved, GitLab 400s with "Note position is invalid" (→ staleAnchor).
+ *
+ * The line coordinates depend on which side of the diff the anchor sits on,
+ * and — for the new side — whether it is an addition or unchanged context:
+ * a removed line exists only in the old file, so it sends `old_line` alone;
+ * an added line exists only in the new file, so it sends `new_line` alone;
+ * an unchanged context line exists, unchanged, in both, and GitLab's
+ * position API rejects it (or resolves it to the wrong line) unless BOTH
+ * coordinates are given. `anchor.oldLine` is how a context anchor carries
+ * its old-side pairing (`DiffAnchor.oldLine`) — its absence is what tells
+ * this apart from a plain addition.
  */
 export function buildPosition(anchor: DiffAnchor): Record<string, unknown> {
   const refs = anchor.refs as Partial<GlDiffRefs> | undefined;
@@ -371,6 +381,7 @@ export function buildPosition(anchor: DiffAnchor): Record<string, unknown> {
     position.old_line = anchor.line;
   } else {
     position.new_line = anchor.line;
+    if (anchor.oldLine !== undefined) position.old_line = anchor.oldLine;
   }
   return position;
 }

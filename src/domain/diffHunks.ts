@@ -124,14 +124,24 @@ export function addedLines(diff: string): Array<{ line: number; text: string }> 
  * flagged statement sits on a context line (very common in a hunk that
  * rewrites only part of a function) was previously unable to anchor at all,
  * however exactly its recorded line and code matched the file.
+ *
+ * A context candidate also carries `oldLine`, its paired old-file line
+ * number — GitLab's position API rejects an unchanged line's position
+ * unless it names both coordinates (`gitlab/mappers.ts#buildPosition`), and
+ * this is the one place that pairing is known: `parseHunks` already tracks
+ * both counters for a context line, it was just never threaded past this
+ * function. An added line has no old-side counterpart to pair with, and a
+ * removed line's `line` already IS the old-side number, so neither sets it.
  */
 export function diffAnchorCandidates(
   diff: string,
-): Array<{ line: number; text: string; side: 'old' | 'new' }> {
-  const candidates: Array<{ line: number; text: string; side: 'old' | 'new' }> = [];
+): Array<{ line: number; text: string; side: 'old' | 'new'; oldLine?: number }> {
+  const candidates: Array<{ line: number; text: string; side: 'old' | 'new'; oldLine?: number }> = [];
   for (const hunk of parseHunks(diff)) {
     for (const l of hunk.lines) {
-      if ((l.kind === 'add' || l.kind === 'context') && l.newLine !== undefined) {
+      if (l.kind === 'context' && l.newLine !== undefined && l.oldLine !== undefined) {
+        candidates.push({ line: l.newLine, text: l.text, side: 'new', oldLine: l.oldLine });
+      } else if (l.kind === 'add' && l.newLine !== undefined) {
         candidates.push({ line: l.newLine, text: l.text, side: 'new' });
       } else if (l.kind === 'del' && l.oldLine !== undefined) {
         candidates.push({ line: l.oldLine, text: l.text, side: 'old' });

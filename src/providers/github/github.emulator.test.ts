@@ -1413,3 +1413,59 @@ describe('stopping before the wall', () => {
     expect(budget.secondsUntilReset('acct', 'core', 50, NOW_MS)).toBe(600);
   });
 });
+
+describe('anchorPayload — LEFT/RIGHT, start_line/start_side, and the head commit_id', () => {
+  // `anchorPayload` is private to the provider, so it is exercised the same
+  // way every other GitHub request shape in this file is: through a real
+  // `submitReview` call, capturing the POST body the fake would otherwise
+  // just validate and discard.
+  function connectCapturing(options: FakeGitHubOptions = {}) {
+    const inner = makeFakeGitHubFetch(options);
+    const requests: Array<{ body: Record<string, unknown> }> = [];
+    const capturing: FetchLike = async (url, init) => {
+      if (init?.method === 'POST' && init.body) {
+        requests.push({ body: JSON.parse(init.body) as Record<string, unknown> });
+      }
+      return inner(url, init);
+    };
+    return { conn: createGitHubProvider(capturing).connect(CONFIG), requests };
+  }
+
+  it('maps an added line, a context line, a deleted line, and a range, and sends the head commit_id', async () => {
+    const { conn, requests } = connectCapturing();
+    const diff = await conn.getChangeRequestDiff(CR);
+    const refs = diff.anchorRefs as { commitId: string };
+    requests.length = 0;
+
+    await conn.submitReview(CR, {
+      comments: [
+        // An added or context line both take RIGHT + the new-file number —
+        // `oldLine` (only ever set for context) plays no part in what
+        // GitHub receives; anchorPayload does not read it at all.
+        { key: 'added', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 12, side: 'new', refs } },
+        { key: 'context', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 13, side: 'new', oldLine: 13, refs } },
+        // A deleted line takes LEFT + the old-file number.
+        { key: 'deleted', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 8, side: 'old', refs } },
+        // A range takes the end line as `line`, and the start of the range
+        // as `start_line`/`start_side` (same side as the whole range).
+        { key: 'range', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 10, endLine: 12, side: 'new', refs } },
+      ],
+      summary: 's',
+    });
+
+    const reviewRequest = requests.find((r) => Array.isArray(r.body.comments));
+    const comments = reviewRequest?.body.comments as Array<Record<string, unknown>> | undefined;
+    expect(comments?.[0]).toMatchObject({ path: 'src/limiter.ts', line: 12, side: 'RIGHT' });
+    expect(comments?.[0]?.start_line).toBeUndefined();
+    expect(comments?.[1]).toMatchObject({ path: 'src/limiter.ts', line: 13, side: 'RIGHT' });
+    expect(comments?.[1]?.start_line).toBeUndefined();
+    expect(comments?.[2]).toMatchObject({ path: 'src/limiter.ts', line: 8, side: 'LEFT' });
+    expect(comments?.[2]?.start_line).toBeUndefined();
+    expect(comments?.[3]).toMatchObject({
+      path: 'src/limiter.ts', line: 12, side: 'RIGHT', start_line: 10, start_side: 'RIGHT',
+    });
+    // `commit_id` is the single head commit for the whole review, sent
+    // top-level rather than per comment (enforced separately above).
+    expect(reviewRequest?.body.commit_id).toBe(refs.commitId);
+  });
+});
