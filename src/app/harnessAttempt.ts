@@ -1940,6 +1940,15 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     latestContradicted = output.contradicted ?? [];
     for (const entry of latestContradicted) {
       appendActivity({ kind: 'toolFailed', tool: 'contradictionCheck', target: entry.candidateId, reason: entry.reason }, 'verifying');
+      // Fix 2 (a second, independent engine defect the phase rail's neighbour line exposed): this
+      // pass excludes a contradicted candidate from `survivingFindings` above, but until now never
+      // told `candidateTracker` — every subsequent checkpoint kept reporting it `accepted`, so the
+      // running screen's "N findings so far" (`reviewFlow.ts`'s `runCounts.findings`, a straight
+      // `state === 'accepted'` filter over the checkpoint's own candidates) counted a finding the
+      // reviewer will never see. Demoting it here, the moment the contradiction pass concludes it
+      // is not a real finding, is the same moment `latestContradicted`/the activity event above
+      // already record the fact — this only makes `candidateTracker`'s own state agree with them.
+      candidateTracker.contradict(entry.candidateId, [{ code: 'contradicted', message: entry.reason }]);
     }
     // The same public trail for the opposite outcome. A finding whose check never
     // ran (`output.unverified`) is kept and reaches the reviewer looking exactly
@@ -2514,7 +2523,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       const reason = candidate.reasons.map((entry) => `${entry.code}: ${entry.message}`).join(' ');
       return {
         candidateId: candidate.candidateId,
-        state: candidate.state,
+        // `contradicted` (Fix 2) is a host-tracker-only distinction — *why* a candidate is closed,
+        // for a checkpoint or a reviewer to read. The model-facing protocol (`harnessModelSeam.ts`'s
+        // `InvestigationSubmission`, committed with only three states) only needs to say *whether* a
+        // candidate is closed at all, which a contradicted candidate is exactly like a rejected one:
+        // it keeps no finding (see `CandidateTracker.contradict`) and must not be resubmitted. The
+        // reason line below still carries the real "contradicted: ..." explanation either way.
+        state: candidate.state === 'contradicted' ? 'rejected' : candidate.state,
         ...(candidate.finding !== undefined ? { path: candidate.finding.evidence.primary.path } : {}),
         ...(reason === '' ? {} : { reason }),
       };
@@ -3105,7 +3120,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return currentCompletionEvaluation();
   }
 
-  async function runPersisting(evaluation: CompletionEvaluation): Promise<HarnessAttemptResult> {
+  async function runPersisting(evaluation: CompletionEvaluation, phaseReachedBeforeCompleting: RunPhase): Promise<HarnessAttemptResult> {
     currentPhase = 'persisting';
     const cancelledNow = isCancelled();
     // D11: cancellation preserves only already-*validated* findings, as partial — never routed
@@ -3117,10 +3132,32 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     if (!isTerminalLifecycle(lifecycle)) {
       throw new Error(`HarnessAttempt computed a non-terminal lifecycle at persistence: ${lifecycle}`);
     }
-    appendActivity({ kind: 'terminalResult', lifecycle, completeness: outcome.completeness, limitations: outcome.limitations }, 'persisting');
+    // `run()` calls `runCompleting()`/`runPersisting()` unconditionally, even once cancellation has
+    // already skipped one or more of `runPlanning`/`runInvestigating`/`runVerifying` — those two
+    // phases' own bookkeeping (host validation, the terminal event and checkpoint) always genuinely
+    // runs, cancelled or not, so `currentPhase` alone cannot tell "every phase truly ran" from
+    // "cancellation cut the sequence short and completing/persisting merely wrapped up the attempt
+    // where it stood." `phaseReachedBeforeCompleting` is `currentPhase` as `run()` left it right
+    // before calling `runCompleting()` — the last phase this attempt actually entered under its own
+    // forward progression, unmodified by the unconditional tail. A cancelled attempt reports that
+    // phase, so a reviewer who cancelled during `planning` sees `planning`, never a `persisting`
+    // that would read as `investigating`/`verifying` having passed when they never ran. An attempt
+    // that was never cancelled reports `persisting` as before: nothing was skipped, so every phase,
+    // completing and persisting included, genuinely ran to produce this outcome, `succeeded` or
+    // `failed` alike.
+    const terminalPhase: RunPhase = cancelledNow ? phaseReachedBeforeCompleting : 'persisting';
+    appendActivity({ kind: 'terminalResult', lifecycle, completeness: outcome.completeness, limitations: outcome.limitations }, terminalPhase);
     // Reported after the terminal fact above, deliberately without `fireCheckpoint`'s own marker
     // event (see `reportCheckpoint`'s doc comment) — this is the checkpoint that must land in
-    // `HarnessRunStore` as terminal.
+    // `HarnessRunStore` as terminal. Deliberately still tagged `'persisting'`, never
+    // `terminalPhase`: this call's `reason` is `'phaseBoundary'`, the same reason every genuine
+    // per-phase checkpoint above already used for whichever phase it actually reported (see
+    // `runInvestigating`/`runVerifying`'s own `fireCheckpoint` calls) — stamping it with a phase
+    // this attempt already left would report a *second* `phaseBoundary` checkpoint for that same
+    // phase, which is exactly what a caller keying off "one phaseBoundary checkpoint per phase" does
+    // not expect. This checkpoint's own identity is "persisting's terminal write", which genuinely
+    // is what just happened, cancelled or not; only the public `terminalResult` activity event above
+    // — the one `reduceActivity`'s projection actually reads — needed the truthful phase.
     await reportCheckpoint(mintId('ckpt'), 'persisting', 'phaseBoundary');
     terminalCheckpointWritten = true;
     const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, conclusion, cancelled: cancelledNow, contradicted: latestContradicted };
@@ -3290,8 +3327,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       if (!isCancelled() && plan !== undefined) await runInvestigating();
       if (!isCancelled()) await runVerifying();
 
+      // Captured before `runCompleting()`/`runPersisting()` — the two phases that always run,
+      // cancelled or not — so `runPersisting` can tell a cancelled attempt's true last phase from
+      // its own unconditional `currentPhase = 'completing'`/`'persisting'` stamps. See
+      // `runPersisting`'s own doc comment on `phaseReachedBeforeCompleting`.
+      const phaseReachedBeforeCompleting = currentPhase;
       const evaluation = await runCompleting();
-      return await runPersisting(evaluation);
+      return await runPersisting(evaluation, phaseReachedBeforeCompleting);
     } catch (error) {
       // The catch-all itself: see `finalizeEscapedError`'s own doc comment. The original error
       // always propagates, whether or not the terminal checkpoint it triggers could be written.

@@ -13,6 +13,7 @@ import {
   type SynthesisVerificationRunner,
 } from './harnessAttempt';
 import { createSynthesisVerification } from './harnessSynthesisVerification';
+import { reduceActivity } from './harnessActivityProjection';
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
 import { PromptCeilingExceededError, type InvestigationMapMember, type InvestigationSubmission } from './harnessModelSeam';
 import { createBudgetTracker } from './harnessBudgets';
@@ -701,6 +702,120 @@ describe('HarnessAttempt.run (10.3 phase transitions)', () => {
 });
 
 /**
+ * Fix 1: `run()` calls `runCompleting()`/`runPersisting()` unconditionally, even once cancellation
+ * already skipped one or more of `runPlanning`/`runInvestigating`/`runVerifying` — those two phases'
+ * own bookkeeping always genuinely runs, so the ordinary (non-throwing) completion path used to
+ * stamp the terminal `activityLog` event with a hardcoded `'persisting'` regardless. Reproduced live:
+ * cancel during `planning`, and the reducer's own projection (`reduceActivity`) read
+ * `phase: 'persisting'`, `lifecycle: 'cancelled'` — the phase rail then marked `investigating` and
+ * `verifying` as passed, though neither ever ran. These tests build a real activity log through a
+ * real attempt (never a hand-built `RunProjection`, which is how the earlier tests missed this) and
+ * run it through the real reducer.
+ */
+describe("Fix 1: the terminal activity event's phase names where the attempt actually stopped, not always 'persisting'", () => {
+  it('cancelling during planning reports the terminal phase as planning — investigating and verifying never ran and must not read as passed', async () => {
+    const cancellation = fakeCancellationToken();
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    // Cancels as a side effect of the planning turn itself, before any plan is created and long
+    // before investigating/verifying would ever start — `runPhaseLoop`'s own `isCancelled()` check
+    // at the top of its next iteration is what actually stops the loop.
+    const seam = scriptedModelSeam({
+      planning: [
+        () => {
+          cancellation.cancel();
+          return STOP_TURN;
+        },
+      ],
+      // Never reached if cancellation works — scripted only so a stray extra ask never throws.
+      investigating: [STOP_TURN],
+      verifying: [STOP_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      cancellation: cancellation.token,
+    });
+
+    const result = await attempt.run();
+
+    expect(result.cancelled).toBe(true);
+    expect(result.lifecycle).toBe('cancelled');
+    expect(result.plan).toBeUndefined();
+
+    const projection = reduceActivity(result.activityLog);
+    expect(projection.lifecycle).toBe('cancelled');
+    expect(projection.phase).toBe('planning'); // never 'persisting' — investigating/verifying never ran
+
+    const terminalEvent = result.activityLog.events.find((e) => e.kind === 'terminalResult');
+    expect(terminalEvent?.phase).toBe('planning');
+  });
+
+  it('a failure that is not cancelled — investigating and verifying genuinely run, nothing was skipped — still reports the terminal phase as persisting', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      // No candidate is ever submitted and no completion is ever requested, so verification never
+      // runs (`latestPasses` stays at its initial, incomplete default) and the attempt ends
+      // `failed` — but every phase, `investigating` and `verifying` included, genuinely ran its own
+      // turn loop; nothing here is cancelled or skipped.
+      investigating: [STOP_TURN],
+      verifying: [STOP_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.cancelled).toBe(false);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.plan).toBeDefined(); // planning genuinely completed
+
+    const projection = reduceActivity(result.activityLog);
+    expect(projection.lifecycle).toBe('failed');
+    // Truthful, not a regression: every phase really did run through to persisting, so persisting
+    // is exactly where this outcome was decided.
+    expect(projection.phase).toBe('persisting');
+  });
+
+  it('a genuinely succeeded run keeps reporting persisting — every phase truly ran', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.cancelled).toBe(false);
+    expect(result.lifecycle).toBe('succeeded');
+
+    const projection = reduceActivity(result.activityLog);
+    expect(projection.lifecycle).toBe('succeeded');
+    expect(projection.phase).toBe('persisting');
+  });
+});
+
+/**
  * A path the model invented is a fact the host held and threw away.
  *
  * Measured over one 207-file review: 57 of 237 tool calls asked for 13 paths that are not in the
@@ -1221,6 +1336,106 @@ describe('HarnessAttempt.run (11.2: a contradicted finding reaches activity, onC
     // The persisted outcome (`onPersist`) and the returned result both carry it too.
     expect(persistedOutcome?.contradicted).toEqual([{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }]);
     expect(result.contradicted).toEqual([{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }]);
+  });
+
+  // Fix 2: `output.contradicted` reaching activity/checkpoint/persistence (the test above) is not
+  // the whole gap. Until now `candidateTracker` itself never heard about a contradiction, so it
+  // kept reporting `cand-1` as `accepted` at every checkpoint after the one that excluded it —
+  // exactly what the running screen's live counts line reads (`reviewFlow.ts`'s `runCounts.findings`
+  // is a bare `candidates.filter((c) => c.state === 'accepted').length` over this same array), so a
+  // contradicted candidate kept inflating "N findings so far" for the rest of the attempt.
+  it("demotes the contradicted candidate out of 'accepted' in candidateTracker itself, so every checkpoint after the contradiction pass reports it honestly", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const contradictingVerification: SynthesisVerificationRunner = async () => ({
+      findings: [],
+      contradicted: [{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }],
+      contradictionPassComplete: true,
+      deduplicationComplete: true,
+      finalVerificationComplete: true,
+    });
+    const checkpoints: CheckpointInfo[] = [];
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: contradictingVerification }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+      onCheckpoint: (info) => {
+        checkpoints.push(info);
+      },
+    });
+
+    const result = await attempt.run();
+
+    // The final result already excluded it (task 10.6/11.2's own job); this fix is about the
+    // *tracker's* own bookkeeping, not the findings list, which was already correct.
+    expect(result.findings.some((f) => f.candidateId === 'cand-1')).toBe(false);
+
+    // Every checkpoint fired after verification ran (`completing`/`persisting`) sees `cand-1`
+    // demoted — never left reporting `accepted` for a candidate the contradiction pass just
+    // excluded, and never counted by a bare `state === 'accepted'` filter over this array.
+    const afterVerification = checkpoints.filter((c) => c.phase === 'completing' || c.phase === 'persisting');
+    expect(afterVerification.length).toBeGreaterThan(0);
+    for (const checkpoint of afterVerification) {
+      const tracked = checkpoint.candidates.find((c) => c.candidateId === 'cand-1');
+      expect(tracked?.state).toBe('contradicted');
+      expect(checkpoint.candidates.filter((c) => c.state === 'accepted')).toHaveLength(0);
+    }
+  });
+
+  it("the persisted checkpoint round-trips the demoted 'contradicted' state through HarnessRunStore's own parser", async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    const investigatingTurn2: ScriptEntry = (call) => {
+      const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref));
+    };
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const contradictingVerification: SynthesisVerificationRunner = async () => ({
+      findings: [],
+      contradicted: [{ candidateId: 'cand-1', reason: 'The model found the cited evidence does not support this claim.' }],
+      contradictionPassComplete: true,
+      deduplicationComplete: true,
+      finalVerificationComplete: true,
+    });
+    const snapshot = testSnapshot();
+    const policy = testPolicy();
+    const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: contradictingVerification }),
+      snapshot,
+      members: [member(connection)],
+      modelSeam: seam,
+      policy,
+      onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+    });
+
+    const result = await attempt.run();
+    expect(result.findings.some((f) => f.candidateId === 'cand-1')).toBe(false);
+
+    // Read back through `readLineage`'s own parser (`parseTrackedCandidate`/`isTrackedCandidateState`)
+    // — not the in-memory `CheckpointInfo` the test above inspects — so this proves `'contradicted'`
+    // is a state the store's own fail-closed schema actually accepts, not only a value this module
+    // happens to produce.
+    const record = harnessRunStore.readLineage(snapshot.lineageId);
+    expect(record).toBeDefined();
+    const terminal = record?.checkpoints.find((c) => c.phase === 'persisting');
+    expect(terminal).toBeDefined();
+    const tracked = terminal?.candidates.find((c) => c.candidateId === 'cand-1');
+    expect(tracked?.state).toBe('contradicted');
   });
 });
 

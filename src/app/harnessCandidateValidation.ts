@@ -424,7 +424,20 @@ export function revalidateFindings(findings: readonly ValidatedFinding[], contex
   return { valid, invalidated };
 }
 
-export type TrackedCandidateState = 'accepted' | 'unresolved' | 'rejected';
+/**
+ * `contradicted` (task 10.6/11.2's gap closure) is its own terminal state, not a fourth spelling
+ * of `rejected`: `rejected` names a candidate the *host's own validation* (schema, citations,
+ * criteria, location) refused, closed the same turn it was submitted; `contradicted` names one the
+ * *synthesis/verification pass* (`./harnessSynthesisVerification.ts`'s contradiction check)
+ * concluded, sometime later, is not a real finding after all — a different collaborator, at a
+ * different phase, reaching a different kind of conclusion. Conflating the two into `rejected`
+ * would make every checkpoint's candidate list lie about which stage actually closed a candidate,
+ * exactly the kind of state-blurring D9 exists to rule out. Like `rejected`, it never blocks
+ * completion (`unresolvedCount`/`blocksCompletion` below count only `unresolved`) and is excluded
+ * from `triageFindings()` — the contradiction pass already decided this candidate is not a finding
+ * a reviewer should see.
+ */
+export type TrackedCandidateState = 'accepted' | 'unresolved' | 'rejected' | 'contradicted';
 
 export interface TrackedCandidate {
   readonly candidateId: string;
@@ -439,6 +452,16 @@ export interface CandidateTracker {
   record(outcome: CandidateValidationOutcome): TrackedCandidate;
   /** Moves a previously accepted candidate back to unresolved after revalidation failed. */
   invalidate(candidateId: string, reasons: readonly ValidationReason[]): TrackedCandidate | undefined;
+  /**
+   * Demotes a previously accepted candidate the contradiction pass concluded is not a real
+   * finding (task 11.2's gap closure — see `TrackedCandidateState`'s own doc comment on why this
+   * is its own state rather than `invalidate`'s `unresolved` or a synthetic `rejected`). A no-op,
+   * like `invalidate`, on a candidate that is not currently `accepted` — a contradiction check
+   * only ever runs against `candidateTracker.triageFindings()`'s own accepted set
+   * (`harnessAttempt.ts`'s `runSynthesisVerification`), so this should never be called otherwise,
+   * but a collaborator-supplied candidate id is not trusted to guarantee that.
+   */
+  contradict(candidateId: string, reasons: readonly ValidationReason[]): TrackedCandidate | undefined;
   get(candidateId: string): TrackedCandidate | undefined;
   all(): readonly TrackedCandidate[];
   /** Accepted findings only — what triage may show. */
@@ -503,6 +526,11 @@ export function createCandidateTracker(options: CandidateTrackerOptions = {}): C
       const previous = tracked.get(candidateId);
       if (!previous || previous.state !== 'accepted') return previous;
       return set({ candidateId, state: 'unresolved', repairs: previous.repairs, reasons });
+    },
+    contradict(candidateId, reasons) {
+      const previous = tracked.get(candidateId);
+      if (!previous || previous.state !== 'accepted') return previous;
+      return set({ candidateId, state: 'contradicted', repairs: previous.repairs, reasons });
     },
     get: (candidateId) => tracked.get(candidateId),
     all: () => [...tracked.values()],

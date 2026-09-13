@@ -478,7 +478,7 @@ function parseRetainedEvidenceRecord(raw: unknown): RetainedEvidenceRecord | und
   };
 }
 
-const TRACKED_CANDIDATE_STATES: readonly TrackedCandidateState[] = ['accepted', 'unresolved', 'rejected'];
+const TRACKED_CANDIDATE_STATES: readonly TrackedCandidateState[] = ['accepted', 'unresolved', 'rejected', 'contradicted'];
 
 function isTrackedCandidateState(value: unknown): value is TrackedCandidateState {
   return (TRACKED_CANDIDATE_STATES as readonly unknown[]).includes(value);
