@@ -13,6 +13,7 @@ import {
   type SynthesisVerificationRunner,
 } from './harnessAttempt';
 import { createSynthesisVerification } from './harnessSynthesisVerification';
+import type { CompletionRequestResponse } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
 import { PromptCeilingExceededError, type InvestigationMapMember, type InvestigationSubmission } from './harnessModelSeam';
@@ -280,6 +281,11 @@ function sourceRefFrom(result: HostToolResult): { sourceId: string; digest: stri
   return { sourceId: result.sourceId, digest: result.digest };
 }
 
+function completionResponseFrom(result: HostToolResult): CompletionRequestResponse {
+  if (result.state !== 'complete' || result.content.tool !== 'requestCompletion') throw new Error(`Expected a requestCompletion result, got ${JSON.stringify(result)}.`);
+  return result.content.response;
+}
+
 function candidateSubmissionMessage(candidateId: string, path: string, ref: { sourceId: string; digest: string }): unknown {
   return {
     kind: 'candidateSubmission',
@@ -297,6 +303,38 @@ function candidateSubmissionMessage(candidateId: string, path: string, ref: { so
       citations: { primary: { sourceId: ref.sourceId, digest: ref.digest, path, range: { startLine: 1, endLine: 1 } } },
     },
   };
+}
+
+/** Same as `candidateSubmissionMessage`, but citing an explicit line range — the no-progress-bound tests below need a citation wide enough to overrun the contradiction pass's excerpt window, and later a narrower resubmission of the same candidateId. */
+function candidateSubmissionMessageAt(candidateId: string, path: string, ref: { sourceId: string; digest: string }, startLine: number, endLine: number): unknown {
+  return {
+    kind: 'candidateSubmission',
+    candidate: {
+      candidateId,
+      memberId: 'm1',
+      file: path,
+      line: startLine,
+      endLine,
+      severity: 'major',
+      category: 'errorHandling',
+      confidence: 80,
+      title: `Issue in ${path}`,
+      body: 'A real issue found during investigation.',
+      citations: { primary: { sourceId: ref.sourceId, digest: ref.digest, path, range: { startLine, endLine } } },
+    },
+  };
+}
+
+/**
+ * A synthetic diff whose FULL cited span is comfortably past `harnessSynthesisVerification.ts`'s
+ * 4,000-character contradiction-excerpt budget — the same shape (`bigPatch`) that module's own test
+ * file uses to exercise `selectEvidenceExcerpt`'s `unavailable` branch, reused here to drive the
+ * same failure through the real end-to-end attempt loop instead of the collaborator in isolation.
+ */
+function bigDiffPageResult(path: string, lineCount: number): DiffPageResult {
+  const lines = [`@@ -1,${lineCount} +1,${lineCount} @@`];
+  for (let i = 1; i <= lineCount; i += 1) lines.push(`+const value${i} = 'marker-${i}-${'x'.repeat(40)}';`);
+  return { snapshot: SNAPSHOT_REF, state: 'complete', value: { path, patch: lines.join('\n'), positions: [{ path, side: 'new', line: 1, endLine: lineCount }] } };
 }
 
 /** Passes every verification clause without asking the model — the collaborator's own concern (task 10.6) is not this pass's job to implement. */
@@ -1555,6 +1593,151 @@ describe('HarnessAttempt.run (10.9: the real 10.6 collaborator, end to end — a
     expect(result.outcome.kind).toBe('completeClean');
     expect(result.outcome.completeness).toBe('complete');
     expect(result.findings).toHaveLength(0);
+  });
+});
+
+describe('HarnessAttempt.run (the no-progress bound: a citation stuck past the excerpt window cannot hold completion hostage forever)', () => {
+  it('the diagnosed morning shape — a wide-span candidate plus a stream of new submissions — terminates within the bound, denies with actionable guidance meanwhile, and is eventually granted with a truthful limitation naming the candidate', async () => {
+    let file2Ref: { sourceId: string; digest: string } | undefined;
+    let file3Ref: { sourceId: string; digest: string } | undefined;
+    const connection = reviewConnection({
+      files: ['file1.ts', 'file2.ts', 'file3.ts'],
+      readDiff: async (request) => (request.path === 'file1.ts' ? bigDiffPageResult('file1.ts', 120) : diffPageResult(request.path)),
+    });
+
+    const submitWide: ScriptEntry = (call) => messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', sourceRefFrom(call.toolResults[0] as HostToolResult), 1, 120));
+    const readFile2: ScriptEntry = () => messages(readDiffMessage('file2.ts'));
+    const captureFile2ThenReadFile3: ScriptEntry = (call) => {
+      file2Ref = sourceRefFrom(call.toolResults[0] as HostToolResult); // this turn's own single readDiffMessage('file2.ts') result
+      return messages(readDiffMessage('file3.ts'));
+    };
+    const captureFile3ThenStop: ScriptEntry = (call) => {
+      file3Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return STOP_TURN;
+    };
+
+    // Every model-turn result the verifying phase's own turns (not the contradiction pass's own
+    // internal `askModel` calls, handled generically below) actually receive, captured by turn
+    // index — index 2 is what arrives at the turn right after the first `requestCompletion`, i.e.
+    // that request's own denial.
+    const verifyingTurnResults: (readonly HostToolResult[])[] = [];
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        // The contradiction pass's own directive (`buildContradictionDirective`) — never sent for
+        // `cand-wide`, whose span is skipped before any model call. Always answers "not contradicted"
+        // so `cand-b`/`cand-c` survive verification cleanly on every re-run.
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        if (!match) throw new Error(`unexpected verifying repairInstruction shape: ${call.repairInstruction}`);
+        return JSON.stringify({ candidateId: match[1], contradicted: false });
+      }
+      verifyingTurnResults.push(call.toolResults);
+      switch (verifyingTurnResults.length - 1) {
+        case 0:
+          return messages(candidateSubmissionMessage('cand-b', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+        case 1:
+          return COMPLETION_TURN;
+        case 2:
+          return messages(candidateSubmissionMessage('cand-c', 'file3.ts', file3Ref as { sourceId: string; digest: string }));
+        case 3:
+          return COMPLETION_TURN;
+        default:
+          throw new Error('ran out of scripted verifying turns — the bound did not end the phase when expected');
+      }
+    };
+
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), submitWide, readFile2, captureFile2ThenReadFile3, captureFile3ThenStop],
+      verifying: [respondToVerifying],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    // Terminated within the bound: exactly two `requestCompletion` turns happened (index 1 and 3
+    // above) rather than the production run's 37 identical refusals, and the second one was granted.
+    expect(verifyingTurnResults).toHaveLength(4);
+
+    // The first denial (streak at 2 of the bound's 3) still blocks completion exactly as an ordinary
+    // repairable `contradictionPending` always has, and names the stuck candidate with the actionable
+    // repair rather than one opaque aggregate boolean.
+    const firstDenial = completionResponseFrom(verifyingTurnResults[2]?.[0] as HostToolResult);
+    expect(firstDenial.granted).toBe(false);
+    if (!firstDenial.granted) {
+      expect(firstDenial.repairable).toBe(true);
+      expect(firstDenial.blockers).toContain('contradictionPending');
+      const detail = firstDenial.missingConditions.find((d) => d.blocker === 'contradictionPending');
+      expect(detail?.message).toContain('cand-wide');
+      expect(detail?.message).toContain('4000-character excerpt budget');
+      expect(detail?.message).toContain('Resubmit candidate cand-wide');
+      expect(detail?.message).toContain('4000 characters');
+    }
+
+    // The bound then closes the candidate out rather than refusing forever: completion is granted,
+    // carrying a truthful limitation that names the candidate — never silently dropped, never
+    // silently called fully verified.
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.findings.map((f) => f.candidateId).sort()).toEqual(['cand-b', 'cand-c', 'cand-wide']);
+    const limitation = result.outcome.limitations.find((l) => l.code === 'unverifiableCitation');
+    expect(limitation?.message).toContain('cand-wide');
+    expect(limitation?.message).toContain('3 attempts');
+  });
+
+  it('a candidate that narrows its citation after the guidance gets verified normally, never reaching the bound', async () => {
+    let file1Ref: { sourceId: string; digest: string } | undefined;
+    const connection = reviewConnection({
+      files: ['file1.ts'],
+      readDiff: async () => bigDiffPageResult('file1.ts', 120),
+    });
+    const submitWide: ScriptEntry = (call) => {
+      file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref, 1, 120));
+    };
+
+    // The first verifying-phase turn resubmits the SAME candidateId with a citation now comfortably
+    // inside the excerpt window — the exact repair `selectEvidenceExcerpt`'s guidance names — after
+    // the phase entry's own synthesis/verification pass has already reported it unverified once
+    // (streak 1 of the bound's 3). The second turn asks for completion.
+    let verifyingTurns = 0;
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        if (!match) throw new Error(`unexpected verifying repairInstruction shape: ${call.repairInstruction}`);
+        return JSON.stringify({ candidateId: match[1], contradicted: false });
+      }
+      verifyingTurns += 1;
+      if (verifyingTurns === 1) return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref as { sourceId: string; digest: string }, 10, 11));
+      return COMPLETION_TURN;
+    };
+
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), submitWide, STOP_TURN],
+      verifying: [respondToVerifying],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-wide']);
+    // Verified for real — never through the no-progress bound, which never had a chance to trip
+    // (the streak reset the moment the reason changed / the candidate resolved).
+    expect(result.outcome.limitations.some((l) => l.code === 'unverifiableCitation')).toBe(false);
   });
 });
 

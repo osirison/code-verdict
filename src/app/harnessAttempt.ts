@@ -154,6 +154,7 @@ import {
   type CompletionRequestResponse,
   type CitationRevalidationSummary,
   type MemberHeadCheck,
+  type UnverifiedContradictionDetail,
   type VerificationPasses,
 } from './harnessCompletion';
 import { sha256Hex, canonicalStringify } from './contentDigest';
@@ -804,6 +805,39 @@ const EARLY_STOP_NUDGE_PHASES: ReadonlySet<RunPhase> = new Set<RunPhase>(['inves
 const MAX_EARLY_STOP_NUDGES_PER_PHASE = 3;
 
 /**
+ * Bounds a different failure than `MAX_EARLY_STOP_NUDGES_PER_PHASE`: not a model that stops, but a
+ * contradiction check that structurally cannot conclude for one candidate — `harnessSynthesisVerification.ts`'s
+ * `selectEvidenceExcerpt`/`buildBoundedContradictionDirective` reporting the *same* candidate with the
+ * *same* `unverified` reason on every re-run, because nothing about that candidate's own cited span
+ * changes between passes (this module never edits a candidate's citation; only a resubmission can). Left
+ * unbounded, `contradictionPassComplete` stays `false` forever, `evaluateCompletion` keeps refusing
+ * `requestCompletion` as `repairable: true` (correctly, in general — most contradiction-pending states
+ * genuinely are fixable by more work), and the model has no way to learn this one is not: it keeps doing
+ * "productive" work (new submissions, more reads) that `runPhaseLoop`'s own progress check
+ * (`turnAdvancedTheReview`/coverage/digest deltas) correctly treats as real progress, so the phase never
+ * reaches its own early-stop nudge path at all. A production run burned 56 minutes and 37 identical
+ * refusals this way before the attempt's hard elapsed-time limit killed it — see
+ * `docs/agent-notes/` for this run's diagnosis.
+ *
+ * `runSynthesisVerification` (below) tracks each unverified candidate's `(reason)` across re-runs; once
+ * one has recurred byte-identically this many times in a row, it stops counting against
+ * `contradictionPassComplete` — recorded instead as its own `unverifiableCitation` run limitation (a
+ * truthful "this could not be checked" a reviewer will see) — rather than holding every future
+ * completion request hostage. The streak resets the moment the reason changes (a narrower resubmission
+ * changes the reported character count) or the candidate leaves the unverified set entirely (resolved,
+ * contradicted, or excluded), so genuine progress is never mistaken for a stall.
+ *
+ * Three, matching `MAX_EARLY_STOP_NUDGES_PER_PHASE`'s own host-patience precedent: the first capped pass
+ * is also the first turn that ever carries the actionable "resubmit narrower" guidance
+ * (`selectEvidenceExcerpt`'s reason text), so the model needs at least one full turn to act on it before
+ * a second identical failure is even informative — and the diagnosed run's own shape interleaves
+ * unrelated candidate submissions between verification re-runs, so two more identical passes after the
+ * first is enough to distinguish "still trying to fix this" from "cannot fix this" without cutting off a
+ * model that acts on the guidance promptly.
+ */
+const MAX_UNVERIFIABLE_CONTRADICTION_STREAK = 3;
+
+/**
  * What one tool result costs the assembled prompt on top of its own content, when nothing has been
  * measured yet this turn.
  *
@@ -1015,6 +1049,25 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   /** The contradiction pass's exclusions (task 10.6's collaborator's `output.contradicted`), captured here so `fireCheckpoint`/`runPersisting` can hand them to the checkpoint collaborator and `HarnessAttemptOutcome` instead of dropping them at this closure's boundary. */
   let latestContradicted: readonly ContradictedFindingRecord[] = [];
   /**
+   * Candidates still genuinely blocking `contradictionPassComplete` after the no-progress bound has
+   * excluded any that recurred identically `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` times — see that
+   * constant's own doc comment. Fed to `evaluateCompletion` so a refused `requestCompletion` names
+   * which candidate(s) and why, instead of the one aggregate boolean. Empty before the first
+   * `runSynthesisVerification` call, same as `latestPasses` above.
+   */
+  let latestUnverifiedContradictions: readonly UnverifiedContradictionDetail[] = [];
+  /**
+   * `candidateId -> {reason, count}` for `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s streak: how many
+   * *consecutive* `runSynthesisVerification` calls reported this candidate `unverified` with this
+   * exact reason text. A changed reason (a narrower resubmission changes the character count in it)
+   * or the candidate's absence from the latest `unverified` list both reset it to nothing — never
+   * incremented past what the current run actually shows, so a stale streak from an already-resolved
+   * candidate can never later miscount.
+   */
+  const unverifiedContradictionStreak = new Map<string, { readonly reason: string; readonly count: number }>();
+  /** Every candidateId this attempt has already recorded an `unverifiableCitation` limitation for — `extraLimitations` is appended-only and read verbatim into the terminal result, so without this a candidate capped early and re-verified several times over (every later `passesStale` re-run sees it capped again) would push the same limitation once per re-run instead of once ever. */
+  const loggedUnverifiableCitations = new Set<string>();
+  /**
    * Set the moment `runPersisting`/`finalizeBootstrapFailure` succeeds in writing this attempt's
    * one terminal checkpoint — read by `finalizeEscapedError` (`run()`'s catch-all) so an error that
    * escapes *after* that point (e.g. from `onPersist`) can never write a second, competing terminal
@@ -1199,6 +1252,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       unresolved: { unresolvedFetches: 0, unresolvedCandidates: candidateTracker.unresolvedCount() },
       citations: latestCitations,
       passes: latestPasses,
+      unverifiedContradictions: latestUnverifiedContradictions,
       budget: { hardExhausted: budget.state().hardExhausted, timedOut: budget.state().timedOut },
     };
     return evaluateCompletion(input);
@@ -1927,11 +1981,49 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     const revalidation = revalidateFindings(output.findings, { ledger, now: now() });
     survivingFindings = revalidation.valid;
     latestCitations = { revalidated: true, invalidatedCount: revalidation.invalidated.length };
+
+    // No-progress bound (`MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s own doc comment): advance each
+    // still-unverified candidate's streak, byte-identical reason against byte-identical reason, and
+    // drop the streak of any candidate this run does NOT report unverified — resolved, contradicted,
+    // or already excluded, so a stale count can never later miscount a candidate that moved on.
+    const unverifiedNow = output.unverified ?? [];
+    const unverifiedIds = new Set(unverifiedNow.map((entry) => entry.candidateId));
+    for (const candidateId of [...unverifiedContradictionStreak.keys()]) {
+      if (!unverifiedIds.has(candidateId)) unverifiedContradictionStreak.delete(candidateId);
+    }
+    const stillPending: UnverifiedFindingRecord[] = [];
+    const newlyCapped: UnverifiedFindingRecord[] = [];
+    for (const entry of unverifiedNow) {
+      const previous = unverifiedContradictionStreak.get(entry.candidateId);
+      const count = previous && previous.reason === entry.reason ? previous.count + 1 : 1;
+      unverifiedContradictionStreak.set(entry.candidateId, { reason: entry.reason, count });
+      if (count >= MAX_UNVERIFIABLE_CONTRADICTION_STREAK) newlyCapped.push(entry);
+      else stillPending.push(entry);
+    }
+    // Truthful only when the bound is the WHOLE reason this pass is incomplete: cancellation is
+    // its own, separate incompleteness (D2's cancelled semantics; never masked by a candidate-level
+    // bound), and a pass already complete has no unverified candidate to cap in the first place —
+    // `unverifiedNow.length > 0` keeps a vacuous "every one of zero candidates is capped" from ever
+    // firing.
+    const boundReached = !isCancelled() && unverifiedNow.length > 0 && stillPending.length === 0;
     latestPasses = {
-      contradictionPassComplete: output.contradictionPassComplete,
+      contradictionPassComplete: output.contradictionPassComplete || boundReached,
       deduplicationComplete: output.deduplicationComplete,
-      finalVerificationComplete: output.finalVerificationComplete,
+      finalVerificationComplete: output.finalVerificationComplete || boundReached,
     };
+    latestUnverifiedContradictions = stillPending.map((entry) => ({ candidateId: entry.candidateId, reason: entry.reason }));
+    // Recorded once per candidate, ever — not once per re-run: `runSynthesisVerification` reruns on
+    // every later `passesStale` (a fresh submission during the same `verifying` phase), and a capped
+    // candidate stays capped, so without `loggedUnverifiableCitations` this would push one
+    // limitation per re-run instead of one truthful statement of the fact.
+    for (const entry of newlyCapped) {
+      if (loggedUnverifiableCitations.has(entry.candidateId)) continue;
+      loggedUnverifiableCitations.add(entry.candidateId);
+      extraLimitations.push({
+        code: 'unverifiableCitation',
+        message: `Candidate ${entry.candidateId} could not be checked for contradiction after ${MAX_UNVERIFIABLE_CONTRADICTION_STREAK} attempts and ships unverified: ${entry.reason}`,
+      });
+    }
     // Known-gap closure (task 11.2): `output.contradicted` used to end here, never reaching
     // activity or persistence. It is now recorded for `fireCheckpoint`/`runPersisting` below, and
     // each exclusion becomes its own public `toolFailed` event — `appendActivity`'s existing

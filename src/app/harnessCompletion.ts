@@ -66,6 +66,24 @@ export interface VerificationPasses {
   readonly finalVerificationComplete: boolean;
 }
 
+/**
+ * One candidate still genuinely blocking `contradictionPassComplete` — named, so the completion
+ * refusal can tell the model *which* finding and *why*, rather than the one aggregate boolean
+ * `passes.contradictionPassComplete` carries on its own. Absent (or empty) whenever the caller has
+ * no per-candidate detail to give (the pass has simply never run yet, or a fake collaborator
+ * reports only the aggregate flag): `evaluateCompletion` then falls back to the single generic
+ * clause message it always used, so every existing caller and test keeps working unchanged.
+ *
+ * A candidate that `harnessAttempt.ts`'s no-progress bound has already closed out as
+ * unverifiable-as-cited is never in this list — the bound retires it into a run limitation instead,
+ * precisely so it stops appearing here as a live blocker (see that module's own doc comment on
+ * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`).
+ */
+export interface UnverifiedContradictionDetail {
+  readonly candidateId: string;
+  readonly reason: string;
+}
+
 export interface BudgetExhaustionFacts {
   readonly hardExhausted: boolean;
   readonly timedOut: boolean;
@@ -78,6 +96,8 @@ export interface CompletionEvaluationInput {
   readonly unresolved: UnresolvedWork;
   readonly citations: CitationRevalidationSummary;
   readonly passes: VerificationPasses;
+  /** See `UnverifiedContradictionDetail`. Read only when `passes.contradictionPassComplete` is false. */
+  readonly unverifiedContradictions?: readonly UnverifiedContradictionDetail[];
   readonly budget?: BudgetExhaustionFacts;
 }
 
@@ -258,7 +278,21 @@ export function evaluateCompletion(input: CompletionEvaluationInput): Completion
 
   // 8.-10. verification passes
   clauses.contradictionPassComplete = true;
-  if (!input.passes.contradictionPassComplete) fail('contradictionPassComplete', 'contradictionPending', 'The contradiction pass has not completed.');
+  if (!input.passes.contradictionPassComplete) {
+    const named = input.unverifiedContradictions ?? [];
+    if (named.length === 0) {
+      // No per-candidate detail to give — the pass has not run at all yet, or the collaborator
+      // reports only the aggregate flag. Same message as before this fix, so every existing
+      // caller/test that never supplies `unverifiedContradictions` sees no change.
+      fail('contradictionPassComplete', 'contradictionPending', 'The contradiction pass has not completed.');
+    } else {
+      // Named and bounded, one detail per still-genuinely-blocking candidate (candidates the
+      // no-progress bound already retired are excluded by the caller — see
+      // `UnverifiedContradictionDetail`) — so a repeated `requestCompletion` tells the model
+      // exactly which finding to fix and how, instead of one opaque boolean it has no way to act on.
+      for (const detail of named) fail('contradictionPassComplete', 'contradictionPending', `Candidate ${detail.candidateId}: ${detail.reason}`);
+    }
+  }
   clauses.deduplicationComplete = true;
   if (!input.passes.deduplicationComplete) fail('deduplicationComplete', 'deduplicationPending', 'Deduplication has not completed.');
   clauses.finalVerificationComplete = true;

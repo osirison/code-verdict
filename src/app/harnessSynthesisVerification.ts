@@ -87,6 +87,18 @@
  * finding is an ordinary surviving finding whose pass did not conclude — the
  * completion clause and the activity trail are where that belongs.
  *
+ * **Bounded, not permanent.** This module reports the same `unverified` reason for the same
+ * candidate on every re-run for as long as its citation is unchanged — by design, since neither
+ * stage here mutates a candidate's own citation. `harnessAttempt.ts`'s `runSynthesisVerification`
+ * is what turns that byte-identical repetition into a bound: after `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`
+ * consecutive re-runs report the *same* candidate with the *same* reason, that candidate ships
+ * recorded unverifiable-as-cited (a run limitation naming it) and stops being counted against
+ * `contradictionPassComplete` — which the host may then report `true` even though this module
+ * itself never confirmed that one candidate. Nothing in this module implements or is aware of that
+ * bound; it exists so a citation this module can never honestly excerpt does not hold every future
+ * completion request hostage forever. See `harnessAttempt.ts`'s own doc comment on the constant.
+ *
+
  * **Malformed-verdict repair budget.** A shared allowance across the whole
  * contradiction stage, reusing `HarnessPolicy.protocolRepairsPerPhase`
  * (never a new magic number) rather than a separate per-finding budget —
@@ -560,7 +572,18 @@ export function selectEvidenceExcerpt(finding: ValidatedFinding, source: LedgerE
 
   const citedChars = spanChars(index, anchor.first, anchor.last);
   if (citedChars > maxExcerptChars) {
-    return { kind: 'unavailable', reason: `The cited lines of ${primary.path} are ${citedChars} characters on their own, past the ${maxExcerptChars}-character excerpt budget, so they cannot be shown in full.` };
+    // Named and actionable, not just descriptive (task: "the model has no signal that this
+    // specific block is unfixable"). This is the one `unavailable` reason a resubmission can
+    // actually cure — the span itself, not the file, is what is too big — so it is the one that
+    // names the fix in terms of the real number just enforced, never a hardcoded guess. The other
+    // `unavailable` branches in this function (unindexable file, unlocatable citation) do not get
+    // this treatment: narrowing the citation would not help either of those.
+    return {
+      kind: 'unavailable',
+      reason:
+        `The cited lines of ${primary.path} are ${citedChars} characters on their own, past the ${maxExcerptChars}-character excerpt budget, so they cannot be shown in full. ` +
+        `Resubmit candidate ${finding.candidateId} (same id) citing at most ${maxExcerptChars} characters — a narrower line range within ${primary.path} — so the contradiction check can run.`,
+    };
   }
 
   const window = expandWindow(index, anchor, maxExcerptChars);
