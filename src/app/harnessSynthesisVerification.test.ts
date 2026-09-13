@@ -538,7 +538,13 @@ describe('runContradictionChecks (task 10.6, stage 2)', () => {
     // Exactly 1 + maxRepairs asks for this one finding.
     expect(seam.calls).toBe(3);
     // And the incompleteness names the finding it is about, rather than being one bare flag for the stage.
-    expect(result.unverified).toEqual([{ candidateId: 'cand-malformed', reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.' }]);
+    expect(result.unverified).toEqual([
+      {
+        candidateId: 'cand-malformed',
+        reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.',
+        cause: 'verificationExhausted',
+      },
+    ]);
   });
 
   it('a shared repair allowance across findings: a malformed response on one finding does not grant extra retries to the next', async () => {

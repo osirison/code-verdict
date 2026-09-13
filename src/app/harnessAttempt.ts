@@ -344,6 +344,20 @@ export interface ContradictedFindingRecord {
 }
 
 /**
+ * Which of two structurally different reasons a finding's contradiction check did not run or
+ * conclude (adversarial-review finding 3, alongside `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`): a
+ * `citationUnavailable` candidate's own cited span could not be honestly excerpted —
+ * deterministic, a property of that citation, and the one cause a resubmission can sometimes cure
+ * (`harnessSynthesisVerification.ts`'s `selectEvidenceExcerpt`/`buildBoundedContradictionDirective`
+ * `unavailable` branches); a `verificationExhausted` candidate's citation showed fine, but no
+ * usable verdict ever came back within the shared malformed-verdict repair allowance —
+ * nondeterministic (a provider hiccup, not the citation), and narrowing the citation would not
+ * help it at all. Both retire under the no-progress bound the same way, but never under the same
+ * name: naming the wrong one would tell a model to narrow a citation that was never the problem.
+ */
+export type UnverifiedContradictionCause = 'citationUnavailable' | 'verificationExhausted';
+
+/**
  * One *surviving* finding whose contradiction check did not happen or did not
  * conclude, with why — the opposite outcome to `ContradictedFindingRecord` and
  * deliberately its own type, because the consequence is the opposite too: this
@@ -354,6 +368,8 @@ export interface ContradictedFindingRecord {
 export interface UnverifiedFindingRecord {
   readonly candidateId: string;
   readonly reason: string;
+  /** See `UnverifiedContradictionCause` — which retirement name and guidance this candidate earns if the no-progress bound closes it out. */
+  readonly cause: UnverifiedContradictionCause;
 }
 
 export interface SynthesisVerificationOutput {
@@ -821,11 +837,30 @@ const MAX_EARLY_STOP_NUDGES_PER_PHASE = 3;
  *
  * `runSynthesisVerification` (below) tracks each unverified candidate's `(reason)` across re-runs; once
  * one has recurred byte-identically this many times in a row, it stops counting against
- * `contradictionPassComplete` — recorded instead as its own `unverifiableCitation` run limitation (a
- * truthful "this could not be checked" a reviewer will see) — rather than holding every future
- * completion request hostage. The streak resets the moment the reason changes (a narrower resubmission
- * changes the reported character count) or the candidate leaves the unverified set entirely (resolved,
- * contradicted, or excluded), so genuine progress is never mistaken for a stall.
+ * `contradictionPassComplete` — recorded instead as its own truthfully-named run limitation (a
+ * reviewer-visible "this could not be checked", named per `UnverifiedContradictionCause`) — rather
+ * than holding every future completion request hostage. The streak resets the moment the reason
+ * changes (a narrower resubmission changes the reported character count) or the candidate leaves
+ * the unverified set entirely (resolved, contradicted, or excluded), so genuine progress is never
+ * mistaken for a stall.
+ *
+ * **Two counters share this one bound, for two structurally different ways to idle.** The streak
+ * above — `unverifiedContradictionStreak` — only ever advances when `runSynthesisVerification`
+ * actually re-runs, which (outside phase entry) requires a fresh submission (`passesStale`). A
+ * production variant of the same hang skipped that entirely: a model that submits once, then calls
+ * `requestCompletion` over and over with nothing further, never sets `passesStale`, so no re-run
+ * ever happens and this streak sits frozen below the bound forever while the phase loop denies the
+ * *identical* request turn after turn — 154 verifying turns in one run, the same deadlock shape
+ * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` exists to close, arriving through the one door this
+ * streak cannot see. `deniedContradictionStreak` (in `runPhaseLoop`'s `completionRequest` handling)
+ * is the second counter that closes it: it advances on every `requestCompletion` **denial** whose
+ * still-blocking candidates are byte-identical to the previous denial's, whether or not a real
+ * re-run happened in between — a re-run that changes nothing is still "no progress" by this
+ * counter's own definition, so the two counters agree exactly on that overlap and neither one
+ * needs to know the other exists. Both retire a candidate through the same shared bookkeeping
+ * (`retireUnverifiableCandidate`), so "why two counters" never becomes "two copies of the retirement
+ * logic to keep in sync" — see that function's own doc comment for the lifecycle both counters
+ * feed into (including finding 2's fix: retirement is not a one-way door).
  *
  * Three, matching `MAX_EARLY_STOP_NUDGES_PER_PHASE`'s own host-patience precedent: the first capped pass
  * is also the first turn that ever carries the actionable "resubmit narrower" guidance
@@ -833,9 +868,28 @@ const MAX_EARLY_STOP_NUDGES_PER_PHASE = 3;
  * a second identical failure is even informative — and the diagnosed run's own shape interleaves
  * unrelated candidate submissions between verification re-runs, so two more identical passes after the
  * first is enough to distinguish "still trying to fix this" from "cannot fix this" without cutting off a
- * model that acts on the guidance promptly.
+ * model that acts on the guidance promptly. `deniedContradictionStreak` reuses the same number for the
+ * same reason, one denial per idle turn rather than one re-run per submitting turn.
  */
 const MAX_UNVERIFIABLE_CONTRADICTION_STREAK = 3;
+
+/**
+ * Per-cause retirement vocabulary for `UnverifiedContradictionCause` (finding 3): the label and the
+ * human text a capped candidate's run limitation carries, kept here as one table rather than an
+ * if/else at each of the two call sites that can trigger retirement
+ * (`runSynthesisVerification`'s own streak, and `deniedContradictionStreak`'s). `unverifiableCitation`
+ * is the pre-existing code (every caller and test asserting it today means the citation-shaped
+ * cause, never the exhaustion one) — kept rather than renamed, so this fix adds a name instead of
+ * breaking one. `describe` never mentions resubmitting: that guidance already lives inside
+ * `citationUnavailable`'s own `reason` text for the one sub-case it actually helps
+ * (`selectEvidenceExcerpt`'s "cited lines... past the excerpt budget" branch) and would be a lie for
+ * every other `citationUnavailable` sub-case and for `verificationExhausted` altogether — the
+ * verdict never came back for a reason that has nothing to do with the citation's width.
+ */
+const CAPPED_CONTRADICTION_LABEL: Readonly<Record<UnverifiedContradictionCause, { readonly code: string; readonly describe: string }>> = Object.freeze({
+  citationUnavailable: { code: 'unverifiableCitation', describe: 'its cited evidence could not be excerpted for the contradiction check' },
+  verificationExhausted: { code: 'contradictionCheckExhausted', describe: 'the contradiction check never returned a usable verdict within the shared repair allowance' },
+});
 
 /**
  * What one tool result costs the assembled prompt on top of its own content, when nothing has been
@@ -1057,16 +1111,51 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
    */
   let latestUnverifiedContradictions: readonly UnverifiedContradictionDetail[] = [];
   /**
-   * `candidateId -> {reason, count}` for `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s streak: how many
-   * *consecutive* `runSynthesisVerification` calls reported this candidate `unverified` with this
-   * exact reason text. A changed reason (a narrower resubmission changes the character count in it)
-   * or the candidate's absence from the latest `unverified` list both reset it to nothing — never
-   * incremented past what the current run actually shows, so a stale streak from an already-resolved
-   * candidate can never later miscount.
+   * `candidateId -> {reason, count}` for `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s first counter:
+   * how many *consecutive* `runSynthesisVerification` calls reported this candidate `unverified`
+   * with this exact reason text. A changed reason (a narrower resubmission changes the character
+   * count in it) or the candidate's absence from the latest `unverified` list both reset it to
+   * nothing — never incremented past what the current run actually shows, so a stale streak from
+   * an already-resolved candidate can never later miscount.
    */
   const unverifiedContradictionStreak = new Map<string, { readonly reason: string; readonly count: number }>();
-  /** Every candidateId this attempt has already recorded an `unverifiableCitation` limitation for — `extraLimitations` is appended-only and read verbatim into the terminal result, so without this a candidate capped early and re-verified several times over (every later `passesStale` re-run sees it capped again) would push the same limitation once per re-run instead of once ever. */
-  const loggedUnverifiableCitations = new Set<string>();
+  /**
+   * The bound's second counter (see `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s "two counters"
+   * paragraph, finding 1): how many *consecutive* `requestCompletion` denials reported this
+   * candidate as a byte-identical `contradictionPending` blocker — advanced once per denial in
+   * `processMessages`'s `completionRequest` handling, whether or not that turn's denial was
+   * preceded by a real `runSynthesisVerification` re-run. Same shape and same reset rule as
+   * `unverifiedContradictionStreak` above, kept as its own map rather than folded into it: the two
+   * count different events (re-runs vs. denials) that can occur on different turns, and merging
+   * them would let a burst of one kind of event silently borrow the other's progress toward the cap.
+   */
+  const deniedContradictionStreak = new Map<string, { readonly reason: string; readonly count: number }>();
+  /**
+   * `candidateId -> {limitation, reason, cause}` for every candidate either streak has already
+   * capped this attempt — the authoritative "this one is retired" record both
+   * `runSynthesisVerification` and the denial counter consult before ever recomputing a streak, and
+   * the fix for finding 2's truthfulness gap: `extraLimitations` itself stays append-only (many
+   * unrelated limitations share it and nothing here may reorder or drop those), but a *specific*
+   * pushed `Limitation` object is kept here by reference so `retireUnverifiableCandidate` can
+   * `indexOf`/`splice` exactly that entry back out — no scanning by message text, no risk of
+   * removing a different candidate's limitation that happens to render similarly. A candidate
+   * present here with the SAME `reason` as this round's report stays retired (never re-pushed, never
+   * a live blocker again); a *changed* reason or the candidate's outright absence from this round's
+   * `unverified` list means it was resubmitted or genuinely resolved, and its retirement is
+   * retracted — see `retireUnverifiableCandidate`'s own doc comment for why a capped candidate is
+   * not a one-way door.
+   */
+  const retiredUnverifiableCandidates = new Map<string, { readonly limitation: Limitation; readonly reason: string; readonly cause: UnverifiedContradictionCause }>();
+  /**
+   * `candidateId -> cause` for every candidate `latestUnverifiedContradictions` currently names —
+   * rebuilt in lockstep with that array on every `runSynthesisVerification` call, from the same
+   * `stillPending` list, so the two can never disagree on which candidates exist. Exists only so
+   * the denial counter (which reads the *aggregate* `UnverifiedContradictionDetail` shape —
+   * candidateId and reason, no cause) can still retire a candidate under its truthful
+   * `UnverifiedContradictionCause` label without `evaluateCompletion`'s own input type needing to
+   * carry a field nothing else consumes.
+   */
+  let latestUnverifiedCauseByCandidate = new Map<string, UnverifiedContradictionCause>();
   /**
    * Set the moment `runPersisting`/`finalizeBootstrapFailure` succeeds in writing this attempt's
    * one terminal checkpoint — read by `finalizeEscapedError` (`run()`'s catch-all) so an error that
@@ -1948,6 +2037,95 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   // ---- Synthesis and verification (task 10.6's seam; task 10.3 owns the phase around it) ----
 
+  /**
+   * Pushes one candidate's truthful "could not be checked" limitation and marks it retired — the
+   * one call site both of `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s counters (`runSynthesisVerification`'s
+   * own re-run streak, and `noteContradictionDenialsWithoutProgress`'s denial streak below) go
+   * through, so there is exactly one place deciding the label (`CAPPED_CONTRADICTION_LABEL`) and
+   * exactly one place guarding against pushing the same candidate's limitation twice — a Set/Map
+   * check here, not two copies of one at each call site. Idempotent: a candidate already in
+   * `retiredUnverifiableCandidates` is left exactly as it is, reason and all, so a caller never
+   * needs to check first.
+   */
+  function retireUnverifiableCandidate(candidateId: string, reason: string, cause: UnverifiedContradictionCause): void {
+    if (retiredUnverifiableCandidates.has(candidateId)) return;
+    const label = CAPPED_CONTRADICTION_LABEL[cause];
+    const limitation: Limitation = Object.freeze({
+      code: label.code,
+      message: `Candidate ${candidateId} could not be checked for contradiction after ${MAX_UNVERIFIABLE_CONTRADICTION_STREAK} attempts because ${label.describe}: ${reason}`,
+    });
+    retiredUnverifiableCandidates.set(candidateId, { limitation, reason, cause });
+    extraLimitations.push(limitation);
+  }
+
+  /**
+   * The other half of `retireUnverifiableCandidate` (finding 2): undoes exactly that one retirement,
+   * by object reference — `extraLimitations` mixes many unrelated limitation kinds from across this
+   * whole attempt, so removing "whichever entry's message looks like this candidate's" would risk
+   * matching the wrong one; removing the exact object this module itself pushed cannot.
+   */
+  function retractRetirement(candidateId: string): void {
+    const retired = retiredUnverifiableCandidates.get(candidateId);
+    if (!retired) return;
+    retiredUnverifiableCandidates.delete(candidateId);
+    const index = extraLimitations.indexOf(retired.limitation);
+    if (index !== -1) extraLimitations.splice(index, 1);
+  }
+
+  /**
+   * The bound's second counter (finding 1; see `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s "two
+   * counters" paragraph for why this exists alongside `unverifiedContradictionStreak`). Called from
+   * `processMessages`'s `completionRequest` handling on every turn a `requestCompletion` comes back
+   * denied, whether or not that turn's denial was preceded by a real `runSynthesisVerification`
+   * re-run — it reads whatever `latestUnverifiedContradictions` currently holds, which is exactly
+   * "the denial's own contradiction-pending state" regardless of how recently it was computed.
+   *
+   * Advances against `deniedContradictionStreak` with the identical byte-for-byte-reason rule
+   * `runSynthesisVerification` uses for its own streak, and retires through the same
+   * `retireUnverifiableCandidate` — so a candidate this counter caps reads no differently, to a
+   * reviewer or to a later `evaluateCompletion` call, than one the re-run counter caps. The one
+   * asymmetry against that counter's own same-round grant: because this only ever runs *after*
+   * observing a denial, the denial that trips the cap has already gone out to the model as a refusal
+   * — the grant follows on the *next* `requestCompletion`, one round later. That lag is inherent to
+   * counting denials rather than re-runs, not a bug to chase: the model calls `requestCompletion`
+   * again regardless (that is the whole idle-spam shape this counter exists to bound), and the next
+   * call is answered against the now-retired state.
+   */
+  function noteContradictionDenialsWithoutProgress(): void {
+    if (isCancelled()) return; // Same reasoning as `runSynthesisVerification`'s own retraction guard: a cancelled attempt does not manufacture new retirements from denials it will not act on further.
+    const current = latestUnverifiedContradictions;
+    const currentIds = new Set(current.map((entry) => entry.candidateId));
+    for (const candidateId of [...deniedContradictionStreak.keys()]) {
+      if (!currentIds.has(candidateId)) deniedContradictionStreak.delete(candidateId);
+    }
+    const newlyCapped: UnverifiedContradictionDetail[] = [];
+    for (const entry of current) {
+      // Defensive, not reachable in the ordinary flow: `latestUnverifiedContradictions` is rebuilt
+      // wholesale by `runSynthesisVerification` from `stillPending`, which already excludes any
+      // candidate retired with this exact reason — so a `retired` hit here would mean some other
+      // path mutated the live blocking set without going through that rebuild.
+      const retired = retiredUnverifiableCandidates.get(entry.candidateId);
+      if (retired && retired.reason === entry.reason) continue;
+      const previous = deniedContradictionStreak.get(entry.candidateId);
+      const count = previous && previous.reason === entry.reason ? previous.count + 1 : 1;
+      deniedContradictionStreak.set(entry.candidateId, { reason: entry.reason, count });
+      if (count >= MAX_UNVERIFIABLE_CONTRADICTION_STREAK) newlyCapped.push(entry);
+    }
+    if (newlyCapped.length === 0) return;
+    for (const entry of newlyCapped) {
+      const cause = latestUnverifiedCauseByCandidate.get(entry.candidateId) ?? 'citationUnavailable';
+      retireUnverifiableCandidate(entry.candidateId, entry.reason, cause);
+    }
+    const cappedIds = new Set(newlyCapped.map((entry) => entry.candidateId));
+    latestUnverifiedContradictions = latestUnverifiedContradictions.filter((entry) => !cappedIds.has(entry.candidateId));
+    // Mirrors `runSynthesisVerification`'s own `boundReached`: once every candidate this attempt was
+    // still waiting on is retired, the pass and final verification are complete for the same reason
+    // a re-run-triggered cap would make them complete — the bound, not a real confirmed verdict.
+    if (latestUnverifiedContradictions.length === 0) {
+      latestPasses = { ...latestPasses, contradictionPassComplete: true, finalVerificationComplete: true };
+    }
+  }
+
   /** Runs the injected collaborator, then the host's own already-built citation revalidation (D9's "the host then reruns citation validation") — never a second dedup/contradiction implementation. */
   async function runSynthesisVerification(): Promise<void> {
     const before = candidateTracker.triageFindings();
@@ -1985,15 +2163,48 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // No-progress bound (`MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s own doc comment): advance each
     // still-unverified candidate's streak, byte-identical reason against byte-identical reason, and
     // drop the streak of any candidate this run does NOT report unverified — resolved, contradicted,
-    // or already excluded, so a stale count can never later miscount a candidate that moved on.
+    // or already excluded, so a stale count can never later miscount a candidate that moved on. The
+    // denial counter gets the identical treatment here, in lockstep: a real re-run is itself a
+    // "verification-state change", so any candidate it no longer names is exactly as resolved for
+    // denial-counting purposes as it is for re-run-counting purposes.
     const unverifiedNow = output.unverified ?? [];
     const unverifiedIds = new Set(unverifiedNow.map((entry) => entry.candidateId));
     for (const candidateId of [...unverifiedContradictionStreak.keys()]) {
       if (!unverifiedIds.has(candidateId)) unverifiedContradictionStreak.delete(candidateId);
     }
+    for (const candidateId of [...deniedContradictionStreak.keys()]) {
+      if (!unverifiedIds.has(candidateId)) deniedContradictionStreak.delete(candidateId);
+    }
+    // Finding 2's truthfulness fix: a candidate either counter already retired, whose *this* real
+    // verification result no longer names it unverified at all, was resolved — cleanly verified, or
+    // excluded as contradicted, `output.unverified`'s own silence does not distinguish which and
+    // does not need to — so its capped-early limitation is retracted rather than left standing next
+    // to a final result that quietly contradicts it. Never while cancelled:
+    // `runContradictionChecks` stops early on cancellation and pushes its untouched remainder
+    // straight to `output.findings`, so a capped candidate's absence from `output.unverified` there
+    // means "never re-asked this round", not "resolved" — retracting on that would erase a truthful
+    // limitation from a result already being reported partial for the cancellation itself.
+    if (!isCancelled()) {
+      for (const candidateId of [...retiredUnverifiableCandidates.keys()]) {
+        if (!unverifiedIds.has(candidateId)) retractRetirement(candidateId);
+      }
+    }
     const stillPending: UnverifiedFindingRecord[] = [];
     const newlyCapped: UnverifiedFindingRecord[] = [];
     for (const entry of unverifiedNow) {
+      const retired = retiredUnverifiableCandidates.get(entry.candidateId);
+      if (retired) {
+        // Reported unverified again with the exact reason it was retired for: stays retired, stays
+        // out of `stillPending` (so it is never again a live blocker), never re-pushed —
+        // `retireUnverifiableCandidate` guards that on its own, but there is nothing new here to
+        // give it anyway.
+        if (retired.reason === entry.reason) continue;
+        // A *different* reason while still retired means a resubmission (most often a narrower
+        // citation) landed and did not verify cleanly either — retract the stale retirement and let
+        // it fall through as a genuinely fresh candidate, streaks restarting at 1 below, rather than
+        // leaving last time's stale limitation standing beside this time's live blocker.
+        retractRetirement(entry.candidateId);
+      }
       const previous = unverifiedContradictionStreak.get(entry.candidateId);
       const count = previous && previous.reason === entry.reason ? previous.count + 1 : 1;
       unverifiedContradictionStreak.set(entry.candidateId, { reason: entry.reason, count });
@@ -2012,18 +2223,15 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       finalVerificationComplete: output.finalVerificationComplete || boundReached,
     };
     latestUnverifiedContradictions = stillPending.map((entry) => ({ candidateId: entry.candidateId, reason: entry.reason }));
-    // Recorded once per candidate, ever — not once per re-run: `runSynthesisVerification` reruns on
-    // every later `passesStale` (a fresh submission during the same `verifying` phase), and a capped
-    // candidate stays capped, so without `loggedUnverifiableCitations` this would push one
-    // limitation per re-run instead of one truthful statement of the fact.
-    for (const entry of newlyCapped) {
-      if (loggedUnverifiableCitations.has(entry.candidateId)) continue;
-      loggedUnverifiableCitations.add(entry.candidateId);
-      extraLimitations.push({
-        code: 'unverifiableCitation',
-        message: `Candidate ${entry.candidateId} could not be checked for contradiction after ${MAX_UNVERIFIABLE_CONTRADICTION_STREAK} attempts and ships unverified: ${entry.reason}`,
-      });
-    }
+    // Rebuilt wholesale, in lockstep with `latestUnverifiedContradictions` above, from the very same
+    // `stillPending` list — see that field's own doc comment for why the denial counter needs it.
+    latestUnverifiedCauseByCandidate = new Map(stillPending.map((entry) => [entry.candidateId, entry.cause]));
+    // `retireUnverifiableCandidate` is itself the once-per-candidate guard (it checks
+    // `retiredUnverifiableCandidates` before pushing), so re-running this on every later
+    // `passesStale` re-run — which happens whenever a fresh submission arrives during the same
+    // `verifying` phase — is always safe: a candidate this round newly crosses the bound gets its
+    // one limitation; one already retired earlier is a no-op here.
+    for (const entry of newlyCapped) retireUnverifiableCandidate(entry.candidateId, entry.reason, entry.cause);
     // Known-gap closure (task 11.2): `output.contradicted` used to end here, never reaching
     // activity or persistence. It is now recorded for `fireCheckpoint`/`runPersisting` below, and
     // each exclusion becomes its own public `toolFailed` event — `appendActivity`'s existing
@@ -2490,6 +2698,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
             // completion — a refused request is a claim the host disagreed with, not a verdict —
             // and already bounded and sanitized at parse, so nothing untrusted reaches the record.
             if (message.rationale !== undefined && message.rationale.trim() !== '') conclusion = message.rationale.trim();
+          } else if (phase === 'verifying') {
+            // Finding 1's fix: a denial reaches here whether or not the line above's `passesStale`
+            // check just re-ran verification — a model that submits once and then spams
+            // `requestCompletion` with nothing further never sets `passesStale` again, so without
+            // this call the only counter that ever advances (`unverifiedContradictionStreak`) sits
+            // frozen and this identical denial repeats forever. See
+            // `noteContradictionDenialsWithoutProgress`'s own doc comment for the counter this feeds.
+            noteContradictionDenialsWithoutProgress();
           }
           break;
         }

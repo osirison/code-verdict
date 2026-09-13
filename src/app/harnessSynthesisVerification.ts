@@ -92,11 +92,23 @@
  * stage here mutates a candidate's own citation. `harnessAttempt.ts`'s `runSynthesisVerification`
  * is what turns that byte-identical repetition into a bound: after `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`
  * consecutive re-runs report the *same* candidate with the *same* reason, that candidate ships
- * recorded unverifiable-as-cited (a run limitation naming it) and stops being counted against
- * `contradictionPassComplete` — which the host may then report `true` even though this module
- * itself never confirmed that one candidate. Nothing in this module implements or is aware of that
- * bound; it exists so a citation this module can never honestly excerpt does not hold every future
- * completion request hostage forever. See `harnessAttempt.ts`'s own doc comment on the constant.
+ * recorded as retired (a run limitation naming it, under one of two truthful labels — see below) and
+ * stops being counted against `contradictionPassComplete` — which the host may then report `true`
+ * even though this module itself never confirmed that one candidate. Nothing in this module
+ * implements or is aware of that bound, or of the second, denial-counting one that closes an idle
+ * `requestCompletion` spam shape the same way (`harnessAttempt.ts`'s own doc comment on
+ * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` covers both); it exists so a citation this module can
+ * never honestly excerpt, or a verdict that never comes back at all, does not hold every future
+ * completion request hostage forever.
+ *
+ * Every `UnverifiedFindingRecord` this module pushes carries a `cause` alongside its `reason`,
+ * because the two `unverified` push sites below are not the same failure and must not retire under
+ * the same name: `directive.kind === 'unavailable'` (an excerpt that could not be built honestly —
+ * unindexable, unlocatable, or too large a cited span) is `citationUnavailable`, deterministic and
+ * sometimes curable by a narrower resubmission; the exhausted-repair-allowance branch is
+ * `verificationExhausted`, a provider/protocol failure that has nothing to do with the citation and
+ * that no resubmission could fix. `harnessAttempt.ts`'s `CAPPED_CONTRADICTION_LABEL` is what turns
+ * that into the actual limitation code and text a reviewer sees.
  *
 
  * **Malformed-verdict repair budget.** A shared allowance across the whole
@@ -830,7 +842,7 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
     const directive = buildBoundedContradictionDirective(finding, source, context.policy.maxPromptBytesPerTurn);
     if (directive.kind === 'unavailable') {
       complete = false;
-      unverified.push({ candidateId: finding.candidateId, reason: `Contradiction check not performed. ${directive.reason}` });
+      unverified.push({ candidateId: finding.candidateId, reason: `Contradiction check not performed. ${directive.reason}`, cause: 'citationUnavailable' });
       survivors.push(finding);
       continue;
     }
@@ -845,7 +857,7 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
 
     if (verdict === undefined) {
       complete = false;
-      unverified.push({ candidateId: finding.candidateId, reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.' });
+      unverified.push({ candidateId: finding.candidateId, reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.', cause: 'verificationExhausted' });
       survivors.push(finding);
       continue;
     }
