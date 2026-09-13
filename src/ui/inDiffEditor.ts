@@ -17,6 +17,7 @@ import {
   type ModelVisibleWorkspaceRoot,
 } from '../app/modelVisiblePath';
 import { documentCandidates, resolveAnchor } from '../domain/anchor';
+import { escapeMarkdownText } from '../domain/markdownSafety';
 import type { ReviewItem, Verdict } from '../domain/types';
 
 export interface InDiffAnchorTarget {
@@ -187,7 +188,7 @@ export class InDiffEditor {
         author: { name: target.agentLabel },
         body: new vscode.MarkdownString(
           [
-            `**${item.title}**`,
+            `**${escapeMarkdownText(item.title)}**`,
             '',
             item.body,
             item.suggestion
