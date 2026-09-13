@@ -6,20 +6,27 @@ import type {
   AuthMode,
   Connection,
   ConnectionConfig,
+  Credential,
   HostDescriptor,
   ProviderCapabilities,
   ScmProvider,
   Vocabulary,
 } from '../../platform/provider';
-import { bearerToken } from '../../platform/provider';
+import { basicAuthorizationHeaderValue, credentialSecret } from '../../platform/provider';
 import type {
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   CommentOutcome,
   ConnectionStatus,
+  CurrentHeadResult,
   DiffAnchor,
+  IssueDetailRequest,
+  IssueDetailResult,
+  ObjectSourceResult,
   Repository,
   ReviewCommentDraft,
   ReviewSubmission,
@@ -29,6 +36,7 @@ import type {
   SubmitResult,
   WorkItem,
 } from '../../platform/types';
+import { isFetchableObjectSourceUrl } from '../../platform/types';
 import { ScmError, toScmError } from '../../platform/errors';
 import type { FetchLike } from './http';
 import { EtagCache, GitHubHttp, RateBudget, hostOf, isDotCom, splitRepoId } from './http';
@@ -38,22 +46,33 @@ import {
   isRealIssue,
   toCiSummary,
   toChangeRequest,
+  toCheckSummariesFromRollup,
   toCiRun,
   toFileDiff,
+  toNormalizedDetail,
+  toNormalizedDetailFromIssue,
   toRepoGroup,
   toRepository,
   toReviewThread,
+  toThreadNoteFromIssueComment,
   toWorkItem,
+  type GhCompareResult,
   type GhFile,
   type GhIssue,
+  type GhIssueComment,
   type GhOrg,
   type GhPull,
+  type GhPullCommit,
   type GhRepo,
   type GhWorkflowRun,
   type GqlChecksResponse,
+  type GqlRollup,
   type GqlThread,
   type CiSummary,
 } from './mappers';
+
+/** The declared page bound for detail retrieval — self-imposed, since GitHub returns a pull request's detail in one call rather than paginating it. */
+const INVESTIGATION_MANIFEST_PAGE = 100;
 
 const CAPABILITIES: ProviderCapabilities = {
   // ```suggestion blocks render as an applyable "Commit suggestion".
@@ -65,6 +84,22 @@ const CAPABILITIES: ProviderCapabilities = {
   groupHierarchy: true,
   // POST /pulls/{n}/reviews carries the whole review at once.
   batchedReview: true,
+  // D7: the two detail reads, and nothing else. This declaration used to carry
+  // five more — manifests, diff reads, file reads, repository search and diff
+  // search — all read from the Compare API. They are gone, because this
+  // provider is no longer an investigation source at all: everything answerable
+  // from two commits is answered by git, locally, and what the Compare API
+  // actually answered for a 207-file change was 137 files it declined to render
+  // in the byte-identical shape a binary file produces. Repository search was
+  // already declared `supported: false` here — `/search/code` indexes only a
+  // repository's default branch and takes no ref — which is the same gap from
+  // the other end: a forge cannot answer a revision-pinned question about the
+  // repository's own content.
+  detailRetrieval: {
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: INVESTIGATION_MANIFEST_PAGE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -238,11 +273,101 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }`;
 
+/** The same rollup shape as `CHECKS_QUERY`, scoped to one pull request — used by `getChangeRequestDetails` (task 4.6), which needs every check, not just the one worth linking to. */
+const PR_ROLLUP_QUERY = `
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 20) {
+                nodes {
+                  __typename
+                  ... on CheckRun { databaseId name conclusion status permalink summary }
+                  ... on StatusContext { context state targetUrl description }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+
+
+
+/**
+ * The username GitHub wants in the Basic pair for git over HTTPS. The token is
+ * the password half; this is the other one, and it is a fixed sentinel rather
+ * than anybody's login.
+ */
+const GIT_HTTPS_USERNAME = 'x-access-token';
+
+/**
+ * The complete `Authorization` value a `git fetch` against this connection's
+ * repository should carry, or `undefined` when there is no credential to send.
+ *
+ * **The live failure this replaces.** Until 2026-09-09 this composed
+ * `Bearer ${token}`, the same scheme `http.ts` uses for the REST API. A review
+ * of `osirison/code-verdict!66` stopped with "A local object store could not
+ * serve this change (The object source would not authorize this fetch with the
+ * credential this connection has for it.)": GitHub's git-over-HTTPS smart
+ * protocol does not accept a bearer token, so it ignored the header, git fell
+ * through to askpass, and prompting is disabled by design D7 — the fetch died
+ * at the challenge without ever asking for an object.
+ *
+ * **Measured, 2026-09-09**, against `https://github.com/osirison/code-verdict.git`
+ * with a real `gho_` token, fetching a bare commit id with the value supplied
+ * as `http.extraHeader` exactly as the invocation supplies it:
+ *
+ *     Authorization: Bearer <token>                        -> exit 128, askpass fallthrough
+ *     Authorization: Basic base64("x-access-token:<token>") -> exit 0, fetch succeeds
+ *     Authorization: Basic base64("<token>:x-oauth-basic")  -> exit 0, fetch succeeds
+ *
+ * **Why the first of the two working forms.** It is the one GitHub documents
+ * for HTTPS git access — `git clone https://x-access-token:TOKEN@github.com/owner/repo.git`
+ * (docs.github.com, "Authenticating as a GitHub App installation", read
+ * 2026-09-11) — while `x-oauth-basic` is the older OAuth-only spelling. And it
+ * puts the secret in the password half of the pair: the username half is the
+ * half that gets echoed into diagnostics and proxy logs when a `user@host` URL
+ * is reconstructed anywhere, and a secret is better off in the half nothing
+ * treats as a name.
+ *
+ * Both credential kinds send the same form. GitHub authenticates a personal
+ * access token and an editor session token identically here; only how they were
+ * obtained and how they recover from a 401 differ, which is the distinction
+ * `Credential` exists for and not one this header knows about.
+ *
+ * A connection with no credential gets no header at all, rather than one with
+ * an empty token in it: `Basic base64("x-access-token:")` is a credential a
+ * remote can reject in its own way, and "no credential" must be
+ * indistinguishable from never having been asked for one.
+ */
+function gitAuthorizationHeaderValue(credential: Credential): string | undefined {
+  const secret = credentialSecret(credential);
+  return secret === '' ? undefined : basicAuthorizationHeaderValue(GIT_HTTPS_USERNAME, secret);
+}
+
 export class GitHubConnection implements Connection {
   constructor(
     private readonly http: GitHubHttp,
     /** The connected instance's host, for validating pasted source URLs. */
     private readonly instanceHost: string,
+    /**
+     * The pod's credential, held for one purpose only: composing the
+     * `Authorization` header value in `getObjectSource`'s descriptor
+     * (`add-local-git-investigation` task 2.4), so a source that fetches git
+     * objects itself can authenticate as this connection does. Every API call
+     * this class makes still authenticates through `http`, which holds its own
+     * copy; this one never reaches a URL, a log line or an error string
+     * (`src/providers/objectSourceCredential.test.ts`).
+     */
+    private readonly credential: Credential,
   ) {}
 
   private repoPath(repoId: string): string {
@@ -252,6 +377,157 @@ export class GitHubConnection implements Connection {
 
   private prPath(ref: ChangeRequestRef): string {
     return `${this.repoPath(ref.repoId)}/pulls/${encodeURIComponent(ref.number)}`;
+  }
+
+  // ---- the Compare API, for the merge base only ---------------------------
+  //
+  // `GET /repos/{owner}/{repo}/compare/{base}...{head}` used to back five
+  // review-investigation operations here. All five are gone; what is left is
+  // `getChangeRequestDiff`'s read of `merge_base_commit.sha`, which is a
+  // scalar field the response carries regardless of how much of its file list
+  // it truncated. The truncation is exactly why the file list is no longer
+  // read: on the measured 207-file change this endpoint returned 137 ordinary
+  // TypeScript files with `patch` absent and every count zero.
+
+  private async compare(repoId: string, baseSha: string, headSha: string): Promise<GhCompareResult | undefined> {
+    try {
+      return await this.http.get<GhCompareResult>(
+        `${this.repoPath(repoId)}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+      );
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') return undefined;
+      throw e;
+    }
+  }
+
+  private async checkRollupForPull(ref: ChangeRequestRef): Promise<GqlRollup | null | undefined> {
+    const { owner, repo } = splitRepoId(ref.repoId);
+    try {
+      const data = await this.http.graphql<{
+        repository?: {
+          pullRequest?: { commits?: { nodes?: Array<{ commit?: { statusCheckRollup?: GqlRollup | null } } | null> } } | null;
+        } | null;
+      }>(PR_ROLLUP_QUERY, { owner, repo, number: Number(ref.number) });
+      return data.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+    } catch {
+      // Checks are decoration on the detail; a repository whose checks cannot be read must still return the rest.
+      return undefined;
+    }
+  }
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    const { snapshot } = request;
+    const ref: ChangeRequestRef = { repoId: snapshot.repoId, number: request.number };
+    let pull: GhPull;
+    try {
+      pull = await this.http.get<GhPull>(this.prPath(ref));
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+      }
+      throw e;
+    }
+    const [commits, threads, rollup] = await Promise.all([
+      this.http.getAll<GhPullCommit>(`${this.prPath(ref)}/commits`),
+      this.fetchThreads(ref),
+      this.checkRollupForPull(ref),
+    ]);
+    const discussion = threads.flatMap((thread) => toReviewThread(ref, thread).notes);
+    return {
+      snapshot,
+      state: 'complete',
+      value: toNormalizedDetail(pull, commits, discussion, toCheckSummariesFromRollup(rollup)),
+    };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    const { snapshot } = request;
+    const issuePath = `${this.repoPath(request.issueRepoId)}/issues/${encodeURIComponent(request.issueNumber)}`;
+    let issue: GhIssue;
+    try {
+      issue = await this.http.get<GhIssue>(issuePath);
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') {
+        return { snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+      }
+      throw e;
+    }
+    const comments = await this.http.getAll<GhIssueComment>(`${issuePath}/comments`);
+    return { snapshot, state: 'complete', value: toNormalizedDetailFromIssue(issue, comments.map(toThreadNoteFromIssueComment)) };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    try {
+      const pull = await this.http.get<GhPull>(this.prPath(ref));
+      return { repoId: ref.repoId, state: 'resolved', headSha: pull.head.sha };
+    } catch (e) {
+      if (toScmError(e).kind === 'notFound') return { repoId: ref.repoId, state: 'notFound' };
+      throw e;
+    }
+  }
+
+  /**
+   * Where a source that computes diffs itself may fetch this repository's git
+   * objects (`add-local-git-investigation` design.md D2/D8, task 2.4).
+   *
+   * The location comes from GitHub's own `clone_url` rather than being
+   * composed from the host and the repository id. Composing it would be a
+   * guess that happens to be right today for both github.com and an
+   * enterprise host, and a guess about where to send a credential is not one
+   * worth making; `html_url` + `.git` is the fallback for a response that
+   * omits the field, which is the same value by GitHub's own construction.
+   * The request is a conditional GET like every other, so repeating it across
+   * members of one changeset costs nothing against the rate limit.
+   *
+   * The ref hint is `refs/pull/{n}/head`: the ref GitHub keeps for a pull
+   * request's head even after a force-push leaves that commit unreachable
+   * from any branch. Composing it is this provider's job and it stays here —
+   * the descriptor hands it over as an opaque string, and nothing above the
+   * provider boundary learns that such a ref exists (design.md D8).
+   *
+   * Every failure answers `unavailable` rather than throwing: the caller's
+   * question is "can objects be obtained", and the answer to no is that this
+   * repository cannot be reviewed and the reason says why. There is no forge
+   * fallback behind it any more — this provider serves no investigation — so
+   * an unavailable descriptor ends the attempt rather than routing it
+   * somewhere else. The reason names the neutral error kind only, never
+   * GitHub's own message, which is a channel a credential could ride out on.
+   */
+  async getObjectSource(ref: ChangeRequestRef): Promise<ObjectSourceResult> {
+    let repo: GhRepo;
+    try {
+      repo = await this.http.get<GhRepo>(this.repoPath(ref.repoId));
+    } catch (e) {
+      return { state: 'unavailable', reason: `The repository's object location could not be read (${toScmError(e).kind}).` };
+    }
+    const fetchUrl = repo.clone_url ?? `${repo.html_url}.git`;
+    if (!isFetchableObjectSourceUrl(fetchUrl)) {
+      return { state: 'unavailable', reason: 'The repository reports no ordinary HTTP or HTTPS clone location.' };
+    }
+    // The branch this pull request targets, which is what the merge base is
+    // computed against locally. It is a fact about the pull request and lives
+    // nowhere in the repository's own objects, so it is exactly the kind of
+    // thing this connection is still asked for — and one request answers it,
+    // against the endpoint that already exists here.
+    let target: string | undefined;
+    try {
+      target = (await this.http.get<GhPull>(this.prPath(ref))).base.ref;
+    } catch {
+      // Left absent rather than guessed. A default-branch fallback would look
+      // right almost always and quietly review the wrong pair of commits for a
+      // pull request that targets a release branch.
+      target = undefined;
+    }
+    const authorization = gitAuthorizationHeaderValue(this.credential);
+    return {
+      state: 'available',
+      descriptor: {
+        fetchUrl,
+        ...(authorization === undefined ? {} : { authorizationHeaderValue: authorization }),
+        refHint: `refs/pull/${ref.number}/head`,
+        ...(target === undefined ? {} : { mergeTargetRef: `refs/heads/${target}` }),
+      },
+    };
   }
 
   async testConnection(): Promise<ConnectionStatus> {
@@ -414,11 +690,46 @@ export class GitHubConnection implements Connection {
     return perRepo.flat();
   }
 
+  /**
+   * `baseSha` is the merge base, and getting it costs the third request below
+   * (`add-local-git-investigation` task 5.1, design.md D4).
+   *
+   * It used to be `pull.base.sha`, which is the *current tip of the target
+   * branch*. A commit landing on `main` while a review is in flight silently
+   * changed what "base" meant for that review: a resumed attempt compared
+   * against a different commit than the one it started from, and evidence
+   * already cited was relabelled as evidence against a pair of commits it was
+   * never computed over. The merge base does not move unless the change
+   * request itself is rebased.
+   *
+   * The file list below never had this problem — `/pulls/{n}/files` has always
+   * returned the merge-base-to-head diff. Only the reported base disagreed
+   * with the files it was supposed to describe.
+   *
+   * `GET /pulls/{n}` carries no merge base at all, so this reads the Compare
+   * API through the same private helper the investigation operations use. One
+   * added request per call; the response is a 304 from the second call onward
+   * (`GitHubHttp` sends every GET conditionally), which GitHub does not charge
+   * against the rate limit.
+   *
+   * A comparison that does not resolve, or resolves without a merge base,
+   * throws. Falling back to `pull.base.sha` would be the original defect with
+   * a new name — a target-branch tip reported as a merge base, undetectably.
+   */
   async getChangeRequestDiff(ref: ChangeRequestRef): Promise<ChangeRequestDiff> {
     const pull = await this.http.get<GhPull>(this.prPath(ref));
     const files = await this.http.getAll<GhFile>(`${this.prPath(ref)}/files`);
+    const compared = await this.compare(ref.repoId, pull.base.sha, pull.head.sha);
+    if (!compared) {
+      throw new ScmError('notFound', `Cannot determine the base revision: comparing ${pull.base.sha}...${pull.head.sha} in ${ref.repoId} resolved to nothing.`);
+    }
+    const mergeBase = compared.merge_base_commit?.sha;
+    if (mergeBase === undefined || mergeBase === '') {
+      throw new ScmError('unknown', `Cannot determine the base revision: the comparison of ${pull.base.sha}...${pull.head.sha} in ${ref.repoId} carried no merge base.`);
+    }
     return {
       ref,
+      baseSha: mergeBase,
       headSha: pull.head.sha,
       files: files.map(toFileDiff),
       // Opaque to the platform layer: GitHub needs one commit id where GitLab
@@ -533,14 +844,38 @@ export class GitHubConnection implements Connection {
       commit_id: commitIdOf(submission.comments[0]?.anchor),
     });
 
-    const threadIds = await this.threadIdsForReview(ref, review?.id, submission.comments.length);
+    const { threadIds, confirmedCount } = await this.threadIdsForReview(
+      ref, review?.id, submission.comments.length,
+    );
 
     return {
-      comments: submission.comments.map((comment, index) => ({
-        key: comment.key,
-        ok: true,
-        threadId: threadIds[index],
-      })),
+      comments: submission.comments.map((comment, index) => {
+        // `confirmedCount` is how many comments the review's own comments
+        // endpoint actually lists — undefined when that lookup itself failed
+        // (network, GraphQL down), in which case there is nothing to compare
+        // against and the historical "the POST succeeded, trust it" behaviour
+        // holds. But when the lookup succeeded and came back short, GitHub
+        // silently dropped part of the batch without failing the POST at all
+        // — the endpoint's atomicity is not actually guaranteed for every
+        // position — and claiming `ok: true` for a comment nobody can prove
+        // exists is exactly the false success this exists to rule out.
+        // Matched by index into creation order, per `threadIdsForReview`'s own
+        // doc comment; the endpoint is documented all-or-nothing, so a real
+        // mismatch should be rare and it is unclear which submitted comment(s)
+        // a partial drop would correspond to. Reporting the numeric tail
+        // (rather than guessing which middle entry vanished) risks flagging an
+        // early comment that did land as failed, which would duplicate it if
+        // the retry re-posts it standalone — accepted here as the safer
+        // failure mode than the blanket `ok: true` this replaces.
+        if (confirmedCount !== undefined && index >= confirmedCount) {
+          return {
+            key: comment.key,
+            ok: false,
+            error: new ScmError('unknown', 'GitHub did not confirm this comment was created in the review'),
+          };
+        }
+        return { key: comment.key, ok: true, threadId: threadIds[index] };
+      }),
       // Only the user's own summary counts as posted. A verdict-only review
       // carries canned text because GitHub demands a body — reporting that as
       // "your summary landed" would be a lie the UI then repeats.
@@ -642,23 +977,37 @@ export class GitHubConnection implements Connection {
    * Thread ids for the comments a batched review just created, in the order
    * they were submitted. GitHub returns them from the review's own comments
    * endpoint in creation order, which is the order they were sent.
+   *
+   * `confirmedCount` is `posted.length` — how many comments that endpoint
+   * actually lists under the review — whenever the lookup itself succeeds,
+   * regardless of whether the GraphQL thread-id resolution nested inside it
+   * also succeeded (that failure is independently degraded, never wrong: an
+   * absent thread id just makes the panel fall back to "threads you
+   * started"). It is `undefined` only when the comments-listing call itself
+   * threw, i.e. this function genuinely does not know how many landed —
+   * `submitAsOneReview` must not read a short `threadIds` array as a
+   * dropped-comment signal in that case, only when the count is a real,
+   * fetched number smaller than `expected`.
    */
   private async threadIdsForReview(
     ref: ChangeRequestRef,
     reviewId: number | undefined,
     expected: number,
-  ): Promise<Array<string | undefined>> {
-    if (reviewId === undefined || expected === 0) return [];
+  ): Promise<{ threadIds: Array<string | undefined>; confirmedCount?: number }> {
+    if (reviewId === undefined || expected === 0) return { threadIds: [] };
     try {
       const posted = await this.http.getAll<{ id: number }>(
         `${this.prPath(ref)}/reviews/${reviewId}/comments`,
       );
       const byCommentId = await this.threadIdsByCommentId(ref);
-      return posted.slice(0, expected).map((comment) => byCommentId.get(comment.id));
+      return {
+        threadIds: posted.slice(0, expected).map((comment) => byCommentId.get(comment.id)),
+        confirmedCount: posted.length,
+      };
     } catch {
       // Degraded, never wrong: an absent thread id makes the panel fall back to
       // "threads you started" rather than matching against a bogus id.
-      return [];
+      return { threadIds: [] };
     }
   }
 
@@ -783,11 +1132,12 @@ export function createGitHubProvider(fetchImpl?: FetchLike, now?: () => number):
     },
     connect(config: ConnectionConfig): Connection {
       return new GitHubConnection(
-        new GitHubHttp(config.instanceUrl, bearerToken(config.credential), fetchImpl, now, etags, {
+        new GitHubHttp(config.instanceUrl, credentialSecret(config.credential), fetchImpl, now, etags, {
           budget,
           intent: config.intent,
         }),
         hostOf(config.instanceUrl),
+        config.credential,
       );
     },
   };

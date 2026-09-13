@@ -420,25 +420,64 @@ describe('changeset scope in the sidebar (spec §15)', () => {
 
 /**
  * Reviews in flight, shown whatever screen the sidebar is on. A background run
- * the reviewer cannot see is a run they will not know finished.
+ * the reviewer cannot see is a run they will not know finished. Task 14.3
+ * (design.md D14): every field here is the same compact projection data the
+ * active review screen reads, never a second sidebar-local notion of state.
  */
 describe('the active-run list', () => {
-  it('lists each run with its elapsed time and a way to cancel it', () => {
+  it('lists each run with its lifecycle, elapsed time, and a way to cancel it', () => {
     const html = renderSidebarHtml({
       ...state,
       activeRuns: [
-        { key: '9101!2841', label: '!2841', state: 'running', elapsedMs: 42_000 },
-        { key: '9101!2900', label: '!2900', state: 'queued', elapsedMs: 3_000 },
+        { key: '9101!2841', label: '!2841', lifecycle: 'investigating', elapsedMs: 42_000, progressMode: 'indeterminate', attention: 'none' },
+        { key: '9101!2900', label: '!2900', lifecycle: 'queued', elapsedMs: 3_000, progressMode: 'indeterminate', attention: 'none' },
       ],
     }, 'nonce123');
     expect(html).toContain('Running · 1 of 2');
     expect(html).toContain('!2841');
+    expect(html).toContain('Investigating');
     // A stopwatch, not a duration phrase.
     expect(html).toContain('0:42');
     // A queued run says so instead of showing a clock for work not started.
     expect(html).toContain('queued');
     expect(html).toContain('data-cancel-run="9101!2841"');
     expect(html).toContain('data-cancel-run="9101!2900"');
+  });
+
+  it('shows the current public action next to the lifecycle', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: '!1', lifecycle: 'investigating', currentAction: 'Reading src/auth/token.ts',
+        elapsedMs: 0, progressMode: 'indeterminate', attention: 'none',
+      }],
+    }, 'nonce123');
+    expect(html).toContain('Investigating — Reading src/auth/token.ts');
+  });
+
+  it('shows a real fraction once a denominator exists, never a fabricated percentage', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: '!1', lifecycle: 'investigating',
+        elapsedMs: 90_000, progressMode: 'determinate', progressUnits: { completed: 5, total: 20 }, attention: 'none',
+      }],
+    }, 'nonce123');
+    expect(html).toContain('5/20');
+    // Elapsed time yields to the real fraction once one exists.
+    expect(html).not.toContain('1:30');
+  });
+
+  it('marks a run that needs reviewer attention', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: '!1', lifecycle: 'paused', currentAction: 'Waiting on a rate limit',
+        elapsedMs: 0, progressMode: 'indeterminate', attention: 'attentionRequired',
+      }],
+    }, 'nonce123');
+    expect(html).toContain('run-row-attention');
+    expect(html).toContain('Paused');
   });
 
   it('renders nothing at all when no review is running', () => {
@@ -457,7 +496,7 @@ describe('the active-run list', () => {
   it('formats a run past a minute as minutes and seconds', () => {
     const html = renderSidebarHtml({
       ...state,
-      activeRuns: [{ key: 'k', label: '!1', state: 'running', elapsedMs: 727_000 }],
+      activeRuns: [{ key: 'k', label: '!1', lifecycle: 'investigating', elapsedMs: 727_000, progressMode: 'indeterminate', attention: 'none' }],
     }, 'nonce123');
     expect(html).toContain('12:07');
   });
@@ -465,10 +504,54 @@ describe('the active-run list', () => {
   it('escapes a label rather than letting a change request title reach the DOM', () => {
     const html = renderSidebarHtml({
       ...state,
-      activeRuns: [{ key: 'k', label: '<img src=x onerror=alert(1)>', state: 'running', elapsedMs: 0 }],
+      activeRuns: [{
+        key: 'k', label: '<img src=x onerror=alert(1)>', lifecycle: 'investigating',
+        elapsedMs: 0, progressMode: 'indeterminate', attention: 'none',
+      }],
     }, 'nonce123');
     expect(html).not.toContain('<img src=x');
     expect(html).toContain('&lt;img');
+  });
+
+  it('escapes a current action rather than letting model-derived text reach the DOM', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: '!1', lifecycle: 'investigating', currentAction: '<img src=x onerror=alert(1)>',
+        elapsedMs: 0, progressMode: 'indeterminate', attention: 'none',
+      }],
+    }, 'nonce123');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('truncates a long label and a long current action with CSS rather than breaking the row', () => {
+    // Long text stays in the markup, in full — layout safety is the
+    // stylesheet's job (`.run-label`/`.run-action`: overflow hidden,
+    // ellipsis, no wrap), never truncated text or a JS length cap.
+    const longLabel = 'A'.repeat(200);
+    const longAction = 'Reading a very deeply nested path in a monorepo/'.repeat(6);
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: longLabel, lifecycle: 'investigating', currentAction: longAction,
+        elapsedMs: 0, progressMode: 'indeterminate', attention: 'none',
+      }],
+    }, 'nonce123');
+    expect(html).toContain(longLabel);
+    expect(html).toContain('run-label');
+    expect(html).toContain('run-action');
+  });
+
+  it('writes no inline style attribute in the active-run list', () => {
+    const html = renderSidebarHtml({
+      ...state,
+      activeRuns: [{
+        key: 'k', label: '!1', lifecycle: 'investigating', currentAction: 'Reading files',
+        elapsedMs: 0, progressMode: 'determinate', progressUnits: { completed: 1, total: 4 }, attention: 'attentionRequired',
+      }],
+    }, 'nonce123');
+    expect(html).not.toContain('style="');
   });
 });
 

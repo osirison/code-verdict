@@ -178,6 +178,11 @@ function fakeRuns(): ReviewRunManager {
     acknowledge: vi.fn(),
     cancel: vi.fn(),
     trigger: vi.fn(),
+    // Task 14.6: the review screen reads its pause/resume/cancel controls
+    // from the manager on every render. No row here drives a live run, so
+    // there is nothing to pause, resume or cancel — matching what
+    // `deriveRunControls` itself returns for no live record and no stored run.
+    controlsFor: vi.fn(() => ({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false })),
   } as unknown as ReviewRunManager;
 }
 

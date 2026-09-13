@@ -4,12 +4,108 @@
  * provider contract exercises. No sockets — just a FetchLike.
  */
 import { loadSpecFixtures } from '../../testing/specFixtures';
+import { linesFromUnifiedDiff } from './mappers';
 import type { FetchLike, FetchResponseLike } from './http';
 
 export interface FakeGitLabOptions {
   /** 1-based index of the discussion POST that fails with a stale-anchor 400. */
   failDiscussionPostAt?: number;
+  /**
+   * Every detail-retrieval route fails with the neutral rate-limited error.
+   *
+   * It used to cover the compare, file and search routes too, because those
+   * backed the provider's five investigation operations. Those operations are
+   * gone; what is left for a rate limit to hit is the merge request's own
+   * detail, its discussions and a linked issue's.
+   */
+  investigationRateLimited?: boolean;
+  /**
+   * A target branch that moves while the review is in flight (task 5.6).
+   *
+   * GitLab keeps both commits in one place: `diff_refs.start_sha` is the
+   * target-branch commit the diff was started from, and `diff_refs.base_sha`
+   * is the merge base. They are the same commit in the spec fixture, which is
+   * the ordinary case and also the one where reading the wrong one cannot be
+   * caught — so this option moves `start_sha` and leaves `base_sha` alone.
+   *
+   * Mutable on purpose, exactly as the GitHub fake's is: a branch advancing
+   * mid-review is only observable through one `Connection` making two calls.
+   */
+  targetBranch?: { tip: string };
 }
+
+// ---- git over HTTPS ------------------------------------------------------------------
+
+/** The credential a GitLab instance would accept for git over HTTPS, as the instance itself knows it. */
+export interface FakeGitLabGitCredential {
+  /** The token. GitLab reads it out of the *password* half of the pair and nowhere else. */
+  readonly token: string;
+  /**
+   * True when the instance issued this as an OAuth access token — the editor
+   * session credential (`Credential` kind `session`) rather than a personal
+   * access token. It is what pins the username to `oauth2`.
+   */
+  readonly oauth?: boolean;
+}
+
+/**
+ * Whether GitLab's git-over-HTTPS endpoints would accept this `Authorization`
+ * header value for this credential.
+ *
+ * **The live failure this exists to catch** is the one
+ * `../github/fakeGitHub.ts` records at length: the object-source descriptor
+ * composed `Authorization: Bearer <token>`, which is right for the REST API
+ * and wrong for git, and no test could fail because every fake accepted every
+ * header. That header is `getObjectSource`'s only output that a test in this
+ * repository cannot check against the thing that has to accept it.
+ *
+ * **What GitLab accepts, and where it comes from.** Read, not measured — no
+ * GitLab instance was available to measure against, and that distinction is
+ * the point of stating it here:
+ *
+ * - Git over HTTPS is HTTP Basic, and the token goes in the password half.
+ *   GitLab never reads a token out of the username half, which is one real
+ *   difference from GitHub and the reason this function is not a copy of that
+ *   one.
+ * - Personal access token — *confirmed, documentation*: "The `username` in the
+ *   `clone` command: Can be any string value. Must not be an empty string."
+ *   (docs.gitlab.com, "Personal access tokens", read 2026-09-11.)
+ * - OAuth access token — *documented as `oauth2`*
+ *   (`https://oauth2:<token>@gitlab.example.com/…`, docs.gitlab.com, "OAuth 2.0
+ *   identity provider API"). *Inferred, not confirmed*: `lib/gitlab/auth.rb` on
+ *   master today reaches `oauth_access_token_check(password)`, which takes no
+ *   login and so cannot inspect one, but older releases took `(login,
+ *   password)` and required `login == "oauth2"`. A self-managed instance can be
+ *   any release, so `oauth2` is the only username documented to work on every
+ *   one of them, and this fake requires it for an OAuth credential.
+ *
+ * **Limits.** `fakeGitHub.ts`'s limits apply unchanged — one line held, not a
+ * claim that everything accepted here works — and this one carries a further
+ * limit that the GitHub fake does not: its rules were read out of documents
+ * and source rather than measured against a running instance, so it can only
+ * be as right as those documents were on the day they were read, and a GitLab
+ * release can move them without anything here going red.
+ */
+export function gitLabAcceptsGitAuthorization(headerValue: string | undefined, credential: FakeGitLabGitCredential): boolean {
+  const credentials = basicCredentials(headerValue);
+  if (credentials === undefined) return false;
+  if (credentials.secret !== credential.token) return false;
+  if (credentials.username === '') return false;
+  return credential.oauth !== true || credentials.username === 'oauth2';
+}
+
+/** RFC 7617 `Basic` credentials, or `undefined` for any other scheme — `Bearer` included, which is the whole point. */
+function basicCredentials(headerValue: string | undefined): { readonly username: string; readonly secret: string } | undefined {
+  const match = /^Basic ([A-Za-z0-9+/]+={0,2})$/.exec(headerValue ?? '');
+  if (match === null) return undefined;
+  const decoded = Buffer.from(match[1] as string, 'base64').toString('utf8');
+  const separator = decoded.indexOf(':');
+  if (separator === -1) return undefined;
+  return { username: decoded.slice(0, separator), secret: decoded.slice(separator + 1) };
+}
+
+/** Where `main` gets to when a commit lands on it mid-review — see `FakeGitLabOptions.targetBranch`. */
+export const ADVANCED_TARGET_BRANCH_SHA = 'b7d4f16c8e2a90b3d5f7091a2c4e6b8d0f2a4c61';
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): FetchResponseLike {
   return {
@@ -23,7 +119,18 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
 
 const PROJECTS = [
   { id: 9101, path_with_namespace: 'hve/platform/core', name: 'core', web_url: 'https://gitlab.example/hve/platform/core' },
-  { id: 9102, path_with_namespace: 'hve/platform/auth-service', name: 'auth-service', web_url: 'https://gitlab.example/hve/platform/auth-service' },
+  // The one project here that reports its own `http_url_to_repo`, on a
+  // different host than its web URL — the self-managed shape the field exists
+  // for. `getObjectSource` (`add-local-git-investigation` task 2.4) must take
+  // it as given rather than composing a location from `web_url`, which the
+  // other four projects still exercise as the fallback.
+  {
+    id: 9102,
+    path_with_namespace: 'hve/platform/auth-service',
+    name: 'auth-service',
+    web_url: 'https://gitlab.example/hve/platform/auth-service',
+    http_url_to_repo: 'https://git.gitlab.example/hve/platform/auth-service.git',
+  },
   { id: 9103, path_with_namespace: 'hve/platform/api-gateway', name: 'api-gateway', web_url: 'https://gitlab.example/hve/platform/api-gateway' },
   { id: 9104, path_with_namespace: 'hve/platform/billing', name: 'billing', web_url: 'https://gitlab.example/hve/platform/billing' },
   { id: 9105, path_with_namespace: 'hve/platform/notifications', name: 'notifications', web_url: 'https://gitlab.example/hve/platform/notifications' },
@@ -31,10 +138,36 @@ const PROJECTS = [
 
 const GROUP = { id: 4821, full_path: 'hve/platform', name: 'Platform' };
 
+/** Same content the `/changes` route below hands out — kept as one literal so `/compare` and `/changes` describe the same snapshot. */
+const TOKEN_TS_DIFF =
+  '@@ -63,1 +63,1 @@\n-      logger.error(\'refresh failed\')\n+      logger.error(`refresh failed ${this.refreshToken}`)\n';
+const AUTH_SPEC_DIFF = "@@ -10,1 +10,2 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n";
+const LOGO_BINARY_DIFF = 'Binary files a/assets/logo.png and b/assets/logo.png differ';
+/** Strictly older than !2841's own base/head — proves a pinned read never substitutes the branch tip (task 3.7). */
+const PRIOR_BASE_SHA = 'prior-base-1';
+const PRIOR_HEAD_SHA = 'prior-head-1';
+const PRIOR_FILE_DIFF = '@@ -1,1 +1,1 @@\n-old\n+older\n';
+
+const LINKED_ISSUE = {
+  id: 500001,
+  iid: 1180,
+  project_id: 9101,
+  title: 'Support refresh envelope',
+  description: 'Needs the retry envelope from !2841.',
+  state: 'opened',
+  labels: ['backend'],
+  assignees: [],
+  milestone: null,
+  updated_at: '2026-07-20T00:00:00.000Z',
+  web_url: 'https://gitlab.example/hve/platform/core/-/issues/1180',
+};
+
 export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
   const fixtures = loadSpecFixtures();
   const mr = fixtures.gitlabMergeRequest as Record<string, unknown>;
   const diffRefs = mr.diff_refs as Record<string, string>;
+  const baseSha = diffRefs.base_sha ?? '';
+  const headSha = diffRefs.head_sha ?? '';
   const discussions = (fixtures.discussionsResponse as { discussions: unknown[] }).discussions;
 
   let discussionPosts = 0;
@@ -69,23 +202,85 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
     }
 
     const mrBase = '/api/v4/projects/9101/merge_requests/2841';
+    if (opts.investigationRateLimited && /^\/api\/v4\/projects\/9101\/(merge_requests\/2841(\/|$)|issues\/1180)/.test(path)) {
+      return json(429, { message: '429 Too Many Requests' }, { 'retry-after': '30' });
+    }
     if (route === `GET ${mrBase}/changes`) {
       return json(200, {
-        diff_refs: diffRefs,
+        // Read at request time, not at construction: the point of the option
+        // is that the branch moves between two calls on one connection.
+        diff_refs: opts.targetBranch ? { ...diffRefs, start_sha: opts.targetBranch.tip } : diffRefs,
         changes: [
-          {
-            old_path: 'src/auth/token.ts',
-            new_path: 'src/auth/token.ts',
-            diff: '@@ -63,1 +63,1 @@\n-      logger.error(\'refresh failed\')\n+      logger.error(`refresh failed ${this.refreshToken}`)\n',
-          },
-          {
-            old_path: 'test/auth.spec.ts',
-            new_path: 'test/auth.spec.ts',
-            diff: "@@ -10,1 +10,2 @@\n describe('token', () => { /* happy path only */ })\n+  it.todo('401 -> refresh path')\n",
-          },
+          { old_path: 'src/auth/token.ts', new_path: 'src/auth/token.ts', diff: TOKEN_TS_DIFF },
+          { old_path: 'test/auth.spec.ts', new_path: 'test/auth.spec.ts', diff: AUTH_SPEC_DIFF },
         ],
       });
     }
+    if (route === `GET ${mrBase}`) return json(200, mr);
+    if (route === `GET ${mrBase}/commits`) {
+      return json(200, [
+        { id: headSha, short_id: headSha.slice(0, 8), title: 'Refactor token refresh', message: 'Refactor token refresh', author_name: 'You' },
+      ]);
+    }
+    if (route === 'GET /api/v4/projects/9101/repository/compare') {
+      const from = parsed.searchParams.get('from');
+      const to = parsed.searchParams.get('to');
+      if (from === baseSha && to === headSha) {
+        return json(200, {
+          commits: [{ id: to, short_id: to.slice(0, 8), title: 'Refactor token refresh', message: 'Refactor token refresh', author_name: 'You' }],
+          diffs: [
+            { old_path: 'src/auth/token.ts', new_path: 'src/auth/token.ts', diff: TOKEN_TS_DIFF, new_file: false, renamed_file: false, deleted_file: false, too_large: false },
+            { old_path: 'test/auth.spec.ts', new_path: 'test/auth.spec.ts', diff: AUTH_SPEC_DIFF, new_file: false, renamed_file: false, deleted_file: false, too_large: false },
+            { old_path: 'assets/logo.png', new_path: 'assets/logo.png', diff: LOGO_BINARY_DIFF, new_file: true, renamed_file: false, deleted_file: false, too_large: false },
+            { old_path: 'package-lock.json', new_path: 'package-lock.json', diff: '', new_file: false, renamed_file: false, deleted_file: false, too_large: true },
+          ],
+          compare_timeout: false,
+          compare_same_ref: false,
+        });
+      }
+      if (from === PRIOR_BASE_SHA && to === PRIOR_HEAD_SHA) {
+        return json(200, {
+          commits: [],
+          diffs: [{ old_path: 'src/legacy/old.ts', new_path: 'src/legacy/old.ts', diff: PRIOR_FILE_DIFF, new_file: false, renamed_file: false, deleted_file: false, too_large: false }],
+          compare_timeout: false,
+          compare_same_ref: false,
+        });
+      }
+      return json(404, { message: '404 Commit Not Found' });
+    }
+    const filesMatch = path.match(/^\/api\/v4\/projects\/9101\/repository\/files\/(.+)$/);
+    if (method === 'GET' && filesMatch) {
+      const filePath = decodeURIComponent(filesMatch[1] as string);
+      const ref = parsed.searchParams.get('ref');
+      if (ref !== baseSha && ref !== headSha) return json(404, { message: '404 Commit Not Found' });
+      if (filePath === 'assets/logo.png') {
+        const content = Buffer.from([0, 1, 2, 3, 0]).toString('base64');
+        return json(200, { file_name: 'logo.png', file_path: filePath, size: 5, encoding: 'base64', content, content_sha256: 'x', ref, blob_id: 'x', commit_id: 'x', last_commit_id: 'x' });
+      }
+      if (filePath === 'src/auth/token.ts') {
+        const text = linesFromUnifiedDiff(TOKEN_TS_DIFF).join('\n');
+        const content = Buffer.from(text, 'utf8').toString('base64');
+        return json(200, { file_name: 'token.ts', file_path: filePath, size: text.length, encoding: 'base64', content, content_sha256: 'x', ref, blob_id: 'x', commit_id: 'x', last_commit_id: 'x' });
+      }
+      return json(404, { message: '404 File Not Found' });
+    }
+    if (route === 'GET /api/v4/projects/9101/search') {
+      const scope = parsed.searchParams.get('scope');
+      const search = parsed.searchParams.get('search') ?? '';
+      const ref = parsed.searchParams.get('ref') ?? '';
+      if (scope !== 'blobs') return json(400, { message: '400 Bad Request' });
+      const matches = linesFromUnifiedDiff(TOKEN_TS_DIFF)
+        .map((line, index) => ({ line, index }))
+        .filter(({ line }) => search !== '' && line.includes(search));
+      return json(
+        200,
+        matches.map(({ line, index }) => ({
+          basename: 'token', data: line, path: 'src/auth/token.ts', filename: 'src/auth/token.ts', ref, startline: index + 1, project_id: 9101,
+        })),
+      );
+    }
+    if (route === 'GET /api/v4/projects/9101/issues/1180') return json(200, LINKED_ISSUE);
+    if (route === 'GET /api/v4/projects/9101/issues/1180/discussions') return json(200, []);
     if (route === `POST ${mrBase}/discussions`) {
       discussionPosts += 1;
       if (discussionPosts === opts.failDiscussionPostAt) {
@@ -114,7 +309,7 @@ export function makeFakeGitLabFetch(opts: FakeGitLabOptions = {}): FetchLike {
         {
           id: 90412,
           status: 'success',
-          sha: diffRefs.head_sha,
+          sha: headSha,
           ref: 'feat/auth-refresh',
           web_url: 'https://gitlab.example/hve/platform/core/-/pipelines/90412',
         },

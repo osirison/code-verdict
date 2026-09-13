@@ -24,7 +24,14 @@ export interface DashboardRow {
   branch: string;
   project: string;
   scope: RowScope;
-  ai: { label: string; cls: 'pill-warn' | 'pill-bad' | 'pill-ok' | 'pill-agent' | 'pill' };
+  ai: {
+    label: string;
+    cls: 'pill-warn' | 'pill-bad' | 'pill-ok' | 'pill-agent' | 'pill';
+    /** A native hover tooltip — why a partial stopped short, or why an interrupted run cannot resume (task 14.4/14.6). Never truncated: unlike the pill's own label, a tooltip has no fixed-width column to break. */
+    title?: string;
+    /** "prev: 8 findings" — the retained review a live rerun (task 14.4) might replace, kept visible and distinct from the rerun's own current status rather than hidden behind it. */
+    note?: string;
+  };
   submitted: boolean;
   ciStatus?: CiStatus;
   age: string;
@@ -218,6 +225,17 @@ section { padding: 16px 0 6px; }
 .issue-empty { color: var(--fg-dim); font-size: 12px; }
 .row-title { font-size: 12.5px; font-weight: 500; color: var(--fg-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); margin-top: 3px; }
+/* The AI review cell (task 14.4): a live run's lifecycle label
+   (runLifecycleLabel, e.g. "Investigating") can run longer than a plain
+   outcome pill ("no findings") — truncated with an ellipsis on its own
+   line, in its 104px column, rather than shortened or reworded away from
+   the shared label every other surface renders (D14). The "prev: …" note
+   stacks under it the same way .row-meta stacks under .row-title, keeping
+   a retained complete review visible and distinct from whatever the pill
+   above says the rerun is doing right now, never merged into one string. */
+.ai-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pill-ai { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-note { font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-dimmer); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-repo { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cell-ci { font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 .cell-age { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-dimmer); }
@@ -348,7 +366,10 @@ export function renderDashboardBody(state: DashboardViewState): string {
           <div class="row-meta">${e(r.refLabel)} · @${e(r.author)} · ${e(r.branch)}</div>
         </div>
         <div class="cell-repo">${e(r.project)}</div>
-        <div><span class="pill ${r.ai.cls}">${e(r.ai.label)}</span></div>
+        <div class="ai-cell">
+          <span class="pill pill-ai ${r.ai.cls}"${r.ai.title ? ` title="${e(r.ai.title)}"` : ''}>${e(r.ai.label)}</span>
+          ${r.ai.note ? `<span class="ai-note">${e(r.ai.note)}</span>` : ''}
+        </div>
         <div class="cell-ci ${r.ciStatus ? CI_TEXT[r.ciStatus].cls : 'dimmer'}">${r.ciStatus ? CI_TEXT[r.ciStatus].label : '—'}</div>
         <div class="cell-age">${e(r.age)}</div>
       </div>`,

@@ -1,0 +1,501 @@
+import { describe, expect, it } from 'vitest';
+import type { ChangedFileEntry, ChangedFileManifestResult, InvestigationSnapshotRef } from '../platform/types';
+import { applyCoverageSeed, coverageChangedFact, createChangedFileInventory } from './harnessInventory';
+import type { MemberCoverage } from '../domain/harnessCoverage';
+import { preLocalGitCheckpointCoverage } from './migrationFixtures';
+
+const SNAPSHOT: InvestigationSnapshotRef = { repoId: 'repo-1', baseSha: 'base-1', headSha: 'head-1' };
+const OTHER_HEAD: InvestigationSnapshotRef = { ...SNAPSHOT, headSha: 'head-2' };
+
+function entry(path: string, overrides: Partial<ChangedFileEntry> = {}): ChangedFileEntry {
+  return { path, kind: 'modified', binary: false, addedLines: 1, removedLines: 1, ...overrides };
+}
+
+function complete(entries: ChangedFileEntry[], snapshot = SNAPSHOT): ChangedFileManifestResult {
+  return { snapshot, state: 'complete', value: entries };
+}
+
+function paginated(entries: ChangedFileEntry[], cursor: string, snapshot = SNAPSHOT): ChangedFileManifestResult {
+  return { snapshot, state: 'paginated', value: entries, cursor };
+}
+
+function inventoryWith(entries: ChangedFileEntry[]) {
+  const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+  expect(inventory.acceptManifestPage('m1', complete(entries)).ok).toBe(true);
+  return inventory;
+}
+
+describe('manifest accumulation (task 8.1)', () => {
+  it('exposes no total denominator while a continuation is pending', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    const first = inventory.acceptManifestPage('m1', paginated([entry('a.ts'), entry('b.ts')], 'c1'));
+    expect(first).toEqual({ ok: true, added: 2, duplicates: 0, enumeration: 'inProgress' });
+    expect(inventory.member('m1')?.pendingCursor).toBe('c1');
+    expect(inventory.counts().known).toBe(2);
+    expect(inventory.counts().total).toBeUndefined();
+    expect(inventory.coverage('m1')?.manifestComplete).toBe(false);
+    expect(inventory.coverage('m1')?.totalFiles).toBeUndefined();
+    expect(inventory.coverageProgress().total).toBeUndefined();
+
+    const last = inventory.acceptManifestPage('m1', complete([entry('c.ts')]));
+    expect(last).toEqual({ ok: true, added: 1, duplicates: 0, enumeration: 'complete' });
+    expect(inventory.member('m1')?.pendingCursor).toBeUndefined();
+    expect(inventory.counts().total).toBe(3);
+    expect(inventory.coverage('m1')?.totalFiles).toBe(3);
+    expect(inventory.everyMemberComplete()).toBe(true);
+  });
+
+  it('never loses a file across pages and is idempotent when a page is replayed', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    const page1 = paginated([entry('a.ts'), entry('b.ts')], 'c1');
+    inventory.acceptManifestPage('m1', page1);
+    // Redelivery of the same page (retry after a lost response) adds nothing and removes nothing.
+    expect(inventory.acceptManifestPage('m1', page1)).toEqual({ ok: true, added: 0, duplicates: 2, enumeration: 'inProgress' });
+    // A page repeating a known path alongside a new one only adds the new one.
+    expect(inventory.acceptManifestPage('m1', complete([entry('b.ts'), entry('c.ts')]))).toEqual({
+      ok: true,
+      added: 1,
+      duplicates: 1,
+      enumeration: 'complete',
+    });
+    expect(inventory.member('m1')?.files.map((file) => file.path)).toEqual(['a.ts', 'b.ts', 'c.ts']);
+    // Replaying the final page after completion is still accepted as a no-op.
+    expect(inventory.acceptManifestPage('m1', complete([entry('b.ts'), entry('c.ts')])).ok).toBe(true);
+    expect(inventory.counts().total).toBe(3);
+  });
+
+  it('refuses a page that would grow a closed enumeration', () => {
+    const inventory = inventoryWith([entry('a.ts')]);
+    const outcome = inventory.acceptManifestPage('m1', complete([entry('z.ts')]));
+    expect(outcome).toMatchObject({ ok: false, code: 'enumerationClosed' });
+    expect(inventory.counts().total).toBe(1);
+  });
+
+  it('refuses a page bound to another head or an unknown member', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    expect(inventory.acceptManifestPage('m1', complete([entry('a.ts')], OTHER_HEAD))).toMatchObject({ ok: false, code: 'snapshotMismatch' });
+    expect(inventory.acceptManifestPage('m2', complete([entry('a.ts')]))).toMatchObject({ ok: false, code: 'unknownMember' });
+    expect(inventory.counts().known).toBe(0);
+  });
+
+  it('records truncated enumeration as a provider limit with known counts and no denominator', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    const outcome = inventory.acceptManifestPage('m1', { snapshot: SNAPSHOT, state: 'truncated', value: [entry('a.ts')], knownRemainingUnits: 40 });
+    expect(outcome).toEqual({ ok: true, added: 1, duplicates: 0, enumeration: 'truncated' });
+    const member = inventory.member('m1');
+    expect(member?.knownRemainingUnits).toBe(40);
+    expect(member?.reason).toMatch(/could not enumerate/);
+    expect(inventory.counts().known).toBe(1);
+    expect(inventory.counts().total).toBeUndefined();
+    expect(inventory.everyMemberComplete()).toBe(false);
+    expect(inventory.acceptManifestPage('m1', complete([entry('b.ts')]))).toMatchObject({ ok: false, code: 'enumerationClosed' });
+  });
+
+  it('records an unavailable manifest without inventing an empty complete inventory, and lets a retry recover', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    inventory.acceptManifestPage('m1', paginated([entry('a.ts')], 'c1'));
+    expect(inventory.acceptManifestPage('m1', { snapshot: SNAPSHOT, state: 'unavailable', reason: 'rate limited' })).toEqual({
+      ok: true,
+      added: 0,
+      duplicates: 0,
+      enumeration: 'unavailable',
+    });
+    expect(inventory.member('m1')?.enumeration).toBe('unavailable');
+    expect(inventory.member('m1')?.files).toHaveLength(1);
+    expect(inventory.counts().total).toBeUndefined();
+    expect(inventory.acceptManifestPage('m1', complete([entry('b.ts')])).ok).toBe(true);
+    expect(inventory.member('m1')?.enumeration).toBe('complete');
+    expect(inventory.counts().total).toBe(2);
+  });
+
+  it('keeps renamed old paths, binary flags, deletions, and sizes as explicit manifest facts', () => {
+    const inventory = inventoryWith([
+      entry('src/auth/tokenStore.ts', { kind: 'renamed', oldPath: 'src/legacy/tokenStore.ts' }),
+      entry('assets/logo.png', { binary: true, byteSize: 4096, addedLines: undefined, removedLines: undefined }),
+      entry('src/old.ts', { kind: 'deleted', addedLines: 0, removedLines: 30 }),
+    ]);
+    expect(inventory.file('m1', 'src/auth/tokenStore.ts')).toMatchObject({ kind: 'renamed', oldPath: 'src/legacy/tokenStore.ts', state: 'unvisited' });
+    expect(inventory.file('m1', 'assets/logo.png')).toMatchObject({ binary: true, byteSize: 4096, state: 'unvisited' });
+    expect(inventory.file('m1', 'src/old.ts')).toMatchObject({ kind: 'deleted', removedLines: 30 });
+    expect(inventory.counts().known).toBe(3);
+  });
+
+  it('refuses a manifest entry whose path escapes the repository', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    expect(inventory.acceptManifestPage('m1', complete([entry('../etc/passwd')]))).toMatchObject({ ok: false, code: 'invalidPath' });
+    expect(inventory.counts().known).toBe(0);
+  });
+
+  it('normalizes a leading slash so the same file cannot be counted twice', () => {
+    const inventory = inventoryWith([entry('/src/a.ts'), entry('src/a.ts')]);
+    expect(inventory.counts().known).toBe(1);
+    expect(inventory.file('m1', '/src/a.ts')?.path).toBe('src/a.ts');
+  });
+
+  it('scopes totals per member: one incomplete member removes the aggregate denominator', () => {
+    const m2Snapshot: InvestigationSnapshotRef = { repoId: 'repo-2', baseSha: 'b', headSha: 'h' };
+    const inventory = createChangedFileInventory([
+      { memberId: 'm1', snapshot: SNAPSHOT },
+      { memberId: 'm2', snapshot: m2Snapshot },
+    ]);
+    inventory.acceptManifestPage('m1', complete([entry('a.ts')]));
+    expect(inventory.acceptManifestPage('m2', paginated([entry('x.ts')], 'c', m2Snapshot)).ok).toBe(true);
+    expect(inventory.counts('m1').total).toBe(1);
+    expect(inventory.counts('m2').total).toBeUndefined();
+    expect(inventory.counts().total).toBeUndefined();
+    expect(inventory.counts().known).toBe(2);
+    expect(inventory.everyMemberComplete()).toBe(false);
+  });
+
+  it('rejects an empty member list and duplicate member ids', () => {
+    expect(() => createChangedFileInventory([])).toThrow(/at least one member/);
+    expect(() =>
+      createChangedFileInventory([
+        { memberId: 'm1', snapshot: SNAPSHOT },
+        { memberId: 'm1', snapshot: SNAPSHOT },
+      ]),
+    ).toThrow(/Duplicate/);
+  });
+});
+
+describe('changed-file state transitions (task 8.2)', () => {
+  it('walks unvisited -> classified -> inspected and reports real counts at each step', () => {
+    const inventory = inventoryWith([entry('a.ts'), entry('b.ts')]);
+    expect(inventory.counts()).toMatchObject({ unvisited: 2, classified: 0, inspected: 0, known: 2, total: 2 });
+    const classified = inventory.classify('m1', 'a.ts', { risk: 'high', logicalUnit: 'auth', policyId: 'policy-root' });
+    expect(classified).toMatchObject({ ok: true, changed: true, file: { state: 'classified', risk: 'high', logicalUnit: 'auth', policyId: 'policy-root' } });
+    expect(inventory.counts()).toMatchObject({ unvisited: 1, classified: 1 });
+    expect(inventory.markInspected('m1', 'a.ts')).toMatchObject({ ok: true, changed: true, file: { state: 'inspected' } });
+    expect(inventory.counts()).toMatchObject({ unvisited: 1, classified: 0, inspected: 1 });
+    expect(inventory.markInspected('m1', 'a.ts')).toMatchObject({ ok: true, changed: false });
+  });
+
+  it('refuses inspection or a terminal state before classification (D10 ordering)', () => {
+    const inventory = inventoryWith([entry('assets/logo.png', { binary: true })]);
+    expect(inventory.markInspected('m1', 'assets/logo.png')).toMatchObject({ ok: false, code: 'notClassified' });
+    expect(inventory.markTerminal('m1', 'assets/logo.png', 'binary', 'binary content')).toMatchObject({ ok: false, code: 'notClassified' });
+    expect(inventory.file('m1', 'assets/logo.png')?.state).toBe('unvisited');
+  });
+
+  it('reaches every non-inspected terminal state only with a public reason', () => {
+    const inventory = inventoryWith([entry('a'), entry('b'), entry('c'), entry('d')]);
+    for (const path of ['a', 'b', 'c', 'd']) inventory.classify('m1', path, { risk: 'low' });
+    expect(inventory.markTerminal('m1', 'a', 'excludedByPolicy', 'generated file excluded by AGENTS.md')).toMatchObject({ ok: true, file: { state: 'excludedByPolicy' } });
+    expect(inventory.markTerminal('m1', 'b', 'unavailable', 'provider returned unavailable')).toMatchObject({ ok: true, file: { state: 'unavailable' } });
+    expect(inventory.markTerminal('m1', 'c', 'binary', 'binary content')).toMatchObject({ ok: true, file: { state: 'binary' } });
+    expect(inventory.markTerminal('m1', 'd', 'oversized', 'diff exceeds the single-result ceiling')).toMatchObject({ ok: true, file: { state: 'oversized' } });
+    expect(inventory.counts()).toMatchObject({ excludedByPolicy: 1, unavailable: 1, binary: 1, oversized: 1, classified: 0, unvisited: 0, inspected: 0 });
+    for (const file of inventory.member('m1')?.files ?? []) expect(file.reason).toBeTruthy();
+  });
+
+  it('refuses a terminal transition with an empty reason or an unknown state', () => {
+    const inventory = inventoryWith([entry('a')]);
+    inventory.classify('m1', 'a', { risk: 'low' });
+    expect(inventory.markTerminal('m1', 'a', 'oversized', '   ')).toMatchObject({ ok: false, code: 'missingReason' });
+    expect(inventory.markTerminal('m1', 'a', 'inspected' as never, 'x')).toMatchObject({ ok: false, code: 'invalidState' });
+    expect(inventory.file('m1', 'a')?.state).toBe('classified');
+  });
+
+  it('freezes a terminal state: no further transition or reclassification', () => {
+    const inventory = inventoryWith([entry('a')]);
+    inventory.classify('m1', 'a', { risk: 'low' });
+    inventory.markTerminal('m1', 'a', 'binary', 'binary content');
+    expect(inventory.markInspected('m1', 'a')).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+    expect(inventory.markTerminal('m1', 'a', 'oversized', 'x')).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+    expect(inventory.classify('m1', 'a', { risk: 'high' })).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+    expect(inventory.markTerminal('m1', 'a', 'binary', 'same again')).toMatchObject({ ok: true, changed: false });
+    expect(inventory.file('m1', 'a')?.state).toBe('binary');
+  });
+
+  it('allows reclassification while still classified, but not after inspection', () => {
+    const inventory = inventoryWith([entry('a')]);
+    inventory.classify('m1', 'a', { risk: 'low' });
+    expect(inventory.classify('m1', 'a', { risk: 'high' })).toMatchObject({ ok: true, file: { risk: 'high' } });
+    inventory.markInspected('m1', 'a');
+    expect(inventory.classify('m1', 'a', { risk: 'low' })).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+  });
+
+  it('refuses unknown paths, unknown members, and garbage risk levels', () => {
+    const inventory = inventoryWith([entry('a')]);
+    expect(inventory.classify('m1', 'zzz', { risk: 'low' })).toMatchObject({ ok: false, code: 'unknownPath' });
+    expect(inventory.classify('m9', 'a', { risk: 'low' })).toMatchObject({ ok: false, code: 'unknownMember' });
+    expect(inventory.classify('m1', 'a', { risk: 'critical' as never })).toMatchObject({ ok: false, code: 'invalidRisk' });
+  });
+
+  it('sanitizes the logical unit and reason text before storing them', () => {
+    const inventory = inventoryWith([entry('a')]);
+    inventory.classify('m1', 'a', { risk: 'low', logicalUnit: 'auth token=ghp_abcdefghijklmnopqrstuvwxyz0123456789' });
+    expect(inventory.file('m1', 'a')?.logicalUnit).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+    inventory.markTerminal('m1', 'a', 'unavailable', 'Bearer abcdefghijklmnopqrstuvwxyz failed');
+    expect(inventory.file('m1', 'a')?.reason).not.toContain('abcdefghijklmnopqrstuvwxyz');
+  });
+
+  it('exposes coverage as the domain MemberCoverage shape', () => {
+    const inventory = inventoryWith([entry('a'), entry('b')]);
+    inventory.classify('m1', 'a', { risk: 'high', logicalUnit: 'auth' });
+    inventory.markInspected('m1', 'a');
+    expect(inventory.coverage('m1')).toEqual({
+      memberId: 'm1',
+      manifestComplete: true,
+      totalFiles: 2,
+      files: [
+        { path: 'a', memberId: 'm1', state: 'inspected', risk: 'high', logicalUnit: 'auth' },
+        { path: 'b', memberId: 'm1', state: 'unvisited' },
+      ],
+    });
+    expect(inventory.coverage('nope')).toBeUndefined();
+  });
+});
+
+describe('declined content is recorded without closing anything (add-local-git-investigation, tasks 3.2/3.5)', () => {
+  it('carries the manifest entry’s declined flag onto the file record, leaving it unvisited like any other file', () => {
+    const inventory = inventoryWith([entry('src/app/harnessAttempt.ts', { contentDeclined: true, addedLines: undefined, removedLines: undefined })]);
+    expect(inventory.file('m1', 'src/app/harnessAttempt.ts')).toMatchObject({ contentDeclined: true, binary: false, state: 'unvisited' });
+  });
+
+  it('marks a classified file declined without moving it out of classified, so a later read can still inspect it', () => {
+    const inventory = inventoryWith([entry('a.ts')]);
+    inventory.classify('m1', 'a.ts', { risk: 'high' });
+    expect(inventory.markContentDeclined('m1', 'a.ts')).toMatchObject({ ok: true, changed: true });
+    expect(inventory.file('m1', 'a.ts')).toMatchObject({ state: 'classified', contentDeclined: true });
+    // The whole reason this is not a `markTerminal` state: the file is still
+    // readable, and a source that serves it must be able to close the gap.
+    expect(inventory.markInspected('m1', 'a.ts')).toMatchObject({ ok: true, changed: true });
+    expect(inventory.file('m1', 'a.ts')?.state).toBe('inspected');
+    expect(inventory.counts()).toMatchObject({ inspected: 1, classified: 0 });
+  });
+
+  it('is idempotent, and refuses a file that is already terminal', () => {
+    const inventory = inventoryWith([entry('a.ts'), entry('b.ts')]);
+    inventory.classify('m1', 'a.ts', { risk: 'low' });
+    inventory.markContentDeclined('m1', 'a.ts');
+    expect(inventory.markContentDeclined('m1', 'a.ts')).toMatchObject({ ok: true, changed: false });
+
+    inventory.classify('m1', 'b.ts', { risk: 'low' });
+    inventory.markTerminal('m1', 'b.ts', 'binary', 'binary content');
+    expect(inventory.markContentDeclined('m1', 'b.ts')).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+  });
+});
+
+/**
+ * The other read outcome that establishes nothing (`InvestigationResult`'s
+ * `unknown`): an invocation stopped at a bound, a pinned revision the object
+ * store cannot resolve, a diff that fails for a path the manifest just
+ * enumerated. It closes nothing, exactly like a declined read — and, unlike
+ * before, it now leaves a record, because leaving none let a low-risk file
+ * whose diff was never served pass the completion gate with no blocker at all.
+ */
+describe('a read that established nothing is recorded without closing anything (add-local-git-investigation, task 10.6)', () => {
+  it('marks a classified file read-failed without moving it out of classified, so a later read can still inspect it', () => {
+    const inventory = inventoryWith([entry('a.ts')]);
+    inventory.classify('m1', 'a.ts', { risk: 'high' });
+    expect(inventory.markReadFailed('m1', 'a.ts')).toMatchObject({ ok: true, changed: true });
+    expect(inventory.file('m1', 'a.ts')).toMatchObject({ state: 'classified', readFailed: true });
+    expect(inventory.markInspected('m1', 'a.ts')).toMatchObject({ ok: true, changed: true });
+    expect(inventory.file('m1', 'a.ts')?.state).toBe('inspected');
+    expect(inventory.counts()).toMatchObject({ inspected: 1, classified: 0 });
+  });
+
+  it('is idempotent, and refuses a file that is already terminal', () => {
+    const inventory = inventoryWith([entry('a.ts'), entry('b.ts')]);
+    inventory.classify('m1', 'a.ts', { risk: 'low' });
+    inventory.markReadFailed('m1', 'a.ts');
+    expect(inventory.markReadFailed('m1', 'a.ts')).toMatchObject({ ok: true, changed: false });
+
+    inventory.classify('m1', 'b.ts', { risk: 'low' });
+    inventory.markTerminal('m1', 'b.ts', 'binary', 'binary content');
+    expect(inventory.markReadFailed('m1', 'b.ts')).toMatchObject({ ok: false, code: 'alreadyTerminal' });
+  });
+
+  it('never comes from a manifest entry — only a read can fail', () => {
+    const inventory = inventoryWith([entry('a.ts', { contentDeclined: true })]);
+    expect(inventory.file('m1', 'a.ts')?.readFailed).toBeUndefined();
+  });
+});
+
+describe('coverage progress facts (section-5 integration)', () => {
+  it('reports classified/inspected counts and a total only once every member is complete', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    inventory.acceptManifestPage('m1', paginated([entry('a'), entry('b')], 'c1'));
+    inventory.classify('m1', 'a', { risk: 'high' });
+    expect(coverageChangedFact(inventory, ['high'])).toEqual({ kind: 'coverageChanged', coverage: { classified: 1, inspected: 0 } });
+    inventory.acceptManifestPage('m1', complete([entry('c')]));
+    inventory.markInspected('m1', 'a');
+    inventory.classify('m1', 'b', { risk: 'low' });
+    inventory.markInspected('m1', 'b');
+    expect(coverageChangedFact(inventory, ['high'])).toEqual({
+      kind: 'coverageChanged',
+      coverage: { classified: 2, inspected: 2, total: 3, requiredInspected: 1 },
+    });
+  });
+});
+
+describe('applyCoverageSeed (task 14.6: replaying a resumed attempt\'s classifications onto a freshly enumerated inventory)', () => {
+  it('re-applies inspected, classified and terminal states onto matching freshly enumerated files', () => {
+    // `binary: true` on the fresh entry is load-bearing since the corroboration
+    // rule below: a replayed `binary` is only re-applied where the source that
+    // just enumerated the file says the same.
+    const inventory = inventoryWith([entry('inspected.ts'), entry('classified.ts'), entry('binary.png', { binary: true }), entry('untouched.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      totalFiles: 4,
+      files: [
+        { path: 'inspected.ts', memberId: 'm1', state: 'inspected', risk: 'high', logicalUnit: 'auth' },
+        { path: 'classified.ts', memberId: 'm1', state: 'classified', risk: 'low' },
+        { path: 'binary.png', memberId: 'm1', state: 'binary', risk: 'low', reason: 'Binary file.' },
+        { path: 'untouched.ts', memberId: 'm1', state: 'unvisited' },
+      ],
+    }];
+
+    applyCoverageSeed(inventory, coverage);
+
+    expect(inventory.file('m1', 'inspected.ts')).toMatchObject({ state: 'inspected', risk: 'high', logicalUnit: 'auth' });
+    expect(inventory.file('m1', 'classified.ts')).toMatchObject({ state: 'classified', risk: 'low' });
+    expect(inventory.file('m1', 'binary.png')).toMatchObject({ state: 'binary', risk: 'low', reason: 'Binary file.' });
+    expect(inventory.file('m1', 'untouched.ts')).toMatchObject({ state: 'unvisited' });
+  });
+
+  it('skips a checkpoint record for a path the fresh enumeration does not know, rather than throwing', () => {
+    const inventory = inventoryWith([entry('still-here.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      files: [{ path: 'renamed-away.ts', memberId: 'm1', state: 'inspected', risk: 'high' }],
+    }];
+
+    expect(() => applyCoverageSeed(inventory, coverage)).not.toThrow();
+    expect(inventory.file('m1', 'still-here.ts')).toMatchObject({ state: 'unvisited' });
+  });
+
+  /**
+   * `add-local-git-investigation` task 10.6, and a real hole it found.
+   *
+   * A read that comes back declined for a file whose manifest entry was clean
+   * sets `contentDeclined` and nothing else — the file stays `classified`,
+   * because the source proved nothing about it (`markContentDeclined`). That
+   * flag is the only thing standing between such a file and a run reported
+   * complete and clean: the completion gate blocks on it by name, and the risk
+   * floors do not, because inspection is required at medium risk and above
+   * while a declined `.md` sits at low.
+   *
+   * Before this, the flag was not carried in `ChangedFileRecord`, so a
+   * checkpoint stored it nowhere and a resumed attempt replayed the file as
+   * merely `classified`. The resumed run could then end complete and clean over
+   * content nobody was ever served — the exact failure class this whole change
+   * exists to remove, reached by a different route.
+   */
+  it('carries a declined-content file’s flag through coverage and replays it onto the resumed attempt', () => {
+    const inventory = inventoryWith([entry('docs/notes.md')]);
+    expect(inventory.classify('m1', 'docs/notes.md', { risk: 'low' }).ok).toBe(true);
+    expect(inventory.markContentDeclined('m1', 'docs/notes.md').ok).toBe(true);
+
+    const carried = inventory.coverage('m1')!.files[0]!;
+    expect(carried).toMatchObject({ path: 'docs/notes.md', state: 'classified', contentDeclined: true });
+
+    const resumed = inventoryWith([entry('docs/notes.md')]);
+    applyCoverageSeed(resumed, [inventory.coverage('m1')!]);
+
+    const replayed = resumed.file('m1', 'docs/notes.md');
+    expect(replayed).toMatchObject({ state: 'classified', risk: 'low', contentDeclined: true });
+  });
+
+  /**
+   * `add-local-git-investigation` task 10.6, the half that reaches back to
+   * records already on disk.
+   *
+   * The build before this change mapped a patchless, zero-count compare entry
+   * to `binary`, closed the file irreversibly, and the completion gate counted
+   * the closure as satisfied — which is how a run read a third of a 207-file
+   * change and reported itself complete and clean. Task 3.3 stopped the
+   * mapping at the point the guess was made. It could not reach the guesses
+   * already written to a checkpoint, and replaying one reproduces the outcome
+   * on the resumed attempt, so the replay has to refuse them.
+   *
+   * `PRE_LOCAL_GIT_CHECKPOINT_COVERAGE_JSON` is that checkpoint, recorded as
+   * the text a store holds rather than as a typed value, so it cannot drift
+   * with the type.
+   */
+  describe('a replayed binary state is corroborated against the current source', () => {
+    const preChangeCoverage = () => preLocalGitCheckpointCoverage() as MemberCoverage[];
+
+    it('does not re-apply a binary state the freshly enumerated file does not carry', () => {
+      // What the source says today about the same two files: it enumerated
+      // them and did not serve their content, which is not a statement that
+      // the content is binary.
+      const inventory = inventoryWith([
+        entry('src/app/harnessInventory.ts', { contentDeclined: true, addedLines: undefined, removedLines: undefined }),
+        entry('docs/notes.md', { contentDeclined: true, addedLines: undefined, removedLines: undefined }),
+        entry('src/app/harnessCompletion.ts'),
+      ]);
+
+      applyCoverageSeed(inventory, preChangeCoverage());
+
+      // Neither file is closed, both are still readable, and the classification
+      // the lost attempt paid for is kept.
+      expect(inventory.file('m1', 'src/app/harnessInventory.ts')).toMatchObject({ state: 'classified', risk: 'medium', contentDeclined: true });
+      expect(inventory.file('m1', 'docs/notes.md')).toMatchObject({ state: 'classified', risk: 'medium', contentDeclined: true });
+      expect(inventory.counts('m1').binary).toBe(0);
+    });
+
+    it('keeps every other state the lost attempt established, rather than discarding the attempt', () => {
+      const inventory = inventoryWith([
+        entry('src/app/harnessInventory.ts', { contentDeclined: true }),
+        entry('docs/notes.md', { contentDeclined: true }),
+        entry('src/app/harnessCompletion.ts'),
+      ]);
+
+      applyCoverageSeed(inventory, preChangeCoverage());
+
+      expect(inventory.file('m1', 'src/app/harnessCompletion.ts')).toMatchObject({ state: 'inspected', risk: 'medium', logicalUnit: 'completion gate' });
+    });
+
+    it('re-applies a binary state the current source still stands behind', () => {
+      // The constraint that stops this from being a blunt "distrust every old
+      // record": a genuinely binary file recorded by the old build is still
+      // binary, and a source that says so is the one thing that can settle it.
+      const inventory = inventoryWith([
+        entry('src/app/harnessInventory.ts', { binary: true }),
+        entry('docs/notes.md', { binary: true }),
+        entry('src/app/harnessCompletion.ts'),
+      ]);
+
+      applyCoverageSeed(inventory, preChangeCoverage());
+
+      expect(inventory.file('m1', 'src/app/harnessInventory.ts')).toMatchObject({ state: 'binary', risk: 'medium' });
+      expect(inventory.file('m1', 'docs/notes.md')).toMatchObject({ state: 'binary', risk: 'medium' });
+      expect(inventory.counts('m1').binary).toBe(2);
+    });
+  });
+
+  /**
+   * The same round trip `contentDeclined` makes above, for the other fact a
+   * `classified` file can carry. Without it a resumed attempt replays a file
+   * whose every read failed as merely classified, and a merely-classified
+   * low-risk file does not block completion.
+   */
+  it('carries a failed read’s flag through coverage and replays it onto the resumed attempt', () => {
+    const inventory = inventoryWith([entry('docs/notes.md')]);
+    expect(inventory.classify('m1', 'docs/notes.md', { risk: 'low' }).ok).toBe(true);
+    expect(inventory.markReadFailed('m1', 'docs/notes.md').ok).toBe(true);
+
+    expect(inventory.coverage('m1')!.files[0]!).toMatchObject({ path: 'docs/notes.md', state: 'classified', readFailed: true });
+
+    const resumed = inventoryWith([entry('docs/notes.md')]);
+    applyCoverageSeed(resumed, [inventory.coverage('m1')!]);
+
+    expect(resumed.file('m1', 'docs/notes.md')).toMatchObject({ state: 'classified', risk: 'low', readFailed: true });
+  });
+
+  it('leaves a file unvisited rather than guessing when a non-unvisited record carries no risk', () => {
+    const inventory = inventoryWith([entry('odd.ts')]);
+    const coverage: MemberCoverage[] = [{
+      memberId: 'm1',
+      manifestComplete: true,
+      files: [{ path: 'odd.ts', memberId: 'm1', state: 'inspected' }], // risk missing — should not happen in production
+    }];
+
+    applyCoverageSeed(inventory, coverage);
+    expect(inventory.file('m1', 'odd.ts')).toMatchObject({ state: 'unvisited' });
+  });
+});

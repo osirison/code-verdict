@@ -72,6 +72,46 @@ describe('review-run store', () => {
     expect(store.byRef().get('9101!2999')?.findingCount).toBe(1);
   });
 
+  describe('recordIfFresher', () => {
+    it('drops the write when the stored row for the ref is already at least as fresh', async () => {
+      const store = new ReviewRunStore(memoryStore());
+      await store.record(run({ outcome: 'findings', findingCount: 5, ranAt: '2026-08-25T11:00:00.000Z' }));
+
+      await store.recordIfFresher(run({ outcome: 'interrupted', findingCount: 0, ranAt: '2026-08-25T10:00:00.000Z' }));
+
+      expect(store.list()).toEqual([
+        { repoId: '9101', crNumber: '2841', outcome: 'findings', findingCount: 5, agentLabel: 'Copilot', ranAt: '2026-08-25T11:00:00.000Z' },
+      ]);
+    });
+
+    it('drops the write on an exact tie', async () => {
+      const store = new ReviewRunStore(memoryStore());
+      await store.record(run({ outcome: 'findings', findingCount: 5, ranAt: '2026-08-25T11:00:00.000Z' }));
+
+      await store.recordIfFresher(run({ outcome: 'interrupted', findingCount: 0, ranAt: '2026-08-25T11:00:00.000Z' }));
+
+      expect(store.list()[0]?.outcome).toBe('findings');
+    });
+
+    it('writes when the incoming run is strictly newer than the stored row', async () => {
+      const store = new ReviewRunStore(memoryStore());
+      await store.record(run({ outcome: 'interrupted', findingCount: 0, ranAt: '2026-08-25T09:00:00.000Z' }));
+
+      await store.recordIfFresher(run({ outcome: 'findings', findingCount: 5, ranAt: '2026-08-25T11:00:00.000Z' }));
+
+      expect(store.list()[0]?.outcome).toBe('findings');
+    });
+
+    it('writes when there is no stored row for the ref yet', async () => {
+      const store = new ReviewRunStore(memoryStore());
+
+      await store.recordIfFresher(run({ outcome: 'interrupted', findingCount: 0 }));
+
+      expect(store.list()).toHaveLength(1);
+      expect(store.list()[0]?.outcome).toBe('interrupted');
+    });
+  });
+
   it('reads an empty store without throwing, and never hands out its own array', async () => {
     const backing = memoryStore();
     const store = new ReviewRunStore(backing);

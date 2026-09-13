@@ -62,7 +62,44 @@ Confirm what each probe did by grepping its own log — for steps 1 and 2,
 `"$PROBE"/data/logs/*/window1/exthost/exthost.log`; for step 3, the newest `window<N>` under the
 real session directory.
 
+## The decisive line is in the renderer log, not the extension host log
+
+Added 2026-09-08, after a recurrence. The two shapes above are both symptoms of one cause, and
+there is a third shape they do not cover: **a window with no `exthost/` directory at all.** When
+that happens the extension host never got far enough to open its own log, so grepping `exthost.log`
+finds nothing and the window looks like it was never created.
+
+Look in that window's `renderer.log` instead. One line settles it:
+
+    [error] [LocalProcessExtensionHost]: Extension host did not start in 10 seconds (debugBrk: true)
+
+`debugBrk: true` means the host was launched paused on its first line, waiting for the debugger to
+attach. The debugger never arrived, VS Code waited ten seconds and killed it. Nothing in `src/` can
+influence that — the extension had not begun to load.
+
+A single F5 can produce **both** shapes in sequence: one window dying at ~100ms with the three-line
+`renderer closed the MessagePort` log, then a second window four seconds later that hangs on
+`debugBrk` and is killed at ten seconds.
+
+### It is intermittent, and retrying usually works
+
+Counting three-line extension host logs across all sessions found six occurrences between
+2026-08-28 and 2026-09-08 — so this is long-standing, not a regression from any particular change.
+On 2026-09-08 a host died at 12:28:58 and the retry seven seconds later activated normally and ran
+a full review. **Press F5 again before investigating anything.**
+
+### Skip the debugger when you only need to exercise the extension
+
+The failure is in the debug attach, so the fix is to not attach: **Ctrl+F5** (Run Without
+Debugging) launches the same configuration with `noDebug`, keeping the `env` block the launch
+config sets. Breakpoints are unavailable; everything else behaves identically. Reach for it when
+the goal is to test behaviour rather than to step through code.
+
 ## Verifying the bundle without a window at all
+
+**`npm run probe`** — `scripts/activation-probe.cjs`, committed so the stub below never has to be
+written again. It builds, loads `dist/extension.js` against a stubbed `vscode`, and calls
+`activate()`.
 
 `dist/extension.js` can be loaded head­lessly against a stubbed `vscode` module to prove
 `activate()` neither throws nor spins. Requiring the bundle with `Module._load` patched to return a
@@ -75,7 +112,15 @@ seconds, without a display.
 Treat those counts as a floor that grows, not a fixture: what matters is that `activate()` resolves
 rather than throwing or hanging, and that a command you have just added appears in the list. The
 stub needs `Memento.keys()` since retention reads it, and `lm.selectChatModels` returning `[]` is
-enough — nothing on the activation path awaits a model.
+enough — nothing on the activation path awaits a model. As of the agentic-review-harness change the
+probe resolves in ~2ms with 30 commands, 37 subscriptions and 6 status-bar items.
+
+**The trap when writing the stub:** a top-level permissive `Proxy` over the whole `vscode` object
+does not cover members of the namespaces you spell out. `window` is a real object in the stub, so a
+member it does not define — `onDidChangeWindowState`, which `VerdictNotifier.start` calls — is
+`undefined` rather than a no-op, and `activate()` throws for a reason that has nothing to do with
+what is being checked. Wrap each namespace in its own proxy that returns a disposable-returning
+function for anything unknown, then wrap the whole object as well.
 
 ## Two shell traps hit while doing this
 
@@ -101,3 +146,9 @@ Checked with evidence rather than assumed, on Fedora 44 / KDE / VS Code 1.134.0:
   `:8971`, node exits `EADDRINUSE`, that line never prints, and the launch waits forever — a hang,
   not a crash.
 - **A stale inspect port or orphaned host** — `ps -eo pid,cmd | grep inspect-brk-extensions`.
+
+## One more shell trap
+
+`ls` is `eza` on this machine, and it rejects `-t` on directories: `ls -dt <glob>` prints an error
+about `--time` and **returns nothing**, which reads exactly like "there are no logs". Use
+`/usr/bin/ls -t` when sorting log directories by time.
