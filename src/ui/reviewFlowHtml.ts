@@ -1264,6 +1264,56 @@ function liveCountsLine(coverage: CoverageProgress | undefined, counts: FlowView
   return parts.length > 0 ? `<div class="coverage-line">${parts.map(e).join(' · ')}</div>` : '';
 }
 
+/**
+ * "Where the time went" — the repo-owner's follow-up once an external trace analysis found that
+ * roughly 96% of a run's wall clock is the model's first-byte wait: the phase rail says which phase a
+ * run is in, `liveCountsLine` says how much it has done, but neither says what it is actually waiting
+ * *on*. `model`/`tools` are exact sums of every `toolCompleted`/`toolFailed` fact's own `durationMs` —
+ * split on `tool === 'modelTurn'` versus every other tool, the same convention `ActivityCallMetadata`'s
+ * own doc comment (`../domain/harnessActivity.ts`) documents. A fact carrying no `durationMs`
+ * contributes nothing to either sum, never a fabricated zero passed off as a measurement.
+ *
+ * **Not a compaction undercount.** `harnessActivityCompaction.ts` only ever folds a *consecutive* run
+ * of same-tool `toolCompleted` events, and it folds by *summing* `durationMs` across the run
+ * (`sumOptional`), never by keeping just one event's value — so a folded run and its unfolded events
+ * report the identical total. And neither source read here is ever that compacted, on-disk copy in the
+ * first place: `FlowViewState.runActivity` is the attempt's live in-memory log (`RunRecord.checkpoint`
+ * is the raw `CheckpointInfo` `applyCheckpoint` was handed, not the compacted `PersistedCheckpoint`
+ * `harnessRunStore` writes), and `retainedDetails.activity` is that same in-memory log at attempt end
+ * (`result.activityLog.events`). The on-disk compacted copy exists solely so a lost attempt can
+ * resume, and a resumed attempt starts its own log fresh at sequence 1 rather than inheriting the old
+ * one's facts — so this line's sums are exact for the attempt they describe, never a lower bound.
+ *
+ * **What this line does not, and must not, claim.** The first-byte-vs-streaming split *inside* one
+ * model turn's own `durationMs` is measured only on the trace channel (`agentTrace.ts`), never written
+ * into a checkpoint fact — inventing that split here from data that cannot support it is exactly what
+ * D10's truthful-progress rule forbids, so `model` stays one number, not two.
+ *
+ * `elapsed` is `RunProjection.elapsedMs` — the same field the `run-elapsed` stopwatch above already
+ * renders via `elapsedClock` at every repaint — never a second, independently sourced elapsed figure
+ * such as `BudgetConsumption.elapsedMs` (which `retainedDetails` does not even carry). Both read the
+ * same source at the same repaint; the stopwatch alone keeps ticking client-side between repaints (the
+ * `setInterval` client script below, driven by `run-elapsed`'s `data-started`), so the two can drift
+ * apart by up to one checkpoint interval without ever disagreeing about where either number came from.
+ * `elapsedClock`'s own doc comment is the reason to reuse it rather than write a second one: one
+ * spelling for a run's elapsed time, not two formatters that could read one run's age differently.
+ *
+ * Absent entirely before the first checkpoint (`activity` undefined or empty) — the same "nothing to
+ * report yet" gate `phaseRail`/`liveCountsLine` already use — never a placeholder row of zeroes.
+ */
+function timeLine(activity: readonly ActivityEvent[] | undefined, elapsedMs: number | undefined): string {
+  if (!activity || activity.length === 0) return '';
+  let modelMs = 0;
+  let toolsMs = 0;
+  for (const event of activity) {
+    if ((event.kind !== 'toolCompleted' && event.kind !== 'toolFailed') || event.durationMs === undefined) continue;
+    if (event.tool === 'modelTurn') modelMs += event.durationMs;
+    else toolsMs += event.durationMs;
+  }
+  const parts = [`model ${elapsedClock(modelMs)}`, `tools ${elapsedClock(toolsMs)}`, `elapsed ${elapsedClock(elapsedMs ?? 0)}`];
+  return `<div class="coverage-line">time: ${parts.map(e).join(' · ')}</div>`;
+}
+
 function limitationsList(limitations: readonly Limitation[]): string {
   if (limitations.length === 0) return '';
   return `<div class="limitations">${limitations.map((l) => `<div class="limitation-chip">${e(l.message)}</div>`).join('')}</div>`;
@@ -1440,6 +1490,7 @@ function renderRunning(s: FlowViewState): string {
     ${progressBar(projection)}
     <div class="run-live"><span><b id="run-elapsed" data-started="${s.runStartedAt ?? ''}">${e(elapsedClock(projection?.elapsedMs ?? 0))}</b> elapsed</span></div>
     ${liveCountsLine(projection?.coverage, s.runCounts)}
+    ${timeLine(s.runActivity, projection?.elapsedMs)}
     ${completenessNote}
     ${planBlock(activity)}
     ${limitationsList(projection?.limitations ?? [])}
@@ -1567,6 +1618,7 @@ function retainedDetailsBlock(s: FlowViewState): string {
     ${lineageLine}
     ${phaseRail(finalProjection)}
     ${coverageLine(finalProjection?.coverage)}
+    ${timeLine(details.activity, finalProjection?.elapsedMs)}
     ${planBlock(details.activity)}
     ${limitationsList(details.limitations)}
     ${activityFeed(details.activity)}

@@ -247,18 +247,30 @@ export function parsePlan(raw: unknown): Plan | undefined {
   return raw.rationale === undefined ? { revision: raw.revision, items } : { revision: raw.revision, items, rationale: raw.rationale };
 }
 
+/**
+ * A `coverageChanged` fact's `CoverageProgress` (`../domain/harnessCoverage.ts`). Same validation
+ * rules as the write side: `harnessActivityLog.ts`'s `sanitizeFact` fails a `coverageChanged` fact
+ * closed the moment any of these five fields is negative, `NaN`, or `Infinity` (its own
+ * `nonNegativeFinite` check), never just wrong-typed — a parser that only checked `typeof === 'number'`
+ * would happily read a persisted `-1` or `Infinity` back as valid, which the write side would have
+ * refused to accept in the first place. `classified`/`inspected` are required, so their check is
+ * inline; the three optional fields reuse `parseOptionalNonNegativeFinite`, the same helper
+ * `parseCallMetadata` above already uses for its own five optional numeric fields.
+ */
 function parseCoverageProgress(raw: unknown): CoverageProgress | undefined {
   if (!isRecord(raw)) return undefined;
-  if (typeof raw.classified !== 'number' || typeof raw.inspected !== 'number') return undefined;
-  if (raw.total !== undefined && typeof raw.total !== 'number') return undefined;
-  if (raw.requiredInspected !== undefined && typeof raw.requiredInspected !== 'number') return undefined;
-  if (raw.requiredTotal !== undefined && typeof raw.requiredTotal !== 'number') return undefined;
+  const nonNegativeFinite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  if (!nonNegativeFinite(raw.classified) || !nonNegativeFinite(raw.inspected)) return undefined;
+  const total = parseOptionalNonNegativeFinite(raw.total);
+  const requiredInspected = parseOptionalNonNegativeFinite(raw.requiredInspected);
+  const requiredTotal = parseOptionalNonNegativeFinite(raw.requiredTotal);
+  if (!total.ok || !requiredInspected.ok || !requiredTotal.ok) return undefined;
   return {
     classified: raw.classified,
     inspected: raw.inspected,
-    ...(raw.total !== undefined ? { total: raw.total as number } : {}),
-    ...(raw.requiredInspected !== undefined ? { requiredInspected: raw.requiredInspected as number } : {}),
-    ...(raw.requiredTotal !== undefined ? { requiredTotal: raw.requiredTotal as number } : {}),
+    ...(total.value !== undefined ? { total: total.value } : {}),
+    ...(requiredInspected.value !== undefined ? { requiredInspected: requiredInspected.value } : {}),
+    ...(requiredTotal.value !== undefined ? { requiredTotal: requiredTotal.value } : {}),
   };
 }
 

@@ -1060,6 +1060,49 @@ describe('the running screen renders from the shared projection alone (task 14.1
       expect(html).not.toContain('model turn');
     });
   });
+
+  describe('the time line — where the run\'s wall clock actually went (repo-owner incident follow-up)', () => {
+    it('sums modelTurn durations separately from every other tool\'s, next to the projection\'s own elapsed figure', () => {
+      const activity: FlowViewState['runActivity'] = [
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'toolCompleted', tool: 'modelTurn', summary: 'ok', durationMs: 400_000 },
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:00.000Z', phase: 'investigating', elapsedMs: 400_000, kind: 'toolFailed', tool: 'modelTurn', reason: 'retried', durationMs: 300_000 },
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 3, occurredAt: '2026-08-28T09:02:00.000Z', phase: 'investigating', elapsedMs: 700_000, kind: 'toolCompleted', tool: 'readDiff', target: 'a.ts', summary: '1 unit(s) returned.', durationMs: 4_000 },
+      ];
+      const html = running({ runActivity: activity, runProjection: baseProjection({ elapsedMs: 726_000 }) });
+      // model: 400s + 300s = 700s = 11:40; tools: 4s = 0:04; elapsed: 726s = 12:06.
+      expect(html).toContain('time: model 11:40 · tools 0:04 · elapsed 12:06');
+    });
+
+    it('never treats a fact with no recorded duration as a fabricated zero — it simply does not contribute', () => {
+      const activity: FlowViewState['runActivity'] = [
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0, kind: 'actionStarted', action: 'Reading the diff' },
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:00:05.000Z', phase: 'planning', elapsedMs: 5_000, kind: 'toolFailed', tool: 'modelTurn', reason: 'A stalled model turn needed a longer retry wait.' },
+      ];
+      const html = running({ runActivity: activity, runProjection: baseProjection({ elapsedMs: 5_000 }) });
+      expect(html).toContain('time: model 0:00 · tools 0:00 · elapsed 0:05');
+    });
+
+    it('reports the identical total whether the durations arrive as separate facts or already folded into one (compaction sums, never drops)', () => {
+      const unfolded: FlowViewState['runActivity'] = [
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'toolCompleted', tool: 'readDiff', target: 'a.ts', summary: '1 unit(s) returned.', durationMs: 1_000 },
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:00:01.000Z', phase: 'investigating', elapsedMs: 1_000, kind: 'toolCompleted', tool: 'readDiff', target: 'b.ts', summary: '1 unit(s) returned.', durationMs: 2_000 },
+      ];
+      // The same run of two readDiff completions, already coalesced by `harnessActivityCompaction.ts`'s
+      // `foldToolCompletedRun` into one event carrying the summed `durationMs` (`sumOptional`).
+      const folded: FlowViewState['runActivity'] = [
+        { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:00:01.000Z', phase: 'investigating', elapsedMs: 1_000, kind: 'toolCompleted', tool: 'readDiff', target: undefined, summary: '2 similar "readDiff" completions.', durationMs: 3_000 },
+      ];
+      const unfoldedHtml = running({ runActivity: unfolded, runProjection: baseProjection({ elapsedMs: 1_000 }) });
+      const foldedHtml = running({ runActivity: folded, runProjection: baseProjection({ elapsedMs: 1_000 }) });
+      expect(unfoldedHtml).toContain('time: model 0:00 · tools 0:03 · elapsed 0:01');
+      expect(foldedHtml).toContain('time: model 0:00 · tools 0:03 · elapsed 0:01');
+    });
+
+    it('renders nothing before the first checkpoint', () => {
+      const html = running({ runActivity: undefined });
+      expect(html).not.toContain('time: model');
+    });
+  });
 });
 
 describe('the failure card names specific files, not just that some files (task: say which files)', () => {
@@ -1822,6 +1865,28 @@ describe('retained/completed run details show what actually happened (task 14.2)
     expect(html).toContain('Inspect authorization changes');
     expect(html).toContain('20 of 20 changed files classified');
     expect(html).toContain('Attempt 1');
+  });
+
+  it('shows the same time-line breakdown on the retained/done screen, from the retained activity alone (no budget field exists on retainedDetails)', () => {
+    const activity: FlowViewState['runActivity'] = [
+      { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-08-28T09:00:00.000Z', phase: 'planning', elapsedMs: 0, kind: 'toolCompleted', tool: 'modelTurn', summary: 'ok', durationMs: 90_000 },
+      { runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: 2, occurredAt: '2026-08-28T09:01:30.000Z', phase: 'investigating', elapsedMs: 92_000, kind: 'toolCompleted', tool: 'readDiff', target: 'a.ts', summary: '1 unit(s) returned.', durationMs: 2_000 },
+    ];
+    const html = body({
+      screen: 'done',
+      doneSentence: 'Review submitted.',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'harness', lineageId: 'lineage-1', attempt: 1, limitations: [], activity },
+    });
+    expect(html).toContain('time: model 1:30 · tools 0:02 · elapsed 1:32');
+  });
+
+  it('shows no time line for a legacy result, matching its "no plan/activity/coverage detail" rule', () => {
+    const html = body({
+      screen: 'done',
+      doneSentence: 'Review submitted.',
+      retainedDetails: { completeness: 'complete', protocolProvenance: 'legacy-one-shot', limitations: [], activity: [] },
+    });
+    expect(html).not.toContain('time: model');
   });
 
   it('shows an interrupted earlier attempt when the retained result is attempt 2 or later', () => {

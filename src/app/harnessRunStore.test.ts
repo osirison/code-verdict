@@ -51,6 +51,28 @@ function seedRaw(store: KeyValueStore, key: string, raw: unknown): void {
   void store.update(key, raw);
 }
 
+/**
+ * Like `jsonMemoryStore` but stores the exact JS value it is handed, with no `JSON.stringify`/`.parse`
+ * pass on either side — the one way to seed a value JSON cannot represent at all (`NaN`/`Infinity`,
+ * which `JSON.stringify` silently turns into `null`). A real workspace store never persists either
+ * value, but this suite still needs to prove the parser refuses them outright rather than merely
+ * refusing the `null` `JSON.stringify` would have reduced them to.
+ */
+function rawMemoryStore(): KeyValueStore {
+  const map = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => (map.has(key) ? (map.get(key) as T) : undefined),
+    update: async (key, value) => {
+      if (value === undefined) {
+        map.delete(key);
+        return;
+      }
+      map.set(key, value);
+    },
+    keys: () => [...map.keys()],
+  };
+}
+
 const RUN_ID = 'run-1';
 
 function testSnapshot(overrides: Partial<ReviewRunSnapshot> = {}): ReviewRunSnapshot {
@@ -684,8 +706,88 @@ describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and un
         ];
       },
     ],
+    // wrong-typed (out of range): `parseCoverageProgress`'s own non-negative-finite check, one entry
+    // per field, mirroring `sanitizeFact`'s identical write-side rule for the same five fields
+    // (`harnessActivityLog.ts`). A negative number survives the store's own JSON round trip
+    // (`jsonMemoryStore`) unchanged, so this fixture reaches the parser's finiteness check itself
+    // rather than the wrong-typed check above it.
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative classified',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: -1, inspected: 1 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative inspected',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: -1 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative total',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, total: -3 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative requiredInspected',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredInspected: -2 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative requiredTotal',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredTotal: -4 } },
+        ];
+      },
+    ],
   ])('%s makes the whole lineage record fail closed (undefined), not partially trusted', async (_label, corrupt) => {
     const backing = jsonMemoryStore();
+    const record = validLineage();
+    corrupt(record);
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+    expect(runStore.checkpointsFor('lineage-1')).toEqual([]);
+  });
+
+  // `JSON.stringify` silently turns `NaN`/`Infinity` into `null` before they would ever reach the
+  // parser through the store's own write path (see `jsonMemoryStore`'s own header comment) — which
+  // means the it.each suite above, built on that store, can never actually exercise
+  // `parseCoverageProgress`'s finiteness check with either value; it would only ever see the
+  // already-`null` result and fail on the `typeof` branch instead. `rawMemoryStore` skips that pass so
+  // these two values reach the parser exactly as written, proving the finiteness check itself refuses
+  // them rather than merely refusing the `null` a real store would have reduced them to.
+  it.each([
+    [
+      'a coverageChanged event carries NaN as classified',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: NaN, inspected: 1 } },
+        ];
+      },
+    ],
+    [
+      'a coverageChanged event carries Infinity as total',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, total: Infinity } },
+        ];
+      },
+    ],
+  ])('%s makes the whole lineage record fail closed (undefined), not coerced to null and refused for the wrong reason', (_label, corrupt) => {
+    const backing = rawMemoryStore();
     const record = validLineage();
     corrupt(record);
     seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
