@@ -212,6 +212,66 @@ export function findRecentDiagnosticsCandidates(
 }
 
 /**
+ * Merges a pod's live (running/queued) records into `findRecentDiagnosticsCandidates`'s
+ * disk-derived list, live taking precedence over disk for any target both name — a live record is
+ * always fresher than whatever was last persisted to a checkpoint, and a run in its first moments
+ * (before its own first checkpoint) has no disk candidate to find at all yet
+ * (`evaluateLineage`'s own `incompleteAttempt` rejection, which the disk list alone cannot see past).
+ * Never invents a target neither list already named.
+ */
+export function mergeLiveDiagnosticsCandidates(
+  diskCandidates: readonly DiagnosticsCandidate[],
+  liveCandidates: readonly DiagnosticsCandidate[],
+): readonly DiagnosticsCandidate[] {
+  const byTarget = new Map<string, DiagnosticsCandidate>();
+  for (const candidate of diskCandidates) byTarget.set(candidate.targetKey, candidate);
+  for (const candidate of liveCandidates) byTarget.set(candidate.targetKey, candidate);
+  return [...byTarget.values()].sort((a, b) => (a.occurredAt < b.occurredAt ? 1 : a.occurredAt > b.occurredAt ? -1 : 0));
+}
+
+/** What `selectDiagnosticsCandidate` decided, and what is left to offer afterward. */
+export interface DiagnosticsSelection {
+  readonly chosen: DiagnosticsCandidate;
+  /** Every candidate not chosen — never a gate on the first report, only what a follow-up "pick a different run" offer shows afterward. */
+  readonly others: readonly DiagnosticsCandidate[];
+}
+
+/**
+ * Which candidate `codeVerdict.showRunDiagnostics` reports on immediately, without asking first.
+ *
+ * This closes the defect a headless investigation traced the command's silent no-op to: the old
+ * handler always blocked its very first write on an interactive `showQuickPick` the moment more
+ * than one candidate existed, and a picker the reviewer does not immediately answer — attention is
+ * naturally on the very run it is asking about, and VS Code's own quick pick does not dismiss just
+ * because focus moves to another part of the same window — leaves that write permanently pending.
+ * From the reviewer's seat that is indistinguishable from "the command does nothing": no channel
+ * text, no disk file, no notification, ever, for as long as the picker sits unanswered. Evidence for
+ * exactly this on a real run: the dedicated output channel's own VS Code capture stayed a 0-byte
+ * file for the whole session while sibling channels grew, and neither the on-disk report archive nor
+ * the agent-trace file ever gained a single entry — the command was invoked, and its first write
+ * never landed.
+ *
+ * A run live for this pod right now is reported on unasked whenever it is the only one live — the
+ * reviewer watching it is never blocked on choosing the one thing already in front of them.
+ * Otherwise the most recently occurred candidate is reported on. `others` is everything not chosen,
+ * offered afterward rather than gating the first write.
+ */
+export function selectDiagnosticsCandidate(
+  candidates: readonly DiagnosticsCandidate[],
+  liveTargetKeys: ReadonlySet<string>,
+): DiagnosticsSelection | undefined {
+  if (candidates.length === 0) return undefined;
+  const live = candidates.filter((candidate) => liveTargetKeys.has(candidate.targetKey));
+  // Newest by `occurredAt`, computed here rather than assumed from input order — a caller's own
+  // sort (`mergeLiveDiagnosticsCandidates`, `findRecentDiagnosticsCandidates`) is what every real
+  // caller already hands this, but a selection function silently trusting that would make "which
+  // one is newest" two, potentially diverging answers instead of one.
+  const newest = candidates.reduce((a, b) => (b.occurredAt > a.occurredAt ? b : a));
+  const chosen = live.length === 1 ? live[0]! : newest;
+  return { chosen, others: candidates.filter((candidate) => candidate !== chosen) };
+}
+
+/**
  * The full picture `codeVerdict.showRunDiagnostics`'s not-found report needs when
  * `findRecentDiagnosticsCandidates` comes back empty — counts and identities, never content, and
  * always computed (never skipped because a caller "already knows" the answer is zero), so the

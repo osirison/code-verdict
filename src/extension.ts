@@ -31,6 +31,8 @@ import {
 } from './app/harnessDiagnostics';
 import {
   findRecentDiagnosticsCandidates,
+  mergeLiveDiagnosticsCandidates,
+  selectDiagnosticsCandidate,
   summarizeDiagnosticsDiscovery,
   type DiagnosticsCandidate,
   type IdentifyDiagnosticsTarget,
@@ -64,6 +66,9 @@ import { createObjectCache, type ObjectCache } from './localgit/objectAcquisitio
 
 /** `codeVerdict.showRunDiagnostics`'s bounded on-disk archive — see `writeDiagnosticsReportToDisk`'s own comment. */
 const MAX_RETAINED_DIAGNOSTICS_REPORTS = 20;
+
+/** `codeVerdict.showRunDiagnostics`'s own three write destinations, named once rather than at every call site that reports on them. */
+const DIAGNOSTICS_DESTINATIONS = 'the "Verdict: Run diagnostics" channel and the "Code Verdict: Agent Trace" channel';
 
 /**
  * A process-wide monotonic counter, never a wall-clock read for uniqueness (`harnessAttempt.ts`'s
@@ -1010,6 +1015,83 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  /**
+   * A pod's own live (running/queued) attempts, reshaped as `DiagnosticsCandidate`s so
+   * `selectDiagnosticsCandidate` can weigh them against disk-derived ones. `runManager.active()`
+   * already scopes to "not yet terminal" (D2); this only adds the pod filter `RunInput.podId`
+   * already carries — never `identifyDiagnosticsTargetForPod`'s `ReviewRunSnapshot` matching, which
+   * a live record in its first moments has no snapshot on disk to run that match against at all.
+   */
+  const liveDiagnosticsCandidatesForPod = (pod: Pod): DiagnosticsCandidate[] =>
+    runManager
+      .active()
+      .filter((record) => record.input.podId === pod.id)
+      .map((record) => ({
+        targetKey: record.key,
+        refLabel: record.input.refLabel,
+        lineageId: record.lineageId,
+        attempt: record.attempt,
+        lifecycle: record.lifecycle,
+        completeness: record.completeness,
+        occurredAt: new Date(record.startedAt ?? record.queuedAt).toISOString(),
+        record,
+      }));
+
+  /**
+   * Writes and shows a found `codeVerdict.showRunDiagnostics` report, then — only afterward —
+   * offers a way to see a different candidate instead. Never the other order: the defect this
+   * closes is exactly a picker asked *before* the command's first write, which a reviewer whose
+   * attention is on the very run being asked about may never resolve, leaving the write pending
+   * forever with nothing to show for it (see `selectDiagnosticsCandidate`'s own doc comment for the
+   * evidence this was traced to). Recurses into itself when a different run is picked, so "Pick a
+   * different run…" keeps working for as many times as the reviewer wants to switch.
+   */
+  const reportFoundDiagnosticsRecord = async (
+    record: DiagnosticsSourceRecord,
+    offerOthers: readonly DiagnosticsCandidate[],
+  ): Promise<void> => {
+    const report = buildAttemptDiagnosticsReport(record, () => new Date().toISOString());
+    const text = renderAttemptDiagnosticsText(report);
+    runDiagnosticsChannel.clear();
+    const savedPath = await writeDiagnosticsReportToDisk(context, text, report, 'found');
+    runDiagnosticsChannel.appendLine(text);
+    runDiagnosticsChannel.show(true);
+    writeDiagnosticsReportToAgentTrace(text, traceNow);
+    const savedNote = savedPath ? ` Also saved to ${savedPath}.` : ' (a copy could not be saved to disk.)';
+    // The interesting cases are long — offered, never forced, so a quick glance at the channel
+    // above never waits on this prompt. "Pick a different run…" only appears once there is one to
+    // offer, and it is an action on an already-delivered report, never a gate on delivering it.
+    const choice = await vscode.window.showInformationMessage(
+      `Verdict: run diagnostics ready — written to ${DIAGNOSTICS_DESTINATIONS}.${savedNote}`,
+      ...(offerOthers.length > 0 ? ['Pick a different run…'] : []),
+      'Save as JSON…',
+    );
+    if (choice === 'Save as JSON…') {
+      const uri = await vscode.window.showSaveDialog({
+        filters: { JSON: ['json'] },
+        defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
+      });
+      if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
+    } else if (choice === 'Pick a different run…') {
+      const picked = await vscode.window.showQuickPick(
+        offerOthers.map((candidate) => ({
+          label: candidate.refLabel,
+          description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
+          candidate,
+        })),
+        { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on instead?' },
+      );
+      if (picked) {
+        const live = runManager.get(picked.candidate.targetKey);
+        const nextRecord =
+          live && live.lineageId === picked.candidate.lineageId && live.attempt === picked.candidate.attempt
+            ? live
+            : picked.candidate.record;
+        await reportFoundDiagnosticsRecord(nextRecord, offerOthers.filter((candidate) => candidate !== picked.candidate));
+      }
+    }
+  };
+
   const handlers: Partial<Record<string, () => Promise<void> | void>> = {
     [COMMANDS.openDashboard]: openDashboard,
     [COMMANDS.addProject]: addProject,
@@ -1054,23 +1136,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
     /**
-     * Two previous fixes here changed *what the command resolves*; neither was the actual bug. The
-     * old shape returned early — with only a transient notification — the moment resolution could
-     * not find a target, a picker was dismissed, or a pod was not connected, leaving the channel
-     * unwritten and unshown: an empty panel with no explanation the reviewer could act on.
+     * Every branch below sets exactly one of `record` (a found attempt) or `notFound` (a
+     * `DiagnosticsNotFoundReport` naming why nothing was found), and there is exactly one place,
+     * after the branching, that reports on `record` or writes `notFound` — no path through this
+     * handler can reach that point having written nothing, because nothing before it returns early.
      *
-     * The fix is structural, not another resolution tweak: every branch below sets exactly one of
-     * `record` (a found attempt) or `notFound` (a `DiagnosticsNotFoundReport` naming why nothing was
-     * found, `harnessDiagnostics.ts`'s own sibling of the found-report builder/renderer) — and there
-     * is exactly one place, after the branching, that clears, writes, and shows the channel. No path
-     * through this handler can reach that point having written nothing, because nothing before it
-     * returns early.
+     * That alone is not sufficient, and headless verification of it was the mistake an earlier
+     * version of this fix made: a real reproduction (a live run's own state, a growing
+     * synchronously-written trace file, and VS Code's own per-channel capture) traced the actual
+     * silent no-op to `showQuickPick` itself — asked, as it used to be, *before* this handler's
+     * first write, whenever more than one candidate existed (routine: any pod with more than one
+     * past review already has this). A picker the reviewer does not immediately answer never
+     * dismisses on its own just because focus moves elsewhere in the same window, so that first
+     * write — and with it the channel, the disk file, and the trace marker — stayed pending
+     * indefinitely: indistinguishable, from the reviewer's seat, from the command doing nothing at
+     * all. `selectDiagnosticsCandidate` (`harnessDiagnosticsSource.ts`) is what removes the picker
+     * from this handler's write path — it always resolves a candidate outright, offering the choice
+     * only afterward, from `reportFoundDiagnosticsRecord`'s own completion notification.
      */
     [COMMANDS.showRunDiagnostics]: async () => {
       const now = () => new Date().toISOString();
       const openReviewPanelsCount = (): number => (ReviewFlowPanel.isOpen() ? 1 : 0) + (ChangesetReviewPanel.isOpen() ? 1 : 0);
       let record: DiagnosticsSourceRecord | undefined;
       let notFound: ReturnType<typeof buildDiagnosticsNotFoundReport> | undefined;
+      let pickAnother: readonly DiagnosticsCandidate[] = [];
 
       try {
         // Whichever review panel is open, single-CR or changeset, still holding its own live
@@ -1098,10 +1187,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           } else {
             const identify = identifyDiagnosticsTargetForPod(pod);
             const lineages = harnessRunStore.listLineages();
-            const candidates = findRecentDiagnosticsCandidates(lineages, identify);
+            const diskCandidates = findRecentDiagnosticsCandidates(lineages, identify);
+            const liveCandidates = liveDiagnosticsCandidatesForPod(pod);
+            const candidates = mergeLiveDiagnosticsCandidates(diskCandidates, liveCandidates);
             const podIdentity = { name: pod.name, providerId: pod.providerId, instanceUrl: pod.instanceUrl };
 
-            if (candidates.length === 0) {
+            // Never a `showQuickPick` gate here — see this command's own doc comment. A live run
+            // for this pod is preferred outright when it is the only one; otherwise the newest
+            // candidate is, and everything else becomes `pickAnother`'s post-write offer instead.
+            const selection = selectDiagnosticsCandidate(candidates, new Set(liveCandidates.map((c) => c.targetKey)));
+            if (!selection) {
               notFound = buildDiagnosticsNotFoundReport(
                 {
                   reason: { kind: 'noMatchingRuns' },
@@ -1112,43 +1207,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 now,
               );
             } else {
-              let chosen: DiagnosticsCandidate = candidates[0]!;
-              if (candidates.length > 1) {
-                const picked = await vscode.window.showQuickPick(
-                  candidates.map((candidate) => ({
-                    label: candidate.refLabel,
-                    description: `${candidate.lifecycle} (${candidate.completeness}) — ran ${new Date(candidate.occurredAt).toLocaleString()}`,
-                    candidate,
-                  })),
-                  { title: 'Verdict: run diagnostics', placeHolder: 'Which run should this report on?' },
-                );
-                if (!picked) {
-                  // Dismissed rather than silently returning: the picker only ever appears once a
-                  // real choice existed, so the channel names what was on offer.
-                  notFound = buildDiagnosticsNotFoundReport(
-                    {
-                      reason: { kind: 'pickerDismissed', offered: candidates },
-                      pod: podIdentity,
-                      openReviewPanels,
-                      discovery: summarizeDiagnosticsDiscovery(harnessRunStore.lineageKeyCount(), lineages, identify),
-                    },
-                    now,
-                  );
-                } else {
-                  chosen = picked.candidate;
-                }
-              }
-
-              if (!notFound) {
-                // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle`
-                // only ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure,
-                // the exact shape of this bug, so still has the fuller live record in memory even
-                // though no panel is showing it. Preferred only when it is still the *same* attempt
-                // the disk resolved, so a different, newer run in flight for this target is never
-                // silently substituted for the one the reviewer picked.
-                const live = runManager.get(chosen.targetKey);
-                record = live && live.lineageId === chosen.lineageId && live.attempt === chosen.attempt ? live : chosen.record;
-              }
+              pickAnother = selection.others;
+              // `ReviewRunManager` keeps a failed record until its screen dismisses it (`settle`
+              // only ever drops `succeeded`/`cancelled`) — a panel-closed-but-window-alive failure
+              // still has the fuller live record in memory even though no panel is showing it.
+              // Preferred only when it is still the *same* attempt the selection resolved, so a
+              // different, newer run in flight for this target is never silently substituted for
+              // the one just chosen.
+              const live = runManager.get(selection.chosen.targetKey);
+              record =
+                live && live.lineageId === selection.chosen.lineageId && live.attempt === selection.chosen.attempt
+                  ? live
+                  : selection.chosen.record;
             }
           }
         }
@@ -1196,44 +1266,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       // The one place either report reaches the channel — every branch above set exactly one of
-      // `record`/`notFound`, and none of them may skip past this. The disk write happens first
-      // (see `writeDiagnosticsReportToDisk`'s own comment): the channel is a surface a reviewer
-      // may not be able to see at all, so a file that always exists lands before anything that
-      // depends on the channel being visible. The Agent Trace copy (`writeDiagnosticsReportToAgentTrace`,
-      // Part 4's "make the channel irrelevant" fix) is a third destination alongside it — never a
-      // replacement for either of the other two.
-      const destinations = 'the "Verdict: Run diagnostics" channel and the "Code Verdict: Agent Trace" channel';
-      runDiagnosticsChannel.clear();
+      // `record`/`notFound`, and none of them may skip past this, and neither branch below awaits
+      // anything before its first write: `reportFoundDiagnosticsRecord` writes before it ever shows
+      // a notification, and the not-found branch has no interactive step at all. No user input
+      // stands between invocation and the first write, on any path.
       if (record) {
-        const report = buildAttemptDiagnosticsReport(record, now);
-        const text = renderAttemptDiagnosticsText(report);
-        const savedPath = await writeDiagnosticsReportToDisk(context, text, report, 'found');
-        runDiagnosticsChannel.appendLine(text);
-        runDiagnosticsChannel.show(true);
-        writeDiagnosticsReportToAgentTrace(text, traceNow);
-        const savedNote = savedPath ? ` Also saved to ${savedPath}.` : ' (a copy could not be saved to disk.)';
-        // The interesting cases are long — offered, never forced, so a quick
-        // glance at the channel above never waits on this prompt.
-        const choice = await vscode.window.showInformationMessage(
-          `Verdict: run diagnostics ready — written to ${destinations}.${savedNote}`,
-          'Save as JSON…',
-        );
-        if (choice === 'Save as JSON…') {
-          const uri = await vscode.window.showSaveDialog({
-            filters: { JSON: ['json'] },
-            defaultUri: vscode.Uri.file(`verdict-run-diagnostics-${report.runId}-attempt-${report.attempt}.json`),
-          });
-          if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
-        }
+        await reportFoundDiagnosticsRecord(record, pickAnother);
       } else {
         const text = renderDiagnosticsNotFoundText(notFound!);
+        runDiagnosticsChannel.clear();
         const savedPath = await writeDiagnosticsReportToDisk(context, text, notFound!, 'not-found');
         runDiagnosticsChannel.appendLine(text);
         runDiagnosticsChannel.show(true);
         writeDiagnosticsReportToAgentTrace(text, traceNow);
         const savedNote = savedPath ? ` Also saved to ${savedPath}.` : ' (a copy could not be saved to disk.)';
         void vscode.window.showInformationMessage(
-          `Verdict: ${hintForNotFound(notFound!.reason)} See ${destinations} for detail.${savedNote}`,
+          `Verdict: ${hintForNotFound(notFound!.reason)} See ${DIAGNOSTICS_DESTINATIONS} for detail.${savedNote}`,
         );
       }
     },

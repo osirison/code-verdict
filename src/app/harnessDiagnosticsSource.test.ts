@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { buildCheckpoint, type CheckpointBuildInput } from './harnessCheckpoint';
-import { diagnosticsCheckpointFromPersisted, findRecentDiagnosticsCandidates, summarizeDiagnosticsDiscovery, type IdentifyDiagnosticsTarget } from './harnessDiagnosticsSource';
+import {
+  diagnosticsCheckpointFromPersisted,
+  findRecentDiagnosticsCandidates,
+  mergeLiveDiagnosticsCandidates,
+  selectDiagnosticsCandidate,
+  summarizeDiagnosticsDiscovery,
+  type DiagnosticsCandidate,
+  type IdentifyDiagnosticsTarget,
+} from './harnessDiagnosticsSource';
 import { buildAttemptDiagnosticsReport, renderAttemptDiagnosticsText } from './harnessDiagnostics';
 import { createHarnessRunStore } from './harnessRunStore';
 import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
@@ -335,5 +343,88 @@ describe('diagnosticsCheckpointFromPersisted', () => {
     expect(checkpoint).toBeDefined();
     const adapted = diagnosticsCheckpointFromPersisted(checkpoint!);
     expect(JSON.stringify(adapted)).not.toContain('RAW CONTENT THAT MUST NEVER REACH A PERSISTED-STORE DIAGNOSTICS REPORT');
+  });
+});
+
+/** A minimal `DiagnosticsCandidate` — these two functions never read `record`, so a stub stands in for the real, larger shape `evaluateLineage` builds. */
+function candidate(overrides: Partial<DiagnosticsCandidate> & { targetKey: string }): DiagnosticsCandidate {
+  return {
+    refLabel: `!${overrides.targetKey}`,
+    lineageId: `lineage-${overrides.targetKey}`,
+    attempt: 1,
+    lifecycle: 'failed',
+    completeness: 'none',
+    occurredAt: '2026-01-01T00:00:00.000Z',
+    record: {} as DiagnosticsCandidate['record'],
+    ...overrides,
+  };
+}
+
+describe('mergeLiveDiagnosticsCandidates', () => {
+  it('keeps a disk candidate whose target no live record names', () => {
+    const disk = [candidate({ targetKey: 'cr-1', occurredAt: '2026-01-01T00:00:00.000Z' })];
+    expect(mergeLiveDiagnosticsCandidates(disk, [])).toEqual(disk);
+  });
+
+  it('prefers the live record for a target both name, even when the disk one is nominally "newer"', () => {
+    const disk = [candidate({ targetKey: 'cr-1', occurredAt: '2026-01-02T00:00:00.000Z', lifecycle: 'failed' })];
+    const live = [candidate({ targetKey: 'cr-1', occurredAt: '2026-01-01T00:00:00.000Z', lifecycle: 'investigating' })];
+    const merged = mergeLiveDiagnosticsCandidates(disk, live);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.lifecycle).toBe('investigating');
+  });
+
+  it('includes a live target the disk list has never heard of — a run in its first moments, before its own first checkpoint', () => {
+    const live = [candidate({ targetKey: 'cr-2', lifecycle: 'queued' })];
+    const merged = mergeLiveDiagnosticsCandidates([], live);
+    expect(merged).toEqual(live);
+  });
+
+  it('sorts the merged list newest first', () => {
+    const disk = [candidate({ targetKey: 'cr-old', occurredAt: '2026-01-01T00:00:00.000Z' })];
+    const live = [candidate({ targetKey: 'cr-new', occurredAt: '2026-01-03T00:00:00.000Z' })];
+    expect(mergeLiveDiagnosticsCandidates(disk, live).map((c) => c.targetKey)).toEqual(['cr-new', 'cr-old']);
+  });
+});
+
+describe('selectDiagnosticsCandidate: the picker-gate fix — no candidate here may require an answer before the caller\'s first write', () => {
+  it('is undefined for an empty candidate list, never a fabricated selection', () => {
+    expect(selectDiagnosticsCandidate([], new Set())).toBeUndefined();
+  });
+
+  it('chooses the one candidate outright when there is only one, live or not', () => {
+    const candidates = [candidate({ targetKey: 'cr-1' })];
+    const selection = selectDiagnosticsCandidate(candidates, new Set());
+    expect(selection?.chosen.targetKey).toBe('cr-1');
+    expect(selection?.others).toEqual([]);
+  });
+
+  it('chooses the run live for this pod outright when it is the only one live, even when a stale candidate is nominally newer', () => {
+    const candidates = [
+      candidate({ targetKey: 'cr-stale-newer', occurredAt: '2026-01-05T00:00:00.000Z' }),
+      candidate({ targetKey: 'cr-live', occurredAt: '2026-01-01T00:00:00.000Z' }),
+    ];
+    const selection = selectDiagnosticsCandidate(candidates, new Set(['cr-live']));
+    expect(selection?.chosen.targetKey).toBe('cr-live');
+    expect(selection?.others.map((c) => c.targetKey)).toEqual(['cr-stale-newer']);
+  });
+
+  it('falls back to the newest candidate when more than one is live at once — never asks which', () => {
+    const candidates = [
+      candidate({ targetKey: 'cr-a', occurredAt: '2026-01-01T00:00:00.000Z' }),
+      candidate({ targetKey: 'cr-b', occurredAt: '2026-01-02T00:00:00.000Z' }),
+    ];
+    const selection = selectDiagnosticsCandidate(candidates, new Set(['cr-a', 'cr-b']));
+    expect(selection?.chosen.targetKey).toBe('cr-b');
+  });
+
+  it('falls back to the newest candidate when nothing is live', () => {
+    const candidates = [
+      candidate({ targetKey: 'cr-a', occurredAt: '2026-01-01T00:00:00.000Z' }),
+      candidate({ targetKey: 'cr-b', occurredAt: '2026-01-02T00:00:00.000Z' }),
+    ];
+    const selection = selectDiagnosticsCandidate(candidates, new Set());
+    expect(selection?.chosen.targetKey).toBe('cr-b');
+    expect(selection?.others.map((c) => c.targetKey)).toEqual(['cr-a']);
   });
 });

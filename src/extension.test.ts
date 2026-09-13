@@ -33,7 +33,13 @@ const state = vi.hoisted(() => ({
   handlers: new Map<string, (...args: unknown[]) => unknown>(),
   channels: [] as Array<{ name: string; lines: string[]; shown: boolean }>,
   messages: [] as Array<[string, string]>,
+  /** The buttons the most recent `showInformationMessage` call offered, in order — never inferred from `messages` alone. */
+  infoMessageItems: [] as string[],
+  /** Which of `infoMessageItems` (if any) the stub resolves the call to — defaults to none picked, matching every test that predates the follow-up "Pick a different run…" offer. */
+  infoMessageImpl: (async () => undefined) as (...args: unknown[]) => Promise<unknown>,
   quickPickImpl: (async () => undefined) as (...args: unknown[]) => Promise<unknown>,
+  /** How many times `showQuickPick` was called this test — the picker-gate fix's own regression guard: the first write must reach zero of these. */
+  quickPickCalls: 0,
   // A real in-memory filesystem, keyed by `fsPath` — `codeVerdict.showRunDiagnostics`'s
   // always-write-to-disk behavior is verified against this, not against a stub that would let
   // `writeFile` vacuously "succeed" without anything to read back.
@@ -80,10 +86,14 @@ vi.mock('vscode', () => {
         state.channels.push(chan);
         return chan;
       },
-      showInformationMessage: async (msg: string) => { state.messages.push(['info', String(msg)]); return undefined; },
+      showInformationMessage: async (msg: string, ...items: string[]) => {
+        state.messages.push(['info', String(msg)]);
+        state.infoMessageItems = items;
+        return state.infoMessageImpl(msg, ...items);
+      },
       showErrorMessage: async () => undefined,
       showWarningMessage: async () => undefined,
-      showQuickPick: (...args: unknown[]) => state.quickPickImpl(...args),
+      showQuickPick: (...args: unknown[]) => { state.quickPickCalls += 1; return state.quickPickImpl(...args); },
       showSaveDialog: async () => undefined,
       onDidChangeActiveTextEditor: () => disposable(),
       activeTextEditor: undefined,
@@ -336,16 +346,25 @@ beforeEach(() => {
   state.handlers.clear();
   state.channels.length = 0;
   state.messages.length = 0;
+  state.infoMessageItems = [];
+  state.infoMessageImpl = async () => undefined;
   state.quickPickImpl = async () => undefined;
+  state.quickPickCalls = 0;
   state.fsFiles.clear();
 });
 
 /** The one file `writeDiagnosticsReportToDisk` wrote for the invocation under test — throws if none did, since every invocation must write exactly one. */
 function writtenDiagnosticsFile(): { path: string; content: string } {
-  const entries = [...state.fsFiles.entries()].filter(([path]) => path.includes('run-diagnostics'));
-  if (entries.length !== 1) throw new Error(`expected exactly one diagnostics file written, found ${entries.length}: ${entries.map(([p]) => p).join(', ')}`);
-  const [path, content] = entries[0] as [string, string];
-  return { path, content };
+  const entries = writtenDiagnosticsFiles();
+  if (entries.length !== 1) throw new Error(`expected exactly one diagnostics file written, found ${entries.length}: ${entries.map((e) => e.path).join(', ')}`);
+  return entries[0]!;
+}
+
+/** Every file `writeDiagnosticsReportToDisk` wrote so far — for a test that drives the "Pick a different run…" follow-up and so expects more than one. */
+function writtenDiagnosticsFiles(): Array<{ path: string; content: string }> {
+  return [...state.fsFiles.entries()]
+    .filter(([path]) => path.includes('run-diagnostics'))
+    .map(([path, content]) => ({ path, content }));
 }
 
 afterEach(() => {
@@ -447,21 +466,68 @@ describe('codeVerdict.showRunDiagnostics always writes to its channel and always
     expect(text).toContain('lineage-other — belongs to a different pod\'s target');
   });
 
-  it('writes a diagnostic, shown report naming the offered runs when the picker is dismissed', async () => {
+  /**
+   * The picker-gate fix's own regression guard. The old shape asked `showQuickPick` — an
+   * interactive, focus-dependent prompt — *before* the command's first write, the moment more than
+   * one candidate existed. A picker the reviewer never answers (VS Code's own quick pick does not
+   * dismiss itself just because focus moves elsewhere in the same window) left that first write
+   * permanently pending: no channel text, no disk file, no trace marker, ever — a real run's own
+   * state reproduced exactly this (see `harnessDiagnosticsSource.ts`'s `selectDiagnosticsCandidate`
+   * doc comment for the evidence). `quickPickCalls` staying `0` here is the direct assertion that
+   * this command's first write no longer waits on anything interactive.
+   */
+  it('reports on the newest candidate immediately when more than one exists, asking no picker before the first write', async () => {
     const store = memoryStore();
     await seedPod(store);
     await seedLineage(store, 'lineage-a', 'repo-1', '10', '2026-01-01T00:00:00.000Z');
     await seedLineage(store, 'lineage-b', 'repo-1', '11', '2026-01-02T00:00:00.000Z');
-    state.quickPickImpl = async () => undefined;
     await activateWith(store);
     await invokeShowRunDiagnostics();
 
+    expect(state.quickPickCalls).toBe(0);
     const chan = runDiagnosticsChannel();
     expect(chan.shown).toBe(true);
     const text = chan.lines.join('\n');
-    expect(text).toContain('The run picker was dismissed without a choice.');
-    expect(text).toContain('!10');
-    expect(text).toContain('!11');
+    // lineage-b is the newer of the two, and the one reported on without being asked.
+    expect(text).toContain('run=run-lineage-b lineage=lineage-b attempt=1');
+    expect(text).not.toContain('run=run-lineage-a');
+
+    // The report was found, not a not-found/picker-dismissed shape — the completion notification is
+    // where the road not taken is offered, never a gate before this report existed at all.
+    expect(state.infoMessageItems).toContain('Pick a different run…');
+  });
+
+  /**
+   * "Pick a different run…" is an action on an already-delivered report, never a second gate: this
+   * drives it end to end and checks a second, distinct report actually gets written for the run the
+   * reviewer asked for instead.
+   */
+  it('writes a second found report for the run chosen from "Pick a different run…", without disturbing the first', async () => {
+    const store = memoryStore();
+    await seedPod(store);
+    await seedLineage(store, 'lineage-a', 'repo-1', '10', '2026-01-01T00:00:00.000Z');
+    await seedLineage(store, 'lineage-b', 'repo-1', '11', '2026-01-02T00:00:00.000Z');
+    state.infoMessageImpl = async (...args: unknown[]) => {
+      const items = args.slice(1) as string[];
+      return items.includes('Pick a different run…') ? 'Pick a different run…' : undefined;
+    };
+    state.quickPickImpl = async (...args: unknown[]) => {
+      const items = args[0] as Array<{ label: string; candidate: unknown }>;
+      return items.find((item) => item.label === '!10');
+    };
+    await activateWith(store);
+    await invokeShowRunDiagnostics();
+
+    const files = writtenDiagnosticsFiles();
+    expect(files).toHaveLength(2);
+    expect(files.some((f) => f.content.includes('run=run-lineage-b'))).toBe(true);
+    expect(files.some((f) => f.content.includes('run=run-lineage-a'))).toBe(true);
+
+    // The channel ends on the second report — the one just asked for, not the first.
+    const chan = runDiagnosticsChannel();
+    const text = chan.lines.join('\n');
+    expect(text).toContain('run=run-lineage-a lineage=lineage-a attempt=1');
+    expect(text).not.toContain('run=run-lineage-b');
   });
 
   it('still resolves and shows the found report normally when exactly one candidate matches (no regression on the success path)', async () => {
