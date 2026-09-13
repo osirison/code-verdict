@@ -1965,6 +1965,19 @@ export class ReviewFlowPanel {
       // ordered activity — never a fixed step list or a fragment count.
       runProjection: this.runRecord?.projection,
       runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      // Live counts for the phase rail's neighbour line (repo-owner incident:
+      // a healthy run in `verifying` read as "looping" with nothing on
+      // screen to say otherwise) — the same checkpoint `runActivity` already
+      // reads, never a second read of the attempt's state. `findings` counts
+      // only `accepted` candidates, matching `CandidateTracker.
+      // triageFindings()`'s own definition of what a reviewer will actually
+      // see; `modelTurnsUsed` is `budget.modelTurnsUsed` verbatim.
+      runCounts: this.runRecord?.checkpoint
+        ? {
+            findings: this.runRecord.checkpoint.candidates.filter((candidate) => candidate.state === 'accepted').length,
+            modelTurnsUsed: this.runRecord.checkpoint.budget.modelTurnsUsed,
+          }
+        : undefined,
       runStartedAt: this.runRecord?.startedAt,
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
         ? { ...this.runRecord.failure, partialCount: 0 }

@@ -12,11 +12,11 @@ import type { Attachment } from '../app/reviewContext';
 import type { HunkLine } from '../domain/diffHunks';
 import type { LinkedWorkItem, ReviewContextEntry } from '../app/reviewContext';
 import type { ActivityEvent, CoverageProgress, Limitation, PlanItem, RunProjection } from '../domain/harnessActivity';
-import type { AttemptNumber, LineageId, ResultCompleteness } from '../domain/harnessLifecycle';
+import type { AttemptNumber, LineageId, ResultCompleteness, RunLifecycle } from '../domain/harnessLifecycle';
 import type { ProtocolProvenance } from '../domain/harnessEvidence';
 import type { CompletionBlockerDetail } from '../app/harnessCompletion';
 import { planHistory } from '../app/harnessActivityPlan';
-import { orderActivity, reduceActivity } from '../app/harnessActivityProjection';
+import { lifecycleForPhase, orderActivity, reduceActivity } from '../app/harnessActivityProjection';
 import type { Vocabulary } from './vocab';
 import { cap, countOf, elapsedClock, runLifecycleLabel } from './vocab';
 import { escapeHtml as e } from './dashboardHtml';
@@ -186,6 +186,26 @@ export interface FlowViewState {
    * legacy results).
    */
   runActivity?: readonly ActivityEvent[];
+  /**
+   * Live counts a reviewer can glance at to tell a healthy run in `verifying`
+   * from a hung one — the incident this was built for: a run doing real
+   * verification work read as "looping" because nothing on screen said how
+   * far it had actually got. Sourced from `RunRecord.checkpoint`'s own
+   * `candidates` (accepted count) and `budget.modelTurnsUsed`, so absent on
+   * exactly the same schedule `runActivity` is — before the first checkpoint,
+   * or for a legacy-adapted run.
+   *
+   * `modelTurnsUsed` carries no denominator on purpose: the resolved
+   * `maxModelTurnsPerAttempt` a run is actually bound by is not plumbed to
+   * any UI surface today — `harnessDiagnostics.ts`'s own turn-budget report
+   * has the identical gap (a bare "model turns used: N", no "of M"). A
+   * render-time re-read of the setting would answer a different question
+   * ("what is configured now") than this field does ("what did this attempt
+   * resolve"), which is the exact ambiguity `harnessPolicyTrace.ts` exists to
+   * kill for the trace log — inventing a denominator here would reopen it on
+   * screen instead.
+   */
+  runCounts?: { findings: number; modelTurnsUsed: number };
   /** Epoch ms the request actually started, so the page can tick its own elapsed clock between repaints — `RunRecord.startedAt`, independent of anything fragment-related. */
   runStartedAt?: number;
   /**
@@ -582,6 +602,23 @@ ${WIDTH_CSS}
 .plan-item-failed .plan-item-glyph { color: var(--sev-blocker); }
 .plan-item-desc { color: var(--fg); }
 .plan-item-completed .plan-item-desc, .plan-item-skipped .plan-item-desc { color: var(--fg-dimmer); }
+.phase-rail { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.rail-stage { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 10px; font-size: 11px; }
+.rail-glyph { font-family: var(--font-mono); }
+.rail-sep { color: var(--fg-dimmer); font-size: 11px; }
+.rail-stage-pending, .rail-stage-pending .rail-glyph { color: var(--fg-dimmer); }
+.rail-stage-current { color: var(--agent); font-weight: 600; }
+.rail-stage-current .rail-glyph { color: var(--agent); }
+.rail-stage-passed { color: var(--fg-dim); }
+.rail-stage-passed .rail-glyph { color: var(--ok); }
+.rail-stage-failed { color: var(--sev-blocker); font-weight: 600; }
+.rail-stage-failed .rail-glyph { color: var(--sev-blocker); }
+.rail-stage-cancelled { color: var(--fg-dim); font-weight: 600; }
+.rail-stage-cancelled .rail-glyph { color: var(--fg-dimmer); }
+.rail-terminal { margin-left: 4px; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.rail-terminal-succeeded { color: var(--ok); background: var(--ok-t); }
+.rail-terminal-failed { color: var(--sev-blocker); background: var(--sev-blocker-t); }
+.rail-terminal-cancelled { color: var(--fg-dim); background: var(--bg3); }
 .limitations { text-align: left; display: flex; flex-direction: column; gap: 4px; }
 .limitation-chip { font-size: 11px; color: var(--sev-major); background: var(--sev-major-t); border-radius: 4px; padding: 5px 9px; }
 .activity-log { text-align: left; max-height: 220px; overflow-y: auto; border: 1px solid var(--line2); border-radius: 6px; display: flex; flex-direction: column; }
@@ -1077,6 +1114,82 @@ function planItemLine(item: PlanItem): string {
  * stay stable across a revision (D5), so a reviewer who watched an item
  * through a revision sees the same row, not a new one.
  */
+const RAIL_PHASES = ['planning', 'investigating', 'verifying', 'completing'] as const;
+
+/** The only three lifecycle values that ever end a run; the rail borrows each one's own name as a CSS/state suffix. */
+const RAIL_TERMINALS = ['succeeded', 'failed', 'cancelled'] as const;
+
+type RailTerminal = (typeof RAIL_TERMINALS)[number];
+
+function isRailTerminal(lifecycle: RunLifecycle): lifecycle is RailTerminal {
+  return (RAIL_TERMINALS as readonly RunLifecycle[]).includes(lifecycle);
+}
+
+const RAIL_TERMINAL_LABEL: Record<RailTerminal, string> = { succeeded: 'Succeeded', failed: 'Failed', cancelled: 'Cancelled' };
+const RAIL_TERMINAL_GLYPH: Record<RailTerminal, string> = { succeeded: '✓', failed: '✕', cancelled: '⊘' };
+
+/**
+ * One rail stage. `index < currentIndex` is "already behind us" regardless of
+ * how the run ends; a `succeeded` terminal additionally promotes the current
+ * stage itself to passed (the run finished cleanly, so `completing` is done
+ * too) — but `failed`/`cancelled` never do, because the stage the run ended
+ * in did not finish; it is exactly where the run stopped, and that stage
+ * alone carries the terminal's own color and glyph. A stage past the current
+ * one stays `pending` no matter how the run ends: D14's own rule ("never
+ * contradict") forbids a rail that shows `verifying`/`completing` as passed
+ * for a run that failed while still `investigating`.
+ */
+function railStage(phase: (typeof RAIL_PHASES)[number], index: number, currentIndex: number, terminal: RailTerminal | undefined): string {
+  let stateClass: string;
+  let glyph: string;
+  if (index < currentIndex || (terminal === 'succeeded' && index === currentIndex)) {
+    stateClass = 'rail-stage-passed';
+    glyph = '✓';
+  } else if (index === currentIndex && terminal) {
+    stateClass = `rail-stage-${terminal}`;
+    glyph = RAIL_TERMINAL_GLYPH[terminal];
+  } else if (index === currentIndex) {
+    stateClass = 'rail-stage-current';
+    glyph = '●';
+  } else {
+    stateClass = 'rail-stage-pending';
+    glyph = '○';
+  }
+  return `<span class="rail-stage ${stateClass}"><span class="rail-glyph" aria-hidden="true">${glyph}</span><span class="rail-label">${cap(phase)}</span></span>`;
+}
+
+/**
+ * The phase rail — planning → investigating → verifying → completing — the
+ * repo-owner incident asked for directly: a healthy run sitting in
+ * `verifying` read as "looping" on screen because nothing said which of the
+ * four phases it had reached. Reuses `lifecycleForPhase`
+ * (`harnessActivityProjection.ts`) to collapse `RunProjection.phase` the
+ * identical way the reducer already collapses it into `RunProjection.
+ * lifecycle` — never a second, screen-local mapping that could disagree
+ * about where `bootstrap`/`persisting` land.
+ *
+ * Color is never the only signal (accessibility): every stage carries its
+ * own glyph shape and its phase name as plain text, agreeing with its color
+ * rather than standing in for it — the same convention `planItemLine`
+ * already uses for plan-item states.
+ *
+ * Absent whenever `runProjection` has no `phase` yet — before the first
+ * checkpoint, or for a legacy-adapted run with no activity at all — rather
+ * than guessing a starting stage.
+ */
+function phaseRail(projection: RunProjection | undefined): string {
+  if (!projection?.phase) return '';
+  const currentIndex = (RAIL_PHASES as readonly RunLifecycle[]).indexOf(lifecycleForPhase(projection.phase));
+  const terminal = isRailTerminal(projection.lifecycle) ? projection.lifecycle : undefined;
+  const stages = RAIL_PHASES.map((phase, index) => railStage(phase, index, currentIndex, terminal)).join(
+    '<span class="rail-sep" aria-hidden="true">→</span>',
+  );
+  const chip = terminal
+    ? `<span class="rail-terminal rail-terminal-${terminal}">${RAIL_TERMINAL_LABEL[terminal]}</span>`
+    : '';
+  return `<div class="phase-rail" role="list" aria-label="Review phases">${stages}${chip}</div>`;
+}
+
 function planBlock(activity: readonly ActivityEvent[]): string {
   const revisions = planHistory(activity);
   const latest = revisions[revisions.length - 1];
@@ -1096,8 +1209,7 @@ function planBlock(activity: readonly ActivityEvent[]): string {
  * (`inspected`/`requiredInspected`) — shown side by side rather than
  * collapsed into one number, since they answer different questions.
  */
-function coverageLine(coverage: CoverageProgress | undefined): string {
-  if (!coverage) return '';
+function coverageParts(coverage: CoverageProgress): string[] {
   const parts: string[] = [
     coverage.total !== undefined
       ? `${coverage.classified} of ${coverage.total} changed files classified`
@@ -1108,7 +1220,30 @@ function coverageLine(coverage: CoverageProgress | undefined): string {
   } else if (coverage.inspected > 0) {
     parts.push(`${coverage.inspected} files inspected`);
   }
-  return `<div class="coverage-line">${parts.map(e).join(' · ')}</div>`;
+  return parts;
+}
+
+function coverageLine(coverage: CoverageProgress | undefined): string {
+  if (!coverage) return '';
+  return `<div class="coverage-line">${coverageParts(coverage).map(e).join(' · ')}</div>`;
+}
+
+/**
+ * The compact live counts line the repo-owner incident asked for: findings
+ * validated so far and model turns spent, next to coverage's own two
+ * denominators — a reviewer glances at one line to tell a healthy long run
+ * from a stuck one. Shares `coverageParts` with `coverageLine` rather than
+ * re-deriving coverage's own text, so the two can never disagree about what
+ * "12 of 20 files classified" means; `runCounts`'s own doc comment
+ * (`FlowViewState`) explains why `modelTurnsUsed` carries no denominator.
+ */
+function liveCountsLine(coverage: CoverageProgress | undefined, counts: FlowViewState['runCounts']): string {
+  const parts: string[] = coverage ? coverageParts(coverage) : [];
+  if (counts) {
+    parts.push(`${counts.findings} ${counts.findings === 1 ? 'finding' : 'findings'} so far`);
+    parts.push(`${counts.modelTurnsUsed} model ${counts.modelTurnsUsed === 1 ? 'turn' : 'turns'} used`);
+  }
+  return parts.length > 0 ? `<div class="coverage-line">${parts.map(e).join(' · ')}</div>` : '';
 }
 
 function limitationsList(limitations: readonly Limitation[]): string {
@@ -1283,9 +1418,10 @@ function renderRunning(s: FlowViewState): string {
     <div class="agent-name">${e(agent?.label ?? '')}</div>
     <div class="run-phase">${e(lifecycleText)}</div>
     ${actionText ? `<div class="run-action">${actionText}</div>` : ''}
+    ${phaseRail(projection)}
     ${progressBar(projection)}
     <div class="run-live"><span><b id="run-elapsed" data-started="${s.runStartedAt ?? ''}">${e(elapsedClock(projection?.elapsedMs ?? 0))}</b> elapsed</span></div>
-    ${coverageLine(projection?.coverage)}
+    ${liveCountsLine(projection?.coverage, s.runCounts)}
     ${completenessNote}
     ${planBlock(activity)}
     ${limitationsList(projection?.limitations ?? [])}
@@ -1411,6 +1547,7 @@ function retainedDetailsBlock(s: FlowViewState): string {
   return `<div class="retained-details">
     ${conclusion}
     ${lineageLine}
+    ${phaseRail(finalProjection)}
     ${coverageLine(finalProjection?.coverage)}
     ${planBlock(details.activity)}
     ${limitationsList(details.limitations)}

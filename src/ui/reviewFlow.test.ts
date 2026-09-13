@@ -841,6 +841,45 @@ describe('run controls are derived from the manager\'s own transition validity (
   });
 });
 
+describe('live counts render from the attempt\'s own checkpoint (traffic-light cue)', () => {
+  it('shows accepted-candidate and model-turn counts once a checkpoint has landed, with no invented turn budget', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({
+      key: runKeyForCr(REF),
+      status: 'running',
+      lifecycle: 'verifying',
+      projection: {
+        runId: 'r1', lineageId: 'l1', attempt: 1, lifecycle: 'verifying', completeness: 'none',
+        phase: 'verifying', elapsedMs: 1_000, progressMode: 'indeterminate', attention: 'none', limitations: [],
+      },
+      checkpoint: {
+        candidates: [
+          { candidateId: 'c1', state: 'accepted', repairs: 0, reasons: [] },
+          { candidateId: 'c2', state: 'unresolved', repairs: 0, reasons: [] },
+          { candidateId: 'c3', state: 'accepted', repairs: 0, reasons: [] },
+        ],
+        budget: { modelTurnsUsed: 7, toolCallsUsed: 0, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+        activityLog: { runId: 'r1', lineageId: 'l1', attempt: 1, events: [] },
+      },
+    } as unknown as RunRecord);
+    await h.post({ type: 'noop' });
+
+    // Only the two accepted candidates count as findings — the unresolved one does not.
+    expect(panel.webview.html).toContain('2 findings so far');
+    expect(panel.webview.html).toContain('7 model turns used');
+    // No fabricated denominator: `readResolvedHarnessPolicy`'s own
+    // `maxModelTurnsPerAttempt` is never re-read here (see `FlowViewState.
+    // runCounts`'s own doc comment for why).
+    expect(panel.webview.html).not.toMatch(/7 model turns used of \d/);
+  });
+});
+
 // ---- 4.7 — a coalesced record is one action's state, never a blend -------------
 
 describe('coalesced record integrity', () => {

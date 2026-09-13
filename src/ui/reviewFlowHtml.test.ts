@@ -963,6 +963,84 @@ describe('the running screen renders from the shared projection alone (task 14.1
     });
     expect(html).not.toContain('style="');
   });
+
+  describe('the phase rail — a traffic-light cue of where the run has got to', () => {
+    it('highlights the current phase, marking the phases before it passed and those after it pending', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'verifying', lifecycle: 'verifying' }) });
+      expect(html).toContain('class="phase-rail"');
+      // Planning and investigating are behind us...
+      expect(html).toMatch(/rail-stage-passed"[^>]*><span[^>]*>✓<\/span><span[^>]*>Planning/);
+      expect(html).toMatch(/rail-stage-passed"[^>]*><span[^>]*>✓<\/span><span[^>]*>Investigating/);
+      // ...verifying is current...
+      expect(html).toMatch(/rail-stage-current"[^>]*><span[^>]*>●<\/span><span[^>]*>Verifying/);
+      // ...and completing has not happened yet.
+      expect(html).toMatch(/rail-stage-pending"[^>]*><span[^>]*>○<\/span><span[^>]*>Completing/);
+      expect(html).not.toContain('rail-terminal');
+    });
+
+    it('collapses bootstrap into planning — the identical collapse `RunProjection.lifecycle` already uses, never a second mapping', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'bootstrap', lifecycle: 'planning' }) });
+      expect(html).toMatch(/rail-stage-current"[^>]*><span[^>]*>●<\/span><span[^>]*>Planning/);
+    });
+
+    it('marks every phase passed, with a green terminal chip, once the run has succeeded', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'persisting', lifecycle: 'succeeded' }) });
+      expect(html).toContain('rail-terminal-succeeded">Succeeded');
+      expect(html).not.toContain('rail-stage-current');
+      expect(html).not.toContain('rail-stage-pending');
+      expect(html.match(/rail-stage-passed/g)?.length).toBe(4);
+    });
+
+    it('does not claim later phases passed when the run failed mid-investigation — only investigating carries the failed color, verifying and completing stay pending', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'investigating', lifecycle: 'failed' }) });
+      expect(html).toContain('rail-terminal-failed">Failed');
+      expect(html).toMatch(/rail-stage-passed"[^>]*><span[^>]*>✓<\/span><span[^>]*>Planning/);
+      expect(html).toMatch(/rail-stage-failed"[^>]*><span[^>]*>✕<\/span><span[^>]*>Investigating/);
+      expect(html).toMatch(/rail-stage-pending"[^>]*><span[^>]*>○<\/span><span[^>]*>Verifying/);
+      expect(html).toMatch(/rail-stage-pending"[^>]*><span[^>]*>○<\/span><span[^>]*>Completing/);
+    });
+
+    it('renders a neutral cancelled chip, not red or green', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'verifying', lifecycle: 'cancelled' }) });
+      expect(html).toContain('rail-terminal-cancelled">Cancelled');
+      expect(html).toMatch(/rail-stage-cancelled"[^>]*><span[^>]*>⊘<\/span><span[^>]*>Verifying/);
+    });
+
+    it('renders nothing before the first checkpoint reports a phase', () => {
+      const html = running({ runProjection: baseProjection({ phase: undefined }) });
+      expect(html).not.toContain('phase-rail');
+    });
+
+    it('carries no inline style attribute', () => {
+      const html = running({ runProjection: baseProjection({ phase: 'investigating', lifecycle: 'failed' }) });
+      expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
+    });
+  });
+
+  describe('live counts — findings so far and model turns used (repo-owner incident: a healthy run looked like it was looping)', () => {
+    it('shows accepted-finding and model-turn counts, next to coverage, with no invented turn denominator', () => {
+      const html = running({
+        runProjection: baseProjection({ coverage: { classified: 12, total: 20, inspected: 3 } }),
+        runCounts: { findings: 4, modelTurnsUsed: 9 },
+      });
+      expect(html).toContain('12 of 20 changed files classified');
+      expect(html).toContain('4 findings so far');
+      expect(html).toContain('9 model turns used');
+      expect(html).not.toMatch(/9 model turns used of \d/);
+    });
+
+    it('uses singular wording for exactly one of each', () => {
+      const html = running({ runCounts: { findings: 1, modelTurnsUsed: 1 } });
+      expect(html).toContain('1 finding so far');
+      expect(html).toContain('1 model turn used');
+    });
+
+    it('renders nothing before the first checkpoint has reported any candidates or budget', () => {
+      const html = running({ runProjection: baseProjection({ coverage: undefined }), runCounts: undefined });
+      expect(html).not.toContain('findings so far');
+      expect(html).not.toContain('model turn');
+    });
+  });
 });
 
 describe('the failure card names specific files, not just that some files (task: say which files)', () => {

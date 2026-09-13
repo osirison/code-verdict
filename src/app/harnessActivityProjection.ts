@@ -64,8 +64,14 @@ export function orderActivity(events: readonly ActivityEvent[]): ActivityEvent[]
  * Phases with no lifecycle value of their own collapse to the nearest one:
  * `bootstrap` precedes planning, and `persisting` is still `completing` from
  * the reviewer's point of view (D2's lifecycle diagram names neither).
+ *
+ * Exported so `reviewFlowHtml.ts`'s phase rail collapses `RunProjection.phase`
+ * the identical way this reducer already does for `RunProjection.lifecycle` —
+ * a second, screen-local switch over `RunPhase` could silently disagree with
+ * this one about where `bootstrap`/`persisting` land, which is exactly the
+ * kind of drift D14 exists to rule out.
  */
-function lifecycleForPhase(phase: RunPhase): RunLifecycle {
+export function lifecycleForPhase(phase: RunPhase): RunLifecycle {
   switch (phase) {
     case 'bootstrap':
     case 'planning':
