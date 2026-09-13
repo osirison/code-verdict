@@ -833,14 +833,33 @@ describe('the running screen renders from the shared projection alone (task 14.1
     expect(html).not.toMatch(INLINE_STYLE_ATTRIBUTE);
   });
 
-  it('shows both coverage denominators when both exist', () => {
+  it('shows both coverage denominators when both exist, with requiredTotal as the true "of Y"', () => {
+    const html = running({
+      runProjection: baseProjection({
+        coverage: { classified: 10, total: 10, inspected: 5, requiredInspected: 3, requiredTotal: 4 },
+      }),
+    });
+    expect(html).toContain('10 of 10 changed files classified · 5 inspected · 3 of 4 required files inspected');
+  });
+
+  it('reads "no files required inspection" rather than a false "0 of 0" when the required set is empty', () => {
+    const html = running({
+      runProjection: baseProjection({
+        coverage: { classified: 2, total: 2, inspected: 2, requiredInspected: 0, requiredTotal: 0 },
+      }),
+    });
+    expect(html).toContain('2 of 2 changed files classified · 2 inspected · no files required inspection');
+    expect(html).not.toContain('0 of 0');
+  });
+
+  it('falls back to a truthful sentence for a checkpoint persisted before requiredTotal existed, never the old false "of Y"', () => {
     const html = running({
       runProjection: baseProjection({
         coverage: { classified: 20, total: 20, inspected: 6, requiredInspected: 9 },
       }),
     });
-    expect(html).toContain('20 of 20 changed files classified');
-    expect(html).toContain('6 of 9 required files inspected');
+    expect(html).toContain('20 of 20 changed files classified · 6 inspected (9 of them required)');
+    expect(html).not.toContain('6 of 9 required files inspected');
   });
 
   it('shows the public plan and its revisions, with stable item identifiers across a revision', () => {

@@ -252,11 +252,13 @@ function parseCoverageProgress(raw: unknown): CoverageProgress | undefined {
   if (typeof raw.classified !== 'number' || typeof raw.inspected !== 'number') return undefined;
   if (raw.total !== undefined && typeof raw.total !== 'number') return undefined;
   if (raw.requiredInspected !== undefined && typeof raw.requiredInspected !== 'number') return undefined;
+  if (raw.requiredTotal !== undefined && typeof raw.requiredTotal !== 'number') return undefined;
   return {
     classified: raw.classified,
     inspected: raw.inspected,
     ...(raw.total !== undefined ? { total: raw.total as number } : {}),
     ...(raw.requiredInspected !== undefined ? { requiredInspected: raw.requiredInspected as number } : {}),
+    ...(raw.requiredTotal !== undefined ? { requiredTotal: raw.requiredTotal as number } : {}),
   };
 }
 

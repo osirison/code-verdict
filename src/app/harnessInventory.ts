@@ -501,12 +501,21 @@ export function createChangedFileInventory(members: readonly InventoryMemberInpu
         if (requiredRisks !== undefined) {
           const required = new Set(requiredRisks);
           let requiredInspected = 0;
+          let requiredTotal = 0;
           for (const member of byMember.values()) {
             for (const file of member.files.values()) {
-              if (file.state === 'inspected' && file.risk !== undefined && required.has(file.risk)) requiredInspected += 1;
+              // `requiredTotal` counts every file whose risk is already classified into the
+              // required set, regardless of inspection state — the true denominator. A file
+              // still `unvisited` (risk undefined) is not yet counted; this total honestly grows
+              // as classification proceeds rather than pretending to know a number it does not.
+              if (file.risk !== undefined && required.has(file.risk)) {
+                requiredTotal += 1;
+                if (file.state === 'inspected') requiredInspected += 1;
+              }
             }
           }
           progress.requiredInspected = requiredInspected;
+          progress.requiredTotal = requiredTotal;
         }
       }
       return Object.freeze(progress);

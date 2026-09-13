@@ -325,7 +325,34 @@ describe('coverage progress facts (section-5 integration)', () => {
     inventory.markInspected('m1', 'b');
     expect(coverageChangedFact(inventory, ['high'])).toEqual({
       kind: 'coverageChanged',
-      coverage: { classified: 2, inspected: 2, total: 3, requiredInspected: 1 },
+      coverage: { classified: 2, inspected: 2, total: 3, requiredInspected: 1, requiredTotal: 1 },
+    });
+  });
+
+  it('grows requiredTotal as classification proceeds, counting only files already classified into the required set', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    inventory.acceptManifestPage('m1', complete([entry('a'), entry('b'), entry('c')]));
+    // 'a' is high risk (required), 'b' is low risk (not required), 'c' is still unvisited —
+    // its eventual risk is unknown, so it must not be counted either way yet.
+    inventory.classify('m1', 'a', { risk: 'high' });
+    inventory.classify('m1', 'b', { risk: 'low' });
+    expect(coverageChangedFact(inventory, ['high']).coverage).toEqual({
+      classified: 2, inspected: 0, total: 3, requiredInspected: 0, requiredTotal: 1,
+    });
+    inventory.markInspected('m1', 'a');
+    // 'c' is now classified as high risk too: the denominator grows honestly.
+    inventory.classify('m1', 'c', { risk: 'high' });
+    expect(coverageChangedFact(inventory, ['high']).coverage).toEqual({
+      classified: 3, inspected: 1, total: 3, requiredInspected: 1, requiredTotal: 2,
+    });
+  });
+
+  it('reports requiredTotal of 0 when required risks are configured but none of the changed files fall in them', () => {
+    const inventory = createChangedFileInventory([{ memberId: 'm1', snapshot: SNAPSHOT }]);
+    inventory.acceptManifestPage('m1', complete([entry('a')]));
+    inventory.classify('m1', 'a', { risk: 'low' });
+    expect(coverageChangedFact(inventory, ['high']).coverage).toEqual({
+      classified: 1, inspected: 0, total: 1, requiredInspected: 0, requiredTotal: 0,
     });
   });
 });

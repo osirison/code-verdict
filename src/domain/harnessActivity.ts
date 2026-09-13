@@ -63,12 +63,25 @@ interface ActivityEventBase {
   elapsedMs: number;
 }
 
-/** A truthful denominator only when a real one exists; otherwise progress stays indeterminate. */
+/**
+ * A truthful denominator only when a real one exists; otherwise progress stays indeterminate.
+ *
+ * `classified`/`total` and `inspected`/`requiredInspected`/`requiredTotal` answer different
+ * questions and are never collapsed into one number: the first pair is the whole changed-file
+ * inventory, the second is how much of the subset a run's required-inspection rule actually
+ * covers. `requiredTotal` — files whose classified risk falls in the required set, regardless of
+ * inspection state — can grow over the course of a run even after `total` is known: a file's risk
+ * is not always classified the moment it is enumerated, so `requiredTotal` only ever counts what
+ * classification has established so far. `requiredInspected` predates `requiredTotal`; a
+ * checkpoint persisted before this field existed carries the former without the latter, and a
+ * renderer must treat that combination as its own case rather than reading it as "0 required".
+ */
 export interface CoverageProgress {
   classified: number;
   total?: number;
   inspected: number;
   requiredInspected?: number;
+  requiredTotal?: number;
 }
 
 /**

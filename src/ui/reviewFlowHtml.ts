@@ -1203,11 +1203,22 @@ function planBlock(activity: readonly ActivityEvent[]): string {
 
 /**
  * "12 of 20 files classified" (D10) — never a percentage of remaining model
- * time. Two independent denominators: the changed-file inventory
- * (`classified`/`total`) and, once configured coverage rules require it,
- * how many of the files that must be inspected have been
- * (`inspected`/`requiredInspected`) — shown side by side rather than
- * collapsed into one number, since they answer different questions.
+ * time. Two independent denominators, shown side by side rather than
+ * collapsed into one number because they answer different questions: the
+ * changed-file inventory (`classified`/`total`) and, once configured
+ * coverage rules require it, how many of the files that must be inspected
+ * have been (`requiredInspected`/`requiredTotal`).
+ *
+ * `requiredTotal` is what makes the second denominator honest: it is the
+ * count of files already classified into the required-risk set, regardless
+ * of inspection state — the true "of Y", not the inspected subset of it.
+ * `requiredTotal === 0` reads as "no files required inspection", never as
+ * "0 of 0" — a rule that mandates nothing is not a coverage gap.
+ *
+ * `requiredInspected` without `requiredTotal` is a checkpoint persisted
+ * before this field existed: the true denominator was never recorded, so
+ * the fallback names only what is actually known rather than fabricating
+ * one.
  */
 function coverageParts(coverage: CoverageProgress): string[] {
   const parts: string[] = [
@@ -1215,8 +1226,15 @@ function coverageParts(coverage: CoverageProgress): string[] {
       ? `${coverage.classified} of ${coverage.total} changed files classified`
       : `${coverage.classified} changed files classified so far`,
   ];
-  if (coverage.requiredInspected !== undefined) {
-    parts.push(`${coverage.inspected} of ${coverage.requiredInspected} required files inspected`);
+  if (coverage.requiredTotal !== undefined) {
+    parts.push(`${coverage.inspected} inspected`);
+    parts.push(
+      coverage.requiredTotal === 0
+        ? 'no files required inspection'
+        : `${coverage.requiredInspected ?? 0} of ${coverage.requiredTotal} required files inspected`,
+    );
+  } else if (coverage.requiredInspected !== undefined) {
+    parts.push(`${coverage.inspected} inspected (${coverage.requiredInspected} of them required)`);
   } else if (coverage.inspected > 0) {
     parts.push(`${coverage.inspected} files inspected`);
   }

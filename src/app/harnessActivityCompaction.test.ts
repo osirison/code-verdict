@@ -135,6 +135,16 @@ describe('compactActivity (11.3)', () => {
     expect(result.events.map((e) => e.kind)).toEqual(['toolCompleted', 'coverageChanged', 'toolCompleted']);
   });
 
+  it('preserves requiredTotal and requiredInspected on a coverage change untouched, same as every other coverage field', () => {
+    const withRequired: ActivityEvent = {
+      ...base(1, '2026-01-01T00:00:00.000Z'),
+      kind: 'coverageChanged',
+      coverage: { classified: 2, inspected: 2, total: 2, requiredInspected: 1, requiredTotal: 2 },
+    };
+    const result = compactActivity([withRequired], GENEROUS_POLICY);
+    expect(result.events).toEqual([withRequired]);
+  });
+
   it('a mixed-target run drops the target rather than misrepresenting a single one', () => {
     const events = [
       toolCompleted(1, '2026-01-01T00:00:00.000Z', 'readDiff', 'file1.ts'),

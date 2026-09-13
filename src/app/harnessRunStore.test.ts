@@ -295,6 +295,48 @@ describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, dige
     },
   );
 
+  it("a coverageChanged fact's requiredTotal survives a real JSON checkpoint round-trip alongside requiredInspected", async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'coverageChanged', coverage: { classified: 8, total: 10, inspected: 5, requiredInspected: 3, requiredTotal: 4 } },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    expect(readBack?.activity).toEqual(built.activity);
+    const coverageChanged = readBack?.activity.find((e) => e.kind === 'coverageChanged');
+    expect(coverageChanged).toMatchObject({ coverage: { classified: 8, total: 10, inspected: 5, requiredInspected: 3, requiredTotal: 4 } });
+  });
+
+  it('a coverageChanged fact persisted before requiredTotal existed still parses, carrying requiredInspected alone', async () => {
+    // A checkpoint written by an earlier build: requiredInspected without the requiredTotal field
+    // this change adds. It must still round-trip rather than fail the whole record closed —
+    // requiredTotal is optional precisely so an old persisted shape stays valid.
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'coverageChanged', coverage: { classified: 2, total: 2, inspected: 2, requiredInspected: 9 } },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    const coverageChanged = readBack?.activity.find((e) => e.kind === 'coverageChanged');
+    expect(coverageChanged).toMatchObject({ coverage: { classified: 2, total: 2, inspected: 2, requiredInspected: 9 } });
+    if (coverageChanged?.kind === 'coverageChanged') expect(coverageChanged.coverage.requiredTotal).toBeUndefined();
+  });
+
   it('a member-scoped plan item\'s memberId survives a real JSON checkpoint round-trip, and a shared item stays without one (task 13.3)', async () => {
     const backing = jsonMemoryStore();
     const runStore = createHarnessRunStore(backing, { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
@@ -630,6 +672,15 @@ describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and un
       (r: ReturnType<typeof validLineage>) => {
         (r.checkpoints[0] as { activity: unknown[] }).activity = [
           { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'toolFailed', tool: 'modelTurn', reason: 'stalled', retryCount: -1 },
+        ];
+      },
+    ],
+    // wrong-typed: a coverageChanged fact's requiredTotal (mirrors requiredInspected's own check).
+    [
+      'wrong-typed: a coverageChanged event carries a string requiredTotal',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredTotal: 'two' } },
         ];
       },
     ],

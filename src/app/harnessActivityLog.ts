@@ -190,11 +190,12 @@ function sanitizeFact(fact: ActivityFact, knownItemIds: () => Set<string>): Acti
       return { ...fact, tool, reason, ...(target.value !== undefined ? { target: target.value } : {}), ...metadata.value };
     }
     case 'coverageChanged': {
-      const { classified, total, inspected, requiredInspected } = fact.coverage;
+      const { classified, total, inspected, requiredInspected, requiredTotal } = fact.coverage;
       const nonNegativeFinite = (n: number) => Number.isFinite(n) && n >= 0;
       if (!nonNegativeFinite(classified) || !nonNegativeFinite(inspected)) return undefined;
       if (total !== undefined && !nonNegativeFinite(total)) return undefined;
       if (requiredInspected !== undefined && !nonNegativeFinite(requiredInspected)) return undefined;
+      if (requiredTotal !== undefined && !nonNegativeFinite(requiredTotal)) return undefined;
       return fact;
     }
     case 'checkpoint': {
