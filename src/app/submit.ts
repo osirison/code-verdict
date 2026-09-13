@@ -24,6 +24,7 @@
 import type { Connection } from '../platform/provider';
 import type { AnchorRefs, ChangeRequestRef, ReviewCommentDraft, SubmitProgressFn, SubmitResult } from '../platform/types';
 import { resolveAnchor, type AnchorCandidate } from '../domain/anchor';
+import { escapeMarkdownText, markdownCodeSpan } from '../domain/markdownSafety';
 import type { Review, ReviewItem } from '../domain/types';
 import { isReviewItemAnchored } from '../domain/types';
 import { providerRelativePath } from './modelVisiblePath';
@@ -119,7 +120,7 @@ export function composeCommentDrafts(
       }
     }
     const applyFix = review.verdicts[item.id]?.applyFix ?? false;
-    const headline = [`**${item.title}**`, ...findingMetaParts(item)].join(' · ');
+    const headline = [`**${escapeMarkdownText(item.title)}**`, ...findingMetaParts(item)].join(' · ');
     drafts.push({
       key: item.id,
       body: `${headline}\n\n${item.body}`,
@@ -157,8 +158,16 @@ export interface SubmitPlan {
  * footer's attribution line, which a summary-carried finding has none of.
  */
 function findingMetaParts(item: ReviewItem, options: { confidence?: boolean } = {}): string[] {
-  return [item.severity, item.category, options.confidence ? `${item.confidence}% confidence` : undefined, item.reference]
-    .filter((part): part is string => Boolean(part));
+  // `severity`/`category` are enum-validated and `confidence` is a number —
+  // none can carry structure-breaking text. `reference` is model-authored
+  // free text (`parseAgentReviewResponse` only coerces it to a string), so
+  // it gets the same neutralizing as a title before landing in this line.
+  return [
+    item.severity,
+    item.category,
+    options.confidence ? `${item.confidence}% confidence` : undefined,
+    item.reference ? escapeMarkdownText(item.reference) : undefined,
+  ].filter((part): part is string => Boolean(part));
 }
 
 /**
@@ -175,8 +184,13 @@ function findingGroupKey(item: ReviewItem): string {
 }
 
 // vocab-ok: "change request" is the neutral contract's own word, not a platform noun
+//
+// `repoId`/`crNumber` reach here as `projectId`/`mrIid` off the model's own
+// response (task 15.8 removed the changeset response validator that used to
+// restrict them to real member refs) — model-authored text, same as a
+// title, so it gets the same neutralizing before landing in this bold run.
 function findingGroupLabel(item: ReviewItem): string {
-  return `${item.repoId} · change request ${item.crNumber}`;
+  return `${escapeMarkdownText(item.repoId ?? '')} · change request ${escapeMarkdownText(item.crNumber ?? '')}`;
 }
 
 /**
@@ -187,11 +201,11 @@ function findingGroupLabel(item: ReviewItem): string {
  */
 function renderFindingBlock(item: ReviewItem, withheldReason?: string): string {
   const parts = [
-    `### ${item.title}`,
+    `### ${escapeMarkdownText(item.title)}`,
     findingMetaParts(item, { confidence: true }).join(' · '),
-    `\`${item.file}\`, line ${item.line}`,
+    `${markdownCodeSpan(item.file)}, line ${item.line}`,
   ];
-  if (withheldReason) parts.push(`**Withheld:** ${withheldReason}`);
+  if (withheldReason) parts.push(`**Withheld:** ${escapeMarkdownText(withheldReason)}`);
   parts.push(item.body);
   return parts.join('\n\n');
 }
@@ -203,8 +217,19 @@ function renderFindingBlock(item: ReviewItem, withheldReason?: string): string {
  * ordinary case, and every per-member changeset submission) never repeats
  * it at all; only a section spanning more than one change request (the
  * changeset-wide preview) names each member once, above its findings.
+ *
+ * Whether labels print is decided by `multipleMembers`, the whole summary's
+ * span across every section it renders — never by this section's own slice
+ * of items. A changeset spanning two repos must label every section's
+ * groups even when one section's items all happen to come from a single
+ * repo, or a reader loses the only cue for which repo a finding's path
+ * belongs to; a genuinely single-member summary must never label at all.
  */
-function renderFindingSection(items: readonly ReviewItem[], withheldReason?: string): string {
+function renderFindingSection(
+  items: readonly ReviewItem[],
+  multipleMembers: boolean,
+  withheldReason?: string,
+): string {
   if (items.length === 0) return '';
   const groups = new Map<string, ReviewItem[]>();
   for (const item of items) {
@@ -212,10 +237,9 @@ function renderFindingSection(items: readonly ReviewItem[], withheldReason?: str
     const group = groups.get(key);
     if (group) group.push(item); else groups.set(key, [item]);
   }
-  const multipleGroups = groups.size > 1;
   const blocks: string[] = [];
   for (const groupItems of groups.values()) {
-    if (multipleGroups && findingGroupKey(groupItems[0]!) !== '') {
+    if (multipleMembers && findingGroupKey(groupItems[0]!) !== '') {
       blocks.push(`**${findingGroupLabel(groupItems[0]!)}**`);
     }
     for (const item of groupItems) blocks.push(renderFindingBlock(item, withheldReason));
@@ -233,9 +257,15 @@ export function composeSummaryBody(
   const unanchored = review?.items.filter(
     (item) => review.verdicts[item.id]?.verdict === 'accepted' && !isReviewItemAnchored(item),
   ) ?? [];
-  const outsideDiff = renderFindingSection(unanchored);
+  // The label decision spans BOTH sections together — a summary is
+  // multi-member when the union of everything it renders carries more than
+  // one change-request identity, never when either section happens to be
+  // single-member on its own (see `renderFindingSection`).
+  const multipleMembers = new Set([...unanchored, ...withheldInline].map(findingGroupKey)).size > 1;
+  const outsideDiff = renderFindingSection(unanchored, multipleMembers);
   const withoutCurrentAnchor = renderFindingSection(
     withheldInline,
+    multipleMembers,
     'neither its code nor its reported line matches anything currently in the diff.',
   );
   return [

@@ -1155,7 +1155,16 @@ export class ChangesetReviewPanel {
     const provider = getProvider(pod.providerId);
     const issueRef = this.changeset.linkedIssue ? ` (${this.changeset.linkedIssue})` : '';
     const footer = `Part of changeset “${this.changeset.name}”${issueRef} — reviewed together across ${this.members.length} repositories with ${this.agentLabel()}.`;
-    const summary = `${composeSummaryBody(this.summaryText, this.finalNote, this.review)}\n\n---\n\n${footer}`;
+    // The shared prose ONCE, with no finding sections baked in: this string
+    // becomes `summaryText` for a SECOND `composeSummaryBody` call per member
+    // inside `buildChangesetSubmitPlans`, which appends that member's own
+    // finding sections scoped to its own items. Composing the full changeset
+    // review's sections here too — as the `copyMarkdown` clipboard preview
+    // correctly does, for a human reading one combined document — would
+    // duplicate every member's own unanchored/withheld findings into its
+    // posted summary: once from this call spanning every member, once more
+    // from the per-member call that follows.
+    const summary = `${composeSummaryBody(this.summaryText, this.finalNote)}\n\n---\n\n${footer}`;
     const plans = buildChangesetSubmitPlans(
       this.review,
       this.submitMembers(),

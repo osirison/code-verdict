@@ -214,12 +214,14 @@ describe('changeset submission', () => {
     expect(repoBSummary).not.toContain('change request');
     expect(repoASummary).not.toContain('projectId=');
     expect(repoBSummary).not.toContain('mrIid=');
-    expect(repoASummary.match(/Attachment-only A/g)).toHaveLength(1);
+    // A title's hyphen comes back backslash-escaped (`escapeMarkdownText`) —
+    // still "Attachment-only A" to a reader, never literal markdown syntax.
+    expect(repoASummary.match(/Attachment\\-only A/g)).toHaveLength(1);
     expect(repoASummary.match(/Lost anchored A/g)).toHaveLength(1);
-    expect(repoBSummary.match(/Attachment-only B/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Attachment\\-only B/g)).toHaveLength(1);
     expect(repoBSummary.match(/Lost anchored B/g)).toHaveLength(1);
-    expect(repoASummary).not.toMatch(/Attachment-only B|Lost anchored B/);
-    expect(repoBSummary).not.toMatch(/Attachment-only A|Lost anchored A/);
+    expect(repoASummary).not.toMatch(/Attachment\\-only B|Lost anchored B/);
+    expect(repoBSummary).not.toMatch(/Attachment\\-only A|Lost anchored A/);
   });
 
   it('reports withheldCount so completion is never blind to what anchor resolution dropped (mandate C)', async () => {

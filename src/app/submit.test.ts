@@ -38,7 +38,7 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(drafts.map((d) => d.key)).toEqual(['itm_01H9Z4', 'itm_01H9Z6']);
 
     const blocker = drafts[0];
-    expect(blocker?.body).toContain('**Refresh token logged in error path** · blocker · security · CWE-532');
+    expect(blocker?.body).toContain('**Refresh token logged in error path** · blocker · security · CWE\\-532');
     expect(blocker?.footer).toBe(
       '<sub>Flagged by HVE Core · PR Review (96% confidence), accepted by @you via Code Verdict.</sub>',
     );
@@ -112,8 +112,8 @@ describe('composeCommentDrafts (spec §7)', () => {
     // Two change requests share this summary (the changeset-wide preview),
     // so each member's identity is named once, grouping its findings —
     // never repeated into every finding's own heading.
-    const groupA = summary.indexOf('**repo-a · change request 11**');
-    const groupB = summary.indexOf('**repo-b · change request 22**');
+    const groupA = summary.indexOf('**repo\\-a · change request 11**');
+    const groupB = summary.indexOf('**repo\\-b · change request 22**');
     expect(groupA).toBeGreaterThanOrEqual(0);
     expect(groupB).toBeGreaterThanOrEqual(0);
     const titleFirst = summary.indexOf('### First member');
@@ -122,6 +122,41 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(titleSecond).toBeGreaterThan(groupB);
     expect(summary).not.toContain('projectId=');
     expect(summary).not.toContain('mrIid=');
+  });
+
+  it('labels a section by the whole summary\'s span, not that section\'s own slice', () => {
+    const { response: routed } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'combined',
+      items: [
+        { id: 'first', projectId: 'repo-a', mrIid: '11', file: 'docs/evidence.md', line: 12, severity: 'minor', category: 'docs', confidence: 85, title: 'First member', body: 'First body', code: 'stale' },
+        { id: 'second', projectId: 'repo-b', mrIid: '22', file: 'src/diff.ts', line: 999, severity: 'major', category: 'tests', confidence: 90, title: 'Second member', body: 'Second body', code: 'notInTheDiff();' },
+      ],
+    }, {
+      diffPaths: ['src/diff.ts'],
+      attachmentManifest: [{ path: 'docs/evidence.md', ranges: [{ startLine: 12, endLine: 12 }] }],
+    });
+    let review = createReview({
+      repoId: 'changeset', crNumber: 'set-1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response: routed,
+    });
+    review = setVerdict(review, 'first', 'accepted', false);
+    review = setVerdict(review, 'second', 'accepted', false);
+
+    // 'first' is unanchored (repo-a only, routed to "outside the diff");
+    // 'second' is anchored but unresolvable (repo-b, routed to "without a
+    // current inline anchor"). Each section is single-repo on its own —
+    // only the summary as a whole spans two members.
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => []);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((item) => item.id)).toEqual(['second']);
+
+    const summary = composeSummaryBody('Review summary.', '', review, composed.withheld);
+    expect(summary).toContain('## Accepted findings outside the diff');
+    expect(summary).toContain('## Accepted findings without a current inline anchor');
+    // Both single-repo sections still label their group, because the
+    // summary they share spans two members.
+    expect(summary).toContain('**repo\\-a · change request 11**');
+    expect(summary).toContain('**repo\\-b · change request 22**');
   });
 
   it('keeps a drifted diff-file finding anchored, repairs its line, and posts it inline', () => {
@@ -258,6 +293,40 @@ describe('composeCommentDrafts (spec §7)', () => {
       'api',
     ).drafts[0]?.anchor.filePath).toBe('src/diff.ts');
   });
+
+  it('neutralizes a fence or leading hash marks in a title so the inline comment cannot break markdown structure', () => {
+    const { response: hostile } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [
+        {
+          id: 'fenced', file: 'src/diff.ts', line: 4, severity: 'major', category: 'tests', confidence: 90,
+          title: 'Closes early\n```\nrm -rf /\n```', body: 'Body one.', code: 'bad();',
+        },
+        {
+          id: 'hashed', file: 'src/diff.ts', line: 5, severity: 'minor', category: 'tests', confidence: 80,
+          title: '### Fake heading', body: 'Body two.', code: 'next();',
+        },
+      ],
+    }, { diffPaths: ['src/diff.ts'] });
+    let review = createReview({
+      repoId: 'repo', crNumber: '1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response: hostile,
+    });
+    review = setVerdict(review, 'fenced', 'accepted', false);
+    review = setVerdict(review, 'hashed', 'accepted', false);
+
+    const { drafts } = composeCommentDrafts(
+      review,
+      'Agent',
+      'you',
+      refs,
+      () => [{ line: 4, text: 'bad();' }, { line: 5, text: 'next();' }],
+    );
+    // The whole headline stays on one line — no bare fence or heading marker
+    // survives to be read as document structure by the renderer.
+    expect(drafts[0]?.body.split('\n')[0]).toBe('**Closes early \\`\\`\\` rm \\-rf / \\`\\`\\`** · major · tests');
+    expect(drafts[1]?.body.split('\n')[0]).toBe('**\\#\\#\\# Fake heading** · minor · tests');
+  });
 });
 
 describe('composeSummaryBody renders a summary-carried finding like something a human wrote', () => {
@@ -301,7 +370,7 @@ describe('composeSummaryBody renders a summary-carried finding like something a 
       [
         '## Accepted findings without a current inline anchor',
         [
-          '### click_is_below documentation and name are inverted',
+          '### click\\_is\\_below documentation and name are inverted',
           'major · craftsmanship · 88% confidence',
           '`gui/src-tauri/src/panel.rs`, line 638',
           '**Withheld:** neither its code nor its reported line matches anything currently in the diff.',
@@ -313,6 +382,23 @@ describe('composeSummaryBody renders a summary-carried finding like something a 
     expect(summary).not.toContain('projectId=');
     expect(summary).not.toContain('mrIid=');
     expect(summary).not.toContain('file=');
+  });
+
+  it('neutralizes a fenced/hash-leading title and a backtick inside the path, so the summary structure survives', () => {
+    const item: ReviewItem = {
+      id: 'hostile', file: 'src/weird`quote.ts', anchored: false, line: 3, severity: 'minor', category: 'docs',
+      confidence: 60, title: '# Fence attack\n```\nrm -rf /\n```', body: 'Body.', code: 'x',
+    };
+    const review: Review = { ...baseReview, items: [item], verdicts: { hostile: { verdict: 'accepted', applyFix: false } } };
+    const summary = composeSummaryBody('Summary.', '', review);
+    // The heading collapses to one line — no bare fence or leading hash
+    // reaches the start of its own line, where it would be read as
+    // document structure instead of the title's own text.
+    expect(summary).toContain('### \\# Fence attack \\`\\`\\` rm \\-rf / \\`\\`\\`');
+    expect(summary.split('\n')).not.toContainEqual(expect.stringMatching(/^```/));
+    // A raw backtick in the path can no longer close the code span early —
+    // the span's own delimiter is a wider run than any inside the path.
+    expect(summary).toContain('``src/weird`quote.ts``, line 3');
   });
 });
 

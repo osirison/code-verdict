@@ -17,11 +17,12 @@ import type { PodStore } from '../app/pods';
 import type { KeyValueStore } from '../app/storage';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Pod, Review } from '../domain/types';
-import type { ChangeRequest } from '../platform/types';
+import type { ChangeRequest, ChangeRequestRef, ReviewSubmission } from '../platform/types';
 
 const world = vi.hoisted(() => ({
   calls: { changeRequests: 0, workItems: 0, ciRuns: 0, diffs: 0 },
   crs: [] as ChangeRequest[],
+  submissions: [] as Array<{ ref: ChangeRequestRef; submission: ReviewSubmission }>,
 }));
 
 /** The one `AppSurface` panel, with every full `webview.html` assignment logged. */
@@ -89,6 +90,14 @@ vi.mock('../app/connections', () => ({
       getChangeRequestDiff: async (ref: { repoId: string; number: string }) => {
         world.calls.diffs += 1;
         return { ref, headSha: 'head', files: [], anchorRefs: undefined };
+      },
+      submitReview: async (ref: ChangeRequestRef, submission: ReviewSubmission) => {
+        world.submissions.push({ ref, submission });
+        return {
+          comments: submission.comments.map((comment) => ({ key: comment.key, ok: true, threadId: `thread-${comment.key}` })),
+          summaryPosted: true,
+          requestChangesApplied: submission.requestChanges ? true : undefined,
+        };
       },
     }),
 }));
@@ -264,6 +273,7 @@ beforeEach(async () => {
   clearProviders();
   registerBuiltInProviders();
   world.calls = { changeRequests: 0, workItems: 0, ciRuns: 0, diffs: 0 };
+  world.submissions = [];
   world.crs = [
     changeRequest('7', 'Add per-tenant rate limiting'),
     changeRequest('8', 'Enforce the limit at the gateway'),
@@ -515,5 +525,79 @@ describe('triage-only messages are refused off the triage screen (this.review ou
     panel.state.messageHandler?.({ type: 'dismissNotices' });
     await flush();
     expect(panel.state.htmlLog.at(-1)).toContain('1 accepted, 1 rejected, 0 skipped');
+  });
+});
+
+describe('submit posts each member\'s shared prose once, never its own findings twice', () => {
+  it('does not embed the whole-changeset summary into a member\'s own posted summary', async () => {
+    // Both members' only finding is unanchored (not in the — empty — fake
+    // diff), so each is routed through `composeSummaryBody`'s "outside the
+    // diff" section rather than through an inline comment. That is exactly
+    // the section a pre-baked, whole-review `summary` string used to
+    // duplicate: once from the outer call across every member, once more
+    // from the per-member call `buildChangesetSubmitPlans` makes.
+    const review: Review = {
+      repoId: 'changeset',
+      crNumber: CHANGESET_ID,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      modelId: 'lm:acme/turbo',
+      criteria: structuredClone(DEFAULT_CRITERIA),
+      headSha: 'acme/repo!7:head|acme/repo!8:head',
+      items: [
+        {
+          id: 'i1', anchored: false, file: 'docs/notes-7.md', line: 3, severity: 'minor', category: 'docs',
+          confidence: 70, title: 'Member 7 unanchored finding', body: 'Body one.', code: 'note',
+          repoId: 'acme/repo', crNumber: '7',
+        },
+        {
+          id: 'i2', anchored: false, file: 'docs/notes-8.md', line: 4, severity: 'minor', category: 'docs',
+          confidence: 65, title: 'Member 8 unanchored finding', body: 'Body two.', code: 'note',
+          repoId: 'acme/repo', crNumber: '8',
+        },
+      ],
+      verdicts: {
+        i1: { verdict: 'accepted', applyFix: false },
+        i2: { verdict: 'accepted', applyFix: false },
+      },
+      summary: '',
+    };
+    const seed: ChangesetDraft = {
+      ...retainedFromRun({
+        review,
+        ranAt: '2026-09-12T10:00:00.000Z',
+        agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+        agentLabel: 'Security Reviewer',
+        modelId: 'lm:acme/turbo',
+      }),
+      summaryText: 'Shared human summary.',
+    };
+
+    await openPanel(seed);
+    panel.state.messageHandler?.({ type: 'generateSummary' });
+    await flush();
+    // Overwrite the auto-generated text with a known constant — the seeded
+    // `summaryText` above is what `generateSummary` replaces on the way to
+    // the summary screen, not what `submit` reads.
+    panel.state.messageHandler?.({ type: 'editSummary', text: 'Shared human summary.' });
+    await flush();
+    panel.state.messageHandler?.({ type: 'submit' });
+    await flush();
+
+    expect(world.submissions).toHaveLength(2);
+    const member7 = world.submissions.find((s) => s.ref.number === '7');
+    const member8 = world.submissions.find((s) => s.ref.number === '8');
+    const summary7 = member7?.submission.summary ?? '';
+    const summary8 = member8?.submission.summary ?? '';
+
+    // The shared prose lands exactly once in each member's own summary.
+    expect(summary7.match(/Shared human summary\./g)).toHaveLength(1);
+    expect(summary8.match(/Shared human summary\./g)).toHaveLength(1);
+    // So does that member's own finding — never doubled by an outer,
+    // whole-changeset composition baked into the shared text beforehand.
+    expect(summary7.match(/Member 7 unanchored finding/g)).toHaveLength(1);
+    expect(summary8.match(/Member 8 unanchored finding/g)).toHaveLength(1);
+    // And never the OTHER member's finding at all.
+    expect(summary7).not.toContain('Member 8 unanchored finding');
+    expect(summary8).not.toContain('Member 7 unanchored finding');
   });
 });
