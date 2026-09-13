@@ -301,7 +301,8 @@ describe('debug bootstrap against a live emulator', () => {
     );
     expect(drafts).toEqual([]);
     expect(summary).toContain('## Accepted findings outside the diff');
-    expect(summary).toContain('### docs/evidence.md:2 - Unsafe mode remains enabled');
+    expect(summary).toContain('### Unsafe mode remains enabled');
+    expect(summary).toContain('`docs/evidence.md`, line 2');
 
     const threadsBefore = await connection.listThreads(ref);
     const stateBefore = await readEmulatorState();

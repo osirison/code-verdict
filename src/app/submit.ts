@@ -119,9 +119,7 @@ export function composeCommentDrafts(
       }
     }
     const applyFix = review.verdicts[item.id]?.applyFix ?? false;
-    const headline = [`**${item.title}**`, item.severity, item.category, item.reference]
-      .filter(Boolean)
-      .join(' · ');
+    const headline = [`**${item.title}**`, ...findingMetaParts(item)].join(' · ');
     drafts.push({
       key: item.id,
       body: `${headline}\n\n${item.body}`,
@@ -151,12 +149,78 @@ export interface SubmitPlan {
   asSingleThread: boolean;
 }
 
-function summaryFindingLocation(item: Review['items'][number]): string {
-  const location = `${item.file}:${item.line}`;
-  return item.repoId && item.crNumber
-    // vocab-ok: changeset member identity uses the same provider-neutral wire labels as the agent prompt
-    ? `projectId=${item.repoId} mrIid=${item.crNumber} file=${location}`
-    : location;
+/**
+ * The severity/category/(confidence)/reference vocabulary shared with the
+ * inline comment headline (`composeCommentDrafts`) — a summary-carried
+ * finding must read in the same terms as one posted inline, not a second,
+ * invented style. Confidence is opt-in: the inline headline leaves it to the
+ * footer's attribution line, which a summary-carried finding has none of.
+ */
+function findingMetaParts(item: ReviewItem, options: { confidence?: boolean } = {}): string[] {
+  return [item.severity, item.category, options.confidence ? `${item.confidence}% confidence` : undefined, item.reference]
+    .filter((part): part is string => Boolean(part));
+}
+
+/**
+ * A group of findings shares one change request identity when every item
+ * carries the same `repoId`/`crNumber` pair (including "neither carries
+ * one" — a plain, non-changeset review). `''` is that shared, unlabeled
+ * group; only a review whose items genuinely span more than one change
+ * request (the changeset-wide preview in `changesetReview.ts`, never a
+ * per-member submission — `buildChangesetSubmitPlans` already filters each
+ * member's items down to its own pair) produces more than one key.
+ */
+function findingGroupKey(item: ReviewItem): string {
+  return item.repoId && item.crNumber ? `${item.repoId}!${item.crNumber}` : '';
+}
+
+// vocab-ok: "change request" is the neutral contract's own word, not a platform noun
+function findingGroupLabel(item: ReviewItem): string {
+  return `${item.repoId} · change request ${item.crNumber}`;
+}
+
+/**
+ * One finding, rendered to read like something a human wrote: the title as
+ * a heading, its severity/category/confidence in the inline vocabulary, its
+ * location as prose (full path, never a `file=`/`line=` pair), an optional
+ * withholding reason as a short labeled line, then the body.
+ */
+function renderFindingBlock(item: ReviewItem, withheldReason?: string): string {
+  const parts = [
+    `### ${item.title}`,
+    findingMetaParts(item, { confidence: true }).join(' · '),
+    `\`${item.file}\`, line ${item.line}`,
+  ];
+  if (withheldReason) parts.push(`**Withheld:** ${withheldReason}`);
+  parts.push(item.body);
+  return parts.join('\n\n');
+}
+
+/**
+ * A section of summary-carried findings. The change-request identity that
+ * `findingGroupKey` computes is named at most once per group — the summary
+ * already sits on that change request, so a single-group section (the
+ * ordinary case, and every per-member changeset submission) never repeats
+ * it at all; only a section spanning more than one change request (the
+ * changeset-wide preview) names each member once, above its findings.
+ */
+function renderFindingSection(items: readonly ReviewItem[], withheldReason?: string): string {
+  if (items.length === 0) return '';
+  const groups = new Map<string, ReviewItem[]>();
+  for (const item of items) {
+    const key = findingGroupKey(item);
+    const group = groups.get(key);
+    if (group) group.push(item); else groups.set(key, [item]);
+  }
+  const multipleGroups = groups.size > 1;
+  const blocks: string[] = [];
+  for (const groupItems of groups.values()) {
+    if (multipleGroups && findingGroupKey(groupItems[0]!) !== '') {
+      blocks.push(`**${findingGroupLabel(groupItems[0]!)}**`);
+    }
+    for (const item of groupItems) blocks.push(renderFindingBlock(item, withheldReason));
+  }
+  return blocks.join('\n\n');
 }
 
 export function composeSummaryBody(
@@ -169,16 +233,11 @@ export function composeSummaryBody(
   const unanchored = review?.items.filter(
     (item) => review.verdicts[item.id]?.verdict === 'accepted' && !isReviewItemAnchored(item),
   ) ?? [];
-  const outsideDiff = unanchored
-    .map((item) => `### ${summaryFindingLocation(item)} - ${item.title}\n\n${item.body}`)
-    .join('\n\n');
-  const withoutCurrentAnchor = withheldInline
-    .map((item) => [
-      `### ${summaryFindingLocation(item)} - ${item.title}`,
-      '> Withheld from inline submission because neither its code nor its reported line matches anything currently in the diff.',
-      item.body,
-    ].join('\n\n'))
-    .join('\n\n');
+  const outsideDiff = renderFindingSection(unanchored);
+  const withoutCurrentAnchor = renderFindingSection(
+    withheldInline,
+    'neither its code nor its reported line matches anything currently in the diff.',
+  );
   return [
     base,
     outsideDiff === '' ? '' : `## Accepted findings outside the diff\n\n${outsideDiff}`,

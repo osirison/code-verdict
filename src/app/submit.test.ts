@@ -4,7 +4,7 @@ import { resolveAnchor } from '../domain/anchor';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { diffAnchorCandidates } from '../domain/diffHunks';
 import { createReview, setVerdict } from '../domain/reviewState';
-import type { Review } from '../domain/types';
+import type { Review, ReviewItem } from '../domain/types';
 import { loadSpecFixtures } from '../testing/specFixtures';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from './submit';
 
@@ -80,9 +80,14 @@ describe('composeCommentDrafts (spec §7)', () => {
     ).drafts.map((draft) => draft.key)).toEqual(['inline']);
     const summary = composeSummaryBody('Review summary.', '', review);
     expect(summary).toContain('## Accepted findings outside the diff');
-    expect(summary).toContain('### docs/evidence.md:12 - Summary only');
+    expect(summary).toContain('### Summary only');
+    expect(summary).toContain('minor · docs · 85% confidence');
+    expect(summary).toContain('`docs/evidence.md`, line 12');
     expect(summary).toContain('Summary body');
-    expect(summary).not.toContain('### src/diff.ts:4');
+    expect(summary).not.toContain('### Inline');
+    // Single change request: its identity is never named, inline or in the
+    // summary — the summary already sits on it.
+    expect(summary).not.toContain('change request');
   });
 
   it('qualifies duplicate changeset attachment paths with member identity', () => {
@@ -104,8 +109,19 @@ describe('composeCommentDrafts (spec §7)', () => {
     review = setVerdict(review, 'second', 'accepted', false);
 
     const summary = composeSummaryBody('Review summary.', '', review);
-    expect(summary).toContain('### projectId=repo-a mrIid=11 file=docs/evidence.md:12 - First member');
-    expect(summary).toContain('### projectId=repo-b mrIid=22 file=docs/evidence.md:12 - Second member');
+    // Two change requests share this summary (the changeset-wide preview),
+    // so each member's identity is named once, grouping its findings —
+    // never repeated into every finding's own heading.
+    const groupA = summary.indexOf('**repo-a · change request 11**');
+    const groupB = summary.indexOf('**repo-b · change request 22**');
+    expect(groupA).toBeGreaterThanOrEqual(0);
+    expect(groupB).toBeGreaterThanOrEqual(0);
+    const titleFirst = summary.indexOf('### First member');
+    const titleSecond = summary.indexOf('### Second member');
+    expect(titleFirst).toBeGreaterThan(groupA);
+    expect(titleSecond).toBeGreaterThan(groupB);
+    expect(summary).not.toContain('projectId=');
+    expect(summary).not.toContain('mrIid=');
   });
 
   it('keeps a drifted diff-file finding anchored, repairs its line, and posts it inline', () => {
@@ -154,7 +170,7 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(composed.drafts).toEqual([]);
     expect(composed.withheld.map((item) => item.id)).toEqual(['hallucinated']);
     expect(composeSummaryBody('Review summary.', '', review, composed.withheld)).toContain(
-      'Withheld from inline submission because neither its code nor its reported line matches anything currently in the diff.',
+      '**Withheld:** neither its code nor its reported line matches anything currently in the diff.',
     );
   });
 
@@ -181,9 +197,10 @@ describe('composeCommentDrafts (spec §7)', () => {
       () => [{ line: 9, text: 'realAddedLine();' }],
     );
     expect(composed.drafts).toEqual([]);
-    expect(composeSummaryBody('Review summary.', '', review, composed.withheld)).toContain(
-      '### src/diff.ts:40 - Unchanged context',
-    );
+    const summary = composeSummaryBody('Review summary.', '', review, composed.withheld);
+    expect(summary).toContain('### Unchanged context');
+    expect(summary).toContain('`src/diff.ts`, line 40');
+    expect(summary).toContain('**Withheld:** neither its code nor its reported line matches anything currently in the diff.');
   });
 
   it('never sends a hallucinated line to the provider comment list', async () => {
@@ -240,6 +257,62 @@ describe('composeCommentDrafts (spec §7)', () => {
       storedLineCandidates(review),
       'api',
     ).drafts[0]?.anchor.filePath).toBe('src/diff.ts');
+  });
+});
+
+describe('composeSummaryBody renders a summary-carried finding like something a human wrote', () => {
+  const baseReview: Review = {
+    repoId: 'repo', crNumber: '1', agentId: 'agent', headSha: 'h', summary: '',
+    criteria: DEFAULT_CRITERIA, items: [], verdicts: {},
+  };
+
+  it('renders an outside-the-diff finding as a title heading, an inline-vocabulary meta line, and a full path', () => {
+    const review: Review = {
+      ...baseReview,
+      items: [{
+        id: 'outside', file: 'docs/notes.md', anchored: false, line: 7, severity: 'minor', category: 'docs',
+        confidence: 72, title: 'Stale changelog entry', body: 'The entry still names the old flag.', code: 'flag: old',
+      }],
+      verdicts: { outside: { verdict: 'accepted', applyFix: false } },
+    };
+    expect(composeSummaryBody('Summary.', '', review)).toBe([
+      'Summary.',
+      [
+        '## Accepted findings outside the diff',
+        [
+          '### Stale changelog entry',
+          'minor · docs · 72% confidence',
+          '`docs/notes.md`, line 7',
+          'The entry still names the old flag.',
+        ].join('\n\n'),
+      ].join('\n\n'),
+    ].join('\n\n'));
+  });
+
+  it('renders a withheld finding with its full path, its line, and a labeled withholding reason — never a bare blockquote or a projectId=/mrIid=/file= header', () => {
+    const item: ReviewItem = {
+      id: 'withheld', file: 'gui/src-tauri/src/panel.rs', anchored: true, line: 638, severity: 'major',
+      category: 'craftsmanship', confidence: 88, title: 'click_is_below documentation and name are inverted',
+      body: 'The name and the doc comment disagree about the direction.', code: 'fn click_is_below',
+    };
+    const summary = composeSummaryBody('Summary.', '', baseReview, [item]);
+    expect(summary).toBe([
+      'Summary.',
+      [
+        '## Accepted findings without a current inline anchor',
+        [
+          '### click_is_below documentation and name are inverted',
+          'major · craftsmanship · 88% confidence',
+          '`gui/src-tauri/src/panel.rs`, line 638',
+          '**Withheld:** neither its code nor its reported line matches anything currently in the diff.',
+          'The name and the doc comment disagree about the direction.',
+        ].join('\n\n'),
+      ].join('\n\n'),
+    ].join('\n\n'));
+    expect(summary).not.toContain('>');
+    expect(summary).not.toContain('projectId=');
+    expect(summary).not.toContain('mrIid=');
+    expect(summary).not.toContain('file=');
   });
 });
 

@@ -204,8 +204,16 @@ describe('changeset submission', () => {
     expect(plans[1]?.withheld.map((item) => item.id)).toEqual(['lost-b']);
     const repoASummary = plans[0]?.submission.summary ?? '';
     const repoBSummary = plans[1]?.submission.summary ?? '';
-    expect(repoASummary).toContain('projectId=repo-a mrIid=1 file=src/shared.ts:999');
-    expect(repoBSummary).toContain('projectId=repo-b mrIid=2 file=src/other.ts:888');
+    // Each member's own summary carries only its own change request's
+    // findings, and — since a per-member submission never mixes more than
+    // one change request — never names that identity at all: the summary
+    // already sits on it.
+    expect(repoASummary).toContain('`src/shared.ts`, line 999');
+    expect(repoBSummary).toContain('`src/other.ts`, line 888');
+    expect(repoASummary).not.toContain('change request');
+    expect(repoBSummary).not.toContain('change request');
+    expect(repoASummary).not.toContain('projectId=');
+    expect(repoBSummary).not.toContain('mrIid=');
     expect(repoASummary.match(/Attachment-only A/g)).toHaveLength(1);
     expect(repoASummary.match(/Lost anchored A/g)).toHaveLength(1);
     expect(repoBSummary.match(/Attachment-only B/g)).toHaveLength(1);
