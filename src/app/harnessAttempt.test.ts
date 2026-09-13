@@ -711,6 +711,15 @@ describe('HarnessAttempt.run (10.3 phase transitions)', () => {
  * `verifying` as passed, though neither ever ran. These tests build a real activity log through a
  * real attempt (never a hand-built `RunProjection`, which is how the earlier tests missed this) and
  * run it through the real reducer.
+ *
+ * Gap 1 (found by adversarial review of the fix above): the guard that switched away from the
+ * hardcoded `'persisting'` only fired for `cancelledNow`, so a *different* skip — planning ending
+ * with no plan, which stops `runInvestigating` without ever cancelling anything — still stamped
+ * `'persisting'`, again marking `investigating` as passed though it never ran. The last test below
+ * reproduces that live: `runVerifying` genuinely runs even with no plan (only `runInvestigating` is
+ * plan-gated), so the fix must not merely widen the cancellation check to "any skip" and reuse
+ * whatever `currentPhase` happened to be after — it must freeze the reported phase at `planning`,
+ * the last phase that ran before the skip, even though `verifying` ran afterward.
  */
 describe("Fix 1: the terminal activity event's phase names where the attempt actually stopped, not always 'persisting'", () => {
   it('cancelling during planning reports the terminal phase as planning — investigating and verifying never ran and must not read as passed', async () => {
@@ -812,6 +821,42 @@ describe("Fix 1: the terminal activity event's phase names where the attempt act
     const projection = reduceActivity(result.activityLog);
     expect(projection.lifecycle).toBe('succeeded');
     expect(projection.phase).toBe('persisting');
+  });
+
+  it('planning ending with no plan (never cancelled) reports the terminal phase as planning — investigating never ran even though verifying still does, and must not read as passed', async () => {
+    const connection = reviewConnection({ files: ['file1.ts'] });
+    // Never produces a valid protocol turn, so planning exhausts its repair allowance and ends with
+    // no plan — never cancelled. `runInvestigating` is skipped for want of a plan, but `runVerifying`
+    // is gated on cancellation alone and still runs its own turn loop.
+    const seam = scriptedModelSeam({
+      planning: ['this is not a valid protocol turn at all'],
+      verifying: [STOP_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy({ protocolRepairsPerPhase: 1 }),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.cancelled).toBe(false);
+    expect(result.plan).toBeUndefined();
+    expect(result.outcome.limitations.some((l) => l.code === 'noPlan')).toBe(true);
+    // Verifying genuinely ran despite the missing plan — proven by its own public action, not
+    // inferred from the terminal phase alone.
+    expect(result.activityLog.events.some((e) => e.kind === 'actionStarted' && e.action.includes('Synthesizing'))).toBe(true);
+
+    const projection = reduceActivity(result.activityLog);
+    expect(projection.lifecycle).toBe('failed');
+    // Never 'verifying' or 'persisting': investigating never ran, so the rail must not show it, or
+    // anything after it, as passed — even though verifying itself did run.
+    expect(projection.phase).toBe('planning');
+
+    const terminalEvent = result.activityLog.events.find((e) => e.kind === 'terminalResult');
+    expect(terminalEvent?.phase).toBe('planning');
   });
 });
 

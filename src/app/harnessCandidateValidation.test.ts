@@ -417,6 +417,25 @@ describe('revalidation and unresolved tracking (task 7.8)', () => {
     expect(tracker.blocksCompletion()).toBe(false);
     expect(tracker.triageFindings()).toHaveLength(1);
   });
+
+  it('a contradicted candidate stays closed: resubmitting the same id under a fresh, otherwise-accepted validation must not resurrect it (Fix 2)', () => {
+    const fixture = setup();
+    const tracker = createCandidateTracker();
+    tracker.record(validateCandidate(candidate(fixture), fixture.context));
+    expect(tracker.get('cand-1')).toMatchObject({ state: 'accepted' });
+
+    tracker.contradict('cand-1', [{ code: 'contradicted', message: 'A later read of the same file shows the guard already exists.' }]);
+    expect(tracker.get('cand-1')).toMatchObject({ state: 'contradicted' });
+    expect(tracker.triageFindings()).toEqual([]);
+
+    // The same guard `record()` already applies to a `rejected` id (see "closed ids stay closed"
+    // above): resubmitting a fresh, otherwise-valid candidate under the same id must not resurrect
+    // a `contradicted` one to `accepted` — the refusal is surfaced by the state staying put.
+    const resurrection = tracker.record(validateCandidate(candidate(fixture), fixture.context));
+    expect(resurrection.state).toBe('contradicted');
+    expect(tracker.get('cand-1')).toMatchObject({ state: 'contradicted' });
+    expect(tracker.triageFindings()).toEqual([]);
+  });
 });
 
 describe('seeding from a resumed checkpoint (task 14.6)', () => {
@@ -445,6 +464,14 @@ describe('seeding from a resumed checkpoint (task 14.6)', () => {
     // freshly-tracked rejected candidate follows).
     const fixture = setup();
     expect(tracker.record(validateCandidate(candidate(fixture, { candidateId: 'cand-rejected' }), fixture.context)).state).toBe('rejected');
+  });
+
+  it('a seeded contradicted candidate stays closed too (Fix 2) — the resubmission guard covers both closed states, seeded or freshly tracked', () => {
+    const seed: TrackedCandidate[] = [{ candidateId: 'cand-contradicted', state: 'contradicted', repairs: 0, reasons: [{ code: 'contradicted', message: 'Later evidence shows this is not a real finding.' }] }];
+    const tracker = createCandidateTracker({ seed });
+    const fixture = setup();
+    expect(tracker.record(validateCandidate(candidate(fixture, { candidateId: 'cand-contradicted' }), fixture.context)).state).toBe('contradicted');
+    expect(tracker.triageFindings()).toEqual([]);
   });
 });
 

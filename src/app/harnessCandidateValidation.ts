@@ -502,7 +502,12 @@ export function createCandidateTracker(options: CandidateTrackerOptions = {}): C
     record(outcome) {
       const previous = tracked.get(outcome.candidateId);
       const repairs = previous ? previous.repairs : 0;
-      if (previous?.state === 'rejected') return previous; // a rejected candidate is closed; resubmit under a new id
+      // A rejected or contradicted candidate is closed; resubmit under a new id. `contradicted`
+      // predates neither `rejected` nor this guard, but was still missing here (Fix 2): resubmitting
+      // a contradicted candidate's id used to fall through to the switch below and resurrect it as
+      // `accepted`, undoing the contradiction pass's own conclusion with a stale re-validation the
+      // pass never saw.
+      if (previous?.state === 'rejected' || previous?.state === 'contradicted') return previous;
       switch (outcome.state) {
         case 'accepted':
           return set({ candidateId: outcome.candidateId, state: 'accepted', repairs, reasons: [], finding: outcome.finding });

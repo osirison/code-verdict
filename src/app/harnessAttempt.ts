@@ -3120,7 +3120,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return currentCompletionEvaluation();
   }
 
-  async function runPersisting(evaluation: CompletionEvaluation, phaseReachedBeforeCompleting: RunPhase): Promise<HarnessAttemptResult> {
+  async function runPersisting(evaluation: CompletionEvaluation, phaseReachedBeforeCompleting: RunPhase, aPhaseWasSkipped: boolean): Promise<HarnessAttemptResult> {
     currentPhase = 'persisting';
     const cancelledNow = isCancelled();
     // D11: cancellation preserves only already-*validated* findings, as partial — never routed
@@ -3132,20 +3132,30 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     if (!isTerminalLifecycle(lifecycle)) {
       throw new Error(`HarnessAttempt computed a non-terminal lifecycle at persistence: ${lifecycle}`);
     }
-    // `run()` calls `runCompleting()`/`runPersisting()` unconditionally, even once cancellation has
-    // already skipped one or more of `runPlanning`/`runInvestigating`/`runVerifying` — those two
-    // phases' own bookkeeping (host validation, the terminal event and checkpoint) always genuinely
-    // runs, cancelled or not, so `currentPhase` alone cannot tell "every phase truly ran" from
-    // "cancellation cut the sequence short and completing/persisting merely wrapped up the attempt
-    // where it stood." `phaseReachedBeforeCompleting` is `currentPhase` as `run()` left it right
-    // before calling `runCompleting()` — the last phase this attempt actually entered under its own
-    // forward progression, unmodified by the unconditional tail. A cancelled attempt reports that
-    // phase, so a reviewer who cancelled during `planning` sees `planning`, never a `persisting`
-    // that would read as `investigating`/`verifying` having passed when they never ran. An attempt
-    // that was never cancelled reports `persisting` as before: nothing was skipped, so every phase,
-    // completing and persisting included, genuinely ran to produce this outcome, `succeeded` or
-    // `failed` alike.
-    const terminalPhase: RunPhase = cancelledNow ? phaseReachedBeforeCompleting : 'persisting';
+    // `run()` calls `runCompleting()`/`runPersisting()` unconditionally, even once cancellation or a
+    // missing plan has already skipped one or more of `runPlanning`/`runInvestigating`/`runVerifying`
+    // — those two phases' own bookkeeping (host validation, the terminal event and checkpoint) always
+    // genuinely runs regardless, so `currentPhase` alone cannot tell "every phase truly ran" from
+    // "something cut the sequence short and completing/persisting merely wrapped up the attempt
+    // where it stood." `phaseReachedBeforeCompleting` is `run()`'s own progressively-tracked "furthest
+    // phase reached under unbroken forward progression" — frozen the moment `run()` first skips a
+    // phase for ANY reason, so a later phase that still happens to run despite an earlier skip (Gap
+    // 1: `runVerifying` always runs when the attempt is not cancelled, even with no plan, so even
+    // with `runInvestigating` skipped) can never advance it back past that point. `aPhaseWasSkipped`
+    // is `run()`'s own record of whether that freeze ever happened at all.
+    //
+    // `cancelledNow` is read fresh, here, rather than folded into `run()`'s own tracking, because
+    // cancellation can land after `run()`'s last `isCancelled()` check — between `runVerifying`
+    // finishing and `runCompleting` starting, say — with no phase ever explicitly skipped
+    // (`aPhaseWasSkipped` stays `false`) even though the attempt still ends `cancelled`. Either signal
+    // alone would misreport one of the two cases this fixes: `aPhaseWasSkipped` alone would miss that
+    // late cancellation; `cancelledNow` alone (the pre-fix condition) is exactly the gap that let a
+    // no-plan skip, which cancels nothing, fall through to the hardcoded `'persisting'` below.
+    //
+    // A genuinely complete run hits neither: nothing was ever skipped, and cancellation never fired,
+    // so `'persisting'` is reported as before — every phase, completing and persisting included,
+    // genuinely ran to produce this outcome, `succeeded` or `failed` alike.
+    const terminalPhase: RunPhase = cancelledNow || aPhaseWasSkipped ? phaseReachedBeforeCompleting : 'persisting';
     appendActivity({ kind: 'terminalResult', lifecycle, completeness: outcome.completeness, limitations: outcome.limitations }, terminalPhase);
     // Reported after the terminal fact above, deliberately without `fireCheckpoint`'s own marker
     // event (see `reportCheckpoint`'s doc comment) — this is the checkpoint that must land in
@@ -3322,18 +3332,38 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
       computeSmallFlag();
 
-      if (!isCancelled()) await runPlanning();
-      if (plan === undefined) extraLimitations.push({ code: 'noPlan', message: 'No plan was ever created for this attempt.' });
-      if (!isCancelled() && plan !== undefined) await runInvestigating();
-      if (!isCancelled()) await runVerifying();
+      // The furthest phase this attempt reaches under its own *unbroken* forward progression —
+      // planning, then investigating, then verifying — for `runPersisting`'s terminal-phase stamp
+      // (see its own doc comment). Updated only while `aPhaseWasSkipped` is still `false`, so once
+      // any phase below is skipped for any reason, this freezes at the last phase that genuinely ran
+      // before it: a later phase that still executes despite that skip — `runVerifying` always runs
+      // when the attempt is not cancelled, even with no plan, so `runInvestigating` being skipped for
+      // want of one does not stop it — can never advance this past the true stopping point (Gap 1).
+      let phaseReachedBeforeCompleting: RunPhase = currentPhase;
+      let aPhaseWasSkipped = false;
 
-      // Captured before `runCompleting()`/`runPersisting()` — the two phases that always run,
-      // cancelled or not — so `runPersisting` can tell a cancelled attempt's true last phase from
-      // its own unconditional `currentPhase = 'completing'`/`'persisting'` stamps. See
-      // `runPersisting`'s own doc comment on `phaseReachedBeforeCompleting`.
-      const phaseReachedBeforeCompleting = currentPhase;
+      if (!isCancelled()) {
+        await runPlanning();
+        if (!aPhaseWasSkipped) phaseReachedBeforeCompleting = currentPhase;
+      } else {
+        aPhaseWasSkipped = true;
+      }
+      if (plan === undefined) extraLimitations.push({ code: 'noPlan', message: 'No plan was ever created for this attempt.' });
+      if (!isCancelled() && plan !== undefined) {
+        await runInvestigating();
+        if (!aPhaseWasSkipped) phaseReachedBeforeCompleting = currentPhase;
+      } else {
+        aPhaseWasSkipped = true;
+      }
+      if (!isCancelled()) {
+        await runVerifying();
+        if (!aPhaseWasSkipped) phaseReachedBeforeCompleting = currentPhase;
+      } else {
+        aPhaseWasSkipped = true;
+      }
+
       const evaluation = await runCompleting();
-      return await runPersisting(evaluation, phaseReachedBeforeCompleting);
+      return await runPersisting(evaluation, phaseReachedBeforeCompleting, aPhaseWasSkipped);
     } catch (error) {
       // The catch-all itself: see `finalizeEscapedError`'s own doc comment. The original error
       // always propagates, whether or not the terminal checkpoint it triggers could be written.
