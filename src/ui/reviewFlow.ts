@@ -46,6 +46,7 @@ import {
   carryRetainedResult,
   clearSubmitLedger,
   draftKeyFor,
+  partialDraftKeyFor,
   readRetained,
   runKeyForCr,
   screenForRetained,
@@ -1026,14 +1027,22 @@ export class ReviewFlowPanel {
    * whether there was one. This is the whole of "a completed review is what a
    * target opens on": one reader, used by `load()`, by a finished run, and by a
    * cancelled one.
+   *
+   * `source` defaults to the complete-review key every one of those callers
+   * wants; `usePartial`'s own call site is the one exception (budget-exhausted
+   * resume feature) — it reads the *separate* durable partial key instead
+   * (`retainedReview.ts`'s `partialDraftKeyFor`/`readRetained`'s own
+   * `{partial: true}` option), so "Use N partial findings" actually opens the
+   * partial review it names rather than whatever complete review this target
+   * happened to retain before.
    */
-  private enterRetained(): boolean {
+  private enterRetained(source: { key: string; partial?: boolean } = { key: this.draftKey() }): boolean {
     // A pending coalesced write may hold newer triage than the store; land it
     // first, or this read would revert the screen to the pre-burst state (a
     // cancelled re-run re-entering the review is the reachable case). The
     // flush's get/update pair is synchronous, so the read below sees it.
     this.draftWriter.flushQuietly();
-    const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(this.draftKey()));
+    const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(source.key), { partial: source.partial });
     if (!retained) {
       // Cleared, not merely left: a change request with no record must not
       // inherit the previous one's, which is what the header line and the
@@ -1222,14 +1231,18 @@ export class ReviewFlowPanel {
         return;
       }
       case 'resumeFromCheckpoint': {
-        // Task 14.6: identical context-reference resolution to `run` above —
-        // the `RunInput` a resumed attempt builds must be exactly as fresh
-        // as an ordinary one, since `decideResume` compares it against the
-        // stored checkpoint dimension by dimension. Only the final manager
-        // call differs (`resumeRun` in `run()`, not `trigger()`), gated by
+        // Task 14.6 (extended for the budget-exhausted resume feature):
+        // identical context-reference resolution to `run` above — the
+        // `RunInput` a resumed attempt builds must be exactly as fresh as an
+        // ordinary one, since `decideResume` compares it against the stored
+        // checkpoint dimension by dimension. Only the final manager call
+        // differs (`resumeRun` in `run()`, not `trigger()`), gated by
         // `fromCheckpoint`; the button that dispatches this message is
-        // itself only rendered when `interruptedPrior.resumable` said the
-        // offer was live.
+        // itself only rendered when either offer said it was live —
+        // `interruptedPrior.resumable` on the `'agent'` picker screen, or
+        // `runError.freshAttempt.resumable` on this failure card. `resumeRun`
+        // itself tells the two apart (`ReviewRun.outcome`, via
+        // `harnessResume.ts`'s `resumeBudgetModeFor`) — this handler need not.
         const loadToken = this.loadSeq;
         const target = this.ref;
         const targetIsCurrent = (): boolean => (
@@ -1284,11 +1297,14 @@ export class ReviewFlowPanel {
         await vscode.commands.executeCommand('codeVerdict.selectAgent');
         return;
       case 'usePartial':
-        // The demo agent never produces partials; the lm path reports 0
-        // today — reachable once streaming partial parses land.
+        // The demo agent never produces partials. The lm path's own durable
+        // partial write (`ReviewRunManager.completeAttempt`) is what this
+        // reads back — the separate `partialDraftKeyFor` key, never this
+        // target's complete-review key (`enterRetained`'s own doc comment on
+        // why `usePartial` is its one caller that overrides `source`).
         this.deps.runs.acknowledge(this.runKey());
         this.runRecord = undefined;
-        if (!this.enterRetained()) this.screen = 'agent';
+        if (!this.enterRetained({ key: partialDraftKeyFor(this.ref), partial: true })) this.screen = 'agent';
         break;
       case 'newRun':
         // Open the pickers over a result that stays exactly where it is. Only a
@@ -1987,8 +2003,22 @@ export class ReviewFlowPanel {
           }
         : undefined,
       runStartedAt: this.runRecord?.startedAt,
+      // `partialCount` reads `RunRecord.partialResult` — `settle`'s own field for exactly this
+      // (`reviewRunManager.ts`), never a hardcoded 0: a failed run's validated findings are real
+      // and the failure card names them accurately, arming both "Use N partial findings" and the
+      // fresh-attempt sentence below with the true count. `freshAttempt` is the budget-exhausted
+      // resume feature's own offer for this failed run — `RunControls.canStartFreshAttempt`/
+      // `.freshAttemptReasons`, gated off `demo` the same way `interruptedPrior` below is (a demo
+      // selection has no checkpoint continuity contract to offer against).
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
-        ? { ...this.runRecord.failure, partialCount: 0 }
+        ? {
+            ...this.runRecord.failure,
+            partialCount: this.runRecord.partialResult?.items.length ?? 0,
+            freshAttempt:
+              controls.canStartFreshAttempt || controls.freshAttemptReasons
+                ? { resumable: controls.canStartFreshAttempt && this.selectedAgent().source !== 'demo', reasons: controls.freshAttemptReasons }
+                : undefined,
+          }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
       // Task 14.6: both fields below come from the one derivation

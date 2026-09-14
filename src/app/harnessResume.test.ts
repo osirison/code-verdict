@@ -17,6 +17,7 @@ import {
   importRetainedEvidence,
   interruptedLimitation,
   nextAttemptNumber,
+  resumeBudgetModeFor,
   ResumeIncompatibleError,
   type ResumeIncompatibilityCode,
 } from './harnessResume';
@@ -477,6 +478,21 @@ describe('no-reconnect wording (11.8, D13 "the rule that matters most")', () => 
     expect(text).toMatch(/interrupted/i);
   });
 
+  // Budget-exhausted resume feature: the 'fresh' branch narrates a live `failed` terminal
+  // attempt honestly — never "interrupted" (it did not crash), never "resume"/"continue" either.
+  it('describeResumeStart(..., \'fresh\') names the budget running out, never calls it interrupted, and stays clean of every forbidden phrase', () => {
+    const text = describeResumeStart(1, 2, 'completing', 'fresh');
+    assertClean(text);
+    expect(text).toMatch(/attempt 2/i);
+    expect(text).toMatch(/checkpoint/i);
+    expect(text).toMatch(/budget/i);
+    expect(text).not.toMatch(/interrupted/i);
+  });
+
+  it('describeResumeStart defaults to the original carryForward/interrupted sentence — the pinned three-argument call is byte-identical to before this parameter existed', () => {
+    expect(describeResumeStart(1, 2, 'investigating')).toBe(describeResumeStart(1, 2, 'investigating', 'carryForward'));
+  });
+
   it('interruptedLimitation states the attempt is closed, never that it can be reconnected to', () => {
     const limitation = interruptedLimitation(1, 'investigating');
     assertClean(limitation.message);
@@ -658,6 +674,43 @@ describe('buildResumePayload (11.6): preserve plan, coverage, findings, and budg
     expect(payload.budget).toEqual(checkpoint.budget);
     expect(payload.retry).toEqual(checkpoint.retry);
     expect(payload.retainedEvidence).toEqual(checkpoint.evidence);
+  });
+});
+
+// ---- resumeBudgetModeFor / ResumePayload.budgetMode (budget-exhausted resume feature) ------
+
+describe('resumeBudgetModeFor: which resume shape a checkpoint\'s own terminal lifecycle calls for', () => {
+  it('a checkpoint the activation sweep closed as interrupted (a crash) is carryForward — task 11.6\'s original contract, unchanged', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = testCheckpoint(snapshot, { projection: { ...testCheckpoint(snapshot).projection, lifecycle: 'interrupted' } });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('carryForward');
+    expect(buildResumePayload(checkpoint).budgetMode).toBe('carryForward');
+  });
+
+  it('a `failed` checkpoint runPersisting itself wrote in the ordinary course (reason: phaseBoundary — most commonly budget exhaustion) is fresh — this feature\'s own new case', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = testCheckpoint(snapshot, { reason: 'phaseBoundary', projection: { ...testCheckpoint(snapshot).projection, lifecycle: 'failed' } });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('fresh');
+    expect(buildResumePayload(checkpoint).budgetMode).toBe('fresh');
+  });
+
+  it('a `failed` checkpoint from finalizeEscapedError\'s own crash catch-all (reason: attemptFailed) is carryForward, NOT fresh — a genuine crash is not a budget-exhaustion decision, whichever of the two ways it ended up persisted (harnessRuntime.test.ts\'s own crash-resume fixture exercises exactly this shape end to end)', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = testCheckpoint(snapshot, { reason: 'attemptFailed', projection: { ...testCheckpoint(snapshot).projection, lifecycle: 'failed' } });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('carryForward');
+    expect(buildResumePayload(checkpoint).budgetMode).toBe('carryForward');
+  });
+
+  it('decideResume threads the same budgetMode into the compatible payload and the start narrative, for both lifecycles', () => {
+    const stored = testSnapshot();
+    for (const [lifecycle, expectedMode] of [['interrupted', 'carryForward'], ['failed', 'fresh']] as const) {
+      const checkpoint = testCheckpoint(stored, { projection: { ...testCheckpoint(stored).projection, lifecycle } });
+      const decision = decideResume({ storedSnapshot: stored, checkpoint, candidateSnapshot: stored });
+      expect(decision.kind).toBe('compatible');
+      if (decision.kind !== 'compatible') continue;
+      expect(decision.payload.budgetMode).toBe(expectedMode);
+      expect(decision.startAction).toBe(describeResumeStart(checkpoint.attempt, nextAttemptNumber(checkpoint.attempt), checkpoint.phase, expectedMode));
+    }
   });
 });
 

@@ -634,15 +634,19 @@ export function isLegalRunTransition(from: RunLifecycle, to: RunLifecycle): bool
 }
 
 /**
- * Task 14.6: what any screen may offer for one target right now — pause,
- * live in-session resume, and cancel for a run in flight; resume-from-
- * checkpoint (never both at once with the first three, see below) for a
- * target with none in flight but an `interrupted` stored outcome whose
- * checkpoint passed the sweep's integrity check. A plain restart (a fresh
- * `trigger()`) needs no field here at all — it is legal exactly when nothing
- * is in flight, which every screen already establishes for itself before
- * offering its ordinary "run" action, and it accepts an `interrupted` prior
- * outcome the same as any other terminal one.
+ * Task 14.6 (extended for the budget-exhausted resume feature): what any
+ * screen may offer for one target right now — pause, live in-session
+ * resume, and cancel for a run in flight; a new-attempt-from-checkpoint
+ * offer (never with the first three at once, see below) for a target with
+ * none in flight but a stored outcome whose checkpoint passed an integrity
+ * check — `canResumeFromCheckpoint` for an `interrupted` stored outcome
+ * (the sweep's own check, carried-forward budget) and `canStartFreshAttempt`
+ * for a `'partial'` stored outcome the live settle path itself checked (a
+ * budget-exhaustion blocker, most commonly — fresh budget). A plain restart
+ * (a fresh `trigger()`) needs no field here at all — it is legal exactly
+ * when nothing is in flight, which every screen already establishes for
+ * itself before offering its ordinary "run" action, and it accepts any
+ * terminal stored outcome the same way.
  */
 export interface RunControls {
   readonly canPause: boolean;
@@ -667,6 +671,28 @@ export interface RunControls {
    * "legacy interrupted runs offer restart".
    */
   readonly resumeReasons?: readonly Limitation[];
+  /**
+   * Task (budget-exhausted resume): a *different* offer from
+   * `canResumeFromCheckpoint` above, deliberately never folded into it —
+   * that field's own doc comment, and every reader of it (the `'agent'`
+   * picker screen's interrupted banner), speak only of a crash. This one is
+   * for a target whose last outcome is `'partial'` with a checkpoint the
+   * live settle path itself (`ReviewRunManager.completeAttempt`) or the
+   * sweep's own live-terminal branch already checked for integrity —
+   * offered on the failure card, never the picker screen's interrupted
+   * banner, and reusing the identical resume machinery
+   * (`ReviewRunManager.resumeRun`/`executeAttempt`) with a fresh budget
+   * rather than the carried-forward one an `interrupted` resume gets
+   * (`harnessResume.ts`'s `ResumeBudgetMode`). `true` only when
+   * `ReviewRun.resumable === true` and `.lineageId` is present on a
+   * `'partial'` row that actually carries a `resumable` value at all — a
+   * `'partial'` row from a *cancelled* run never does (nothing computes it
+   * for that lifecycle), so this is structurally `false` there without a
+   * separate check.
+   */
+  readonly canStartFreshAttempt: boolean;
+  /** `checkCheckpointIntegrity`'s findings for the `canStartFreshAttempt` offer, present only alongside `canStartFreshAttempt: false` for a row that did carry a checked-but-failed integrity result. */
+  readonly freshAttemptReasons?: readonly Limitation[];
 }
 
 /**
@@ -685,19 +711,23 @@ export function deriveRunControls(live: RunRecord | undefined, stored: ReviewRun
       canResume: isLegalRunTransition(live.lifecycle, 'resuming'),
       canCancel: isLegalRunTransition(live.lifecycle, 'cancelling'),
       canResumeFromCheckpoint: false,
+      canStartFreshAttempt: false,
     };
   }
-  if (stored?.outcome !== 'interrupted') {
-    return { canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false };
+  const none: RunControls = { canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false, canStartFreshAttempt: false };
+  if (stored?.outcome === 'interrupted') {
+    const resumable = stored.resumable === true && stored.lineageId !== undefined;
+    return { ...none, canResumeFromCheckpoint: resumable, resumeReasons: resumable ? undefined : stored.resumeReasons };
   }
-  const resumable = stored.resumable === true && stored.lineageId !== undefined;
-  return {
-    canPause: false,
-    canResume: false,
-    canCancel: false,
-    canResumeFromCheckpoint: resumable,
-    resumeReasons: resumable ? undefined : stored.resumeReasons,
-  };
+  // A `'partial'` row only ever carries `resumable` when the writer actually computed it —
+  // `completeAttempt`'s `failed` branch and the sweep's live-terminal `'failed'` branch, never the
+  // `cancelled` path (`recordPartialHistory`'s own doc comment) — so a cancelled run's row falls
+  // through to `none` below exactly like one with no offer at all.
+  if (stored?.outcome === 'partial' && stored.resumable !== undefined) {
+    const resumable = stored.resumable === true && stored.lineageId !== undefined;
+    return { ...none, canStartFreshAttempt: resumable, freshAttemptReasons: resumable ? undefined : stored.resumeReasons };
+  }
+  return none;
 }
 
 /**
@@ -1622,6 +1652,29 @@ export class ReviewRunManager {
       code: result.outcome.limitations[0]?.code ?? 'harness.incomplete',
       blockerDetails: result.outcome.blockerDetails,
     };
+    // A live `failed` settle — unlike `cancelled` above — is exactly the terminal state this
+    // feature offers a fresh-budget new attempt from (most commonly a budget-exhaustion blocker),
+    // so this computes the same stored-checkpoint-integrity offer the activation sweep computes for
+    // an `interrupted` lineage (`checkCheckpointIntegrity`), here for a lineage that never left
+    // this process at all. Written into the `ReviewRunStore` row *before* `settle()` below (never
+    // after, the way `recordPartialHistory`'s own doc comment describes the `cancelled` branch's
+    // ordering) — `settle()`'s notify is what makes a panel re-render and read `controlsFor`, and
+    // the offer must already be in the row that read sees, not arrive on some later, unrelated
+    // repaint. Computed and recorded even at zero findings: the offer's value is the plan and
+    // coverage a resumed attempt reuses, not only the findings.
+    let checkpointOffer: { lineageId?: string; resumable?: boolean; resumeReasons?: readonly Limitation[] } = {};
+    const latestOwnCheckpoint = this.harnessRunStore.latestCheckpoint(record.lineageId);
+    if (latestOwnCheckpoint) {
+      const storedSnapshot = this.harnessRunStore.readSnapshot(record.lineageId, latestOwnCheckpoint.attempt);
+      const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latestOwnCheckpoint) : undefined;
+      checkpointOffer = {
+        lineageId: record.lineageId,
+        resumable: reasons ? reasons.length === 0 : false,
+        resumeReasons: reasons && reasons.length > 0 ? reasons : undefined,
+      };
+    }
+    await this.recordPartialHistory(identity, input.agentLabel, partial?.items.length ?? 0, ranAt, result.outcome.limitations, checkpointOffer);
+    if (!this.isSettleable(key)) return;
     this.settle(record, {
       lifecycle: 'failed',
       failure,
@@ -1630,24 +1683,35 @@ export class ReviewRunManager {
       partialResult: partial,
       completionEvaluation: result.completionEvaluation,
     });
-    if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
   }
 
   /**
    * Task 12.5: the run-history counterpart to a durable partial write
    * (`completeAttempt`'s failed/cancelled tail) — an explicit `'partial'`
-   * outcome, never folded into `'findings'`. Recorded after `settle`'s
-   * notify, mirroring the succeeded path's own `this.runs.record`/
-   * `onRunRecorded` ordering above (run-history/dashboard metadata, not the
-   * result a panel reads back to render — see `completeAttempt`'s own
-   * write-before-notify comment on the retained-review and durable-partial
-   * writes themselves, which do precede notify).
+   * outcome, never folded into `'findings'`. The `cancelled` call site keeps
+   * this file's original ordering (recorded after `settle`'s notify,
+   * mirroring the succeeded path's own `this.runs.record`/`onRunRecorded`
+   * ordering above — run-history/dashboard metadata, not something a panel
+   * reads back to render). The `failed` call site is the one exception
+   * (task: budget-exhausted resume): `completeAttempt`'s own comment there
+   * calls this *before* `settle()`, because `checkpointOffer` below is
+   * exactly what a freshly-repainted failure card reads through
+   * `controlsFor` — the ordinary metadata-after-notify rule would leave that
+   * card's first paint without the offer it should already have.
    *
    * Task 14.4: `limitations` is the same `HarnessAttemptResult.outcome.
    * limitations` the durable partial record and the `settle` call just
    * above both already carry — never a second read or a re-derivation —
    * so the dashboard row's "why partial" tooltip can read straight off
    * `ReviewRun.limitations` instead of only off the record a panel opens.
+   *
+   * `checkpointOffer` is present only from the `failed` call site — the same
+   * `checkCheckpointIntegrity` computation the activation sweep runs for an
+   * `interrupted` lineage, run here for a lineage that never left this
+   * process. Absent (the `cancelled` call site) writes a row with none of
+   * `lineageId`/`resumable`/`resumeReasons` set, exactly as before this
+   * parameter existed — `deriveRunControls` never offers a fresh attempt for
+   * a row that never claims one.
    */
   private async recordPartialHistory(
     identity: { repoId: string; crNumber: string },
@@ -1655,6 +1719,7 @@ export class ReviewRunManager {
     findingCount: number,
     ranAt: string,
     limitations: readonly Limitation[],
+    checkpointOffer?: { lineageId?: string; resumable?: boolean; resumeReasons?: readonly Limitation[] },
   ): Promise<void> {
     await this.runs.record({
       repoId: identity.repoId,
@@ -1664,6 +1729,9 @@ export class ReviewRunManager {
       agentLabel,
       ranAt,
       limitations,
+      ...(checkpointOffer?.lineageId !== undefined ? { lineageId: checkpointOffer.lineageId } : {}),
+      ...(checkpointOffer?.resumable !== undefined ? { resumable: checkpointOffer.resumable } : {}),
+      ...(checkpointOffer?.resumeReasons !== undefined ? { resumeReasons: checkpointOffer.resumeReasons } : {}),
     });
     this.deps.onRunRecorded?.();
   }
@@ -2032,8 +2100,15 @@ function acceptedFindingCount(candidates: readonly { readonly state: string; rea
  * `'findings'` for `succeeded`, `'partial'` for `failed`/`cancelled`) — the
  * identical shape a live settle would have produced for this lineage, had
  * the extension host not stopped before it could run. `resumable`/
- * `resumeReasons` are never set for it: those name a live resume *offer*,
- * which a lineage that already finished has nothing left to offer.
+ * `resumeReasons` are set for exactly one of this function's three
+ * lifecycles — `'failed'` — the same live-terminal-checkpoint integrity
+ * check `ReviewRunManager.completeAttempt`'s own `failed` branch runs
+ * (`checkCheckpointIntegrity`), computed by the loop below rather than by
+ * this function itself (it has no `harnessRunStore` to read the stored
+ * snapshot from). A lineage that ended `succeeded` has nothing left to
+ * offer, and one that ended `cancelled` is a reviewer's own stop, not this
+ * feature's case — neither ever carries `resumable`, matching the live
+ * settle path's own identical split.
  */
 function truthfulTerminalRow(
   lifecycle: RunLifecycle,
@@ -2080,6 +2155,18 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
       if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
         const findingCount = acceptedFindingCount(latest.candidates);
         const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
+        // `'failed'` is the one live-terminal lifecycle this row offers a fresh-budget new attempt
+        // for (`truthfulTerminalRow`'s own doc comment) — the same `checkCheckpointIntegrity` check
+        // `ReviewRunManager.completeAttempt`'s own `failed` branch runs, here because the extension
+        // host stopped before that branch's own write could land.
+        let terminalResumable: boolean | undefined;
+        let terminalResumeReasons: readonly Limitation[] | undefined;
+        if (latest.projection.lifecycle === 'failed') {
+          const storedSnapshot = harnessRunStore.readSnapshot(lineageId, latest.attempt);
+          const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
+          terminalResumable = reasons ? reasons.length === 0 : false;
+          if (reasons && reasons.length > 0) terminalResumeReasons = reasons;
+        }
         // `recordIfFresher`, not `record`: a fast new run on this same target can already have
         // completed and recorded its own richer row while this loop was awaiting an earlier
         // entry — see that method's own doc comment (`reviewRuns.ts`) for the race.
@@ -2091,6 +2178,8 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
           agentLabel: '',
           ranAt: entry.startedAt,
           ...(limitations !== undefined ? { limitations } : {}),
+          ...(terminalResumable !== undefined ? { resumable: terminalResumable, lineageId } : {}),
+          ...(terminalResumeReasons !== undefined ? { resumeReasons: terminalResumeReasons } : {}),
         });
         continue;
       }

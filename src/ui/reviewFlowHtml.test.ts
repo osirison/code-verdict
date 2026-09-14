@@ -1287,6 +1287,64 @@ describe('resume-from-checkpoint offer on the picker screen (task 14.6)', () => 
   });
 });
 
+/**
+ * Budget-exhausted resume feature: the failure card's own offer, distinct from
+ * `interruptedPrior` above — this one fires for a live `failed` run (most commonly a
+ * budget-exhaustion blocker), never an `interrupted` one, and renders on the failure card itself
+ * rather than the `'agent'` picker screen.
+ */
+describe('fresh-attempt offer on the failure card (budget-exhausted resume feature)', () => {
+  const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i, /\binterrupted\b/i];
+
+  function visibleText(html: string): string {
+    return html.replace(/<[^>]*>/g, ' ');
+  }
+
+  function failureScreen(runError: FlowViewState['runError']): string {
+    return renderReviewFlowBody({ ...state, screen: 'running', runError }, 'HVE Core');
+  }
+
+  it('offers "Start new attempt from checkpoint" and names the true finding count, in wording that never implies interruption or reconnection', () => {
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 3, code: 'harness.incomplete', freshAttempt: { resumable: true } });
+    expect(html).toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('Start new attempt from checkpoint');
+    expect(html).toContain('3 findings, plan, and coverage carry over into a new attempt with a fresh budget.');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('names a zero finding count honestly — "the plan and coverage so far", not "the 0 findings"', () => {
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 0, code: 'harness.budgetExhausted', freshAttempt: { resumable: true } });
+    expect(html).toContain('The plan and coverage so far carry over into a new attempt with a fresh budget.');
+    expect(html).not.toContain('0 findings');
+  });
+
+  it('shows every stored reason and no button when the checkpoint cannot be carried into a new attempt', () => {
+    const reasons: Limitation[] = [{ code: 'model', message: 'The model changed since the checkpoint was written.' }];
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 1, code: 'harness.incomplete', freshAttempt: { resumable: false, reasons } });
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('The model changed since the checkpoint was written.');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('renders no fresh-attempt notice at all when the manager found nothing to check', () => {
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 0, code: 'harness.incomplete' });
+    expect(html).not.toContain('id="resume-from-checkpoint"');
+    expect(html).not.toContain('carry over into a new attempt');
+  });
+
+  it('the button shares the exact id the picker screen\'s own offer uses — `reviewFlowHtml.ts`\'s script wiring dispatches both through the identical resumeFromCheckpoint message, never a second handler', () => {
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 1, code: 'harness.incomplete', freshAttempt: { resumable: true } });
+    expect(html).toContain('id="resume-from-checkpoint"');
+  });
+
+  it('the ordinary Retry and Use-partial-findings offers are unaffected — this is an addition to the failure card, not a replacement', () => {
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 2, code: 'harness.incomplete', freshAttempt: { resumable: true } });
+    expect(html).toContain('id="retry-run"');
+    expect(html).toContain('id="use-partial"');
+    expect(html).toContain('Use 2 partial findings');
+  });
+});
+
 describe('the author is never offered a verdict on their own change request', () => {
   const clean: FlowViewState = { ...state, screen: 'clean', items: [], selectedId: undefined, diffLines: undefined };
   const summary: FlowViewState = {

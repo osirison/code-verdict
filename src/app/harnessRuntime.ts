@@ -804,9 +804,20 @@ function releasingLeases(attempt: HarnessAttempt, assembly: CandidateAssembly): 
  * Compatible: writes the candidate snapshot (a resume-of-a-resume needs it stored too, same
  * ordering as `create`), then builds the attempt seeded with `decideResume`'s payload and start
  * narrative (`harnessAttempt.ts`'s own `HarnessAttemptOptions.resumeSeed` doc comment covers what
- * each piece does). The lost attempt itself is not re-closed here: the activation sweep
- * (`sweepInterruptedRuns`) already closed it as `interrupted` before this ever runs, and
- * `latestCheckpoint` below reads exactly that closed checkpoint.
+ * each piece does).
+ *
+ * `latestCheckpoint` below reads whichever checkpoint is actually the lineage's last one, and which
+ * of the two resume budget shapes it calls for is a distinction this function never has to make
+ * itself (`harnessResume.ts`'s `resumeBudgetModeFor` does, from the checkpoint's own `reason` and
+ * lifecycle, inside `decideResume`/`buildResumePayload`): a checkpoint closed `interrupted` by the
+ * activation sweep (`sweepInterruptedRuns`), or `failed` from `harnessAttempt.ts`'s own crash
+ * catch-all (`finalizeEscapedError`, before the sweep ever got to it, `reason: 'attemptFailed'`) —
+ * both crash-resume, budget carried forward — or a `failed` checkpoint tagged `reason:
+ * 'phaseBoundary'`, the ordinary-course reason: either `runPersisting` itself closing the turn loop
+ * (most commonly a budget-exhaustion blocker; `ReviewRunManager.completeAttempt`'s own doc comment
+ * on where that checkpoint's `resumable`/`lineageId` get recorded) or `finalizeBootstrapFailure`
+ * bailing before bootstrap ever finished — this feature's own new case, a fresh budget for the new
+ * attempt either way. Either way the lost attempt itself is not touched by this function.
  */
 async function assembleResumeAttempt(deps: HarnessRuntimeDeps, input: RunInput, options: HarnessAttemptRunOptions): Promise<HarnessAttempt> {
   const lineageId = options.identity.lineageId;

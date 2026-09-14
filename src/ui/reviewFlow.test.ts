@@ -14,6 +14,7 @@ import { COMMANDS } from '../commands';
 import { DRAFT_WRITE_WINDOW_MS } from '../app/draftWriter';
 import {
   draftKeyFor,
+  partialDraftKeyFor,
   retainedFromRun,
   runKeyForCr,
   type SessionDraft,
@@ -842,6 +843,127 @@ describe('run controls are derived from the manager\'s own transition validity (
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<[^>]*>/g, ' ');
     for (const pattern of FORBIDDEN) expect(visibleText).not.toMatch(pattern);
+  });
+});
+
+describe('budget-exhausted resume (feature): the failure card shows the true finding count and the fresh-attempt offer', () => {
+  it('runError.partialCount reflects RunRecord.partialResult\'s real item count, never a hardcoded 0', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({
+      key: runKeyForCr(REF),
+      status: 'failed',
+      lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+      partialResult: {
+        schemaVersion: '1',
+        agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+        agentLabel: 'Default review',
+        headSha: 'head-1',
+        items: [
+          { id: 'i0', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'Finding 0', body: 'Body', code: '' },
+          { id: 'i1', file: 'src/a.ts', anchored: true, line: 2, severity: 'minor', category: 'style', confidence: 80, title: 'Finding 1', body: 'Body', code: '' },
+        ],
+        candidates: [],
+      },
+    });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('2 findings arrived before it stopped.');
+    expect(panel.webview.html).toContain('Use 2 partial findings');
+  });
+
+  it('populates runError.freshAttempt from RunControls.canStartFreshAttempt/.freshAttemptReasons, gated off a demo selection the same way interruptedPrior is', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.controlsFor.mockReturnValue({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false, canStartFreshAttempt: true } as RunControls);
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({
+      key: runKeyForCr(REF),
+      status: 'failed',
+      lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+    });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).toContain('id="resume-from-checkpoint"');
+    expect(panel.webview.html).toContain('Start new attempt from checkpoint');
+  });
+
+  it('never offers the fresh attempt when canStartFreshAttempt is false, even alongside reasons', async () => {
+    const h = await harness();
+    await h.open();
+    h.runs.controlsFor.mockReturnValue({
+      canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false, canStartFreshAttempt: false,
+      freshAttemptReasons: [{ code: 'model', message: 'The model changed since the checkpoint was written.' }],
+    } as RunControls);
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+
+    h.runs.settle({
+      key: runKeyForCr(REF),
+      status: 'failed',
+      lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+    });
+    await h.post({ type: 'noop' });
+
+    expect(panel.webview.html).not.toContain('id="resume-from-checkpoint"');
+    expect(panel.webview.html).toContain('The model changed since the checkpoint was written.');
+  });
+
+  it('clicking the fresh-attempt button dispatches through the same resumeRun call resumeFromCheckpoint always used, never trigger', async () => {
+    const h = await harness();
+    await h.open();
+    const resumed = { key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord;
+    h.runs.resumeRun.mockReturnValue(resumed);
+
+    void h.post({ type: 'resumeFromCheckpoint' });
+    await vi.waitFor(() => expect(h.runs.resumeRun).toHaveBeenCalled());
+
+    expect(h.runs.trigger).not.toHaveBeenCalled();
+  });
+
+  it('usePartial reads the durable partial record under its own key, never the target\'s complete-review key — the reviewer sees the findings the failure card actually named, not a stale unrelated complete review', async () => {
+    const staleCompleteReview: Review = {
+      repoId: REF.repoId, crNumber: REF.number, agentId: BUILTIN_AGENT_DESCRIPTOR.id, modelId: 'lm:acme/turbo', criteria: DEFAULT_CRITERIA, headSha: 'aaaa',
+      items: [{ id: 'stale-complete', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'A stale complete-review finding', body: 'Body', code: '' }],
+      verdicts: {}, summary: '',
+    };
+    const completeSeed = retainedFromRun({ review: staleCompleteReview, ranAt: RAN_AT, agentId: BUILTIN_AGENT_DESCRIPTOR.id, agentLabel: 'Default review', modelId: 'lm:acme/turbo' });
+    const h = await harness(completeSeed);
+    await h.open();
+
+    const partialReview: Review = {
+      repoId: REF.repoId, crNumber: REF.number, agentId: BUILTIN_AGENT_DESCRIPTOR.id, modelId: 'lm:acme/turbo', criteria: DEFAULT_CRITERIA, headSha: 'aaaa',
+      items: [{ id: 'partial-1', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'The true partial finding from the failed run', body: 'Body', code: '' }],
+      verdicts: {}, summary: '',
+    };
+    const partialSeed = retainedFromRun({ review: partialReview, ranAt: RAN_AT, agentId: BUILTIN_AGENT_DESCRIPTOR.id, agentLabel: 'Default review', modelId: 'lm:acme/turbo', completeness: 'partial', limitations: [{ code: 'harness.budgetExhausted', message: 'Budget exhausted.' }] });
+    await h.workspaceState.update(partialDraftKeyFor(REF), partialSeed);
+
+    h.runs.trigger.mockReturnValue({ key: runKeyForCr(REF), status: 'queued', lifecycle: 'queued' } as RunRecord);
+    void h.post({ type: 'run' });
+    await vi.waitFor(() => expect(h.runs.trigger).toHaveBeenCalled());
+    h.runs.settle({
+      key: runKeyForCr(REF), status: 'failed', lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+      partialResult: { schemaVersion: '1', agentId: BUILTIN_AGENT_DESCRIPTOR.id, agentLabel: 'Default review', headSha: 'aaaa', items: partialReview.items, candidates: [] },
+    });
+    await h.post({ type: 'noop' });
+
+    await h.post({ type: 'usePartial' });
+
+    expect(panel.webview.html).toContain('The true partial finding from the failed run');
+    expect(panel.webview.html).not.toContain('A stale complete-review finding');
   });
 });
 

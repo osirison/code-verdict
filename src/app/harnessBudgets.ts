@@ -213,22 +213,36 @@ export interface BudgetTrackerOptions {
   /**
    * Task 14.6: a resumed attempt's carried-forward consumption, read straight off the prior
    * attempt's last checkpoint (`harnessResume.ts`'s `ResumePayload.budget`) — "budget consumed so
-   * far" is explicitly part of what a resume preserves. This is a coarse aggregate, not a
-   * bucket-level ledger: `evidenceBytesUsed`/`modelTurnsUsed`/`toolCallsUsed` are each a pool's
-   * *total* across every lane and owner, and `highRiskReserveUsed`/`verificationReserveUsed` are
-   * reservation *counts*, not byte/turn amounts — a checkpoint cannot say which lane or which
-   * member's private slice a prior charge drew from. Seeding therefore charges only the
-   * `SHARED_OWNER` buckets (never a per-member private slice — attribution there is
-   * unrecoverable, and leaving per-member minimums fresh errs toward protecting members), in lane
-   * order (ordinary, then highRiskReserve, then verificationReserve) so a total that exceeds the
-   * ordinary lane alone still lands somewhere capacity allows; `decideResume`'s compatibility
-   * check guarantees the same policy, so the total is expected to always fit, but a seed that
-   * still doesn't is clamped with a `carryForwardClamped` warning rather than thrown.
-   * `highRiskReserveUsed`/`verificationReserveUsed` themselves are copied verbatim, since they are
-   * already lineage-cumulative counters, not something to re-derive from the seeded charges.
-   * `elapsedMs` is deliberately NOT carried forward: a checkpoint's elapsed time is attempt-scoped
-   * (the time gate bounds one model session's wall time), and the new attempt gets its own model
-   * and tool session, so it gets its own clock too.
+   * far" is explicitly part of what a resume preserves. **Pass this only when the resume is
+   * `ResumePayload.budgetMode === 'carryForward'`** — the crash/`interrupted` case
+   * (`resumeBudgetModeFor`'s own doc comment covers the other, `'fresh'`, case: a live `failed`
+   * terminal checkpoint, most commonly a budget-exhaustion blocker, where the reviewer explicitly
+   * asked for another attempt with a fresh budget — passing `undefined` there, not this field's
+   * `BudgetConsumption`, is what makes that honest: the caller (`harnessAttempt.ts`) omits this
+   * option entirely rather than passing a zeroed one, so every code path below that only checks
+   * `options.carryForward`'s presence — including the one that seeds `highRiskReserveUsed`/
+   * `verificationReserveUsed` — naturally starts both reserve counters at zero too. A resumed
+   * attempt whose accepted findings are re-verified (`harnessAttempt.ts`'s own doc comment on its
+   * `candidateTracker` seed) needs its verification reserve genuinely intact for that, not merely
+   * nominally reset while still counted spent — carrying reserve counts forward into a `'fresh'`
+   * attempt would underfund exactly the work that attempt is contractually doing).
+   *
+   * This is a coarse aggregate, not a bucket-level ledger: `evidenceBytesUsed`/`modelTurnsUsed`/
+   * `toolCallsUsed` are each a pool's *total* across every lane and owner, and
+   * `highRiskReserveUsed`/`verificationReserveUsed` are reservation *counts*, not byte/turn
+   * amounts — a checkpoint cannot say which lane or which member's private slice a prior charge
+   * drew from. Seeding therefore charges only the `SHARED_OWNER` buckets (never a per-member
+   * private slice — attribution there is unrecoverable, and leaving per-member minimums fresh errs
+   * toward protecting members), in lane order (ordinary, then highRiskReserve, then
+   * verificationReserve) so a total that exceeds the ordinary lane alone still lands somewhere
+   * capacity allows; `decideResume`'s compatibility check guarantees the same policy, so the total
+   * is expected to always fit, but a seed that still doesn't is clamped with a
+   * `carryForwardClamped` warning rather than thrown. `highRiskReserveUsed`/
+   * `verificationReserveUsed` themselves are copied verbatim, since they are already
+   * lineage-cumulative counters, not something to re-derive from the seeded charges.
+   * `elapsedMs` is deliberately NOT carried forward even in the `'carryForward'` case: a
+   * checkpoint's elapsed time is attempt-scoped (the time gate bounds one model session's wall
+   * time), and the new attempt gets its own model and tool session, so it gets its own clock too.
    */
   readonly carryForward?: BudgetConsumption;
 }

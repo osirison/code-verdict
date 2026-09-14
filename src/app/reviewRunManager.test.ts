@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from './agents';
 import { ReviewRunStore, type ReviewRun } from './reviewRuns';
+import { crKey } from './postedReviews';
 import { partialDraftKeyFor, readRetained, runKeyForCr, type SessionDraft } from './retainedReview';
 import {
   InFlightRunStore,
@@ -2234,8 +2235,14 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
 
   /** A genuinely terminal checkpoint: `nonterminalActivityEvents()` plus the same `terminalResult`
    * fact `harnessAttempt.ts`'s `runPersisting`/`finalizeEscapedError` append. */
-  function terminalActivityEvents(lifecycle: 'failed' | 'cancelled') {
-    let log = createActivityLog(SWEEP_RUN_ID, SWEEP_LINEAGE_ID, 1);
+  // `runId`/`lineageId` default to the fixed `SWEEP_*` ids every other fixture in this block uses;
+  // a caller seeding a *real*, manager-minted lineage (the budget-exhausted resume feature's own
+  // tests below) must pass its actual ids instead — `parseActivityEvent`'s own cross-check
+  // (`harnessRunStore.ts`) rejects any event whose embedded identity does not match the checkpoint
+  // it is read back under, so a mismatch here would silently make the whole stored lineage record
+  // fail to parse on the very next read, not merely produce a wrong value.
+  function terminalActivityEvents(lifecycle: 'failed' | 'cancelled', runId: string = SWEEP_RUN_ID, lineageId: string = SWEEP_LINEAGE_ID) {
+    let log = createActivityLog(runId, lineageId, 1);
     log = appendActivityEvent(
       log,
       { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
@@ -2295,6 +2302,19 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
           limitations: built.projection.limitations,
         }),
       ]);
+      // Budget-exhausted resume feature: the sweep's own live-terminal branch offers a fresh-budget
+      // new attempt for exactly the lifecycle `ReviewRunManager.completeAttempt`'s live path does —
+      // `'failed'`, never `'cancelled'` (a reviewer's own stop, not this feature's case).
+      const row = new ReviewRunStore(globalState).list()[0]!;
+      if (lifecycle === 'failed') {
+        expect(row.resumable).toBe(true);
+        expect(row.lineageId).toBe(SWEEP_LINEAGE_ID);
+        expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(true);
+      } else {
+        expect(row.resumable).toBeUndefined();
+        expect(row.lineageId).toBeUndefined();
+        expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(false);
+      }
     },
   );
 
@@ -2432,7 +2452,147 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
 
     const controls = runs.controlsFor('changeset:cs-1', undefined);
 
-    expect(controls).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+    expect(controls).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false, canStartFreshAttempt: false });
+  });
+
+  // ---- Budget-exhausted resume (feature): completeAttempt's own live `failed` settle ---
+
+  it('a live failed settle writes lineageId/resumable to the ReviewRun row BEFORE settle notifies, findings or not, so a repainting panel already sees the offer', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { pending, optionsOf, runners } = controllableAttempts();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.trigger(crInput('42'), 1)!;
+    const { lineageId, runId } = optionsOf.get('!42')!.identity;
+
+    // Reproduces what the real harness runtime's own `onCheckpoint` (`harnessRuntime.ts`) would
+    // already have written against this exact lineage before `completeAttempt` ever runs — the
+    // same fixtures `seedResumableLineage`/the sweep tests above use, keyed to this real minted
+    // lineage instead of the fixed `SWEEP_*` ids.
+    const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const checkpoint = buildCheckpoint(
+      sweepCheckpointInput(snapshot, { runId, lineageId, reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed', runId, lineageId) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
+
+    let controlsAtFailedNotify: RunControls | undefined;
+    runs.subscribe((r) => {
+      if (r.key === record.key && r.lifecycle === 'failed') {
+        controlsAtFailedNotify = runs.controlsFor(runKeyForCr({ repoId: 'repo-1', number: '42' }), { repoId: 'repo-1', number: '42' });
+      }
+    });
+
+    pending.get('!42')!.resolve(failedResult('Budget exhausted.', '!42', 2));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    // The row a repainting panel reads at the exact moment of the `failed` transition already
+    // carries the offer — not merely "eventually", after some unrelated later repaint.
+    expect(controlsAtFailedNotify?.canStartFreshAttempt).toBe(true);
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row).toEqual(
+      expect.objectContaining({ outcome: 'partial', findingCount: 2, resumable: true, lineageId }),
+    );
+  });
+
+  it('a live failed settle with zero findings still writes lineageId/resumable — the offer is the plan and coverage, not only the findings', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { pending, optionsOf, runners } = controllableAttempts();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    runs.trigger(crInput('42'), 1);
+    const { lineageId, runId } = optionsOf.get('!42')!.identity;
+    const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const checkpoint = buildCheckpoint(
+      sweepCheckpointInput(snapshot, { runId, lineageId, reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed', runId, lineageId) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
+
+    pending.get('!42')!.resolve(failedResult('Budget exhausted.', '!42', 0));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row).toEqual(expect.objectContaining({ outcome: 'partial', findingCount: 0, resumable: true, lineageId }));
+  });
+
+  it('a live cancelled settle never writes resumable/lineageId — a reviewer\'s own stop is not this feature\'s case', async () => {
+    const globalState = memoryStore();
+    const { pending, runners } = controllableAttempts();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    runs.trigger(crInput('42'), 1);
+    pending.get('!42')!.resolve(cancelledResult('!42', 3));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row?.outcome).toBe('partial');
+    expect(row?.resumable).toBeUndefined();
+    expect(row?.lineageId).toBeUndefined();
+    expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(false);
+  });
+
+  it('a live failed settle whose checkpoint fails integrity records resumable: false with reasons, never an offer', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { pending, optionsOf, runners } = controllableAttempts();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    runs.trigger(crInput('42'), 1);
+    const { lineageId, runId } = optionsOf.get('!42')!.identity;
+    // A stored snapshot whose model differs from the checkpoint's own digest expectation — the
+    // ordinary "the checkpoint no longer matches what it claims" integrity failure.
+    const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const mismatched = sweepSnapshot({ runId, lineageId, attempt: 1, modelId: 'a-different-model' });
+    const checkpoint = buildCheckpoint(
+      sweepCheckpointInput(mismatched, { runId, lineageId, reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed', runId, lineageId) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
+
+    pending.get('!42')!.resolve(failedResult('Budget exhausted.', '!42', 1));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row?.resumable).toBe(false);
+    expect(row?.resumeReasons?.length).toBeGreaterThan(0);
+    const controls = deriveRunControls(undefined, row);
+    expect(controls.canStartFreshAttempt).toBe(false);
+    expect(controls.freshAttemptReasons).toEqual(row?.resumeReasons);
+  });
+
+  it('resumeRun on a budget-exhausted row mints attempt N+1 and routes through the factory\'s resume, exactly as for an interrupted lineage', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { pending, optionsOf, runners: firstRunners } = controllableAttempts();
+    const first = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners: firstRunners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    first.trigger(crInput('42'), 1);
+    const { lineageId, runId } = optionsOf.get('!42')!.identity;
+    const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const checkpoint = buildCheckpoint(
+      sweepCheckpointInput(snapshot, { runId, lineageId, reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed', runId, lineageId) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
+    pending.get('!42')!.resolve(failedResult('Budget exhausted.', '!42', 1));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    const { calls, runners: secondRunners } = trackedRunners();
+    const second = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners: secondRunners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const resumed = second.resumeRun(crInput('42'), 1);
+
+    expect(resumed).toBeDefined();
+    expect(resumed?.lineageId).toBe(lineageId);
+    expect(resumed?.attempt).toBe(2);
+    await vi.waitFor(() => expect(calls).toEqual(['resume']));
   });
 });
 
@@ -2467,6 +2627,7 @@ describe('deriveRunControls (task 14.6): the one derivation every screen reads',
       canResume: isLegalRunTransition('investigating', 'resuming'),
       canCancel: isLegalRunTransition('investigating', 'cancelling'),
       canResumeFromCheckpoint: false,
+      canStartFreshAttempt: false,
     });
   });
 
@@ -2505,7 +2666,7 @@ describe('deriveRunControls (task 14.6): the one derivation every screen reads',
   });
 
   it('no live record and an outcome that was never interrupted (or nothing stored at all): every control is false', () => {
-    expect(deriveRunControls(undefined, undefined)).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false });
+    expect(deriveRunControls(undefined, undefined)).toEqual({ canPause: false, canResume: false, canCancel: false, canResumeFromCheckpoint: false, canStartFreshAttempt: false });
     expect(deriveRunControls(undefined, stored({ outcome: 'clean', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
     expect(deriveRunControls(undefined, stored({ outcome: 'partial', resumable: true, lineageId: 'lineage-1' })).canResumeFromCheckpoint).toBe(false);
   });

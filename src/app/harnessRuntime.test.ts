@@ -4,7 +4,7 @@ import { fakeInvestigationSource } from '../testing/investigationDouble';
 import type { InvestigationOperations, InvestigationSource } from '../platform/types';
 import { dirname, join } from 'node:path';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
-import { checkCheckpointIntegrity, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
+import { checkCheckpointIntegrity, nextAttemptNumber, resumeBudgetModeFor, ResumeIncompatibleError } from './harnessResume';
 import { computeSnapshotDigest } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { CONTRADICTION_CHECK_MARKER } from './harnessSynthesisVerification';
@@ -617,6 +617,102 @@ describe('resuming an interrupted attempt (task 14.6)', () => {
     const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
     const prose = JSON.stringify(result.activityLog.events).replace(/"kind":"[a-zA-Z]+"/g, '');
     for (const pattern of FORBIDDEN) expect(prose).not.toMatch(pattern);
+  });
+});
+
+describe('budget-exhausted resume (feature): a fresh budget, not a carried-forward one', () => {
+  it('a `failed` attempt that ran out of model turns on its own — never crashed — leaves a `phaseBoundary`-reason checkpoint, and resuming it gets a genuinely fresh budget: the resumed attempt actually takes live model turns and reaches success, which the pre-fix carry-forward bug (refusing at the very first beginTurn) could never do', async () => {
+    // A policy so tight the attempt cannot even finish planning-plus-one-investigating-turn before
+    // its own model-turn pool is exhausted — the completion gate then orderly closes this attempt as
+    // `failed`, through the ordinary turn loop (`runPersisting`), never a thrown/caught error.
+    const tightPolicy: HarnessPolicy = { ...DEFAULT_HARNESS_POLICY, maxModelTurnsPerAttempt: 1 };
+    const exhaustedDeps: HarnessRuntimeDeps = { ...deps, policy: tightPolicy, runTurn: scriptedRunTurn() };
+    const factory = createReviewHarnessFactory(exhaustedDeps);
+    const identity1 = { runId: 'run-budget-1', lineageId: 'lineage-budget-1', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    const result1 = await attempt1.run();
+
+    // Genuinely failed, genuinely out of runway — never a rejection, never a crash.
+    expect(result1.lifecycle).toBe('failed');
+    expect(result1.outcome.completeness).not.toBe('complete');
+
+    const exhaustedCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    expect(exhaustedCheckpoint.projection.lifecycle).toBe('failed');
+    // The signal `resumeBudgetModeFor` (`harnessResume.ts`) actually reads: `runPersisting`'s own
+    // ordinary terminal write, never `finalizeEscapedError`'s crash-catch-all reason.
+    expect(exhaustedCheckpoint.reason).toBe('phaseBoundary');
+    expect(exhaustedCheckpoint.budget.modelTurnsUsed).toBe(tightPolicy.maxModelTurnsPerAttempt);
+
+    // Resuming with a cap set to *exactly* the number of turns this resumed script needs to
+    // complete (4, measured empirically against this fixture — a resumed attempt's own investigating
+    // phase ends one turn sooner than a fresh attempt 1's does) is the sharpest version of the check:
+    // with a genuinely fresh budget, all 4 are available and the script completes exactly at the
+    // wire. If the pre-fix bug (budget always carried forward) were still present, this attempt's
+    // tracker would seed `modelTurnsUsed: 1` from attempt 1 against this same 4-turn cap, leaving
+    // only 3 — one short of what the script needs — so the resumed attempt would fail again partway
+    // through, never reaching `succeeded` at all (verified directly: reverting the fix and rerunning
+    // this exact test reproduces that failure — `expected 'failed' to be 'succeeded'`).
+    const resumeCap: HarnessPolicy = { ...DEFAULT_HARNESS_POLICY, maxModelTurnsPerAttempt: 4 };
+    const resumedDeps: HarnessRuntimeDeps = { ...deps, policy: resumeCap, runTurn: scriptedRunTurn() };
+    const resumeFactory = createReviewHarnessFactory(resumedDeps);
+    const identity2 = { runId: exhaustedCheckpoint.runId, lineageId: exhaustedCheckpoint.lineageId, attempt: nextAttemptNumber(exhaustedCheckpoint.attempt) };
+    const attempt2 = resumeFactory.resume(runInput(), noopRunOptions(identity2));
+    const result2 = await attempt2.run();
+
+    // The pre-fix shape is dead: this attempt actually consumed model turns of its own (not merely
+    // "constructed without error") — it could not have, from a seeded-to-the-cap tracker.
+    expect(result2.turnsUsed).toBeGreaterThan(0);
+    // And with its own full turn budget to work with, the identical script that failed attempt 1
+    // (bound by 1 turn) now runs to genuine completion.
+    expect(result2.lifecycle).toBe('succeeded');
+    expect(result2.outcome.completeness).toBe('complete');
+
+    const finalCheckpoint = harnessRunStore.latestCheckpoint(identity2.lineageId as never)!;
+    expect(finalCheckpoint.attempt).toBe(2);
+    // Fresh, not carried: this attempt's own final usage is bound by its own single-attempt cap
+    // (`resumeCap.maxModelTurnsPerAttempt`), never `attempt1's usage + this attempt's usage` — the
+    // carry-forward arithmetic the interrupted-crash path (unchanged, see the describe block above)
+    // still applies.
+    expect(finalCheckpoint.budget.modelTurnsUsed).toBeLessThanOrEqual(resumeCap.maxModelTurnsPerAttempt);
+  });
+
+  it('the interrupted-crash resume path is unaffected: a crash caught by finalizeEscapedError (reason: attemptFailed, not phaseBoundary) still carries its budget forward end to end — not merely classified as carryForward, but actually seeded from attempt 1\'s own usage', async () => {
+    // The exact fixture the pre-existing crash-resume test at the top of this file uses — restated
+    // here so this describe block carries its own direct proof, not only a borrowed one: the
+    // classification below (`resumeBudgetModeFor`) is necessary but not sufficient — a threading bug
+    // in `harnessAttempt.ts`'s tracker construction could still pass every classification check here
+    // while quietly seeding nothing, and the pre-existing test's own `toBeGreaterThan` assertion
+    // (attempt 2's own usage alone already clears that bar) would not catch it either.
+    const lostDeps: HarnessRuntimeDeps = { ...deps, runTurn: scriptedRunTurnInterruptedAtVerifying() };
+    const factory = createReviewHarnessFactory(lostDeps);
+    const identity1 = { runId: 'run-budget-crash-1', lineageId: 'lineage-budget-crash-1', attempt: 1 };
+    const attempt1 = factory.create(runInput(), noopRunOptions(identity1));
+    await expect(attempt1.run()).rejects.toThrow(/simulated extension host restart/);
+
+    const lostCheckpoint = harnessRunStore.latestCheckpoint(identity1.lineageId as never)!;
+    expect(lostCheckpoint.projection.lifecycle).toBe('failed');
+    expect(lostCheckpoint.reason).toBe('attemptFailed');
+    expect(resumeBudgetModeFor(lostCheckpoint)).toBe('carryForward');
+
+    const identity2 = { runId: lostCheckpoint.runId, lineageId: lostCheckpoint.lineageId, attempt: nextAttemptNumber(lostCheckpoint.attempt) };
+
+    // The seeding arithmetic itself, proven by a sharp cap rather than a threshold a 'fresh' bug
+    // could also clear (the mirror of the tight-cap technique the sibling test above uses): a policy
+    // capped at *exactly* attempt 1's own lost usage leaves zero headroom for a single further turn
+    // if the tracker is genuinely seeded from it — `beginTurn` refuses immediately, so this resumed
+    // attempt cannot even start, let alone reach `succeeded`, and its own final tally cannot exceed
+    // the seed. Under the pre-fix 'fresh' shape (tracker starting at zero against this same cap) the
+    // resumed script has that many turns of real headroom to work with and — per the sibling test's
+    // own empirical finding that this fixture's resumed investigation needs only 4 new turns — would
+    // still reach `succeeded` if the seed here is large enough to clear that bar, which it is.
+    const noHeadroomCap: HarnessPolicy = { ...DEFAULT_HARNESS_POLICY, maxModelTurnsPerAttempt: lostCheckpoint.budget.modelTurnsUsed };
+    const resumeFactory = createReviewHarnessFactory({ ...deps, policy: noHeadroomCap, runTurn: scriptedRunTurn() });
+    const attempt2 = resumeFactory.resume(runInput(), noopRunOptions(identity2));
+    const result2 = await attempt2.run();
+
+    expect(result2.lifecycle).not.toBe('succeeded');
+    const finalCheckpoint = harnessRunStore.latestCheckpoint(identity2.lineageId as never)!;
+    expect(finalCheckpoint.budget.modelTurnsUsed).toBe(lostCheckpoint.budget.modelTurnsUsed);
   });
 });
 

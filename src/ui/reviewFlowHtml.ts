@@ -214,8 +214,26 @@ export interface FlowViewState {
    * per clause by `evaluateCompletion` and already public-safe deterministic host text. Absent for
    * a clean complete result or a genuine crash the manager never ran a completion decision for;
    * `message` alone still renders in either case, unchanged.
+   *
+   * `freshAttempt` (budget-exhausted resume feature): `RunControls.canStartFreshAttempt`/
+   * `.freshAttemptReasons` for this same failed run, read fresh at render time — never a
+   * render-time snapshot of what the manager decided when the run first failed. Present only when
+   * the manager has a stored checkpoint it actually checked (`resumable: true` renders the new-
+   * attempt offer; `resumable: false` renders `reasons` instead, the same "degrade to the reasons
+   * list" shape `interruptedPrior` already uses). Deliberately its own field, never folded into
+   * `interruptedPrior`: that field's own renderer speaks only of an *interrupted* (crashed) prior
+   * attempt, on the `'agent'` picker screen; this one speaks of a *failed* (most commonly
+   * budget-exhausted) one, on this same failure card, in wording that says so honestly — see
+   * `renderRunning`'s own no-reconnect comment on the fail-card notice.
    */
-  runError?: { message: string; requestId: string; partialCount: number; code: string; blockerDetails?: readonly CompletionBlockerDetail[] };
+  runError?: {
+    message: string;
+    requestId: string;
+    partialCount: number;
+    code: string;
+    blockerDetails?: readonly CompletionBlockerDetail[];
+    freshAttempt?: { resumable: boolean; reasons?: readonly Limitation[] };
+  };
   /** Waiting for a concurrency slot: accepted and held, not failed. */
   runQueued?: boolean;
   /**
@@ -334,13 +352,20 @@ export type FlowMessage =
   | { type: 'toggleAutoContextItem'; itemId: string }
   | { type: 'run'; instructions?: string }
   /**
-   * Task 14.6: start a new attempt seeded from an earlier interrupted
-   * attempt's checkpoint (`ReviewRunManager.resumeRun`), never the plain
-   * `run`/`trigger()` path — only dispatched when `interruptedPrior.resumable`
-   * is true. Carries the same `instructions` shape as `run` because it goes
-   * through the identical context-reference resolution before building the
-   * `RunInput` (`reviewFlow.ts`'s `run()`, parameterized by which manager
-   * call it ends in).
+   * Task 14.6 (extended for the budget-exhausted resume feature): start a
+   * new attempt seeded from an earlier attempt's checkpoint
+   * (`ReviewRunManager.resumeRun`), never the plain `run`/`trigger()` path —
+   * dispatched from the identically-labelled button in two places: the
+   * `'agent'` picker screen when `interruptedPrior.resumable` is true (a
+   * crashed prior attempt, carried-forward budget), and this same failure
+   * card when `runError.freshAttempt.resumable` is true (a live `failed`
+   * prior attempt, fresh budget). One message either way — `resumeRun`
+   * itself, not this message, is what tells the two cases apart (`stored.
+   * outcome`, via `harnessResume.ts`'s `resumeBudgetModeFor`). Carries the
+   * same `instructions` shape as `run` because it goes through the identical
+   * context-reference resolution before building the `RunInput`
+   * (`reviewFlow.ts`'s `run()`, parameterized by which manager call it ends
+   * in).
    */
   | { type: 'resumeFromCheckpoint'; instructions?: string }
   | { type: 'cancel' }
@@ -1359,6 +1384,24 @@ function interruptedPriorNotice(prior: FlowViewState['interruptedPrior']): strin
 }
 
 /**
+ * The failure card's own banner (budget-exhausted resume feature) for a live `failed` run whose
+ * stored checkpoint the manager already checked for integrity (`FlowViewState.runError.
+ * freshAttempt`) — the plain-English fact of what carries over, and either the "Start new attempt
+ * from checkpoint" offer (the actions-row button, gated on the same `offer.resumable`) or every
+ * reason the checkpoint itself cannot back one, the identical "degrade to the reasons list" shape
+ * `interruptedPriorNotice` uses. Deliberately different wording from that function: this attempt
+ * did not crash, it ended on its own (most commonly a budget-exhaustion blocker), so nothing here
+ * may call it "interrupted" any more than it may say "resume" or "reconnect" — D13's rule applies
+ * to both false statements equally.
+ */
+function freshAttemptNotice(offer: NonNullable<FlowViewState['runError']>['freshAttempt'], findingCount: number): string {
+  if (!offer) return '';
+  const carried = findingCount > 0 ? `The ${findingCount} finding${findingCount === 1 ? '' : 's'}, plan, and coverage` : 'The plan and coverage so far';
+  const sentence = offer.resumable ? `${carried} carry over into a new attempt with a fresh budget.` : 'A new attempt could not be started from this checkpoint.';
+  return `<div class="notice"><span>${e(sentence)}</span>${offer.resumable ? '' : limitationsList(offer.reasons ?? [])}</div>`;
+}
+
+/**
  * Determinate progress fills an SVG `<rect>` whose `width` is a plain
  * geometry attribute, never a `style="width:…"` attribute — this page's CSP
  * authorises nonce'd `<style>` elements only, so an inline style is silently
@@ -1451,7 +1494,9 @@ function renderRunning(s: FlowViewState): string {
         <div class="fail-title">Agent stopped · ${e(s.runError.message)}</div>
         <div>The run did not complete. ${s.runError.partialCount > 0 ? `${s.runError.partialCount} findings arrived before it stopped.` : 'No findings arrived before it stopped.'}</div>
         ${failDetailsList(s.runError.blockerDetails)}
+        ${freshAttemptNotice(s.runError.freshAttempt, s.runError.partialCount)}
         <div class="actions-row">
+          ${s.runError.freshAttempt?.resumable ? '<button class="btn btn-accent" id="resume-from-checkpoint">Start new attempt from checkpoint</button>' : ''}
           ${s.runError.partialCount > 0 ? `<button class="btn btn-accent" id="use-partial">Use ${s.runError.partialCount} partial findings</button>` : ''}
           <button class="btn" id="retry-run">Retry</button>
           <button class="btn" id="switch-agent">Switch to Fast Diff Review</button>

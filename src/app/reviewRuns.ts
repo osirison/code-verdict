@@ -27,11 +27,14 @@ import type { Limitation } from '../domain/harnessActivity';
  * It is neither reviewed nor submitted, and counts towards no coverage.
  *
  * `partial` (task 12.5, design.md D11) = the run ended (failed or cancelled)
- * with some validated findings but did not satisfy the host completion gate.
- * Explicitly its own outcome, never folded into `findings`: a partial result
- * is not retained as the target's complete review (`retainedReview.ts`'s
- * `partialDraftKeyFor`, a separate key) and must never be presented as if it
- * were one.
+ * without satisfying the host completion gate — `findingCount` validated
+ * findings survived, which may be zero (a `failed` attempt's own live settle
+ * records this outcome regardless of finding count, so its checkpoint's
+ * plan/coverage stay reachable for a fresh-budget new attempt even when
+ * nothing was found yet). Explicitly its own outcome, never folded into
+ * `findings`: a partial result is not retained as the target's complete
+ * review (`retainedReview.ts`'s `partialDraftKeyFor`, a separate key) and
+ * must never be presented as if it were one.
  */
 export type ReviewRunOutcome = 'clean' | 'findings' | 'interrupted' | 'partial';
 
@@ -44,29 +47,38 @@ export interface ReviewRun {
   agentLabel: string;
   ranAt: string;
   /**
-   * Task 12.7: for an `interrupted` entry the activation sweep could match
-   * against a stored harness checkpoint, whether `harnessResume.ts`'s stored-
-   * checkpoint integrity check (`checkCheckpointIntegrity`) found the
-   * checkpoint itself sound — the *offer*, not a live compatibility decision
-   * against the current head/model/policy (`decideResume`'s remaining
-   * dimensions), which needs a live snapshot no code path feeding the
-   * activation sweep builds yet. Absent whenever no checkpoint data was
-   * available to check at all (the ordinary case today, and every entry not
-   * produced by the sweep).
+   * Task 12.7 (extended for the budget-exhausted resume feature): whether a
+   * stored harness checkpoint for this entry's lineage passed
+   * `harnessResume.ts`'s stored-checkpoint integrity check
+   * (`checkCheckpointIntegrity`) — the *offer*, not a live compatibility
+   * decision against the current head/model/policy (`decideResume`'s
+   * remaining dimensions, checked live only once a reviewer actually clicks
+   * through). Two different writers set this, for two different outcomes,
+   * never confused for each other by a reader (`ReviewRunManager.
+   * deriveRunControls` keys on `outcome` first): the activation sweep for an
+   * `interrupted` entry (a crash — carried-forward budget on resume), and
+   * `ReviewRunManager.completeAttempt`'s own live `failed` settle (or the
+   * sweep's live-terminal-checkpoint branch, if the extension host stopped
+   * before that live settle's own write landed) for a `partial` entry whose
+   * underlying attempt ended `failed`, most commonly on a budget-exhaustion
+   * blocker (fresh budget on resume). Absent whenever no checkpoint data was
+   * available to check at all, or checked from a lifecycle this feature
+   * gives no offer for at all (`succeeded`, or a `partial` entry whose
+   * attempt was `cancelled` rather than `failed`).
    */
   resumable?: boolean;
   /**
    * Task 14.4/14.6: every failing dimension `checkCheckpointIntegrity`
-   * (`harnessResume.ts`) found for an `interrupted` entry, when there was
-   * a checkpoint to check at all — present only alongside `resumable:
-   * false`, so a UI reading this never has to fabricate a reason for a
-   * resumable run or an entry the sweep had nothing to check. This is the
-   * *stored-checkpoint-integrity* subset of the full resume decision
-   * (`decideResume`'s remaining live head/model/policy dimensions still
-   * need a live candidate snapshot no code path here builds yet — see
-   * `ReviewRun.resumable`'s own doc comment) — enough to tell a reviewer
-   * truthfully why the checkpoint itself cannot be trusted, never a claim
-   * that every resume dimension was checked.
+   * (`harnessResume.ts`) found, when there was a checkpoint to check at all
+   * — present only alongside `resumable: false`, so a UI reading this never
+   * has to fabricate a reason for a resumable run or an entry nothing
+   * checked. This is the *stored-checkpoint-integrity* subset of the full
+   * resume decision (`decideResume`'s remaining live head/model/policy
+   * dimensions still need a live candidate snapshot, checked only once a
+   * reviewer actually clicks through — see `ReviewRun.resumable`'s own doc
+   * comment) — enough to tell a reviewer truthfully why the checkpoint
+   * itself cannot be trusted, never a claim that every resume dimension was
+   * checked.
    */
   resumeReasons?: readonly Limitation[];
   /**
@@ -78,13 +90,18 @@ export interface ReviewRun {
    */
   limitations?: readonly Limitation[];
   /**
-   * Task 14.6: the harness lineage this entry's checkpoint data (`resumable`/
-   * `resumeReasons` above) came from — the durable target-to-lineage lookup a
-   * resume control needs once `InFlightRunStore`'s own entry is gone (the
-   * activation sweep clears it unconditionally, same call that writes this
-   * record). Present only when the sweep actually had a `lineageId` to
-   * record; absent for every entry from before this field existed and for
-   * outcomes that were never `interrupted`.
+   * Task 14.6 (extended for the budget-exhausted resume feature): the
+   * harness lineage this entry's checkpoint data (`resumable`/
+   * `resumeReasons` above) came from — the durable target-to-lineage lookup
+   * a resume control needs once `InFlightRunStore`'s own entry is gone (for
+   * an `interrupted` entry, the activation sweep clears it unconditionally,
+   * the same call that writes this record; a live `failed` settle never had
+   * one to begin with — `ReviewRunManager.completeAttempt` reads
+   * `RunRecord.lineageId` directly). Present only when a writer actually had
+   * a `lineageId` to record alongside a computed `resumable`; absent for
+   * every entry from before this field existed and for every outcome this
+   * feature gives no offer for (`clean`, `findings`, and a `partial` entry
+   * whose attempt was `cancelled` rather than `failed`).
    */
   lineageId?: string;
 }

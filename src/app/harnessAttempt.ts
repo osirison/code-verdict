@@ -586,8 +586,14 @@ export interface HarnessAttemptOptions {
    *   once evidence re-import (below) is known: an accepted candidate whose cited source could not
    *   be reused moves to unresolved rather than staying accepted on stale evidence (D8).
    * - `payload.budget`: carried into this attempt's `BudgetTracker` as already-spent consumption
-   *   (D12/D15 docs on `BudgetTrackerOptions.carryForward` cover exactly what is and is not
-   *   reconstructible).
+   *   only when `payload.budgetMode === 'carryForward'` (D12/D15 docs on `BudgetTrackerOptions.
+   *   carryForward` cover exactly what is and is not reconstructible) — every shape of crash-resume,
+   *   including a `failed` checkpoint `finalizeEscapedError`'s own catch-all wrote. `budgetMode ===
+   *   'fresh'` — resuming a `failed` checkpoint `runPersisting` itself closed in the ordinary course
+   *   of the turn loop, most commonly a budget-exhaustion blocker — passes `undefined` instead:
+   *   every pool's consumption, and both reserve counters, start at zero, the same as attempt 1.
+   *   `harnessResume.ts`'s `resumeBudgetModeFor` doc comment covers exactly how the two are told
+   *   apart and why.
    * - `payload.retainedEvidence`: imported into this attempt's own evidence ledger
    *   (`harnessResume.ts`'s `importRetainedEvidence`) as soon as the ledger exists, before any
    *   candidate seeding reads it — a source whose exact content and digest still match reuses its
@@ -1283,7 +1289,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     ? importRetainedEvidence(ledger, resumeSeed.payload.retainedEvidence, resumeSeed.payload.candidates)
     : [];
 
-  const budget: BudgetTracker = createBudgetTracker(policy, { members: memberIds, carryForward: resumeSeed?.payload.budget });
+  // `resumeSeed.payload.budgetMode` (`harnessResume.ts`) decides whether this tracker seeds from
+  // the prior attempt's consumption at all — `undefined` here (a fresh attempt, or a `'fresh'`-mode
+  // resume of a live budget-exhausted checkpoint) starts every pool, and both reserve counters,
+  // exactly like attempt 1.
+  const budget: BudgetTracker = createBudgetTracker(policy, {
+    members: memberIds,
+    carryForward: resumeSeed?.payload.budgetMode === 'carryForward' ? resumeSeed.payload.budget : undefined,
+  });
 
   const inventory: ChangedFileInventory = createChangedFileInventory(
     options.members.map((member) => {
@@ -1292,6 +1305,12 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     }),
   );
 
+  // Seeded `accepted` candidates are not exempted from this attempt's own synthesis/contradiction
+  // pass (`runVerifying` below) even though a prior attempt already validated them — accepted cost
+  // for correctness, so a resumed attempt's budget genuinely funds re-checking carried findings
+  // rather than trusting a validation this attempt cannot itself re-derive evidence for. A future
+  // optimization could skip re-verifying a seeded candidate whose cited evidence reimported cleanly
+  // (see `evidenceReuse` below) and whose state has not changed, but that is not this pass.
   const candidateTracker: CandidateTracker = createCandidateTracker({
     maxRepairsPerCandidate: policy.protocolRepairsPerPhase,
     seed: resumeSeed?.payload.candidates,

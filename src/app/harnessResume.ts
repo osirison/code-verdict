@@ -46,6 +46,18 @@
  * `harnessResume.test.ts` ("reconnect", "reattach", "resum(e/ed/ing)",
  * "continu(e/ed/ing/ation)", "still connected", "same session/stream/attempt",
  * "picks ... back up" — none may ever appear).
+ *
+ * **Two resume shapes, not one.** "Preserve... budget consumed so far" (task
+ * 11.6, restated on `ResumePayload` below) is the contract for a checkpoint
+ * the activation sweep closed as `interrupted` — a crash. A checkpoint from a
+ * live `failed` terminal attempt (this codebase's other source of a
+ * resumable checkpoint, most commonly a completion-gate blocker such as
+ * budget exhaustion) is a distinct case this module names explicitly as
+ * `ResumeBudgetMode: 'fresh'` (`resumeBudgetModeFor`, `ResumePayload.
+ * budgetMode`) — every other field of `ResumePayload` (plan, coverage,
+ * candidates, evidence) still carries forward identically either way; only
+ * budget consumption does not, so a reviewer who stopped only because the
+ * pool ran dry actually gets one to spend on the new attempt.
  */
 import { canonicalStringify } from './contentDigest';
 import { closeCheckpointAsTerminal, computeSnapshotDigest, requiredSourceIds, type PersistedCheckpoint, type RetryState } from './harnessCheckpoint';
@@ -418,22 +430,84 @@ export function nextAttemptNumber(prior: AttemptNumber): AttemptNumber {
 /**
  * The public narrative for the new attempt's activity (task 11.8's
  * "no-reconnect wording", spec: "activity and evidence identify the attempt
- * boundary"). Production code does not yet call `appendActivityEvent` with
- * this — no live `HarnessAttempt` exists to own that log until task 12.1
- * starts one — but the string itself is final: it is asserted, post-sanitizer,
- * in `harnessResume.test.ts`.
+ * boundary"). The string itself is final: it is asserted, post-sanitizer, in
+ * `harnessResume.test.ts`.
+ *
+ * `budgetMode` defaults to `'carryForward'` — the original, still-pinned
+ * interrupted-crash sentence, byte-identical to what this function always
+ * said — so every existing caller (and the pinned test that calls this with
+ * three arguments) is untouched. `decideResume` below is the one production
+ * caller that ever passes `'fresh'`, chosen the same way `ResumePayload.
+ * budgetMode` is (`resumeBudgetModeFor`): a checkpoint the sweep closed as
+ * `interrupted` never says its budget "ran out" (it was never given the
+ * chance to exhaust one), and a checkpoint from a live `failed` settle is
+ * never called "interrupted" — each sentence names only what actually
+ * happened to its own prior attempt. Neither branch says "resume" or
+ * "continue" (D13's own rule, this file's own FORBIDDEN-wording test).
  */
-export function describeResumeStart(priorAttempt: AttemptNumber, newAttempt: AttemptNumber, priorPhase: RunPhase): string {
+export function describeResumeStart(priorAttempt: AttemptNumber, newAttempt: AttemptNumber, priorPhase: RunPhase, budgetMode: ResumeBudgetMode = 'carryForward'): string {
+  if (budgetMode === 'fresh') {
+    return `Starting attempt ${newAttempt} in this lineage from the checkpoint attempt ${priorAttempt} left during the ${priorPhase} phase. Attempt ${priorAttempt} ended when its budget ran out; this is a new attempt with its own model and tool session and a fresh budget.`;
+  }
   return `Starting attempt ${newAttempt} in this lineage from the checkpoint attempt ${priorAttempt} left during the ${priorPhase} phase. Attempt ${priorAttempt} is interrupted; this is a new attempt with its own model and tool session.`;
 }
 
 // ---- What section 12 carries forward into the new attempt (task 11.6) ---------------
 
 /**
+ * Which of the two resume shapes a checkpoint calls for — never a caller-supplied flag, so a resume
+ * of a lineage the caller mislabels cannot silently pick the wrong one.
+ *
+ * The signal is `checkpoint.reason` (`CHECKPOINT_REASONS`, `harnessAttempt.ts`), not
+ * `checkpoint.projection.lifecycle` alone — a `'failed'` lifecycle is not by itself evidence of an
+ * orderly, budget-exhaustion-shaped ending: `harnessAttempt.ts`'s own `finalizeEscapedError` (a
+ * genuine unhandled-error catch-all, e.g. a real crash) *also* writes a `'failed'` terminal
+ * checkpoint, tagged `reason: 'attemptFailed'` specifically so a reader downstream (this function)
+ * can tell "the completion gate orderly refused" apart from "something crashed and this is a
+ * best-effort record of it" without re-deriving the distinction from the limitations text. Verified
+ * directly: `harnessRuntime.test.ts`'s own crash-resume fixture (a thrown error mid-attempt, caught
+ * by `finalizeEscapedError` before the activation sweep ever runs) leaves a checkpoint with
+ * `projection.lifecycle === 'failed'` and `reason === 'attemptFailed'` — exactly the shape this
+ * function must still classify as `'carryForward'`, not the new `'fresh'` case.
+ *
+ * `'carryForward'` is task 11.6's original contract, "budget consumed so far": it applies to every
+ * shape of crash-resume — a checkpoint the activation sweep closed as `interrupted` (`reason:
+ * 'attemptInterrupted'`, `closeCheckpointAsTerminal` via `closeAttemptAsInterrupted`, D13's
+ * "Activation closes every persisted nonterminal attempt as interrupted") *and* a checkpoint a
+ * crash's own best-effort write already closed as `'failed'` before the sweep ever got to it
+ * (`reason: 'attemptFailed'`, from `finalizeEscapedError` only) — both are the same "the model
+ * session was cut short by something other than a deliberate decision" case task 11.6 always meant,
+ * whichever of the two ways it happened to get persisted.
+ *
+ * `'fresh'` is the new case this feature adds: a checkpoint `runPersisting` itself closed as
+ * `'failed'` in the *ordinary* course of the turn loop (`reason: 'phaseBoundary'`, the same reason
+ * every clean success uses) — the completion gate orderly decided the attempt could not reach
+ * `complete`, most commonly a budget-exhaustion blocker. `finalizeBootstrapFailure` (a preflight or
+ * bootstrap failure — not a crash, an orderly "this attempt cannot even start") also tags its
+ * checkpoint `reason: 'phaseBoundary'`, so it falls in this bucket too; that is correct rather than
+ * an oversight, since a bootstrap failure has consumed effectively no budget for a fresh pool to
+ * discard. "Start another attempt with a fresh budget" is the whole point here, so consumption
+ * starting over is not a gap, it is the feature. See `BudgetTrackerOptions.carryForward`'s own doc
+ * comment (`harnessBudgets.ts`) for what a `'fresh'` mode omits (every pool's consumption *and* both
+ * reserve counters, not elapsed time alone) and why.
+ */
+export type ResumeBudgetMode = 'carryForward' | 'fresh';
+
+export function resumeBudgetModeFor(checkpoint: PersistedCheckpoint): ResumeBudgetMode {
+  return checkpoint.projection.lifecycle === 'failed' && checkpoint.reason === 'phaseBoundary' ? 'fresh' : 'carryForward';
+}
+
+/**
  * "Preserve the plan and its revision history, coverage, validated findings
  * and their validation state, and budget consumed so far" (task 11.6) — read
- * straight off the compatible checkpoint, untouched. `retainedEvidence` is
- * handed separately to `importRetainedEvidence` once the caller has the new
+ * straight off the compatible checkpoint, untouched, for the `'carryForward'`
+ * case `budgetMode` names. A `'fresh'` checkpoint (a live `failed` terminal
+ * attempt, not a crash) still carries `budget` verbatim here — the same
+ * honest read of what the prior attempt actually spent — but
+ * `harnessAttempt.ts`'s own budget-tracker construction reads `budgetMode`
+ * before deciding whether to seed a new tracker's pools from it; a `'fresh'`
+ * payload's `budget` field is otherwise unused. `retainedEvidence` is handed
+ * separately to `importRetainedEvidence` once the caller has the new
  * attempt's ledger; this payload only carries the metadata through.
  */
 export interface ResumePayload {
@@ -443,6 +517,7 @@ export interface ResumePayload {
   readonly coverage: readonly MemberCoverage[];
   readonly candidates: readonly TrackedCandidate[];
   readonly budget: BudgetConsumption;
+  readonly budgetMode: ResumeBudgetMode;
   readonly retry: RetryState;
   readonly retainedEvidence: readonly RetainedEvidenceRecord[];
 }
@@ -455,6 +530,7 @@ export function buildResumePayload(checkpoint: PersistedCheckpoint): ResumePaylo
     coverage: checkpoint.coverage,
     candidates: checkpoint.candidates,
     budget: checkpoint.budget,
+    budgetMode: resumeBudgetModeFor(checkpoint),
     retry: checkpoint.retry,
     retainedEvidence: checkpoint.evidence,
   };
@@ -483,7 +559,7 @@ export function decideResume(input: ResumeCompatibilityInput): ResumeDecision {
   return {
     kind: 'compatible',
     payload: buildResumePayload(input.checkpoint),
-    startAction: describeResumeStart(input.checkpoint.attempt, newAttempt, input.checkpoint.phase),
+    startAction: describeResumeStart(input.checkpoint.attempt, newAttempt, input.checkpoint.phase, resumeBudgetModeFor(input.checkpoint)),
   };
 }
 
