@@ -1333,6 +1333,25 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     { capabilities: (member) => inputMembersById.get(member.memberId)?.capabilities.reviewInvestigation },
   );
 
+  /**
+   * Whether the attempt's elapsed-time ceiling is blown *right now*, read fresh off `clock()`
+   * against `policy.maxElapsedMsPerAttempt` — deliberately never `budget.state().timedOut`, which
+   * derives from `lastElapsedMs` (`harnessBudgets.ts`), a value `beginTurn`/`reserve` only advance
+   * on a *successful* reservation (`reserveInternal`'s own `lastElapsedMs = request.elapsedMs`,
+   * after every refusal check). The moment a turn is first refused for `'timeout'`, that field
+   * freezes at whatever it last was — under the ceiling, by definition of the refusal it triggered —
+   * and every later reader of `budget.state()` (this function's own prior body, `runVerifying`/
+   * `runCompleting`'s prior unconditional extra work) sees a budget that still looks healthy for the
+   * rest of the attempt's life. Tonight's incident (`run_5a1f8b5f150e7050fb742e5bebc080dc`) is that
+   * gap: its last checkpoint recorded a checkpoint-level `elapsedMs` of 3661602 — 61.6s past a
+   * 3,600,000ms ceiling — while `budget.consumption().elapsedMs` (the same `lastElapsedMs`) still
+   * read 3593398, under it. This function, and the two call sites below that gate further live I/O
+   * on it, are the fix: a fresh read can never go stale, because there is no reservation to freeze.
+   */
+  function elapsedBudgetExhausted(): boolean {
+    return clock() >= policy.maxElapsedMsPerAttempt;
+  }
+
   function currentCompletionEvaluation(): CompletionEvaluation {
     const input: CompletionEvaluationInput = {
       heads: latestHeads,
@@ -1340,9 +1359,30 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       coverageRules: riskCoverageRules,
       unresolved: { unresolvedFetches: 0, unresolvedCandidates: candidateTracker.unresolvedCount() },
       citations: latestCitations,
-      passes: latestPasses,
+      // Never `latestPasses` bare when `passesStale`: that flag means a candidate was accepted
+      // *after* the pass it describes (`processMessages`'s `candidateSubmission` case), and every
+      // other reconciliation point in this file treats that as indistinguishable from a pass that
+      // never ran at all — see `runPhaseLoop`'s own comment just above its `completionRequest`
+      // handling ("a merely-stale-not-yet-rerun pass would look identical to a genuinely missing
+      // one"). Those other points hold the invariant by always reconciling first
+      // (`await runSynthesisVerification()`, unconditionally, before ever reading `latestPasses`);
+      // `runVerifying`'s own exhaustion gate (`elapsedBudgetExhausted`'s doc comment) is the one
+      // place that can now reach here with the reconciling call *skipped* and `passesStale` still
+      // `true` — reporting the stale, pre-submission passes as complete would silently accept an
+      // attempt whose newest finding was never contradiction-checked or deduped, and — worse —
+      // `runPersisting` would then read `survivingFindings` (the *previous* pass's snapshot, which
+      // does not contain it) and drop that finding from the result entirely. Flattening every
+      // clause to `false` here, the same honest "not yet" `latestPasses` starts at before its first
+      // real run, keeps `evaluateCompletion` from ever trusting a stale pass — regardless of why the
+      // reconciling call was skipped — without this file needing to track every future skip site.
+      passes: passesStale ? { contradictionPassComplete: false, deduplicationComplete: false, finalVerificationComplete: false } : latestPasses,
       unverifiedContradictions: latestUnverifiedContradictions,
-      budget: { hardExhausted: budget.state().hardExhausted, timedOut: budget.state().timedOut },
+      // `timedOut` is the OR of the budget's own (possibly stale) view and a fresh clock read —
+      // never the fresh read alone, so a `HarnessAttempt` built with no `clock`/`policy` mismatch
+      // (every production and test caller) keeps reporting a timeout it already knew about even if
+      // this attempt's own `clock()` were somehow to regress. See `elapsedBudgetExhausted`'s own
+      // doc comment for why the fresh half is the one that actually matters.
+      budget: { hardExhausted: budget.state().hardExhausted, timedOut: budget.state().timedOut || elapsedBudgetExhausted() },
     };
     return evaluateCompletion(input);
   }
@@ -2980,7 +3020,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       // Mirrors `processMessages`'s own `completionRequest` case: a candidate accepted since the
       // last verification pass must be reconciled before this evaluation can trust `latestPasses`,
       // or a merely-stale-not-yet-rerun pass would look identical to a genuinely missing one.
-      if (phase === 'verifying' && passesStale) await runSynthesisVerification();
+      //
+      // `!elapsedBudgetExhausted()` gates this the same way `runVerifying`'s own post-loop
+      // reconciliation does (that function's own doc comment): a turn processed here can itself be
+      // the one that pushes elapsed time past the ceiling (its `candidateSubmission` message is
+      // exactly what sets `passesStale` true, one line above `processMessages`'s own case), so this
+      // call site is reachable exhausted even though the turn that reached it was reserved while
+      // still under the ceiling. Left ungated, this would be a fourth unbounded, timeout-less live
+      // round trip standing between the last checkpoint and the terminal write — the same class of
+      // risk `runVerifying`/`runCompleting` were fixed for. Skipping it costs nothing truthful:
+      // `passesStale` stays `true`, and `currentCompletionEvaluation`/`runPersisting`'s own
+      // `passesStale` branches (their own doc comments) already refuse to trust the stale pass or
+      // drop the finding it would have reconciled.
+      if (phase === 'verifying' && passesStale && !elapsedBudgetExhausted()) await runSynthesisVerification();
 
       const evaluation = currentCompletionEvaluation();
       const forNudge = phase === 'investigating' ? scopedForNudge(evaluation, INVESTIGATING_RELEVANT_CLAUSES) : evaluation;
@@ -3401,8 +3453,20 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     currentPhase = 'verifying';
     await fireCheckpoint('verifying', 'phaseBoundary');
     appendActivity({ kind: 'actionStarted', action: 'Synthesizing and verifying findings.' }, 'verifying');
-    await refreshHeads();
-    await runSynthesisVerification();
+    // Every call below `runPhaseLoop`'s own turn loop is live, ungated I/O: a provider round trip
+    // (`refreshHeads`) or a direct `askModelRetried` call (`runSynthesisVerification`, dispatched
+    // outside `runPhaseLoop` — see that function's own doc comment) that carries no timeout and no
+    // `budget.beginTurn` check of its own. `runPhaseLoop` self-gates every turn it starts; nothing
+    // gated these. Tonight's incident reached `verifying` already 8.4s past the elapsed ceiling
+    // (checkpoint-level `elapsedMs` 3608377 against a 3600000 max) and still ran a full
+    // contradiction-check round trip and a second, redundant `refreshHeads` before the run ever
+    // reached `completing` — the unbounded stretch that put the terminal checkpoint at genuine risk
+    // of never being written if either call had stalled. `elapsedBudgetExhausted()` (fresh, never
+    // stale — see its own doc comment) is checked immediately before each one below: once blown,
+    // none of this work can change the outcome (`currentCompletionEvaluation` will report `timedOut`
+    // regardless, via the same fresh check), so skipping it costs nothing and only removes risk.
+    if (!elapsedBudgetExhausted()) await refreshHeads();
+    if (!elapsedBudgetExhausted()) await runSynthesisVerification();
     await runPhaseLoop('verifying', () => false);
     // Task 16.7's own mutation pass found this gap: a candidate accepted *after* synthesis/
     // verification already ran once on this attempt sets `passesStale = true`
@@ -3418,13 +3482,26 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // `passesStale` to `false`), so this is a no-op whenever the model itself already triggered the
     // mid-loop reconciliation. See `harnessCompletionMutation.assurance.test.ts`'s "headline
     // finding" test, which fails against the pre-fix behaviour and passes against this.
-    if (passesStale && !isCancelled()) await runSynthesisVerification();
+    //
+    // `!elapsedBudgetExhausted()` skips only this *live* reconciling round trip once the ceiling is
+    // already blown — never the truthfulness of the result. `passesStale` deliberately stays `true`
+    // when skipped (nothing here resets it, unlike a completed `runSynthesisVerification()` call),
+    // so `currentCompletionEvaluation`'s and `runPersisting`'s own `passesStale` branches (their own
+    // doc comments) still report the pass as incomplete and still surface the finding this call
+    // would have reconciled — the exhausted attempt reports itself honestly stale instead of
+    // spending unbounded, ungated time trying to make itself look complete.
+    if (passesStale && !isCancelled() && !elapsedBudgetExhausted()) await runSynthesisVerification();
   }
 
   async function runCompleting(): Promise<CompletionEvaluation> {
     currentPhase = 'completing';
     await fireCheckpoint('completing', 'phaseBoundary');
-    await refreshHeads();
+    // Same reasoning as `runVerifying`'s own gate immediately above: a second, redundant live
+    // `refreshHeads` round trip once the elapsed ceiling is already blown buys nothing (the
+    // evaluation below reports the timeout regardless) and is exactly the kind of unbounded,
+    // ungated await that must never stand between a checkpoint that already wrote successfully
+    // (the `completing` `phaseBoundary` one, just above) and `runPersisting`'s terminal write.
+    if (!elapsedBudgetExhausted()) await refreshHeads();
     return currentCompletionEvaluation();
   }
 
@@ -3433,7 +3510,24 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     const cancelledNow = isCancelled();
     // D11: cancellation preserves only already-*validated* findings, as partial — never routed
     // through synthesis/dedup, and never eligible to replace a complete retained review.
-    const findings = cancelledNow ? candidateTracker.triageFindings() : survivingFindings;
+    // `!verificationRan` is the same fallback for the other way `runVerifying` can leave
+    // `survivingFindings` at its initial `[]`: `elapsedBudgetExhausted()`'s new gates on
+    // `refreshHeads`/`runSynthesisVerification` (this file's own doc comment on that helper) mean an
+    // attempt that reaches `verifying` already over its elapsed ceiling skips the contradiction pass
+    // entirely — `survivingFindings` never gets set even once. Without this, `runPersisting` would
+    // read the untouched `[]` and report `findingCount: 0` — `classifyOutcome` then returns
+    // `completeness: 'none'` over an attempt that genuinely accepted candidates
+    // (`candidateTracker.triageFindings()`), exactly the "12 accepted candidates must yield
+    // `'partial'`, never `'none'`" truthfulness the elapsed-exhaustion fix must hold.
+    //
+    // `|| passesStale` is the companion to `currentCompletionEvaluation`'s own `passesStale` branch
+    // (see that function's doc comment): when the exhaustion gate skips the reconciling
+    // `runSynthesisVerification()` call, `survivingFindings` is left at the *previous* pass's
+    // snapshot — which does not contain whatever candidate was accepted after it, the exact
+    // candidate that made `passesStale` true in the first place. Reading it here regardless would
+    // silently drop that finding from the result even though `candidateTracker.triageFindings()`
+    // (unlike `survivingFindings`, always current) still has it.
+    const findings = cancelledNow || !verificationRan || passesStale ? candidateTracker.triageFindings() : survivingFindings;
     const limitations = [...extraLimitations, ...budget.warnings().map(budgetWarningLimitation)];
     const outcome = classifyOutcome(evaluation, findings.length, { cancelled: cancelledNow, limitations });
     const lifecycle: RunLifecycle = cancelledNow ? 'cancelled' : outcome.completeness === 'complete' ? 'succeeded' : 'failed';

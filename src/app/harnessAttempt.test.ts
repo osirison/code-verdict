@@ -3309,6 +3309,151 @@ describe("HarnessAttempt.run's catch-all (an error escaping every phase runner s
   });
 });
 
+describe('HarnessAttempt.run (elapsed-exhaustion during completing: a terminal checkpoint is still written, truthfully, and no live call can strand the attempt)', () => {
+  it(
+    "reproduces run_5a1f8b5f150e7050fb742e5bebc080dc's own shape — the ceiling is already blown by the time `completing` starts — through the real phase machinery with an injected clock: every remaining live call is skipped, exactly one terminal checkpoint lands with lifecycle 'failed'/'partial', the elapsed-limit limitation is named, and every accepted candidate is still reported",
+    async () => {
+      const CEILING_MS = 1000;
+      let t = 0;
+      const clock = () => t;
+      // A separate, always-advancing counter for `now()`: `harnessRunStore` only keeps a
+      // checkpoint that is fresher than the last one it wrote, and `clock`/`t` deliberately stays
+      // flat across several turns in this test (see `t`'s own assignments below) — a constant
+      // `now()` would make every checkpoint after the first look like a tie and get dropped.
+      let nowTick = 0;
+      const now = () => new Date(2026, 0, 1, 0, 0, 0, (nowTick += 1)).toISOString();
+
+      // If `runVerifying`'s/`runCompleting`'s `elapsedBudgetExhausted()` gates were ever removed or
+      // miswired, this call would actually happen — and since it never resolves, the test would
+      // time out instead of failing fast. Proves the gate rather than merely observing a skip.
+      let getCurrentHeadCalls = 0;
+      const connection = reviewConnection({
+        files: ['file1.ts'],
+        getCurrentHead: () => {
+          getCurrentHeadCalls += 1;
+          return new Promise(() => {});
+        },
+      });
+
+      const investigatingTurn2: ScriptEntry = (call) => {
+        const ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+        return messages(candidateSubmissionMessage('cand-1', 'file1.ts', ref), candidateSubmissionMessageAt('cand-2', 'file1.ts', ref, 1, 1));
+      };
+      // Reaches the ceiling right here, mid-investigating — the same shape tonight's incident took:
+      // the budget was already blown before `runVerifying`/`runCompleting` ever started their own
+      // work, not mid-way through one of their own live calls.
+      const investigatingTurn3: ScriptEntry = () => {
+        t = CEILING_MS + 1;
+        return STOP_TURN;
+      };
+      const seam = scriptedModelSeam({
+        planning: [PLAN_TURN],
+        investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2, investigatingTurn3],
+        // Deliberately unscripted: once the ceiling is blown, `verifying` must never be asked a turn
+        // at all (`runPhaseLoop`'s own budget refusal) — asking one here would throw "was never
+        // scripted" and fail this test loudly rather than silently passing on the wrong path.
+      });
+
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      const snapshot = testSnapshot();
+      const policy = testPolicy({ maxElapsedMsPerAttempt: CEILING_MS });
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions({ clock, now }),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      });
+
+      const result = await attempt.run();
+
+      expect(getCurrentHeadCalls).toBe(0);
+      expect(result.lifecycle).toBe('failed');
+      expect(result.outcome.completeness).toBe('partial'); // 2 accepted candidates: never 'none'.
+      expect(result.findings).toHaveLength(2);
+      expect(result.outcome.limitations.some((l) => l.code === 'timeout')).toBe(true);
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('failed');
+      const record = harnessRunStore.readLineage(snapshot.lineageId);
+      expect(record?.terminalAttempts).toContainEqual(expect.objectContaining({ attempt: 1, lifecycle: 'failed' }));
+      const terminalCheckpoints = (record?.checkpoints ?? []).filter((c) => c.attempt === 1 && c.projection.lifecycle === 'failed');
+      expect(terminalCheckpoints).toHaveLength(1);
+    },
+  );
+
+  it(
+    'a candidate accepted mid-verifying, the instant before the ceiling is blown, is neither silently dropped nor reported under a falsely complete outcome — the reconciling pass that would have vouched for it is skipped honestly, not silently trusted',
+    async () => {
+      const CEILING_MS = 1000;
+      let t = 0;
+      const clock = () => t;
+      // See the sibling test above's identical comment: `t` deliberately stays flat across turns,
+      // so `now()` needs its own always-advancing counter to keep every checkpoint here fresher
+      // than the last.
+      let nowTick = 0;
+      const now = () => new Date(2026, 0, 1, 0, 0, 0, (nowTick += 1)).toISOString();
+
+      const connection = reviewConnection({ files: ['file1.ts'] });
+
+      let ref: { sourceId: string; digest: string } | undefined;
+      const investigatingTurn2: ScriptEntry = (call) => {
+        ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+        return STOP_TURN; // Investigating itself finds nothing; the whole point lives in verifying.
+      };
+      // Turn 1: the candidate is accepted while the clock is still comfortably under the ceiling —
+      // its own budget reservation must succeed. This is also the turn that sets `passesStale`
+      // (`processMessages`'s `candidateSubmission` case), since the unconditional pre-loop
+      // `runSynthesisVerification()` call (`runVerifying`'s own first line of work) already ran once.
+      const verifyingTurn1: ScriptEntry = () => messages(candidateSubmissionMessageAt('cand-1', 'file1.ts', ref!, 1, 1));
+      // Turn 2: reaches the ceiling right here, as a side effect of this very turn — the reconciling
+      // `runSynthesisVerification()` call inside `runPhaseLoop` (this file's own doc comment on that
+      // call site) is reached in this SAME iteration, after the clock has already moved.
+      const verifyingTurn2: ScriptEntry = () => {
+        t = CEILING_MS;
+        return STOP_TURN;
+      };
+      const seam = scriptedModelSeam({
+        planning: [PLAN_TURN],
+        investigating: [messages(readDiffMessage('file1.ts')), investigatingTurn2],
+        verifying: [verifyingTurn1, verifyingTurn2],
+      });
+
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      const snapshot = testSnapshot();
+      const policy = testPolicy({ maxElapsedMsPerAttempt: CEILING_MS });
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions({ clock, now }),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      });
+
+      const result = await attempt.run();
+
+      // Never 'succeeded'/'complete': the pass that would have vouched for `cand-1` never ran.
+      expect(result.lifecycle).toBe('failed');
+      expect(result.outcome.completeness).toBe('partial');
+      expect(result.outcome.kind).not.toBe('completeClean');
+      // The finding itself survives — read from `candidateTracker.triageFindings()`, never the
+      // stale, pre-submission `survivingFindings` snapshot that does not contain it.
+      expect(result.findings.map((f) => f.candidateId)).toContain('cand-1');
+      expect(result.outcome.limitations.some((l) => l.code === 'timeout')).toBe(true);
+      expect(result.outcome.limitations.some((l) => l.code === 'verificationPending')).toBe(true);
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('failed');
+    },
+  );
+});
+
 // ---- Fix 1: a model round trip consumes the transient retry budget instead of killing the attempt ----
 
 /**

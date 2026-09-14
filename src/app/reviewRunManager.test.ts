@@ -45,6 +45,13 @@ function memoryStore(): KeyValueStore & { snapshot(): Map<string, unknown> } {
     update: async (key, value) => {
       map.set(key, value);
     },
+    // Real `vscode.Memento` carries this (production wires `context.globalState` in directly —
+    // see `extension.ts`); `sweepInterruptedRuns`'s markerless branch (`harnessRunStore.listLineages`)
+    // depends on it to scan every stored lineage rather than only ones a leftover marker names.
+    // Without it here, `store.keys?.()`'s own optional-call fallback silently returns `[]` and that
+    // branch never finds anything — every test exercising it needs this, not only the ones that
+    // already happen to pass an explicit marker.
+    keys: () => [...map.keys()],
     snapshot: () => map,
   };
 }
@@ -1137,6 +1144,187 @@ describe('the in-flight record and the interrupted sweep', () => {
     runs.cancel(record.key);
     await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(0));
   });
+
+  it(
+    'a genuine crash whose own best-effort terminal write also fails leaves the in-flight marker in ' +
+      'place, so the next activation sweep can still find and truthfully close the lineage — the gap that ' +
+      'permanently stranded run_5a1f8b5f150e7050fb742e5bebc080dc/lineage_1ea390cab27a5c6dc58e1cc3ea230cb9',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState } = manager({ runners });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+
+      // What a real attempt's own machinery already persisted before the crash: a genuine, still
+      // nonterminal phase-boundary checkpoint (`investigating`) — the shape `harnessRunStore` is left
+      // in when `HarnessAttempt.run()`'s escaping error reaches this test's `.reject(...)` below with
+      // its own best-effort terminal write (`finalizeEscapedError`) having also failed to land, silently.
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot: ReviewRunSnapshot = {
+        schemaVersion: '1',
+        runId: record.runId,
+        lineageId: record.lineageId,
+        attempt: 1,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        targetKind: 'cr',
+        members: [
+          {
+            memberId: 'm1',
+            providerId: 'fixture',
+            instanceUrl: 'https://example.test',
+            ref: { repoId: 'repo-1', number: '2841' },
+            baseSha: BASE_SHA,
+            headSha: HEAD_SHA,
+            providerCapabilitySignature: 'sig-1',
+            rootAgentsPolicy: { present: false },
+            context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+          },
+        ],
+        agentId: 'built-in',
+        agentInstructions: 'Review the change carefully.',
+        agentInstructionsDigest: 'digest-instructions',
+        personaLabel: 'Built-in reviewer',
+        modelId: 'test-model',
+        effort: 'none',
+        effortInstructionDigest: 'digest-effort',
+        criteria: DEFAULT_CRITERIA,
+        extraInstructionsDigest: 'digest-extra',
+        toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+        harnessPolicyVersion: HARNESS_POLICY_VERSION,
+      };
+      await harnessRunStore.writeSnapshot(snapshot);
+      let log = createActivityLog(record.runId, record.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: record.runId,
+          lineageId: record.lineageId,
+          attempt: 1,
+          phase: 'investigating',
+          reason: 'phaseBoundary',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 1000,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      expect(built.projection.lifecycle).toBe('investigating'); // sanity: genuinely nonterminal
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+
+      // The crash itself.
+      pending.get('!2841')!.reject(new Error('boom'));
+      await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+      // The old, unconditional `settle()` stripped the marker right here regardless of the store's
+      // own state — exactly what stranded tonight's lineage permanently. It survives now.
+      expect(new InFlightRunStore(globalState).list()).toHaveLength(1);
+
+      // And the next activation's sweep still finds and truthfully closes it.
+      const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+      expect(swept).toBeGreaterThan(0);
+      expect(harnessRunStore.latestCheckpoint(record.lineageId)?.projection.lifecycle).toBe('interrupted');
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+    },
+  );
+
+  it(
+    "closes a lineage that carries no in-flight marker at all — tonight's own retroactive state " +
+      '(`lineage_1ea390cab27a5c6dc58e1cc3ea230cb9`, before this fix, already stripped of its marker by ' +
+      "the old unconditional `settle()`) — by scanning `harnessRunStore` directly, never touching " +
+      '`ReviewRunStore` (no repoId/crNumber survives without the marker to name a dashboard row)',
+    async () => {
+      const globalState = memoryStore();
+      expect(new InFlightRunStore(globalState).list()).toEqual([]); // no marker: the old sweep found nothing here at all.
+
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot: ReviewRunSnapshot = {
+        schemaVersion: '1',
+        runId: 'run_5a1f8b5f150e7050fb742e5bebc080dc',
+        lineageId: 'lineage_1ea390cab27a5c6dc58e1cc3ea230cb9',
+        attempt: 1,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        targetKind: 'cr',
+        members: [
+          {
+            memberId: 'm1',
+            providerId: 'fixture',
+            instanceUrl: 'https://example.test',
+            ref: { repoId: 'repo-1', number: '2841' },
+            baseSha: BASE_SHA,
+            headSha: HEAD_SHA,
+            providerCapabilitySignature: 'sig-1',
+            rootAgentsPolicy: { present: false },
+            context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+          },
+        ],
+        agentId: 'built-in',
+        agentInstructions: 'Review the change carefully.',
+        agentInstructionsDigest: 'digest-instructions',
+        personaLabel: 'Built-in reviewer',
+        modelId: 'test-model',
+        effort: 'none',
+        effortInstructionDigest: 'digest-effort',
+        criteria: DEFAULT_CRITERIA,
+        extraInstructionsDigest: 'digest-extra',
+        toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+        harnessPolicyVersion: HARNESS_POLICY_VERSION,
+      };
+      await harnessRunStore.writeSnapshot(snapshot);
+      let log = createActivityLog(snapshot.runId, snapshot.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'completing', elapsedMs: 3661602 },
+      );
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: snapshot.runId,
+          lineageId: snapshot.lineageId,
+          attempt: 1,
+          phase: 'completing',
+          reason: 'phaseBoundary',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 3661602,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      expect(built.projection.lifecycle).toBe('completing'); // sanity: genuinely nonterminal
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+
+      const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+      expect(swept).toBe(1);
+      expect(harnessRunStore.latestCheckpoint(snapshot.lineageId)?.projection.lifecycle).toBe('interrupted');
+      // No marker ever named a repoId/crNumber for this lineage, so there is nothing honest to add
+      // to the dashboard's own row store — closing the persisted lineage truthfully is the whole
+      // scope (this function's own header comment on the markerless branch).
+      expect(new ReviewRunStore(globalState).list()).toEqual([]);
+    },
+  );
 
   it('sweeps a run left behind by a closed window into an interrupted outcome', async () => {
     const globalState = memoryStore();
