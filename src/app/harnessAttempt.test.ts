@@ -3454,6 +3454,184 @@ describe('HarnessAttempt.run (elapsed-exhaustion during completing: a terminal c
   );
 });
 
+describe('HarnessAttempt.run (shouldSkipOptionalWork generalizes the elapsed-exhaustion fix to turn/tool-pool exhaustion and cancellation)', () => {
+  it(
+    "the turn/tool pool exhausted with the elapsed clock still comfortably low still skips every remaining live call — reaching a terminal checkpoint that names the pool ('budgetExhausted'), never the clock ('timeout')",
+    async () => {
+      // Every model turn (`budget.beginTurn`) spends the SAME `modelTurns` pool regardless of phase
+      // or purpose. With both reserve percentages zeroed the whole pool lives in the shared
+      // `ordinary` lane, so a capacity of exactly 1 is exhausted by `planning`'s own turn alone,
+      // before `investigating` or `verifying` ever gets one of their own — reaching `verifying`
+      // already pool-exhausted with the elapsed clock barely off zero, the shape
+      // `elapsedBudgetExhausted()` alone could never catch.
+      let getCurrentHeadCalls = 0;
+      const connection = reviewConnection({
+        files: ['file1.ts'],
+        // If `shouldSkipOptionalWork()` ever stopped reading pool exhaustion, this call would
+        // actually happen — and since it never resolves, the test would time out instead of
+        // failing fast. Proves the gate rather than merely observing a skip.
+        getCurrentHead: () => {
+          getCurrentHeadCalls += 1;
+          return new Promise(() => {});
+        },
+      });
+      // Deliberately unscripted for 'investigating'/'verifying': once the pool is blown, neither
+      // phase's own `runPhaseLoop` may ever reserve a turn to ask for — asking one here would throw
+      // "was never scripted" and fail this test loudly rather than silently passing on the wrong
+      // path (mirrors the elapsed-exhaustion test's own comment on this same shape).
+      const seam = scriptedModelSeam({ planning: [PLAN_TURN] });
+
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      const snapshot = testSnapshot();
+      const policy = testPolicy({ maxModelTurnsPerAttempt: 1, highRiskReservePercent: 0, verificationReservePercent: 0 });
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      });
+
+      const result = await attempt.run();
+
+      expect(getCurrentHeadCalls).toBe(0);
+      expect(result.lifecycle).toBe('failed');
+      expect(result.outcome.limitations.some((l) => l.code === 'budgetExhausted')).toBe(true);
+      expect(result.outcome.limitations.some((l) => l.code === 'timeout')).toBe(false);
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('failed');
+      const record = harnessRunStore.readLineage(snapshot.lineageId);
+      expect(record?.terminalAttempts).toContainEqual(expect.objectContaining({ attempt: 1, lifecycle: 'failed' }));
+    },
+  );
+
+  it(
+    "cancellation landing mid-`verifying` — after that phase's own cancellation check already passed — is still honoured by `runCompleting`'s unconditional call: its `refreshHeads` is skipped and the terminal checkpoint closes 'cancelled', never hanging on a live call `runVerifying`'s own pre-loop already proved works",
+    async () => {
+      const cancellation = fakeCancellationToken();
+      let getCurrentHeadCalls = 0;
+      const connection = reviewConnection({
+        files: ['file1.ts'],
+        getCurrentHead: () => {
+          getCurrentHeadCalls += 1;
+          // Call 1 is `runVerifying`'s own pre-loop `refreshHeads`, made before cancellation fires —
+          // it must resolve normally, proving the call itself works right up to the point
+          // cancellation lands. Any further call — `runCompleting`'s own `refreshHeads`, gated on
+          // `isCancelled()` for the first time by this fix — would hang forever if that gate were
+          // ever miswired, failing this test by timeout rather than silently passing.
+          if (getCurrentHeadCalls >= 2) return new Promise(() => {});
+          return Promise.resolve(currentHeadResult());
+        },
+      });
+      const verifyingTurn1: ScriptEntry = () => {
+        cancellation.cancel();
+        return STOP_TURN;
+      };
+      const seam = scriptedModelSeam({
+        planning: [PLAN_TURN],
+        investigating: [messages(readDiffMessage('file1.ts')), STOP_TURN],
+        verifying: [verifyingTurn1],
+      });
+
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      const snapshot = testSnapshot();
+      const policy = testPolicy();
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        cancellation: cancellation.token,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      });
+
+      const result = await attempt.run();
+
+      expect(getCurrentHeadCalls).toBe(1); // the pre-loop call ran; `runCompleting`'s own was skipped
+      expect(result.lifecycle).toBe('cancelled');
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('cancelled');
+    },
+  );
+
+  it(
+    "bootstrap's own live fetches carry no `shouldSkipOptionalWork()` gate of their own (`runBootstrap`'s doc comment) because they are already dispatcher-routed: a reviewer cancellation already in effect before `attempt.run()` is ever called is honoured by `harnessToolDispatcher.ts`'s own pre-dispatch check, so the provider is never actually called, bootstrap finishes (hollow, not hung), and the attempt still reaches a truthful 'cancelled' terminal checkpoint through the ordinary `runCompleting`/`runPersisting` path",
+    async () => {
+      const cancellation = fakeCancellationToken();
+      cancellation.cancel(); // already cancelled before the attempt starts
+      let getChangeRequestDetailsCalls = 0;
+      const connection = fakeConnection({
+        getChangeRequestDetails: () => {
+          getChangeRequestDetailsCalls += 1;
+          // Never actually reached if the dispatcher's own pre-dispatch cancellation check still
+          // refuses before this — a never-resolving promise here proves it, the same way every
+          // other gate in this file is proved by making the ungated call hang.
+          return new Promise(() => {});
+        },
+        listChangedFiles: async () => manifestResult(['file1.ts']),
+        readDiff: async (request) => diffPageResult(request.path),
+        getCurrentHead: async () => currentHeadResult(),
+      });
+      const seam = scriptedModelSeam({}); // no phase is ever scripted: nothing should ask the model at all
+      const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+      const snapshot = testSnapshot();
+      const policy = testPolicy();
+      await harnessRunStore.writeSnapshot(snapshot);
+
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot,
+        members: [member(connection)],
+        modelSeam: seam,
+        policy,
+        cancellation: cancellation.token,
+        onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+      });
+
+      const result = await attempt.run();
+
+      expect(getChangeRequestDetailsCalls).toBe(0);
+      expect(result.lifecycle).toBe('cancelled');
+
+      const latest = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+      expect(latest?.projection.lifecycle).toBe('cancelled');
+    },
+  );
+
+  it(
+    "a `preflightFailure` bootstrap bail-out that coincides with an already-cancelled attempt reports the terminal checkpoint truthfully as 'cancelled', never the hardcoded 'failed' `finalizeBootstrapFailure` reported before this fix",
+    async () => {
+      const cancellation = fakeCancellationToken();
+      cancellation.cancel();
+      const seam = scriptedModelSeam({});
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot: testSnapshot(),
+        members: [member(reviewConnection({ files: ['file1.ts'] }))],
+        modelSeam: seam,
+        policy: testPolicy(),
+        cancellation: cancellation.token,
+        preflightFailure: { code: 'noInvestigationSource', message: 'Member m1 could not be reviewed: nothing could read this change.' },
+      });
+
+      const outcome = await attempt.run();
+
+      expect(outcome.lifecycle).toBe('cancelled');
+      expect(outcome.cancelled).toBe(true);
+      expect(outcome.outcome.completeness).toBe('none');
+      expect(outcome.outcome.limitations.map((l) => l.code)).toContain('noInvestigationSource');
+    },
+  );
+});
+
 // ---- Fix 1: a model round trip consumes the transient retry budget instead of killing the attempt ----
 
 /**

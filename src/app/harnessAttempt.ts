@@ -1345,11 +1345,58 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
    * rest of the attempt's life. Tonight's incident (`run_5a1f8b5f150e7050fb742e5bebc080dc`) is that
    * gap: its last checkpoint recorded a checkpoint-level `elapsedMs` of 3661602 — 61.6s past a
    * 3,600,000ms ceiling — while `budget.consumption().elapsedMs` (the same `lastElapsedMs`) still
-   * read 3593398, under it. This function, and the two call sites below that gate further live I/O
-   * on it, are the fix: a fresh read can never go stale, because there is no reservation to freeze.
+   * read 3593398, under it. This function, and `shouldSkipOptionalWork()` below (the one gate every
+   * call site in this file actually uses), are the fix: a fresh read can never go stale, because
+   * there is no reservation to freeze.
    */
   function elapsedBudgetExhausted(): boolean {
     return clock() >= policy.maxElapsedMsPerAttempt;
+  }
+
+  /**
+   * Whether this attempt should start no further *optional* live I/O — a provider round trip or
+   * direct model call that carries no timeout and no `budget.beginTurn`/`dispatcher.dispatch` check
+   * of its own, so nothing else stands between starting it and the attempt hanging forever if it
+   * never resolves (`refreshHeads`'s own doc comment; `runSynthesisVerification`'s direct
+   * `askModelRetried` call, dispatched outside `runPhaseLoop`). `elapsedBudgetExhausted()` alone
+   * (5cc869e's original fix) only ever caught one of three ways an attempt can reach that point with
+   * nothing left to gain from more work:
+   *
+   * - The elapsed-time ceiling is blown (`elapsedBudgetExhausted()` itself — fresh, never stale, see
+   *   its own doc comment).
+   * - The `modelTurns` pool is exhausted (`budget.state().pools.modelTurns.remaining === 0`): a
+   *   review that spends `maxModelTurnsPerAttempt` investigating reaches `verifying` with the clock
+   *   still comfortably under the ceiling, so the elapsed-only gate never fired and `refreshHeads`
+   *   ran anyway, hanging on a provider that never answers `getCurrentHead`. Once no further model
+   *   turn can ever be granted, `runPhaseLoop`'s own `beginTurn` refuses every one of `verifying`'s
+   *   turns regardless — nothing downstream can act on what `refreshHeads`/`runSynthesisVerification`
+   *   would have returned, so skipping them costs nothing. Read fresh, exactly as
+   *   `elapsedBudgetExhausted()` is: `PoolBalance.remaining` is recomputed from live bucket usage on
+   *   every read (`harnessBudgets.ts`'s `poolBalance`), never cached off a frozen `lastElapsedMs`.
+   *   Deliberately `modelTurns` alone, never the coarser `budget.state().hardExhausted` (which also
+   *   trips the moment `toolCalls` or `evidenceBytes` empties in ANY lane): a changeset member that
+   *   greedily spends its own private `toolCalls` slice down to nothing must never silence another
+   *   member's still-fully-affordable `verifying` reconciliation — `harnessAttempt.changeset.test.ts`
+   *   ("a dominant large member never touches the small member's guaranteed minimum") is exactly that
+   *   scenario, and asserts no blocker ever names the small member for it.
+   * - The reviewer cancelled (`isCancelled()`): `run()` skips `runVerifying` outright once cancelled,
+   *   but `runCompleting` runs unconditionally by design (its own doc comment) — a cancellation that
+   *   lands mid-`verifying`, after that phase's own cancellation check already passed, reaches
+   *   `runCompleting` with the elapsed clock still low and nothing else stops its `refreshHeads`.
+   *
+   * Any one of the three means the same thing: no further optional round trip can change this
+   * attempt's outcome (`currentCompletionEvaluation` already reports the exhaustion or cancellation
+   * regardless), so starting one only adds unbounded, ungated risk between the last checkpoint and
+   * the terminal write. Two call sites are deliberately exempt, not oversights: `runPersisting`'s own
+   * terminal write must run unconditionally to reach a terminal state at all — there is no "skip
+   * this" available once nothing is left to skip into — and `dispatchAndTrack`'s dispatcher-routed
+   * calls (bootstrap's `fetchMemberSections`/`pageManifestToExhaustion` included) already carry their
+   * own fresh cancellation and budget checks inside `harnessToolDispatcher.ts`'s own `dispatch`,
+   * before ever reaching the provider (see `runBootstrap`'s own doc comment for why that makes an
+   * explicit gate there redundant, not merely inconvenient).
+   */
+  function shouldSkipOptionalWork(): boolean {
+    return elapsedBudgetExhausted() || budget.state().pools.modelTurns.remaining === 0 || isCancelled();
   }
 
   function currentCompletionEvaluation(): CompletionEvaluation {
@@ -3021,18 +3068,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       // last verification pass must be reconciled before this evaluation can trust `latestPasses`,
       // or a merely-stale-not-yet-rerun pass would look identical to a genuinely missing one.
       //
-      // `!elapsedBudgetExhausted()` gates this the same way `runVerifying`'s own post-loop
+      // `!shouldSkipOptionalWork()` gates this the same way `runVerifying`'s own post-loop
       // reconciliation does (that function's own doc comment): a turn processed here can itself be
-      // the one that pushes elapsed time past the ceiling (its `candidateSubmission` message is
-      // exactly what sets `passesStale` true, one line above `processMessages`'s own case), so this
-      // call site is reachable exhausted even though the turn that reached it was reserved while
-      // still under the ceiling. Left ungated, this would be a fourth unbounded, timeout-less live
+      // the one that pushes elapsed time past the ceiling, exhausts the turn/tool pool, or observes a
+      // cancellation that just landed (its `candidateSubmission` message is exactly what sets
+      // `passesStale` true, one line above `processMessages`'s own case) — so this call site is
+      // reachable in any of those three states even though the turn that reached it was reserved
+      // while none of them yet held. Left ungated, this would be an unbounded, timeout-less live
       // round trip standing between the last checkpoint and the terminal write — the same class of
       // risk `runVerifying`/`runCompleting` were fixed for. Skipping it costs nothing truthful:
       // `passesStale` stays `true`, and `currentCompletionEvaluation`/`runPersisting`'s own
       // `passesStale` branches (their own doc comments) already refuse to trust the stale pass or
       // drop the finding it would have reconciled.
-      if (phase === 'verifying' && passesStale && !elapsedBudgetExhausted()) await runSynthesisVerification();
+      if (phase === 'verifying' && passesStale && !shouldSkipOptionalWork()) await runSynthesisVerification();
 
       const evaluation = currentCompletionEvaluation();
       const forNudge = phase === 'investigating' ? scopedForNudge(evaluation, INVESTIGATING_RELEVANT_CLAUSES) : evaluation;
@@ -3267,6 +3315,40 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     }
   }
 
+  /**
+   * Deliberately carries no `shouldSkipOptionalWork()` gate of its own, unlike `runVerifying`/
+   * `runCompleting`'s `refreshHeads` — not an oversight, a decision: every live call this function
+   * and its two helpers (`fetchMemberSections`, `pageManifestToExhaustion`) make goes through
+   * `dispatchAndTrack` → `harnessToolDispatcher.ts`'s own `dispatch`, which already refuses instead
+   * of dispatching once cancellation is requested (`dispatch`'s own pre-check, before
+   * `dispatchToHandler` is ever called) or once `budget.reserve` cannot grant the request — and that
+   * reservation check includes a fresh, per-request elapsed-time comparison against the request's own
+   * `elapsedMs` (`harnessBudgets.ts`'s `reserveInternal`'s `timedOut(request.elapsedMs)`), the exact
+   * "read fresh, never stale" property `elapsedBudgetExhausted()` exists to guarantee for this file's
+   * own gates. A bootstrap fetch that starts already cancelled, past the elapsed ceiling, or out of
+   * `toolCalls` (the pool bootstrap's own host-initiated requests actually draw — never `modelTurns`,
+   * which a bootstrap dispatch never reserves at all) is therefore refused before the provider is
+   * ever called, not hung. A resumed attempt with `modelTurns` alone carried to zero but `toolCalls`
+   * still available is a real exception: `reserve` still grants the request and the fetch genuinely
+   * dispatches — harmless, since `shouldSkipOptionalWork()`'s own `modelTurns`-only reading (its doc
+   * comment) never claims bootstrap fetches are gated by it, and the fetch is still cancellation-
+   * and elapsed-checked, funded by real remaining capacity, and only ever hangs if the provider
+   * itself never answers — the same out-of-scope case named below. Either way,
+   * `fetchMemberSections` already treats a refusal the same as any other non-content result (an
+   * `unavailable` section plus a `bootstrapDetailUnavailable` limitation), and
+   * `pageManifestToExhaustion` simply stops paging — so bootstrap finishes (hollow, but not hanging)
+   * and `run()`'s own `isCancelled()` checks ahead of `runPlanning`/`runInvestigating`/`runVerifying`
+   * correctly skip the rest, reaching `runPersisting` with the truthful `cancelled` lifecycle.
+   * `refreshHeads`/`runSynthesisVerification` needed their own gate precisely because they
+   * bypass this: `refreshHeads` calls `member.connection.getCurrentHead` directly (its own doc
+   * comment — "never routed through the dispatcher"), and `runSynthesisVerification`'s contradiction-
+   * check turn is a direct `askModelRetried` call, neither ever reaching `dispatch`'s checks at all.
+   * The one gap this leaves — a provider call already in flight when cancellation or exhaustion
+   * arrives mid-request, which no in-process check can retroactively refuse — is the same
+   * `dispatchToHandler`-internal risk every other dispatcher-routed call in this file already carries
+   * by design (no in-process timeout on the provider round trip itself); the activation sweep is the
+   * documented backstop for that case, not this function's job.
+   */
   async function runBootstrap(): Promise<{ ok: true } | { ok: false; limitation: Limitation }> {
     currentPhase = 'bootstrap';
     // Task 14.6: the attempt-boundary narrative and the carried plan land in THIS attempt's own
@@ -3461,12 +3543,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // (checkpoint-level `elapsedMs` 3608377 against a 3600000 max) and still ran a full
     // contradiction-check round trip and a second, redundant `refreshHeads` before the run ever
     // reached `completing` — the unbounded stretch that put the terminal checkpoint at genuine risk
-    // of never being written if either call had stalled. `elapsedBudgetExhausted()` (fresh, never
-    // stale — see its own doc comment) is checked immediately before each one below: once blown,
-    // none of this work can change the outcome (`currentCompletionEvaluation` will report `timedOut`
-    // regardless, via the same fresh check), so skipping it costs nothing and only removes risk.
-    if (!elapsedBudgetExhausted()) await refreshHeads();
-    if (!elapsedBudgetExhausted()) await runSynthesisVerification();
+    // of never being written if either call had stalled. `shouldSkipOptionalWork()` (that function's
+    // own doc comment: fresh elapsed, fresh pool exhaustion, or cancellation — never stale) is
+    // checked immediately before each one below: once true, none of this work can change the outcome
+    // (`currentCompletionEvaluation` will report the same exhaustion regardless, via the same fresh
+    // checks), so skipping it costs nothing and only removes risk.
+    if (!shouldSkipOptionalWork()) await refreshHeads();
+    if (!shouldSkipOptionalWork()) await runSynthesisVerification();
     await runPhaseLoop('verifying', () => false);
     // Task 16.7's own mutation pass found this gap: a candidate accepted *after* synthesis/
     // verification already ran once on this attempt sets `passesStale = true`
@@ -3483,25 +3566,32 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // mid-loop reconciliation. See `harnessCompletionMutation.assurance.test.ts`'s "headline
     // finding" test, which fails against the pre-fix behaviour and passes against this.
     //
-    // `!elapsedBudgetExhausted()` skips only this *live* reconciling round trip once the ceiling is
-    // already blown — never the truthfulness of the result. `passesStale` deliberately stays `true`
-    // when skipped (nothing here resets it, unlike a completed `runSynthesisVerification()` call),
-    // so `currentCompletionEvaluation`'s and `runPersisting`'s own `passesStale` branches (their own
-    // doc comments) still report the pass as incomplete and still surface the finding this call
-    // would have reconciled — the exhausted attempt reports itself honestly stale instead of
-    // spending unbounded, ungated time trying to make itself look complete.
-    if (passesStale && !isCancelled() && !elapsedBudgetExhausted()) await runSynthesisVerification();
+    // `!shouldSkipOptionalWork()` skips only this *live* reconciling round trip once the ceiling is
+    // already blown, the pool is exhausted, or the reviewer cancelled — never the truthfulness of
+    // the result (the predicate already folds in cancellation, so no separate `!isCancelled()` term
+    // is needed here). `passesStale` deliberately stays `true` when skipped (nothing here resets it,
+    // unlike a completed `runSynthesisVerification()` call), so `currentCompletionEvaluation`'s and
+    // `runPersisting`'s own `passesStale` branches (their own doc comments) still report the pass as
+    // incomplete and still surface the finding this call would have reconciled — the exhausted
+    // attempt reports itself honestly stale instead of spending unbounded, ungated time trying to
+    // make itself look complete.
+    if (passesStale && !shouldSkipOptionalWork()) await runSynthesisVerification();
   }
 
   async function runCompleting(): Promise<CompletionEvaluation> {
     currentPhase = 'completing';
     await fireCheckpoint('completing', 'phaseBoundary');
     // Same reasoning as `runVerifying`'s own gate immediately above: a second, redundant live
-    // `refreshHeads` round trip once the elapsed ceiling is already blown buys nothing (the
-    // evaluation below reports the timeout regardless) and is exactly the kind of unbounded,
-    // ungated await that must never stand between a checkpoint that already wrote successfully
-    // (the `completing` `phaseBoundary` one, just above) and `runPersisting`'s terminal write.
-    if (!elapsedBudgetExhausted()) await refreshHeads();
+    // `refreshHeads` round trip once the elapsed ceiling is already blown, the turn/tool pool is
+    // exhausted, or the reviewer cancelled buys nothing (the evaluation below reports the same
+    // exhaustion regardless) and is exactly the kind of unbounded, ungated await that must never
+    // stand between a checkpoint that already wrote successfully (the `completing` `phaseBoundary`
+    // one, just above) and `runPersisting`'s terminal write. `run()` calls this function
+    // unconditionally, even once a cancellation lands mid-`verifying` — after `runVerifying`'s own
+    // cancellation check already passed — so `isCancelled()` alone would miss exactly that case;
+    // `shouldSkipOptionalWork()` is the one check that covers it alongside the elapsed and pool
+    // dimensions.
+    if (!shouldSkipOptionalWork()) await refreshHeads();
     return currentCompletionEvaluation();
   }
 
@@ -3511,14 +3601,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // D11: cancellation preserves only already-*validated* findings, as partial — never routed
     // through synthesis/dedup, and never eligible to replace a complete retained review.
     // `!verificationRan` is the same fallback for the other way `runVerifying` can leave
-    // `survivingFindings` at its initial `[]`: `elapsedBudgetExhausted()`'s new gates on
+    // `survivingFindings` at its initial `[]`: `shouldSkipOptionalWork()`'s gates on
     // `refreshHeads`/`runSynthesisVerification` (this file's own doc comment on that helper) mean an
-    // attempt that reaches `verifying` already over its elapsed ceiling skips the contradiction pass
-    // entirely — `survivingFindings` never gets set even once. Without this, `runPersisting` would
-    // read the untouched `[]` and report `findingCount: 0` — `classifyOutcome` then returns
-    // `completeness: 'none'` over an attempt that genuinely accepted candidates
+    // attempt that reaches `verifying` already exhausted (elapsed, pool, or cancelled) skips the
+    // contradiction pass entirely — `survivingFindings` never gets set even once. Without this,
+    // `runPersisting` would read the untouched `[]` and report `findingCount: 0` — `classifyOutcome`
+    // then returns `completeness: 'none'` over an attempt that genuinely accepted candidates
     // (`candidateTracker.triageFindings()`), exactly the "12 accepted candidates must yield
-    // `'partial'`, never `'none'`" truthfulness the elapsed-exhaustion fix must hold.
+    // `'partial'`, never `'none'`" truthfulness the exhaustion fix must hold.
     //
     // `|| passesStale` is the companion to `currentCompletionEvaluation`'s own `passesStale` branch
     // (see that function's doc comment): when the exhaustion gate skips the reconciling
@@ -3606,9 +3696,22 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     smallFlag = isSmallReview(fileCount, totalBytes, policy);
   }
 
+  /**
+   * `cancelledNow` is read fresh here, the same way `runPersisting`/`finalizeEscapedError` already
+   * do (their own doc comments) — this function is not only reached for a genuine bootstrap failure
+   * (an envelope that will not fit the model, `promptBudgetNoRoom`); `options.preflightFailure` can
+   * be true at the very same moment the reviewer has already cancelled, and, per `runBootstrap`'s own
+   * doc comment, a bootstrap that started cancelled or exhausted can finish "successfully" (every
+   * fetch refused rather than hung) and never reach here at all — so this fresh read is what makes
+   * either shape of an already-cancelled bootstrap failure report `'cancelled'` rather than the
+   * hardcoded `'failed'` this function used before, matching the lifecycle every other terminal-
+   * writing path in this file already reports for the same reviewer action.
+   */
   async function finalizeBootstrapFailure(limitation: Limitation): Promise<HarnessAttemptResult> {
     currentPhase = 'persisting';
-    appendActivity({ kind: 'terminalResult', lifecycle: 'failed', completeness: 'none', limitations: [limitation] }, 'bootstrap');
+    const cancelledNow = isCancelled();
+    const lifecycle: RunLifecycle = cancelledNow ? 'cancelled' : 'failed';
+    appendActivity({ kind: 'terminalResult', lifecycle, completeness: 'none', limitations: [limitation] }, 'bootstrap');
     // Reported after the terminal fact, same as `runPersisting` — a bootstrap failure must also
     // land terminal in `HarnessRunStore` rather than leaving the lineage looking merely stalled.
     await reportCheckpoint(mintId('ckpt'), 'bootstrap', 'phaseBoundary');
@@ -3621,19 +3724,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       replacesRetainedReview: false,
       clean: false,
     };
-    const attemptOutcome: HarnessAttemptOutcome = { lifecycle: 'failed', outcome, findings: [], plan: undefined, cancelled: false, contradicted: [] };
+    const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings: [], plan: undefined, cancelled: cancelledNow, contradicted: [] };
     await onPersist?.(attemptOutcome, activityLog);
     const consumption = budget.consumption();
     return {
       runId,
       lineageId,
       attempt: attemptNumber,
-      lifecycle: 'failed',
+      lifecycle,
       outcome,
       findings: [],
       plan: undefined,
       activityLog,
-      cancelled: false,
+      cancelled: cancelledNow,
       small: false,
       turnsUsed: consumption.modelTurnsUsed,
       toolCallsUsed: consumption.toolCallsUsed,
