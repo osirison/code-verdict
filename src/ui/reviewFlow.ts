@@ -1479,8 +1479,15 @@ export class ReviewFlowPanel {
         const connection = await this.connection();
         await connection.approve(this.ref);
         void vscode.window.showInformationMessage(`Verdict: approved ${this.refLabel()}.`);
-        this.screen = 'agent';
-        break;
+        // Nothing left to review here — renderClean only offers this button
+        // once every candidate is filtered out — so land back on the
+        // dashboard the same way 'backToDashboard' does, instead of parking
+        // the reviewer on the agent-picker screen for a change request they
+        // just signed off on. A rejected `connection.approve` throws before
+        // this point, so `onMessage`'s catch re-renders the still-current
+        // clean screen instead of navigating away.
+        void vscode.commands.executeCommand(COMMANDS.openDashboard);
+        return;
       }
       case 'lowerBar': {
         const floorIndex = SEVERITY_ORDER.indexOf(pod.criteria.severityFloor);

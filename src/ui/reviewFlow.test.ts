@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppStore } from '../app/appStore';
 import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
+import { COMMANDS } from '../commands';
 import { DRAFT_WRITE_WINDOW_MS } from '../app/draftWriter';
 import {
   draftKeyFor,
@@ -150,6 +151,7 @@ vi.mock('./inDiffEditor', () => ({
 const world = vi.hoisted(() => ({
   submitReview: undefined as ((submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => Promise<unknown>) | undefined,
   submitCalls: [] as Array<{ storedAtCall: unknown }>,
+  approve: undefined as ((ref: ChangeRequestRef) => Promise<void>) | undefined,
   workspaceState: undefined as (KeyValueStore & { updates: number }) | undefined,
   /** Every platform call, so triage actions can be asserted to make none. */
   calls: { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 },
@@ -180,6 +182,7 @@ vi.mock('../app/connections', () => ({
       // Only the gap-3 propagation test (task 10.1) builds a real `AppStore`
       // for the sidebar to read through — `fetchPodData` calls this too.
       listCiRuns: () => Promise.resolve([]),
+      approve: (ref: ChangeRequestRef) => (world.approve ?? (() => Promise.resolve(undefined)))(ref),
       submitReview: (_ref: unknown, submission: { comments: Array<{ key: string }>; requestChanges: boolean }) => {
         world.calls.submits += 1;
         // Snapshot what is on disk at the moment the platform is called — the
@@ -402,6 +405,7 @@ beforeEach(() => {
   panel.webview.postMessage.mockClear();
   world.submitReview = undefined;
   world.submitCalls = [];
+  world.approve = undefined;
   world.calls = { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 };
   statusBarItems.length = 0;
   executeCommand.mockClear();
@@ -1466,5 +1470,48 @@ describe('verdict.reviewTriageFocus follows the screen as well as the focus', ()
     handlers.dispose?.();
     expect(published('verdict.reviewTriageFocus')).toBe(false);
     expect(published('verdict.reviewFocus')).toBe(false);
+  });
+});
+
+// ---- clean-screen approve navigates back to the dashboard ---------------------
+
+describe('approving from the clean screen', () => {
+  /** `executeCommand` also carries `setContext` traffic — narrow to the navigation call. */
+  const openedDashboard = (): boolean =>
+    executeCommand.mock.calls.some((call) => call[0] === COMMANDS.openDashboard);
+
+  it('navigates to the dashboard once the platform accepts the approval', async () => {
+    const h = await harness();
+    await h.open();
+    executeCommand.mockClear();
+
+    await h.post({ type: 'approve' });
+
+    const vscode = await import('vscode');
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining('approved'),
+    );
+    expect(openedDashboard()).toBe(true);
+  });
+
+  it('stays put and reports the error when the platform refuses the approval', async () => {
+    world.approve = () => Promise.reject(new Error('not a reviewer'));
+    const h = await harness();
+    await h.open();
+    executeCommand.mockClear();
+    const titleBeforeApprove = panel.title;
+
+    await h.post({ type: 'approve' });
+
+    const vscode = await import('vscode');
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining('not a reviewer'),
+    );
+    expect(openedDashboard()).toBe(false);
+    // The failed approve re-rendered whatever screen it was already on
+    // (onMessage's catch) rather than the surface navigating anywhere —
+    // the tab title is deterministic per screen, unlike the nonce-bearing
+    // html, so it is what proves nothing moved.
+    expect(panel.title).toBe(titleBeforeApprove);
   });
 });
