@@ -1514,4 +1514,23 @@ describe('approving from the clean screen', () => {
     // html, so it is what proves nothing moved.
     expect(panel.title).toBe(titleBeforeApprove);
   });
+
+  it('does not navigate when the panel is disposed before the approval resolves', async () => {
+    let releaseApprove!: () => void;
+    world.approve = () => new Promise<void>((resolve) => {
+      releaseApprove = resolve;
+    });
+    const h = await harness();
+    await h.open();
+    executeCommand.mockClear();
+
+    void h.post({ type: 'approve' });
+    await vi.waitFor(() => expect(releaseApprove).toBeTypeOf('function'));
+
+    handlers.dispose?.();
+    releaseApprove();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(openedDashboard()).toBe(false);
+  });
 });

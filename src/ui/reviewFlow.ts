@@ -1478,6 +1478,7 @@ export class ReviewFlowPanel {
       case 'approve': {
         const connection = await this.connection();
         await connection.approve(this.ref);
+        if (this.disposed) return;
         void vscode.window.showInformationMessage(`Verdict: approved ${this.refLabel()}.`);
         // Nothing left to review here — renderClean only offers this button
         // once every candidate is filtered out — so land back on the
