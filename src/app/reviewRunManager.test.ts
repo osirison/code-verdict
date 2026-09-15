@@ -360,6 +360,31 @@ function controllableAttempts(): {
   return { started, cancelled, pending, optionsOf, runners };
 }
 
+/**
+ * A `globalState` wrapper whose `update` throws exactly once — consumed by the first write whose key
+ * starts with `codeVerdict.harness.lineage.` after `arm()` is called — then reverts to delegating
+ * normally. Lets a test make one specific `harnessRunStore.writeCheckpoint` call fail (the finding-1
+ * retry test) without disturbing any other write, including a *later* checkpoint write to the same
+ * lineage (the finding-2 same-lineage leftover-close test, which needs attempt 1's write to fail but
+ * attempt 2's admission-time close of it to still succeed).
+ */
+function throwOnceForNextLineageWrite(base: ReturnType<typeof memoryStore>): { store: ReturnType<typeof memoryStore>; arm(): void } {
+  let armed = false;
+  const store: ReturnType<typeof memoryStore> = {
+    get: base.get,
+    keys: base.keys,
+    snapshot: base.snapshot,
+    update: async (key, value) => {
+      if (armed && key.startsWith('codeVerdict.harness.lineage.')) {
+        armed = false;
+        throw new Error('simulated harnessRunStore write failure');
+      }
+      await base.update(key, value);
+    },
+  };
+  return { store, arm: () => { armed = true; } };
+}
+
 function manager(
   over: Partial<ConstructorParameters<typeof ReviewRunManager>[0]> = {},
 ): {
@@ -1402,6 +1427,92 @@ describe('the in-flight record and the interrupted sweep', () => {
   );
 
   it(
+    "completeAttempt's retry has a genuine checkpoint to close but the store's own write throws (not " +
+      'merely fails validation): the throw is caught and folded into the same not-confirmed path, so ' +
+      "the run settles with the attempt's own GENUINE result — findings, limitations, dashboard row — " +
+      "instead of executeAttempt's generic crash-catch discarding them and settling failed with " +
+      'limitations [] and no dashboard row at all',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const baseGlobalState = memoryStore();
+      const { store: globalState, arm } = throwOnceForNextLineageWrite(baseGlobalState);
+      const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+
+      // A real attempt's own genuine, still-nonterminal phase-boundary checkpoint — the retry's
+      // recovery path has something to close, unlike the "no checkpoint at all" case below.
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot = fixtureHarnessSnapshot(record.runId, record.lineageId);
+      await harnessRunStore.writeSnapshot(snapshot);
+      let log = createActivityLog(record.runId, record.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: record.runId,
+          lineageId: record.lineageId,
+          attempt: 1,
+          phase: 'investigating',
+          reason: 'phaseBoundary',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 1000,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      expect(built.projection.lifecycle).toBe('investigating'); // sanity: genuinely nonterminal
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY); // this write itself must succeed — armed only below
+
+      // Arm the throw now: the very next lineage-key write — the retry's own `writeCheckpoint` inside
+      // `verifyOrRecoverTerminalWrite`, triggered by the resolve below — fails.
+      arm();
+      pending.get('!2841')!.resolve({
+        ...failedResult('Coverage did not reach every high-risk file.', 'irrelevant-result-refLabel', 2),
+        outcome: { ...failedResult('x', 'irrelevant-result-refLabel', 2).outcome, limitations: [{ code: 'coverageIncomplete', message: 'Coverage did not reach every high-risk file.' }] },
+      });
+      await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+      // The genuine result survived the throw: `completeAttempt`'s own normal flow ran to completion
+      // — the settled record carries both the attempt's real limitation AND the persistence-gap one,
+      // never the crash-catch's empty-limitations shape (`this.settle(current, { lifecycle: 'failed',
+      // failure }, ...)` from `executeAttempt`'s `catch`, which never sees `result.outcome.limitations`
+      // at all).
+      const settled = runs.get(record.key)!;
+      expect(settled.limitations).toContainEqual(expect.objectContaining({ code: 'coverageIncomplete' }));
+      expect(settled.limitations).toContainEqual(expect.objectContaining({ code: 'terminalPersistenceGap' }));
+      // The real `completeness` from `result.outcome` (`'partial'` at 2 findings) — never the
+      // crash-catch's own settle, which carries no `completeness` at all and would leave `'none'`.
+      expect(settled.completeness).toBe('partial');
+
+      // A dashboard row exists at all — `recordPartialHistory` ran, which the crash-catch path never
+      // reaches (it settles directly with no durable write).
+      const rows = new ReviewRunStore(baseGlobalState).list();
+      const row = rows.find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+      expect(row).toMatchObject({ outcome: 'partial', findingCount: 2 });
+      expect(row?.limitations).toContainEqual(expect.objectContaining({ code: 'coverageIncomplete' }));
+      expect(row?.limitations).toContainEqual(expect.objectContaining({ code: 'terminalPersistenceGap' }));
+
+      // Not confirmed in storage, so the marker survives for the next activation sweep — same
+      // not-confirmed contract as the "no checkpoint at all" case, reached here via a throw instead.
+      expect(new InFlightRunStore(baseGlobalState).list()).toHaveLength(1);
+    },
+  );
+
+  it(
     'a new trigger on the same target starting immediately after does not destroy a predecessor ' +
       "attempt's own still-unswept in-flight marker — InFlightRunStore.add's latest-wins-per-key " +
       'semantics used to overwrite it silently before any sweep could inspect it',
@@ -1454,6 +1565,110 @@ describe('the in-flight record and the interrupted sweep', () => {
       pending.get('!2841')!.resolve(succeededResult(1, 'irrelevant-result-refLabel'));
       await vi.waitFor(() => expect(runs.get(second.key)).toBeUndefined()); // succeeded records are deleted
       expect(new InFlightRunStore(globalState).list()).toEqual([]);
+    },
+  );
+
+  it(
+    "start()'s leftover-closing guard also runs when the leftover shares the new record's own " +
+      "lineage — resumeRun's own signature (runId/lineageId reused verbatim): attempt 1 leaves an " +
+      'unconfirmed marker, the reviewer immediately resumes the same lineage as attempt 2, and ' +
+      "attempt 1 is found and closed before InFlightRunStore.add replaces its marker with attempt " +
+      "2's, instead of the old same-lineage exclusion silently letting attempt 1's marker (and its " +
+      'permanently non-terminal checkpoint) be destroyed',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const baseGlobalState = memoryStore();
+      const { store: globalState, arm } = throwOnceForNextLineageWrite(baseGlobalState);
+      // A monotonic clock, one tick per call: `InFlightRun.startedAt` is the one field that can tell
+      // attempt 1's own marker apart from attempt 2's replacement below, since `resumeRun` reuses
+      // `runId`/`lineageId` verbatim — the real wall clock could tick the same millisecond twice here.
+      let clock = Date.parse('2026-01-01T00:00:00.000Z');
+      const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}), now: () => (clock += 1) });
+
+      // Attempt 1: genuinely finishes `failed` with a real nonterminal checkpoint to recover from —
+      // but the retry's own write throws (armed below, consumed by that one write), so the terminal
+      // write is never confirmed and attempt 1's in-flight marker survives (finding-1's own
+      // precondition). A genuine checkpoint, not only a snapshot, is required here so
+      // `recordPartialHistory`'s own `checkpointOffer` carries `lineageId` on the stored row — the
+      // same field `resumeRun` reads back below to find this lineage at all.
+      const first = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot = fixtureHarnessSnapshot(first.runId, first.lineageId);
+      await harnessRunStore.writeSnapshot(snapshot);
+      let log = createActivityLog(first.runId, first.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: first.runId,
+          lineageId: first.lineageId,
+          attempt: 1,
+          phase: 'investigating',
+          reason: 'phaseBoundary',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 1000,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+
+      // Arm the throw, and resolve with a sanitizer-safe limitation code — never the shared
+      // `failedResult(...)` fixture's own free-text `'harness.test'` stand-in, which
+      // `appendActivityEvent`'s short-token sanitizer would drop on its own, making
+      // `closeCheckpointAsTerminal` return `undefined` (fact failed validation) before the retry ever
+      // reaches the store at all — the OTHER not-confirmed path, not the one this test means to
+      // exercise (mirrors the succeeding-retry test's own identical care, above).
+      arm();
+      pending.get('!2841')!.resolve({
+        ...failedResult('Coverage did not reach every high-risk file.', 'irrelevant-result-refLabel', 2),
+        outcome: { ...failedResult('x', 'irrelevant-result-refLabel', 2).outcome, limitations: [{ code: 'coverageIncomplete', message: 'Coverage did not reach every high-risk file.' }] },
+      });
+      await vi.waitFor(() => expect(runs.get(first.key)?.status).toBe('failed'));
+      expect(new InFlightRunStore(globalState).list()).toEqual([expect.objectContaining({ key: first.key, lineageId: first.lineageId, runId: first.runId })]);
+      // The retry's write never landed — attempt 1's own last checkpoint is still nonterminal.
+      expect(harnessRunStore.latestCheckpoint(first.lineageId, 1)?.projection.lifecycle).toBe('investigating');
+      const attempt1StartedAt = new InFlightRunStore(baseGlobalState).list()[0]!.startedAt;
+
+      // Attempt 2: `resumeRun`, never a fresh `trigger()` — mints attempt 2 in the SAME lineage,
+      // reusing the stored checkpoint's own `runId`/`lineageId` verbatim (both identical to attempt
+      // 1's own — the one thing `runId`/`lineageId` equality alone can never distinguish, which is
+      // exactly why the old guard used it and got this case wrong). Exactly the shape the old
+      // `leftover.lineageId !== record.lineageId` guard would have skipped closing.
+      const second = runs.resumeRun(crInput('2841'), 3);
+      expect(second).toBeDefined();
+      expect(second!.lineageId).toBe(first.lineageId);
+      expect(second!.runId).toBe(first.runId);
+      expect(second!.attempt).toBe(2);
+
+      // Attempt 1 was found and genuinely closed as `interrupted` — never silently abandoned
+      // mid-`investigating` forever, which is what the old exclusion would have left it as.
+      await vi.waitFor(() =>
+        expect(harnessRunStore.readLineage(first.lineageId)?.terminalAttempts).toContainEqual(expect.objectContaining({ attempt: 1, lifecycle: 'interrupted' })),
+      );
+      expect(harnessRunStore.latestCheckpoint(first.lineageId, 1)?.projection.lifecycle).toBe('interrupted');
+
+      // The in-flight marker was genuinely replaced (a later `startedAt`), not merely left as attempt
+      // 1's own stale entry — `runId`/`lineageId` equality can't tell the two apart, so `startedAt` is
+      // the one field that does.
+      await vi.waitFor(() => {
+        const list = new InFlightRunStore(baseGlobalState).list();
+        expect(list).toHaveLength(1);
+        expect(list[0]!.startedAt).not.toBe(attempt1StartedAt);
+      });
     },
   );
 

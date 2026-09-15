@@ -1213,20 +1213,25 @@ export class ReviewRunManager {
     this.transition(record, 'planning', { startedAt });
     // Fix 3 (marker survival): `InFlightRunStore.add` below is latest-wins per key (its own doc
     // comment) — a fresh trigger on this same target, minting a brand-new `runId`/`lineageId`, would
-    // otherwise silently overwrite an UNRELATED predecessor's still-unswept marker before the next
-    // activation's sweep ever got a chance to close it truthfully, exactly the third exposure this
-    // file's own incident review named (`InFlightRunStore.add`'s "structurally unreachable" gap).
-    // Closed here only when the leftover entry is a genuinely different lineage: this key's own
-    // in-flight admission (`trigger`'s `!isTerminalLifecycle(existing.lifecycle)` refusal) already
-    // guarantees no record for this same key is still live in-memory by the time `start()` runs, so a
-    // same-lineage leftover here would only ever be this key's own prior entry from earlier in this
-    // same still-live attempt (a 9.6 wait/resume cycle) — left untouched, never closed out from under
-    // a run that has not actually ended.
+    // otherwise silently overwrite a predecessor's still-unswept marker before the next activation's
+    // sweep ever got a chance to close it truthfully, exactly the third exposure this file's own
+    // incident review named (`InFlightRunStore.add`'s "structurally unreachable" gap). Closed here
+    // for ANY pre-existing entry under this key, same-lineage included: `start()` runs exactly once
+    // per fresh `queued` record (`pump`'s own dispatch — a `resuming` record goes through
+    // `resumeStart` instead, never here), so any entry already sitting under this key when `start()`
+    // runs is by construction a leftover from a prior attempt or session, never this same live
+    // attempt's own earlier marker. In particular `resumeRun` reuses the lineage's stored `runId`/
+    // `lineageId` verbatim for its fresh (`queued`) record, so the diagnosed incident's own
+    // continuation shape — attempt N leaves an unconfirmed marker, the reviewer immediately resumes
+    // the same lineage as attempt N+1 — lands here with `leftover.lineageId === record.lineageId`; a
+    // same-lineage exclusion would silently let `InFlightRunStore.add` below destroy N's marker
+    // before it was ever closed out. `closeLeftoverInFlightEntry` itself reads
+    // `harnessRunStore.latestCheckpoint(leftover.lineageId)` synchronously, in this same call, before
+    // `executeAttempt` (called after `admitted` is assigned, further down) can write attempt N+1's
+    // first checkpoint — so this always finds and closes attempt N's own last checkpoint, never
+    // attempt N+1's, regardless of same- or different-lineage.
     const leftover = this.inFlight.list().find((entry) => entry.key === record.key);
-    const admitted =
-      leftover && leftover.lineageId !== undefined && leftover.lineageId !== record.lineageId
-        ? closeLeftoverInFlightEntry(leftover, this.runs, this.harnessRunStore, DEFAULT_HARNESS_POLICY, () => this.now())
-        : Promise.resolve();
+    const admitted = leftover ? closeLeftoverInFlightEntry(leftover, this.runs, this.harnessRunStore, DEFAULT_HARNESS_POLICY, () => this.now()) : Promise.resolve();
     // Written before the request goes out, so a host that stops mid-run leaves
     // the evidence the sweep needs.
     void admitted.then(() =>
@@ -1542,20 +1547,29 @@ export class ReviewRunManager {
 
     const latest = this.harnessRunStore.latestCheckpoint(lineageId, attempt);
     if (latest) {
-      const terminalFact: Extract<ActivityFact, { kind: 'terminalResult' }> = {
-        kind: 'terminalResult',
-        lifecycle: result.lifecycle,
-        completeness: result.outcome.completeness,
-        limitations: result.outcome.limitations,
-      };
-      const closed = closeCheckpointAsTerminal(
-        latest,
-        { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(this.now()).toISOString(), reason: 'attemptFailed', terminalFact },
-        DEFAULT_HARNESS_POLICY,
-      );
-      if (closed) {
-        await this.harnessRunStore.writeCheckpoint(closed, DEFAULT_HARNESS_POLICY);
-        if (hasTerminalMarker()) return { confirmed: true };
+      try {
+        const terminalFact: Extract<ActivityFact, { kind: 'terminalResult' }> = {
+          kind: 'terminalResult',
+          lifecycle: result.lifecycle,
+          completeness: result.outcome.completeness,
+          limitations: result.outcome.limitations,
+        };
+        const closed = closeCheckpointAsTerminal(
+          latest,
+          { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(this.now()).toISOString(), reason: 'attemptFailed', terminalFact },
+          DEFAULT_HARNESS_POLICY,
+        );
+        if (closed) {
+          await this.harnessRunStore.writeCheckpoint(closed, DEFAULT_HARNESS_POLICY);
+          if (hasTerminalMarker()) return { confirmed: true };
+        }
+      } catch {
+        // A throwing store write (or a throwing close) IS the genuine gap this recovery exists to
+        // report, never a crash to propagate: falling through to the same not-confirmed outcome
+        // below keeps this method's contract — "return a verdict, never throw" — true regardless of
+        // what the retry's own write does, so `completeAttempt`'s normal flow (the retained review,
+        // the partial record, the dashboard row, the settle) proceeds with this attempt's genuine
+        // result intact instead of losing it to `executeAttempt`'s generic crash-catch.
       }
     }
 
