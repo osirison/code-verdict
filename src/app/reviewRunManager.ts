@@ -94,6 +94,8 @@ import type { KeyValueStore } from './storage';
 import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './harnessAttempt';
 import type { CompletionBlockerDetail, CompletionEvaluation } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
+import { closeCheckpointAsTerminal } from './harnessCheckpoint';
+import type { ActivityFact } from './harnessActivityLog';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { checkCheckpointIntegrity, closeAttemptAsInterrupted, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
 import { crKey } from './postedReviews';
@@ -1209,22 +1211,40 @@ export class ReviewRunManager {
     // (`applyCheckpoint`) advances it from there, whenever it actually
     // arrives (which cannot be assumed synchronous — see `executeAttempt`).
     this.transition(record, 'planning', { startedAt });
+    // Fix 3 (marker survival): `InFlightRunStore.add` below is latest-wins per key (its own doc
+    // comment) — a fresh trigger on this same target, minting a brand-new `runId`/`lineageId`, would
+    // otherwise silently overwrite an UNRELATED predecessor's still-unswept marker before the next
+    // activation's sweep ever got a chance to close it truthfully, exactly the third exposure this
+    // file's own incident review named (`InFlightRunStore.add`'s "structurally unreachable" gap).
+    // Closed here only when the leftover entry is a genuinely different lineage: this key's own
+    // in-flight admission (`trigger`'s `!isTerminalLifecycle(existing.lifecycle)` refusal) already
+    // guarantees no record for this same key is still live in-memory by the time `start()` runs, so a
+    // same-lineage leftover here would only ever be this key's own prior entry from earlier in this
+    // same still-live attempt (a 9.6 wait/resume cycle) — left untouched, never closed out from under
+    // a run that has not actually ended.
+    const leftover = this.inFlight.list().find((entry) => entry.key === record.key);
+    const admitted =
+      leftover && leftover.lineageId !== undefined && leftover.lineageId !== record.lineageId
+        ? closeLeftoverInFlightEntry(leftover, this.runs, this.harnessRunStore, DEFAULT_HARNESS_POLICY, () => this.now())
+        : Promise.resolve();
     // Written before the request goes out, so a host that stops mid-run leaves
     // the evidence the sweep needs.
-    void this.inFlight.add({
-      key: record.key,
-      podId: record.input.podId,
-      refLabel: record.input.refLabel,
-      ...reviewIdentityFor(record.input.target),
-      startedAt: new Date(startedAt).toISOString(),
-      // Task 12.7: lets the activation sweep find this run's lineage in
-      // `harnessRunStore` (see the store field's own doc comment) — a real
-      // harness attempt writes one there as it goes. A run persisted before
-      // this field existed has none, and costs the sweep nothing beyond its
-      // own crude fallback.
-      runId: record.runId,
-      lineageId: record.lineageId,
-    });
+    void admitted.then(() =>
+      this.inFlight.add({
+        key: record.key,
+        podId: record.input.podId,
+        refLabel: record.input.refLabel,
+        ...reviewIdentityFor(record.input.target),
+        startedAt: new Date(startedAt).toISOString(),
+        // Task 12.7: lets the activation sweep find this run's lineage in
+        // `harnessRunStore` (see the store field's own doc comment) — a real
+        // harness attempt writes one there as it goes. A run persisted before
+        // this field existed has none, and costs the sweep nothing beyond its
+        // own crude fallback.
+        runId: record.runId,
+        lineageId: record.lineageId,
+      }),
+    );
     void this.executeAttempt(record.key);
   }
 
@@ -1483,6 +1503,71 @@ export class ReviewRunManager {
    * no channel through `HarnessAttemptResult` — an honest `[]`, never a
    * fabricated bucket.
    */
+  /**
+   * Fix 2 (universal settle verification), `completeAttempt`'s own half — extends, rather than
+   * duplicates, `settle`'s existing `verifyStoreTerminalBeforeClearingMarker` machinery (scoped there
+   * to `executeAttempt`'s crash-catch alone, whose doc comment names exactly why: this class's own
+   * unit tests settle fake harness results through `completeAttempt` without ever wiring a real
+   * `harnessRunStore`-backed `onCheckpoint`, the coupling that lives one layer up in
+   * `harnessRuntime.ts`). Unlike that crash-catch — which has no `HarnessAttemptResult` to recover
+   * from, only an escaped error — `completeAttempt` always has one: `result`'s own genuinely terminal
+   * `lifecycle`/`outcome` is exactly "what `completeAttempt` has in hand" to retry the write with.
+   *
+   * Three outcomes:
+   * - `harnessRunStore.readLineage(lineageId)` is `undefined` — this store has never heard of this
+   *   lineage at all, meaning no evidence a terminal write was ever supposed to land here (the
+   *   coupling above was never wired for this attempt, exactly the unit-test shape). Trusted as
+   *   settleable, same as every ordinary settle always has been — this is not a persistence gap.
+   * - The lineage record exists and already carries a terminal marker for this exact attempt — the
+   *   ordinary, expected production shape (a real attempt's own `runPersisting`/
+   *   `finalizeBootstrapFailure` already wrote it, `IntendedTerminal`-declared per the fix above).
+   *   Settleable.
+   * - The lineage record exists but carries no terminal marker for this attempt — the genuine gap.
+   *   One recovery attempt: close whatever nonterminal checkpoint this attempt last landed
+   *   (`harnessRunStore.latestCheckpoint(lineageId, attempt)`) with a `terminalResult` fact built from
+   *   `result`'s own truthful lifecycle/completeness/limitations — never `'interrupted'`, unlike
+   *   `closeAttemptAsInterrupted`'s own use of this same `closeCheckpointAsTerminal` machinery: this
+   *   attempt did not vanish, it genuinely finished, only failed to record that it did. No checkpoint
+   *   at all to close from (a rebuild is impossible with only what `completeAttempt` has in hand) or
+   *   the close itself failing validation both fall through to the same outcome: not settleable as
+   *   confirmed, with a limitation naming the gap for the caller to fold into every downstream write.
+   */
+  private async verifyOrRecoverTerminalWrite(record: RunRecord, result: HarnessAttemptResult): Promise<{ confirmed: boolean; limitation?: Limitation }> {
+    const lineageId = record.lineageId as LineageId;
+    const attempt = record.attempt as AttemptNumber;
+    const hasTerminalMarker = (): boolean => (this.harnessRunStore.readLineage(lineageId)?.terminalAttempts ?? []).some((marker) => marker.attempt === attempt);
+
+    if (this.harnessRunStore.readLineage(lineageId) === undefined) return { confirmed: true };
+    if (hasTerminalMarker()) return { confirmed: true };
+
+    const latest = this.harnessRunStore.latestCheckpoint(lineageId, attempt);
+    if (latest) {
+      const terminalFact: Extract<ActivityFact, { kind: 'terminalResult' }> = {
+        kind: 'terminalResult',
+        lifecycle: result.lifecycle,
+        completeness: result.outcome.completeness,
+        limitations: result.outcome.limitations,
+      };
+      const closed = closeCheckpointAsTerminal(
+        latest,
+        { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(this.now()).toISOString(), reason: 'attemptFailed', terminalFact },
+        DEFAULT_HARNESS_POLICY,
+      );
+      if (closed) {
+        await this.harnessRunStore.writeCheckpoint(closed, DEFAULT_HARNESS_POLICY);
+        if (hasTerminalMarker()) return { confirmed: true };
+      }
+    }
+
+    return {
+      confirmed: false,
+      limitation: {
+        code: 'terminalPersistenceGap',
+        message: `Attempt ${attempt}'s terminal outcome could not be confirmed in storage. This run's persisted history may be incomplete until the next activation sweep closes it.`,
+      },
+    };
+  }
+
   private async completeAttempt(key: string, rawResult: HarnessAttemptResult): Promise<void> {
     // An entry guard of its own, not only reliance on `executeAttempt`'s own
     // pre-call check: this keeps "never touch storage for a record that
@@ -1517,6 +1602,17 @@ export class ReviewRunManager {
           }
         : rawResult;
     const items = result.findings.map((finding) => finding.item);
+
+    // Fix 2 (universal settle verification): before this attempt's own genuinely terminal outcome
+    // (`result.lifecycle`, computed above) reaches any durable write below, confirm `harnessRunStore`
+    // actually holds a terminal checkpoint for this exact attempt — the one thing the incident this
+    // fix closes never had, despite `run()` resolving cleanly. A miss gets one recovery attempt; a
+    // recovery that also fails folds a truthful limitation into every downstream write below (the
+    // retained review, the partial record, the dashboard row, the settled outcome itself) rather than
+    // silently clearing the in-flight marker over an unconfirmed terminal state.
+    const terminalWriteCheck = await this.verifyOrRecoverTerminalWrite(record, result);
+    if (!this.isSettleable(key)) return;
+    const limitations = terminalWriteCheck.limitation ? [...result.outcome.limitations, terminalWriteCheck.limitation] : result.outcome.limitations;
 
     if (result.lifecycle === 'succeeded') {
       const response: AgentReviewResponse = {
@@ -1581,13 +1677,17 @@ export class ReviewRunManager {
         // retained review is written either way — the work was done and
         // paid for — but the run must not also report itself as succeeded.
         if (!this.isSettleable(key)) return;
-        this.settle(record, {
-          lifecycle: 'succeeded',
-          response,
-          completeness: result.outcome.completeness,
-          limitations: result.outcome.limitations,
-          completionEvaluation: result.completionEvaluation,
-        });
+        this.settle(
+          record,
+          {
+            lifecycle: 'succeeded',
+            response,
+            completeness: result.outcome.completeness,
+            limitations,
+            completionEvaluation: result.completionEvaluation,
+          },
+          { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+        );
 
         // Read-modify-write with no `await` between the pair, per the
         // contract in `storage.ts` — two runs can finish in the same tick.
@@ -1612,13 +1712,17 @@ export class ReviewRunManager {
       // Unreachable under `runPersisting`'s own invariant — see this
       // method's own doc comment above.
       if (!this.isSettleable(key)) return;
-      this.settle(record, {
-        lifecycle: 'succeeded',
-        response,
-        completeness: result.outcome.completeness,
-        limitations: result.outcome.limitations,
-        completionEvaluation: result.completionEvaluation,
-      });
+      this.settle(
+        record,
+        {
+          lifecycle: 'succeeded',
+          response,
+          completeness: result.outcome.completeness,
+          limitations,
+          completionEvaluation: result.completionEvaluation,
+        },
+        { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+      );
       return;
     }
 
@@ -1658,7 +1762,7 @@ export class ReviewRunManager {
         // call would (`result.outcome.completeness` here is always `'partial'` under
         // `runPersisting`'s own invariant — cancellation/failure never reach `complete`).
         completeness: result.outcome.completeness,
-        limitations: result.outcome.limitations,
+        limitations,
         // Task 14.2: same rule as the succeeded path above — set only from
         // `result.plan`'s actual presence, never guessed.
         protocolProvenance: result.plan ? 'harness' : undefined,
@@ -1670,23 +1774,27 @@ export class ReviewRunManager {
       if (!this.isSettleable(key)) return;
     }
     if (result.lifecycle === 'cancelled') {
-      this.settle(record, {
-        lifecycle: 'cancelled',
-        completeness: result.outcome.completeness,
-        limitations: result.outcome.limitations,
-        partialResult: partial,
-        completionEvaluation: result.completionEvaluation,
-      });
-      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, result.outcome.limitations);
+      this.settle(
+        record,
+        {
+          lifecycle: 'cancelled',
+          completeness: result.outcome.completeness,
+          limitations,
+          partialResult: partial,
+          completionEvaluation: result.completionEvaluation,
+        },
+        { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+      );
+      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, limitations);
       return;
     }
     // 'failed', or (structurally unreachable from a live `.run()` — see this
     // method's own doc comment) any other value: never fabricated as a
     // success.
     const failure: RunFailure = {
-      message: result.outcome.limitations.map((limitation) => limitation.message).join(' ') || 'The review could not be completed.',
+      message: limitations.map((limitation) => limitation.message).join(' ') || 'The review could not be completed.',
       requestId: '------',
-      code: result.outcome.limitations[0]?.code ?? 'harness.incomplete',
+      code: limitations[0]?.code ?? 'harness.incomplete',
       blockerDetails: result.outcome.blockerDetails,
     };
     // A live `failed` settle — unlike `cancelled` above — is exactly the terminal state this
@@ -1715,7 +1823,7 @@ export class ReviewRunManager {
       // this offer degrades to `false` — the manager has just-finished live connection access
       // right here, unlike the activation sweep, which never does, so this is where the note is
       // freshest.
-      const notes = headMovedNotes(result.outcome.limitations);
+      const notes = headMovedNotes(limitations);
       const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : notes.length > 0 ? [...integrityReasons, ...notes] : integrityReasons;
       checkpointOffer = {
         lineageId: record.lineageId,
@@ -1723,16 +1831,20 @@ export class ReviewRunManager {
         resumeReasons: reasons && reasons.length > 0 ? reasons : undefined,
       };
     }
-    await this.recordPartialHistory(identity, input.agentLabel, partial?.items.length ?? 0, ranAt, result.outcome.limitations, checkpointOffer);
+    await this.recordPartialHistory(identity, input.agentLabel, partial?.items.length ?? 0, ranAt, limitations, checkpointOffer);
     if (!this.isSettleable(key)) return;
-    this.settle(record, {
-      lifecycle: 'failed',
-      failure,
-      completeness: result.outcome.completeness,
-      limitations: result.outcome.limitations,
-      partialResult: partial,
-      completionEvaluation: result.completionEvaluation,
-    });
+    this.settle(
+      record,
+      {
+        lifecycle: 'failed',
+        failure,
+        completeness: result.outcome.completeness,
+        limitations,
+        partialResult: partial,
+        completionEvaluation: result.completionEvaluation,
+      },
+      { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+    );
   }
 
   /**
@@ -1825,18 +1937,27 @@ export class ReviewRunManager {
     settleOptions?: {
       /**
        * Set only from `executeAttempt`'s own crash catch — the one settle call whose `record.key`
-       * can reach here with `HarnessAttempt.run()` having genuinely rejected mid-attempt, rather than
-       * having already resolved through `runPersisting`/`finalizeBootstrapFailure`'s own terminal
-       * write. Every other caller of `settle` (`completeAttempt`, the cancel-grace timeout, a
-       * cooperative cancellation) reaches it only *after* `run()` already resolved, at which point a
-       * production attempt's terminal checkpoint is already in `harnessRunStore` by contract — so
-       * gating marker removal there too would be correct in production but wrongly strand this
-       * class's own unit tests, whose fake harness factories settle through `completeAttempt`/cancel
-       * without ever wiring a real `harnessRunStore`-backed `onCheckpoint` (that persistence coupling
-       * lives one layer up, in `harnessRuntime.ts`, not in this class). Scoping the check to the one
-       * call site that can actually observe the gap keeps the fix precise to what broke.
+       * can reach here with `HarnessAttempt.run()` having genuinely rejected mid-attempt, with no
+       * `HarnessAttemptResult` in hand to attempt a recovery write from (unlike `completeAttempt`'s
+       * own `terminalWriteConfirmed`, below). `settle` itself checks whether `harnessRunStore` already
+       * holds a terminal marker for this exact attempt (never re-derived from a checkpoint's own
+       * possibly-mis-projected `projection.lifecycle` — `writeCheckpoint`'s own marker gate, and the
+       * incident it closes, is exactly why this reads the marker) — no retry, just a truthful
+       * leave-or-clear. A lineage `harnessRunStore` has never heard of at all trusts the caller, same
+       * as an unconditional clear always has: nothing here proves a terminal write should exist.
        */
       readonly verifyStoreTerminalBeforeClearingMarker?: boolean;
+      /**
+       * Fix 2 (universal settle verification) — set by every `completeAttempt` settle call, from
+       * `verifyOrRecoverTerminalWrite`'s own already-computed result (including its one recovery
+       * attempt): `true` clears the marker exactly like an unconditional settle always has;
+       * `false` deliberately leaves it in place for the next activation's `sweepInterruptedRuns` to
+       * close truthfully, mirroring `verifyStoreTerminalBeforeClearingMarker`'s own leave-not-clear
+       * behavior but without re-running a check `completeAttempt` already ran (and already tried to
+       * repair). Takes precedence over `verifyStoreTerminalBeforeClearingMarker` when both are somehow
+       * given — no real call site passes both.
+       */
+      readonly terminalWriteConfirmed?: boolean;
     },
   ): void {
     let current = this.records.get(record.key) ?? record;
@@ -1905,19 +2026,28 @@ export class ReviewRunManager {
     // Terminal: this key can never resume again, so its admission-order
     // bookkeeping is done.
     this.admissionSequence.delete(record.key);
-    // `verifyStoreTerminalBeforeClearingMarker`: see `settle`'s own doc comment on that option for
-    // why only `executeAttempt`'s crash catch sets it. Without it, this stays the same unconditional
-    // clear every other caller already relies on.
-    if (settleOptions?.verifyStoreTerminalBeforeClearingMarker) {
-      const latestStoredCheckpoint = this.harnessRunStore.latestCheckpoint(record.lineageId);
-      const storeHasTerminalCheckpoint = latestStoredCheckpoint !== undefined && isTerminalLifecycle(latestStoredCheckpoint.projection.lifecycle);
+    // `terminalWriteConfirmed`/`verifyStoreTerminalBeforeClearingMarker`: see `settle`'s own doc
+    // comments on those two options. Neither set is the same unconditional clear every other caller
+    // (the cancel-grace timeout, a cooperative cancellation reaching `executeAttempt`'s catch) already
+    // relies on.
+    if (settleOptions?.terminalWriteConfirmed !== undefined) {
+      // `completeAttempt` already ran `verifyOrRecoverTerminalWrite` — including its one recovery
+      // attempt — before calling `settle`; this trusts that result directly rather than re-checking.
+      if (settleOptions.terminalWriteConfirmed) void this.inFlight.remove(record.key);
+    } else if (settleOptions?.verifyStoreTerminalBeforeClearingMarker) {
+      // The marker itself (`harnessRunStore.readLineage(...).terminalAttempts`), never a checkpoint's
+      // own `projection.lifecycle` — a checkpoint can be genuinely terminal (declared via
+      // `intendedTerminal`) while its projection still mis-derives non-terminal (`IntendedTerminal`'s
+      // own doc comment), and re-deriving from the projection here would defeat that fix for the one
+      // call site guarding against exactly this class of gap.
+      const storeHasTerminalMarker = (this.harnessRunStore.readLineage(record.lineageId)?.terminalAttempts ?? []).some((marker) => marker.attempt === record.attempt);
       // Leaving the marker in place when the store disagrees is exactly what lets
       // `sweepInterruptedRuns` find and truthfully close, on the next activation, a lineage whose
       // own best-effort terminal write (`harnessAttempt.ts`'s `finalizeEscapedError`) also failed —
       // the gap that stranded `lineage_1ea390cab27a5c6dc58e1cc3ea230cb9`
       // (`run_5a1f8b5f150e7050fb742e5bebc080dc`) permanently under this method's old, unconditional
       // removal.
-      if (storeHasTerminalCheckpoint) void this.inFlight.remove(record.key);
+      if (storeHasTerminalMarker) void this.inFlight.remove(record.key);
     } else {
       void this.inFlight.remove(record.key);
     }
@@ -2173,6 +2303,109 @@ function truthfulTerminalRow(
   return { outcome: 'partial', limitations };
 }
 
+/**
+ * Fix 3 (marker survival), shared with the activation sweep: closes one leftover `InFlightRun` entry
+ * truthfully — whether that means recording the already-terminal checkpoint it turns out to have
+ * (a normal completion, or `finalizeEscapedError`'s own best-effort write, that beat this close to the
+ * punch), closing a genuinely nonterminal one as `interrupted`, or falling back to a bare
+ * `interrupted` row when there is no `harnessRunStore`-backed identity to consult at all — and writes
+ * the one `ReviewRunStore` row that shape produces. Extracted out of `sweepInterruptedRuns`'s own
+ * per-entry loop body, unchanged, so `ReviewRunManager.start()` (Fix 3's own new call site — see that
+ * method's doc comment) can run the identical close on an unrelated predecessor's still-unswept
+ * marker before a new attempt's `InFlightRunStore.add()` would otherwise silently overwrite it
+ * (`InFlightRunStore.add`'s own "latest-wins per key" doc comment — the production incident's third
+ * exposure). Never clears `IN_FLIGHT_KEY` itself: the sweep clears the whole list once, after every
+ * entry in it has been closed; `start()`'s own pre-add close only ever touches the one entry it is
+ * about to replace, via `InFlightRunStore.remove`, not this function.
+ */
+async function closeLeftoverInFlightEntry(entry: InFlightRun, runs: ReviewRunStore, harnessRunStore: HarnessRunStore | undefined, policy: HarnessPolicy, now: () => number): Promise<void> {
+  let findingCount = 0;
+  let resumable: boolean | undefined;
+  // Task 14.6: the same reasons `resumable`'s own boolean already
+  // collapsed `.length === 0` from — kept here too, never a second
+  // check, so a UI can show *why* a checkpoint failed integrity rather
+  // than only that it did.
+  let resumeReasons: readonly Limitation[] | undefined;
+  if (harnessRunStore && entry.runId && entry.lineageId) {
+    const lineageId = entry.lineageId as LineageId;
+    const latest = harnessRunStore.latestCheckpoint(lineageId);
+    // A lineage whose latest checkpoint is already terminal settled in-process — a normal
+    // completion, or `HarnessAttempt.run()`'s own catch-all for an error that escaped
+    // mid-attempt (`harnessAttempt.ts`'s `finalizeEscapedError`) — before this leftover
+    // in-flight marker could be cleared, most likely because the extension host itself stopped
+    // right after. It is never re-closed or recorded as `interrupted`: that would silently
+    // overwrite the already-truthful terminal checkpoint with a misleading "stalled and
+    // unresumable" one. It still gets its own truthful `ReviewRunStore` row, from
+    // `truthfulTerminalRow` above (see that function's own doc comment for why this must record
+    // rather than skip) — then straight to clearing the leftover marker with every other entry
+    // once the loop ends, never through `closeAttemptAsInterrupted` or the generic `interrupted`
+    // row built below, both of which are for a genuinely nonterminal checkpoint only.
+    if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
+      const findingCount = acceptedFindingCount(latest.candidates);
+      const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
+      // `'failed'` is the one live-terminal lifecycle this row offers a fresh-budget new attempt
+      // for (`truthfulTerminalRow`'s own doc comment) — the same `checkCheckpointIntegrity` check
+      // `ReviewRunManager.completeAttempt`'s own `failed` branch runs, here because the extension
+      // host stopped before that branch's own write could land.
+      let terminalResumable: boolean | undefined;
+      let terminalResumeReasons: readonly Limitation[] | undefined;
+      if (latest.projection.lifecycle === 'failed') {
+        const storedSnapshot = harnessRunStore.readSnapshot(lineageId, latest.attempt);
+        const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
+        // Mirrors `completeAttempt`'s own `headMovedNotes` fold above: this branch exists for
+        // the identical live-`failed` settle, only reached here because the extension host
+        // stopped before that branch's own write could land — so it needs the identical
+        // treatment, from whatever the persisted checkpoint's own limitations still show. A
+        // moved head is informational only, never a reason `terminalResumable` degrades.
+        const notes = headMovedNotes(latest.projection.limitations);
+        const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : notes.length > 0 ? [...integrityReasons, ...notes] : integrityReasons;
+        terminalResumable = integrityReasons ? integrityReasons.length === 0 : false;
+        if (reasons && reasons.length > 0) terminalResumeReasons = reasons;
+      }
+      // `recordIfFresher`, not `record`: a fast new run on this same target can already have
+      // completed and recorded its own richer row while this loop was awaiting an earlier
+      // entry — see that method's own doc comment (`reviewRuns.ts`) for the race.
+      await runs.recordIfFresher({
+        repoId: entry.repoId,
+        crNumber: entry.crNumber,
+        outcome,
+        findingCount,
+        agentLabel: '',
+        ranAt: entry.startedAt,
+        ...(limitations !== undefined ? { limitations } : {}),
+        ...(terminalResumable !== undefined ? { resumable: terminalResumable, lineageId } : {}),
+        ...(terminalResumeReasons !== undefined ? { resumeReasons: terminalResumeReasons } : {}),
+      });
+      return;
+    }
+    if (latest) {
+      const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
+      if (closed) {
+        await harnessRunStore.writeCheckpoint(closed, policy);
+        findingCount = acceptedFindingCount(closed.candidates);
+        const storedSnapshot = harnessRunStore.readSnapshot(lineageId, closed.attempt);
+        const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, closed) : undefined;
+        resumable = reasons ? reasons.length === 0 : false;
+        if (reasons && reasons.length > 0) resumeReasons = reasons;
+      }
+    }
+  }
+  // `recordIfFresher` here too: the same race applies to this branch — a stale marker's
+  // `interrupted` write is exactly the kind of crash-derived data a genuinely newer run's
+  // row must never be clobbered by.
+  await runs.recordIfFresher({
+    repoId: entry.repoId,
+    crNumber: entry.crNumber,
+    outcome: 'interrupted',
+    findingCount,
+    agentLabel: '',
+    ranAt: entry.startedAt,
+    ...(resumable !== undefined ? { resumable } : {}),
+    ...(resumeReasons !== undefined ? { resumeReasons } : {}),
+    ...(entry.lineageId !== undefined ? { lineageId: entry.lineageId } : {}),
+  });
+}
+
 export async function sweepInterruptedRuns(globalState: KeyValueStore, options: SweepInterruptedOptions = {}): Promise<number> {
   const inFlight = new InFlightRunStore(globalState);
   const leftover = inFlight.list();
@@ -2181,91 +2414,7 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
   const policy = options.policy ?? DEFAULT_HARNESS_POLICY;
   const now = options.now ?? (() => Date.now());
   for (const entry of leftover) {
-    let findingCount = 0;
-    let resumable: boolean | undefined;
-    // Task 14.6: the same reasons `resumable`'s own boolean already
-    // collapsed `.length === 0` from — kept here too, never a second
-    // check, so a UI can show *why* a checkpoint failed integrity rather
-    // than only that it did.
-    let resumeReasons: readonly Limitation[] | undefined;
-    if (harnessRunStore && entry.runId && entry.lineageId) {
-      const lineageId = entry.lineageId as LineageId;
-      const latest = harnessRunStore.latestCheckpoint(lineageId);
-      // A lineage whose latest checkpoint is already terminal settled in-process — a normal
-      // completion, or `HarnessAttempt.run()`'s own catch-all for an error that escaped
-      // mid-attempt (`harnessAttempt.ts`'s `finalizeEscapedError`) — before this leftover
-      // in-flight marker could be cleared, most likely because the extension host itself stopped
-      // right after. It is never re-closed or recorded as `interrupted`: that would silently
-      // overwrite the already-truthful terminal checkpoint with a misleading "stalled and
-      // unresumable" one. It still gets its own truthful `ReviewRunStore` row, from
-      // `truthfulTerminalRow` above (see that function's own doc comment for why this must record
-      // rather than skip) — then straight to clearing the leftover marker with every other entry
-      // once the loop ends, never through `closeAttemptAsInterrupted` or the generic `interrupted`
-      // row built below, both of which are for a genuinely nonterminal checkpoint only.
-      if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
-        const findingCount = acceptedFindingCount(latest.candidates);
-        const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
-        // `'failed'` is the one live-terminal lifecycle this row offers a fresh-budget new attempt
-        // for (`truthfulTerminalRow`'s own doc comment) — the same `checkCheckpointIntegrity` check
-        // `ReviewRunManager.completeAttempt`'s own `failed` branch runs, here because the extension
-        // host stopped before that branch's own write could land.
-        let terminalResumable: boolean | undefined;
-        let terminalResumeReasons: readonly Limitation[] | undefined;
-        if (latest.projection.lifecycle === 'failed') {
-          const storedSnapshot = harnessRunStore.readSnapshot(lineageId, latest.attempt);
-          const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
-          // Mirrors `completeAttempt`'s own `headMovedNotes` fold above: this branch exists for
-          // the identical live-`failed` settle, only reached here because the extension host
-          // stopped before that branch's own write could land — so it needs the identical
-          // treatment, from whatever the persisted checkpoint's own limitations still show. A
-          // moved head is informational only, never a reason `terminalResumable` degrades.
-          const notes = headMovedNotes(latest.projection.limitations);
-          const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : notes.length > 0 ? [...integrityReasons, ...notes] : integrityReasons;
-          terminalResumable = integrityReasons ? integrityReasons.length === 0 : false;
-          if (reasons && reasons.length > 0) terminalResumeReasons = reasons;
-        }
-        // `recordIfFresher`, not `record`: a fast new run on this same target can already have
-        // completed and recorded its own richer row while this loop was awaiting an earlier
-        // entry — see that method's own doc comment (`reviewRuns.ts`) for the race.
-        await runs.recordIfFresher({
-          repoId: entry.repoId,
-          crNumber: entry.crNumber,
-          outcome,
-          findingCount,
-          agentLabel: '',
-          ranAt: entry.startedAt,
-          ...(limitations !== undefined ? { limitations } : {}),
-          ...(terminalResumable !== undefined ? { resumable: terminalResumable, lineageId } : {}),
-          ...(terminalResumeReasons !== undefined ? { resumeReasons: terminalResumeReasons } : {}),
-        });
-        continue;
-      }
-      if (latest) {
-        const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
-        if (closed) {
-          await harnessRunStore.writeCheckpoint(closed, policy);
-          findingCount = acceptedFindingCount(closed.candidates);
-          const storedSnapshot = harnessRunStore.readSnapshot(lineageId, closed.attempt);
-          const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, closed) : undefined;
-          resumable = reasons ? reasons.length === 0 : false;
-          if (reasons && reasons.length > 0) resumeReasons = reasons;
-        }
-      }
-    }
-    // `recordIfFresher` here too: the same race applies to this branch — a stale marker's
-    // `interrupted` write is exactly the kind of crash-derived data a genuinely newer run's
-    // row must never be clobbered by.
-    await runs.recordIfFresher({
-      repoId: entry.repoId,
-      crNumber: entry.crNumber,
-      outcome: 'interrupted',
-      findingCount,
-      agentLabel: '',
-      ranAt: entry.startedAt,
-      ...(resumable !== undefined ? { resumable } : {}),
-      ...(resumeReasons !== undefined ? { resumeReasons } : {}),
-      ...(entry.lineageId !== undefined ? { lineageId: entry.lineageId } : {}),
-    });
+    await closeLeftoverInFlightEntry(entry, runs, harnessRunStore, policy, now);
   }
   if (leftover.length > 0) await inFlight.clear();
 

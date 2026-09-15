@@ -708,6 +708,7 @@ function buildHarnessAttempt(
         coverage: info.coverage,
         unresolved: info.unresolved,
         retry: info.retry,
+        intendedTerminal: info.intendedTerminal,
       },
       policy,
     );

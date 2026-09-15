@@ -52,6 +52,7 @@ import {
   buildCheckpoint,
   isRetryState,
   type CheckpointBuildInput,
+  type IntendedTerminal,
   type PersistedCheckpoint,
 } from './harnessCheckpoint';
 import { reduceActivity } from './harnessActivityProjection';
@@ -132,6 +133,17 @@ export interface TerminalAttemptMarker {
   readonly lifecycle: RunLifecycle;
   readonly completeness: ResultCompleteness;
   readonly occurredAt: string;
+  /**
+   * Set only when this marker was recorded from a checkpoint's declared `intendedTerminal`
+   * (`harnessCheckpoint.ts`) and that declaration *disagreed* with the checkpoint's own
+   * `projection.lifecycle`/`.completeness` — the exact shape of the incident this field exists to
+   * keep visible (`IntendedTerminal`'s own doc comment): the marker is written from the declaration,
+   * never silently reconciled with the projection, so a disagreement is recorded rather than erased
+   * by whichever side "won". Absent whenever the declaration and projection agreed, or when this
+   * marker was derived from the projection alone (no declaration at all — an old checkpoint, or one
+   * this module's own eviction/interruption-closing paths built).
+   */
+  readonly projectedDisagreement?: { readonly lifecycle: RunLifecycle; readonly completeness: ResultCompleteness };
 }
 
 export interface PersistedLineageRecord {
@@ -723,6 +735,8 @@ export function parsePersistedCheckpoint(raw: unknown): PersistedCheckpoint | un
   if (typeof raw.bytes !== 'number' || typeof raw.compatible !== 'boolean') return undefined;
   const incompatibilityReasons = parseArray(raw.incompatibilityReasons, (item) => (typeof item === 'string' ? item : undefined));
   if (!incompatibilityReasons) return undefined;
+  const intendedTerminal = parseIntendedTerminal(raw.intendedTerminal);
+  if (!intendedTerminal.ok) return undefined;
 
   return {
     checkpointId: raw.checkpointId,
@@ -750,6 +764,7 @@ export function parsePersistedCheckpoint(raw: unknown): PersistedCheckpoint | un
     coverage,
     unresolved,
     retry: raw.retry,
+    ...(intendedTerminal.value !== undefined ? { intendedTerminal: intendedTerminal.value } : {}),
     bytes: raw.bytes,
     compatible: raw.compatible,
     incompatibilityReasons,
@@ -760,13 +775,36 @@ function reduceActivityForRead(identity: { runId: RunId; lineageId: LineageId; a
   return reduceActivity({ runId: identity.runId, lineageId: identity.lineageId, attempt: identity.attempt, events });
 }
 
+/**
+ * `PersistedCheckpoint.intendedTerminal` (`harnessCheckpoint.ts`'s `IntendedTerminal`). `undefined` is
+ * a legitimate absence (a checkpoint written before this field existed, or an ordinary non-terminal
+ * one) — matching `parseOptionalNonNegativeFinite`'s own `{ok:true,value:undefined}` convention for
+ * "absent, not malformed" so `parsePersistedCheckpoint` can fail the *whole* checkpoint closed only
+ * when the field is present but shaped wrong, never when it is simply missing.
+ */
+function parseIntendedTerminal(raw: unknown): { ok: false } | { ok: true; value: IntendedTerminal | undefined } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (!isRecord(raw)) return { ok: false };
+  const lifecycle = parseRunLifecycle(raw.lifecycle);
+  const completeness = parseResultCompleteness(raw.completeness);
+  return lifecycle && completeness ? { ok: true, value: { lifecycle, completeness } } : { ok: false };
+}
+
 function parseTerminalAttemptMarker(raw: unknown): TerminalAttemptMarker | undefined {
   if (!isRecord(raw)) return undefined;
   const lifecycle = parseRunLifecycle(raw.lifecycle);
   const completeness = parseResultCompleteness(raw.completeness);
   if (typeof raw.attempt !== 'number' || !lifecycle || !completeness) return undefined;
   if (typeof raw.occurredAt !== 'string' || Number.isNaN(Date.parse(raw.occurredAt))) return undefined;
-  return { attempt: raw.attempt, lifecycle, completeness, occurredAt: raw.occurredAt };
+  let projectedDisagreement: TerminalAttemptMarker['projectedDisagreement'];
+  if (raw.projectedDisagreement !== undefined) {
+    if (!isRecord(raw.projectedDisagreement)) return undefined;
+    const projectedLifecycle = parseRunLifecycle(raw.projectedDisagreement.lifecycle);
+    const projectedCompleteness = parseResultCompleteness(raw.projectedDisagreement.completeness);
+    if (!projectedLifecycle || !projectedCompleteness) return undefined;
+    projectedDisagreement = { lifecycle: projectedLifecycle, completeness: projectedCompleteness };
+  }
+  return { attempt: raw.attempt, lifecycle, completeness, occurredAt: raw.occurredAt, ...(projectedDisagreement !== undefined ? { projectedDisagreement } : {}) };
 }
 
 function parsePersistedLineageRecord(raw: unknown): PersistedLineageRecord | undefined {
@@ -819,9 +857,14 @@ export interface HarnessRunStore {
    * checkpoints are evicted first for the count bound
    * (`retainedCheckpointsPerLineage`), then again for the aggregate byte
    * bound (`maxCheckpointBytesPerLineage`); only if the single newest
-   * checkpoint still cannot fit is it marked incompatible. If this
-   * checkpoint's own projection is terminal, the attempt's terminal marker is
-   * recorded and the run-wide terminal-attempt-history bound
+   * checkpoint still cannot fit is it marked incompatible. Whether the
+   * attempt's terminal marker gets recorded is decided from
+   * `checkpoint.intendedTerminal` when the writer declared one (trusted
+   * directly, with any disagreement against the checkpoint's own projection
+   * recorded on the marker rather than silently resolved — `IntendedTerminal`'s
+   * own doc comment), falling back to `checkpoint.projection.lifecycle` only
+   * when no declaration is present. Either way, once a terminal marker is
+   * recorded the run-wide terminal-attempt-history bound
    * (`terminalAttemptHistoryCount`/`terminalAttemptHistoryMaxAgeDays`) is
    * re-applied across every lineage under the same run.
    */
@@ -1070,13 +1113,32 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     const withoutDuplicate = existing.checkpoints.filter((prior) => prior.checkpointId !== checkpoint.checkpointId);
     const appended = enforceLineageRetention([...withoutDuplicate, checkpoint], policy);
 
+    // The marker gate: a writer's own `intendedTerminal` declaration (`harnessCheckpoint.ts`'s
+    // `IntendedTerminal`), when present, is trusted directly — never re-derived from
+    // `checkpoint.projection.lifecycle`, which is recomputed one layer away by `reduceActivity` over
+    // `compactActivity`'s resorted activity tail and can disagree with what the writer that just
+    // appended this checkpoint's own terminal fact actually knows (the production incident this
+    // declaration exists to close). Absent `intendedTerminal` (an old checkpoint, or an ordinary
+    // phase-boundary one no writer ever declared terminal) falls back to today's projection-derived
+    // decision unchanged. When a declaration is present but disagrees with the projection, the marker
+    // is still written from the declaration — never silently reconciled either way — and the
+    // projection's own values are recorded alongside it (`TerminalAttemptMarker.projectedDisagreement`)
+    // so the projection bug class stays visible rather than silently misfiling a second time.
+    const declared = checkpoint.intendedTerminal;
+    const projectedTerminal = isTerminalLifecycle(checkpoint.projection.lifecycle);
+    const effectiveTerminal = declared ? isTerminalLifecycle(declared.lifecycle) : projectedTerminal;
+
     let terminalAttempts = existing.terminalAttempts;
-    if (isTerminalLifecycle(checkpoint.projection.lifecycle)) {
+    if (effectiveTerminal) {
+      const lifecycle = declared ? declared.lifecycle : checkpoint.projection.lifecycle;
+      const completeness = declared ? declared.completeness : checkpoint.projection.completeness;
+      const disagrees = declared !== undefined && (declared.lifecycle !== checkpoint.projection.lifecycle || declared.completeness !== checkpoint.projection.completeness);
       const marker: TerminalAttemptMarker = {
         attempt: checkpoint.attempt,
-        lifecycle: checkpoint.projection.lifecycle,
-        completeness: checkpoint.projection.completeness,
+        lifecycle,
+        completeness,
         occurredAt: checkpoint.occurredAt,
+        ...(disagrees ? { projectedDisagreement: { lifecycle: checkpoint.projection.lifecycle, completeness: checkpoint.projection.completeness } } : {}),
       };
       terminalAttempts = [...terminalAttempts.filter((existingMarker) => existingMarker.attempt !== marker.attempt), marker];
     }
@@ -1085,7 +1147,7 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     await store.update(lineageKey(lineageId), next);
     await registerLineageInRunIndex(store, runId, lineageId);
 
-    if (isTerminalLifecycle(checkpoint.projection.lifecycle)) {
+    if (effectiveTerminal) {
       await enforceTerminalAttemptHistory(store, runId, policy, options.now());
     }
   }

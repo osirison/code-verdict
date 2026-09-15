@@ -73,7 +73,7 @@ import {
 } from './harnessEvidenceLedger';
 import type { ActivityEvent, Plan, RunPhase, RunProjection } from '../domain/harnessActivity';
 import type { BudgetConsumption, MemberCoverage, UnresolvedWork } from '../domain/harnessCoverage';
-import { isTerminalLifecycle, type AttemptNumber, type LineageId, type RunId } from '../domain/harnessLifecycle';
+import { isTerminalLifecycle, type AttemptNumber, type LineageId, type ResultCompleteness, type RunId, type RunLifecycle } from '../domain/harnessLifecycle';
 import type { HarnessPolicy } from '../domain/harnessPolicy';
 import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 
@@ -95,6 +95,27 @@ export interface RetryState {
 }
 
 export const INITIAL_RETRY_STATE: RetryState = Object.freeze({ waiting: false, transientAttempts: 0 });
+
+/**
+ * A terminal writer's own declared outcome (`runPersisting`/`finalizeBootstrapFailure`/
+ * `finalizeEscapedError` in `harnessAttempt.ts`, and `closeCheckpointAsTerminal` here) — the
+ * production incident's fix. `HarnessRunStore.writeCheckpoint`'s `terminalAttempts` gate used to
+ * derive terminality solely from `checkpoint.projection.lifecycle`, itself recomputed one layer away
+ * by `reduceActivity` over `compactActivity`'s `dedupeAndSort`-re-sorted activity tail — a single
+ * late/out-of-order-sequence activity event landing after the writer's own `terminalResult` fact
+ * could silently misclassify a genuinely terminal checkpoint as non-terminal, and no attempt marker
+ * ever landed. A writer that actually just appended a `terminalResult` fact and is calling this the
+ * attempt's one terminal write *knows* what it intends far more reliably than a re-derivation ever
+ * can, so it says so directly here — trusted by `writeCheckpoint`'s marker gate instead of (or
+ * alongside, to catch disagreement) the projection. `projection` itself is never touched by this
+ * field: it stays exactly what `reduceActivity` computed, for every display/reduction purpose that
+ * already reads it — this field only changes what `writeCheckpoint` trusts for the terminal-marker
+ * decision, never what a checkpoint's own `projection.lifecycle` reports.
+ */
+export interface IntendedTerminal {
+  readonly lifecycle: RunLifecycle;
+  readonly completeness: ResultCompleteness;
+}
 
 export function isRetryState(value: unknown): value is RetryState {
   if (typeof value !== 'object' || value === null) return false;
@@ -142,6 +163,14 @@ export interface PersistedCheckpoint {
   readonly coverage: readonly MemberCoverage[];
   readonly unresolved: UnresolvedWork;
   readonly retry: RetryState;
+  /**
+   * Set only by a writer that just appended this checkpoint's own terminal `terminalResult` fact
+   * (`runPersisting`/`finalizeBootstrapFailure`/`finalizeEscapedError`) or by `closeCheckpointAsTerminal`
+   * closing one — see `IntendedTerminal`'s own doc comment. Absent for every ordinary phase-boundary
+   * checkpoint, and for every checkpoint built before this field existed (old persisted checkpoints
+   * parse it as absent, per this module's fail-closed/backward-compatible convention).
+   */
+  readonly intendedTerminal?: IntendedTerminal;
   /** This record's own serialized size (task 11.4's accounting unit); computed once, over everything but itself. */
   readonly bytes: number;
   /** False only when protected/required content alone still exceeds a per-attempt activity bound (11.3/11.4) — never because content was silently dropped. `HarnessRunStore` (11.1/11.4) may also flip this false on a per-lineage byte bound it alone can see. */
@@ -171,6 +200,8 @@ export interface CheckpointBuildInput {
   readonly coverage: readonly MemberCoverage[];
   readonly unresolved: UnresolvedWork;
   readonly retry?: RetryState;
+  /** Forwarded verbatim onto the built `PersistedCheckpoint` — see `IntendedTerminal`'s own doc comment. */
+  readonly intendedTerminal?: IntendedTerminal;
 }
 
 function latestPlanFrom(events: readonly ActivityEvent[]): Plan | undefined {
@@ -271,6 +302,7 @@ export function buildCheckpoint(
     coverage: input.coverage,
     unresolved: input.unresolved,
     retry,
+    ...(input.intendedTerminal !== undefined ? { intendedTerminal: input.intendedTerminal } : {}),
     compatible: incompatibilityReasons.length === 0,
     incompatibilityReasons,
   };
@@ -375,6 +407,12 @@ export function closeCheckpointAsTerminal(
     occurredAt: clampedOccurredAt,
     projection,
     activity: compaction.events,
+    // This function just appended `context.terminalFact` as the log's own last event and re-derived
+    // `projection` from it, so the two never disagree here the way a live attempt's own checkpoint
+    // can (`IntendedTerminal`'s own doc comment) — declared anyway, for the same reason every other
+    // terminal writer declares it: `writeCheckpoint`'s marker gate should never have to re-derive
+    // what a writer that just closed this checkpoint already knows for certain.
+    intendedTerminal: { lifecycle: context.terminalFact.lifecycle, completeness: context.terminalFact.completeness },
     compatible: latest.compatible && incompatibilityReasons.length === latest.incompatibilityReasons.length,
     incompatibilityReasons,
   };

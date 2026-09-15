@@ -230,6 +230,46 @@ function cancelledResult(refLabel = 'run', itemCount = 0): HarnessAttemptResult 
   };
 }
 
+/**
+ * A minimal, valid `ReviewRunSnapshot` for `runId`/`lineageId` — the same literal shape the Fix 2/Fix 3
+ * incident tests below (and the pre-existing crash-catch test) all need to seed `harnessRunStore`
+ * with before writing a checkpoint against it, factored out to avoid triplicating it.
+ */
+function fixtureHarnessSnapshot(runId: string, lineageId: string): ReviewRunSnapshot {
+  return {
+    schemaVersion: '1',
+    runId,
+    lineageId,
+    attempt: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    targetKind: 'cr',
+    members: [
+      {
+        memberId: 'm1',
+        providerId: 'fixture',
+        instanceUrl: 'https://example.test',
+        ref: { repoId: 'repo-1', number: '2841' },
+        baseSha: BASE_SHA,
+        headSha: HEAD_SHA,
+        providerCapabilitySignature: 'sig-1',
+        rootAgentsPolicy: { present: false },
+        context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+      },
+    ],
+    agentId: 'built-in',
+    agentInstructions: 'Review the change carefully.',
+    agentInstructionsDigest: 'digest-instructions',
+    personaLabel: 'Built-in reviewer',
+    modelId: 'test-model',
+    effort: 'none',
+    effortInstructionDigest: 'digest-effort',
+    criteria: DEFAULT_CRITERIA,
+    extraInstructionsDigest: 'digest-extra',
+    toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+    harnessPolicyVersion: HARNESS_POLICY_VERSION,
+  };
+}
+
 /** Shared by `controllableRunners`/`unresponsiveRunner`: the same items-in, `HarnessAttemptResult`-out conversion the deleted pre-harness `{lm, demo}` adapter (`reviewRunManager.ts`, removed task 15.8) used, kept here purely as a test fixture — never a shipped bypass. */
 function resultFromResponse(refLabel: string, response: AgentReviewResponse): HarnessAttemptResult {
   return { ...succeededResult(response.items.length, refLabel), findings: response.items.map((item) => ({ item }) as unknown as ValidatedFinding) };
@@ -1238,6 +1278,181 @@ describe('the in-flight record and the interrupted sweep', () => {
       const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
       expect(swept).toBeGreaterThan(0);
       expect(harnessRunStore.latestCheckpoint(record.lineageId)?.projection.lifecycle).toBe('interrupted');
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+    },
+  );
+
+  it(
+    "completeAttempt's ordinary failed settle recovers a missing terminal write: verifying finds no " +
+      "terminal marker for this attempt, retries by closing this attempt's own last nonterminal " +
+      'checkpoint with the truthful failed outcome, and clears the in-flight marker normally once the ' +
+      'retry lands',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState } = manager({ runners });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+
+      // A real attempt's own genuine, still-nonterminal phase-boundary checkpoint — what
+      // `harnessRunStore` holds when the store's own terminal write is the one thing missing (Fix 1's
+      // own incident shape, or any other cause), never a crash: `run()` genuinely resolves below.
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot = fixtureHarnessSnapshot(record.runId, record.lineageId);
+      await harnessRunStore.writeSnapshot(snapshot);
+      let log = createActivityLog(record.runId, record.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: record.runId,
+          lineageId: record.lineageId,
+          attempt: 1,
+          phase: 'investigating',
+          reason: 'phaseBoundary',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 1000,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      expect(built.projection.lifecycle).toBe('investigating'); // sanity: genuinely nonterminal
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+
+      // The attempt genuinely, cleanly finishes `failed` — `run()` resolves, not rejects — but this
+      // test's own `harnessRunStore` (the same one production's `harnessRuntime.ts` would have used)
+      // never received the terminal write. A hand-built result, not `failedResult(...)`: that shared
+      // fixture's own `'harness.test'` limitation code is a free-text stand-in never meant to satisfy
+      // `appendActivityEvent`'s own short-token sanitizer (`/^[A-Za-z][A-Za-z0-9]*$/`) — real
+      // production limitations always are one (every code this codebase mints is a plain camelCase
+      // token), so this uses one too, to exercise the retry's genuine success path rather than the
+      // separate "the fact itself failed sanitization" failure mode.
+      pending.get('!2841')!.resolve({
+        ...failedResult('Coverage did not reach every high-risk file.', 'irrelevant-result-refLabel', 2),
+        outcome: { ...failedResult('x', 'irrelevant-result-refLabel', 2).outcome, limitations: [{ code: 'coverageIncomplete', message: 'Coverage did not reach every high-risk file.' }] },
+      });
+      await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+      // The recovery landed: a terminal marker now exists for this exact attempt, carrying the
+      // RESULT's own truthful outcome — never a fabricated `'interrupted'`.
+      const reread = harnessRunStore.readLineage(record.lineageId);
+      expect(reread?.terminalAttempts).toEqual([expect.objectContaining({ attempt: 1, lifecycle: 'failed', completeness: 'partial' })]);
+      expect(harnessRunStore.latestCheckpoint(record.lineageId)?.projection.lifecycle).toBe('failed');
+      // And the marker cleared normally — no persistence-gap limitation was needed.
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+      expect(runs.get(record.key)?.limitations).not.toContainEqual(expect.objectContaining({ code: 'terminalPersistenceGap' }));
+    },
+  );
+
+  it(
+    "completeAttempt's ordinary settle leaves the in-flight marker when even the retry cannot confirm " +
+      'a terminal write (no checkpoint at all exists to recover from), naming the gap as a limitation ' +
+      'on the settled record — and the next activation sweep still closes it truthfully',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState } = manager({ runners });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+
+      // Persistence was engaged for this attempt (a snapshot landed — `readLineage` will find
+      // something) but no checkpoint EVER did: the retry has nothing to close from, so a rebuild is
+      // genuinely impossible with what `completeAttempt` has in hand.
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      await harnessRunStore.writeSnapshot(fixtureHarnessSnapshot(record.runId, record.lineageId));
+
+      pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', 'irrelevant-result-refLabel', 2));
+      await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+      // No terminal marker exists — the retry could not confirm one — so the marker survives for the
+      // sweep, exactly like the crash-catch's own leave-not-clear behavior above.
+      expect(new InFlightRunStore(globalState).list()).toHaveLength(1);
+      // The gap is named on the settled record, not silently absorbed.
+      expect(runs.get(record.key)?.limitations).toContainEqual(expect.objectContaining({ code: 'terminalPersistenceGap' }));
+
+      // The next activation's sweep still runs `closeLeftoverInFlightEntry` for this leftover entry —
+      // there is nothing in `harnessRunStore` to find terminal, so it would fall back to a bare
+      // `interrupted` row, except `completeAttempt` already wrote a truthful `'partial'` row for this
+      // exact run before settling (`recordPartialHistory`, carrying the persistence-gap limitation
+      // itself) — `recordIfFresher` correctly refuses to let the sweep's stale-timestamped
+      // `interrupted` row clobber it (`reviewRuns.ts`'s own freshness guard): the run genuinely did
+      // finish with real content, and `'partial'` is the truthful label, not `'interrupted'`. The
+      // sweep's own durable effect here is exactly what it should be — clearing the in-flight marker.
+      const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+      expect(swept).toBeGreaterThan(0);
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+      const rows = new ReviewRunStore(globalState).list();
+      expect(rows.find((row) => row.repoId === 'repo-1' && row.crNumber === '2841')).toMatchObject({
+        outcome: 'partial',
+        limitations: expect.arrayContaining([expect.objectContaining({ code: 'terminalPersistenceGap' })]),
+      });
+    },
+  );
+
+  it(
+    'a new trigger on the same target starting immediately after does not destroy a predecessor ' +
+      "attempt's own still-unswept in-flight marker — InFlightRunStore.add's latest-wins-per-key " +
+      'semantics used to overwrite it silently before any sweep could inspect it',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState } = manager({ runners });
+
+      // Attempt 1: genuinely finishes `failed`. Persistence was engaged for its lineage (a snapshot
+      // landed) but no checkpoint ever did, so Fix 2's own retry cannot confirm a terminal write and
+      // deliberately leaves attempt 1's in-flight marker in place for the sweep — the same shape the
+      // previous test constructs deliberately, needed again here as the precondition Fix 3 guards.
+      const first = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      await harnessRunStore.writeSnapshot(fixtureHarnessSnapshot(first.runId, first.lineageId));
+      pending.get('!2841')!.resolve(failedResult('Coverage did not reach every high-risk file.', 'irrelevant-result-refLabel', 2));
+      await vi.waitFor(() => expect(runs.get(first.key)?.status).toBe('failed'));
+      expect(new InFlightRunStore(globalState).list()).toEqual([expect.objectContaining({ key: first.key, lineageId: first.lineageId })]);
+
+      // Attempt 2: a completely fresh trigger on the SAME target (repoId!crNumber), minting a
+      // brand-new lineage — allowed because attempt 1's in-memory record already reached `failed`,
+      // a terminal lifecycle, satisfying `trigger`'s own admission check. Before this fix,
+      // `InFlightRunStore.add`'s latest-wins-per-key write below would have silently destroyed
+      // attempt 1's own still-unswept marker the moment this second trigger started.
+      const second = runs.trigger(crInput('2841'), 3);
+      expect(second.lineageId).not.toBe(first.lineageId);
+      // Waits for attempt 2's OWN entry specifically, not merely "length 1": `closeLeftoverInFlightEntry`
+      // runs (and awaits its own writes) before `InFlightRunStore.add` replaces attempt 1's same-key
+      // entry, so the list genuinely does read as length 1 — still attempt 1's own stale entry — for
+      // one or more polls in between.
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toEqual([expect.objectContaining({ key: second.key, lineageId: second.lineageId })]));
+
+      // Attempt 1's predecessor marker was run through `closeLeftoverInFlightEntry` — never silently
+      // dropped — before attempt 2's own marker took its place under the same key: the row
+      // `completeAttempt` already wrote for it (truthful `'partial'`, carrying the persistence-gap
+      // limitation) survives `recordIfFresher`'s own freshness guard exactly like the previous test's
+      // sweep-driven close does, since a live pre-add close and the activation sweep share this exact
+      // machinery.
+      const runStore = new ReviewRunStore(globalState);
+      const rows = runStore.list();
+      expect(rows.find((row) => row.repoId === 'repo-1' && row.crNumber === '2841')).toMatchObject({
+        outcome: 'partial',
+        limitations: expect.arrayContaining([expect.objectContaining({ code: 'terminalPersistenceGap' })]),
+      });
+      // And the list now holds only attempt 2's own live marker — attempt 1's was closed and
+      // removed, not left to coexist or silently vanish.
+      expect(new InFlightRunStore(globalState).list()).toEqual([expect.objectContaining({ key: second.key, lineageId: second.lineageId })]);
+
+      // Attempt 2 itself still resolves normally afterward, unaffected by its predecessor's close.
+      pending.get('!2841')!.resolve(succeededResult(1, 'irrelevant-result-refLabel'));
+      await vi.waitFor(() => expect(runs.get(second.key)).toBeUndefined()); // succeeded records are deleted
       expect(new InFlightRunStore(globalState).list()).toEqual([]);
     },
   );

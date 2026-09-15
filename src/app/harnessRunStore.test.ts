@@ -409,6 +409,127 @@ describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, dige
   });
 });
 
+// ---- The production incident: a terminal write whose own projection mis-derives non-terminal
+// (a late/out-of-order-sequence activity event lands after the writer's own terminalResult fact,
+// so `reduceActivity`'s "read the last event by sequence" rule picks the wrong one) must still land
+// the attempt's terminal marker — from the writer's own `intendedTerminal` declaration, never from
+// the mis-derived projection — and must surface the disagreement rather than silently resolve it. ----
+describe('HarnessRunStore (incident fix): writeCheckpoint trusts a declared intendedTerminal over a mis-derived projection', () => {
+  it('lands the terminal marker from the declaration, and records the projection disagreement, when a late-sequenced event outranks the terminalResult fact', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    // Constructed directly (bypassing `appendActivityEvent`'s own forward-sequencing) to reproduce
+    // exactly what the incident's own diagnosis found: a `terminalResult` fact at sequence 1, but a
+    // second, unrelated activity event that landed at sequence 2 — `dedupeAndSort`'s own
+    // sort-by-sequence rule (`harnessActivityCompaction.ts`) then makes THAT event the log's last one,
+    // so `deriveLifecycle` (`harnessActivityProjection.ts`) reads its non-terminal phase instead of the
+    // terminal fact that, in wall-clock terms, actually happened last.
+    const activityEvents = [
+      {
+        runId: RUN_ID,
+        lineageId: 'lineage-1',
+        attempt: 1,
+        sequence: 1,
+        occurredAt: '2026-01-01T00:00:05.000Z',
+        phase: 'persisting' as const,
+        elapsedMs: 5000,
+        kind: 'terminalResult' as const,
+        lifecycle: 'failed' as const,
+        completeness: 'partial' as const,
+        limitations: [],
+      },
+      {
+        runId: RUN_ID,
+        lineageId: 'lineage-1',
+        attempt: 1,
+        sequence: 2,
+        occurredAt: '2026-01-01T00:00:03.000Z',
+        phase: 'investigating' as const,
+        elapsedMs: 3000,
+        kind: 'toolCompleted' as const,
+        tool: 'readDiff',
+        summary: 'A late tool result arriving after the terminal write.',
+        target: 'file1.ts',
+      },
+    ];
+
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents, intendedTerminal: { lifecycle: 'failed', completeness: 'partial' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    // Sanity: the projection really does mis-derive non-terminal here, exactly like the incident.
+    expect(built.projection.lifecycle).toBe('investigating');
+    expect(built.intendedTerminal).toEqual({ lifecycle: 'failed', completeness: 'partial' });
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const record = runStore.readLineage('lineage-1');
+    // The marker lands — the exact thing the incident's own lineage never got — from the declaration,
+    // never from the mis-derived projection.
+    expect(record?.terminalAttempts).toEqual([
+      {
+        attempt: 1,
+        lifecycle: 'failed',
+        completeness: 'partial',
+        occurredAt: built.occurredAt,
+        projectedDisagreement: { lifecycle: 'investigating', completeness: built.projection.completeness },
+      },
+    ]);
+    // The checkpoint's own projection is untouched — still what `reduceActivity` computed, for every
+    // display/reduction purpose that reads it.
+    expect(runStore.latestCheckpoint('lineage-1')?.projection.lifecycle).toBe('investigating');
+  });
+
+  it('an absent intendedTerminal falls back to today\'s projection-derived decision, unchanged', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    const built = buildCheckpoint(checkpointInput(), DEFAULT_HARNESS_POLICY); // no activity: projection is 'queued', non-terminal, no declaration
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.readLineage('lineage-1')?.terminalAttempts).toEqual([]);
+  });
+
+  it('a declaration that agrees with the projection lands a marker with no disagreement recorded', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(log, { kind: 'terminalResult', lifecycle: 'succeeded', completeness: 'complete', limitations: [] }, { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'persisting', elapsedMs: 1000 });
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, intendedTerminal: { lifecycle: 'succeeded', completeness: 'complete' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    expect(built.projection.lifecycle).toBe('succeeded'); // sanity: declaration and projection genuinely agree here
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.readLineage('lineage-1')?.terminalAttempts).toEqual([{ attempt: 1, lifecycle: 'succeeded', completeness: 'complete', occurredAt: built.occurredAt }]);
+  });
+
+  it('intendedTerminal survives a real JSON checkpoint round-trip, and a checkpoint persisted before this field existed still parses with it absent', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(log, { kind: 'terminalResult', lifecycle: 'failed', completeness: 'none', limitations: [] }, { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'persisting', elapsedMs: 1000 });
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, intendedTerminal: { lifecycle: 'failed', completeness: 'none' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.latestCheckpoint('lineage-1')?.intendedTerminal).toEqual({ lifecycle: 'failed', completeness: 'none' });
+
+    // A pre-existing persisted checkpoint (older schema, no `intendedTerminal` field at all) still
+    // parses, with the field simply absent — never fabricated, never failing the whole record closed.
+    const legacyBuilt = buildCheckpoint(checkpointInput({ checkpointId: 'ckpt-legacy', lineageId: 'lineage-2' }), DEFAULT_HARNESS_POLICY);
+    const legacyRaw = JSON.parse(JSON.stringify(legacyBuilt)) as Record<string, unknown>;
+    expect(legacyRaw.intendedTerminal).toBeUndefined();
+    await runStore.writeCheckpoint(legacyBuilt, GENEROUS_RETENTION);
+    expect(runStore.latestCheckpoint('lineage-2')?.intendedTerminal).toBeUndefined();
+  });
+});
+
 // ---- Persisted root-policy text stays byte-bounded (6784d7c's fix let a real AGENTS.md/CLAUDE.md
 // reach a snapshot's rootAgentsPolicy.text; writeSnapshot itself must not let that grow the stored
 // record without limit). ----

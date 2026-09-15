@@ -103,7 +103,7 @@ import { randomBytes } from 'node:crypto';
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
 import type { AgentTimeoutReason } from './agentTrace';
 import { runWithRetry, retryBackoffPolicyFrom } from './harnessRetry';
-import type { RetryState } from './harnessCheckpoint';
+import type { IntendedTerminal, RetryState } from './harnessCheckpoint';
 import {
   INVESTIGATION_MAP_OFF_MANIFEST_SHOWN,
   type InvestigationMapFile,
@@ -484,6 +484,19 @@ export interface CheckpointInfo {
    * attempt; a hand-built test fixture predating this fix is not forced to.
    */
   readonly retry?: RetryState;
+  /**
+   * Set only by `reportCheckpoint`'s three terminal call sites (`runPersisting`,
+   * `finalizeBootstrapFailure`, `finalizeEscapedError`) — the same lifecycle/completeness each just
+   * appended as this checkpoint's own `terminalResult` activity fact, forwarded here so a real
+   * `onCheckpoint` (`harnessRuntime.ts`) can hand it to `harnessRunStore.buildAndWriteCheckpoint` as
+   * `CheckpointBuildInput.intendedTerminal` (`harnessCheckpoint.ts`'s `IntendedTerminal`) — the
+   * production incident fix: a writer that just wrote the terminal fact itself is a more reliable
+   * source of "is this checkpoint terminal" than a re-derivation one layer away
+   * (`activityLog`'s own `reduceActivity` projection, `CheckpointInfo`'s own header comment on why
+   * this module never persists that projection directly). Absent for every ordinary phase-boundary
+   * checkpoint `fireCheckpoint` reports.
+   */
+  readonly intendedTerminal?: IntendedTerminal;
 }
 
 export type OnCheckpoint = (info: CheckpointInfo) => void | Promise<void>;
@@ -1245,7 +1258,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
    * marker for the 'persisting' phase boundary always fired *before* `runPersisting` appended the
    * terminal fact.
    */
-  async function reportCheckpoint(checkpointId: string, phase: RunPhase, reason: CheckpointReason): Promise<void> {
+  async function reportCheckpoint(checkpointId: string, phase: RunPhase, reason: CheckpointReason, intendedTerminal?: IntendedTerminal): Promise<void> {
     if (!onCheckpoint) return; // nothing to gather a state snapshot for
     const coverage: MemberCoverage[] = [];
     for (const member of inventory.members()) {
@@ -1269,6 +1282,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       coverage,
       unresolved: { unresolvedFetches: 0, unresolvedCandidates: candidateTracker.unresolvedCount() },
       retry: { waiting: false, transientAttempts: modelRetryTransientAttempts },
+      ...(intendedTerminal !== undefined ? { intendedTerminal } : {}),
     };
     await onCheckpoint(info);
   }
@@ -3697,7 +3711,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // not expect. This checkpoint's own identity is "persisting's terminal write", which genuinely
     // is what just happened, cancelled or not; only the public `terminalResult` activity event above
     // — the one `reduceActivity`'s projection actually reads — needed the truthful phase.
-    await reportCheckpoint(mintId('ckpt'), 'persisting', 'phaseBoundary');
+    await reportCheckpoint(mintId('ckpt'), 'persisting', 'phaseBoundary', { lifecycle, completeness: outcome.completeness });
     terminalCheckpointWritten = true;
     const attemptOutcome: HarnessAttemptOutcome = { lifecycle, outcome, findings, plan, conclusion, cancelled: cancelledNow, contradicted: latestContradicted };
     await onPersist?.(attemptOutcome, activityLog);
@@ -3751,7 +3765,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     appendActivity({ kind: 'terminalResult', lifecycle, completeness: 'none', limitations: [limitation] }, 'bootstrap');
     // Reported after the terminal fact, same as `runPersisting` — a bootstrap failure must also
     // land terminal in `HarnessRunStore` rather than leaving the lineage looking merely stalled.
-    await reportCheckpoint(mintId('ckpt'), 'bootstrap', 'phaseBoundary');
+    await reportCheckpoint(mintId('ckpt'), 'bootstrap', 'phaseBoundary', { lifecycle, completeness: 'none' });
     terminalCheckpointWritten = true;
     const outcome: CompletionOutcome = {
       kind: 'failed',
@@ -3847,7 +3861,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       currentPhase,
     );
     try {
-      await reportCheckpoint(mintId('ckpt'), currentPhase, 'attemptFailed');
+      await reportCheckpoint(mintId('ckpt'), currentPhase, 'attemptFailed', { lifecycle: cancelledNow ? 'cancelled' : 'failed', completeness });
       terminalCheckpointWritten = true;
     } catch (writeError) {
       const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
