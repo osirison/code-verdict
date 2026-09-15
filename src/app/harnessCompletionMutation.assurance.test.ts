@@ -20,7 +20,7 @@
  * - The fake `Connection` / real-`createReviewHarnessFactory` idiom from
  *   `harnessProviderLimits.assurance.test.ts` and `harnessRuntime.test.ts`,
  *   for clauses a real provider response and model turn can independently
- *   defeat (headUnchanged, inventoryCompleteForEveryMember,
+ *   defeat (headVerified, inventoryCompleteForEveryMember,
  *   everyFileClassified, configuredRiskCoverageSatisfied,
  *   noUnresolvedCandidates).
  * - The `createHarnessAttempt` / scripted-`HarnessModelSeam` idiom from
@@ -343,10 +343,34 @@ function expectOnlyClauseFailed(result: { outcome: { completeness: string; clean
   expect(result.outcome.blockerDetails?.every((detail) => detail.clause === clause)).toBe(true);
 }
 
-// ---- 1. headUnchanged -----------------------------------------------------------------
+// ---- 1. headVerified -----------------------------------------------------------------
 
-describe('16.7: headUnchanged is load-bearing — a real moved head blocks completion, alone', () => {
-  it('a genuine post-snapshot head move is the only reported blocker', async () => {
+describe('16.7: headVerified is load-bearing — a real unresolvable head blocks completion, alone', () => {
+  it('a genuine provider failure to resolve the current head is the only reported blocker', async () => {
+    const connection = fakeConnection({
+      getChangeRequestDetails: async () => detailResult(),
+      listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [{ path: LOW_FILE, kind: 'modified', binary: false, addedLines: 1, removedLines: 1 }] }),
+      readDiff: async (request) => diffPage(request.path),
+      // The provider genuinely could not resolve the current head — unlike a resolved-but-different
+      // head (below), this says nothing about whether the branch moved, so it must still block: an
+      // unperformed or unresolved check cannot honestly disclose anything either way.
+      getCurrentHead: async () => ({ repoId: REPO_ID, state: 'notFound' }),
+    });
+    registerFakeProvider(connection);
+
+    const runTurn = cleanRunTurn((call) => (call === 1 ? { messages: [{ kind: 'toolRequest', tool: 'readDiff', memberId: MEMBER_ID, request: { snapshot: { repoId: REPO_ID, baseSha: BASE_SHA, headSha: HEAD_SHA }, path: LOW_FILE } }] } : stopMessages()));
+    const deps: HarnessRuntimeDeps = { ...baseDeps(), runTurn };
+    const factory = createReviewHarnessFactory(deps);
+    const identity = { runId: 'run-mut-head', lineageId: 'lineage-mut-head', attempt: 1 };
+    const result = await factory.create(runInput(), noopRunOptions(identity)).run();
+
+    expectOnlyClauseFailed(result, 'headVerified');
+    expect(result.outcome.limitations.map((l) => l.code)).toEqual(['providerLimit']);
+  });
+});
+
+describe('a genuine post-snapshot head move never blocks completion — the owner\'s principle', () => {
+  it('reaches granted, with the moved head disclosed rather than refused', async () => {
     const connection = fakeConnection({
       getChangeRequestDetails: async () => detailResult(),
       listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [{ path: LOW_FILE, kind: 'modified', binary: false, addedLines: 1, removedLines: 1 }] }),
@@ -359,11 +383,14 @@ describe('16.7: headUnchanged is load-bearing — a real moved head blocks compl
     const runTurn = cleanRunTurn((call) => (call === 1 ? { messages: [{ kind: 'toolRequest', tool: 'readDiff', memberId: MEMBER_ID, request: { snapshot: { repoId: REPO_ID, baseSha: BASE_SHA, headSha: HEAD_SHA }, path: LOW_FILE } }] } : stopMessages()));
     const deps: HarnessRuntimeDeps = { ...baseDeps(), runTurn };
     const factory = createReviewHarnessFactory(deps);
-    const identity = { runId: 'run-mut-head', lineageId: 'lineage-mut-head', attempt: 1 };
+    const identity = { runId: 'run-mut-head-moved', lineageId: 'lineage-mut-head-moved', attempt: 1 };
     const result = await factory.create(runInput(), noopRunOptions(identity)).run();
 
-    expectOnlyClauseFailed(result, 'headUnchanged');
-    expect(result.outcome.limitations.map((l) => l.code)).toEqual(['headChanged']);
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.outcome.kind).toBe('completeClean');
+    expect(result.outcome.blockerDetails ?? []).toEqual([]);
+    expect(result.outcome.limitations.map((l) => l.code)).toEqual(['headMovedDuringReview']);
+    expect(result.outcome.limitations[0]?.message).toContain('inline comments will anchor to the reviewed revision');
   });
 });
 

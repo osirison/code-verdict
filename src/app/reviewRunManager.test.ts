@@ -27,7 +27,7 @@ import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
 import { sha256Hex } from './contentDigest';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { RUN_LIFECYCLES, type RunLifecycle } from '../domain/harnessLifecycle';
-import type { RunPhase } from '../domain/harnessActivity';
+import type { Limitation, RunPhase } from '../domain/harnessActivity';
 import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
 import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
 import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
@@ -178,7 +178,7 @@ function succeededResult(itemCount: number, refLabel = 'run'): HarnessAttemptRes
 }
 
 /** `itemCount > 0` produces a `partial` outcome with real findings (D11: "the run persists a partial result plus... limitation report") rather than a plain `none`-completeness failure. `blockerDetails` mirrors `CompletionOutcome.blockerDetails` (task: "say which files, not just that some files") — absent by default, matching every existing caller that never set it. */
-function failedResult(message: string, refLabel = 'run', itemCount = 0, blockerDetails?: readonly CompletionBlockerDetail[]): HarnessAttemptResult {
+function failedResult(message: string, refLabel = 'run', itemCount = 0, blockerDetails?: readonly CompletionBlockerDetail[], extraLimitations?: readonly Limitation[]): HarnessAttemptResult {
   const items = response(itemCount).items;
   return {
     runId: refLabel,
@@ -189,7 +189,7 @@ function failedResult(message: string, refLabel = 'run', itemCount = 0, blockerD
       kind: itemCount > 0 ? 'partialFindings' : 'failed',
       completeness: itemCount > 0 ? 'partial' : 'none',
       findingCount: itemCount,
-      limitations: [{ code: 'harness.test', message }],
+      limitations: [{ code: 'harness.test', message }, ...(extraLimitations ?? [])],
       replacesRetainedReview: false,
       clean: false,
       ...(blockerDetails ? { blockerDetails } : {}),
@@ -2318,7 +2318,7 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     },
   );
 
-  it('the sweep\'s own live-terminal-checkpoint branch degrades the fresh-attempt offer the same way completeAttempt\'s live settle does, when the terminal checkpoint\'s own limitations already show a headChanged blocker', async () => {
+  it('the sweep\'s own live-terminal-checkpoint branch folds a legacy headChanged limitation into an informational note, resumable true — never a refusal, the run persisted before the headChanged-is-not-a-blocker fix', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
     const snapshot = sweepSnapshot();
@@ -2330,8 +2330,10 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
         kind: 'terminalResult',
         lifecycle: 'failed',
         completeness: 'none',
-        // The generic blocker-mapped shape `classifyOutcome`'s `blockerLimitation` writes — a
-        // checkpoint (D13) never retains the richer per-member `CompletionBlockerDetail`.
+        // The generic blocker-mapped shape `classifyOutcome`'s `blockerLimitation` used to write for
+        // the retired `headChanged` blocker — a checkpoint (D13) never retains the richer per-member
+        // `CompletionBlockerDetail`. Exercises `headMovedNotes`' legacy-code fallback: a run
+        // persisted before the headChanged-is-not-a-blocker fix still carries this exact code.
         limitations: [{ code: 'headChanged', message: 'The target head changed after the snapshot was taken.' }],
       },
       { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
@@ -2343,11 +2345,14 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     await sweepInterruptedRuns(globalState, { harnessRunStore });
 
     const row = new ReviewRunStore(globalState).list()[0]!;
-    expect(row.resumable).toBe(false);
-    const headMoved = row.resumeReasons?.find((reason) => reason.code === 'headMoved');
+    // The checkpoint's own integrity is otherwise sound — only the legacy headChanged limitation
+    // is in play, and it no longer degrades the offer.
+    expect(row.resumable).toBe(true);
+    const headMoved = row.resumeReasons?.find((reason) => reason.code === 'headMovedDuringReview');
     expect(headMoved?.message).toContain('The target head changed after the snapshot was taken.');
-    expect(headMoved?.message).toContain('fresh review of the current head');
-    expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(false);
+    expect(headMoved?.message).toContain('A new attempt from this checkpoint reviews that same pinned revision');
+    expect(headMoved?.message.toLowerCase()).not.toMatch(/\b(continue|resume|reconnect)\b/);
+    expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(true);
   });
 
   it('a richer row a faster new run already recorded for the target survives the terminal-checkpoint branch too', async () => {
@@ -2598,9 +2603,9 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     expect(controls.freshAttemptReasons).toEqual(row?.resumeReasons);
   });
 
-  // ---- Incident fix: a headChanged blocker degrades the fresh-attempt offer at settle time ----
+  // ---- A moved-head disclosure never degrades the fresh-attempt offer at settle time ----
 
-  it('a live failed settle whose own outcome carries an unrepairable headChanged blocker records resumable: false, naming the moved head — never a bare "resumable: true" a reviewer could burn a budget against', async () => {
+  it('a live failed settle whose own outcome discloses a moved head records resumable: true, with an informational note — never a refusal a reviewer would have to work around', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
     const { pending, optionsOf, runners } = controllableAttempts();
@@ -2609,8 +2614,10 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     runs.trigger(crInput('42'), 1);
     const { lineageId, runId } = optionsOf.get('!42')!.identity;
     // The stored checkpoint's own integrity is otherwise sound (same snapshot/checkpoint pairing
-    // the passing "writes lineageId/resumable" test above uses) — only the live outcome's own
-    // headChanged blocker should be what degrades this offer.
+    // the passing "writes lineageId/resumable" test above uses); the outcome fails for an
+    // unrelated reason (the generic `harness.test` limitation `failedResult` always carries) while
+    // also disclosing a moved head — neither degrades this offer, since a moved head never blocks
+    // completion any more (`harnessCompletion.ts`'s D11 rewrite).
     const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
     await harnessRunStore.writeSnapshot(snapshot);
     const checkpoint = buildCheckpoint(
@@ -2619,43 +2626,48 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     );
     await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
 
-    const blockerDetails: readonly CompletionBlockerDetail[] = [
-      { blocker: 'headChanged', clause: 'headUnchanged', memberId: 'm1', message: 'Member m1 head moved from aaaaaaa to bbbbbbb.', repairable: false },
-    ];
-    pending.get('!42')!.resolve(failedResult('Head moved from the pinned revision.', '!42', 1, blockerDetails));
+    pending.get('!42')!.resolve(
+      failedResult('Budget exhausted.', '!42', 1, undefined, [
+        { code: 'headMovedDuringReview', message: 'Member m1: reviewed at aaaaaaa; the branch moved to bbbbbbb during the review — inline comments will anchor to the reviewed revision.' },
+      ]),
+    );
     await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
 
     const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
-    expect(row?.resumable).toBe(false);
-    const headMoved = row?.resumeReasons?.find((reason) => reason.code === 'headMoved');
-    expect(headMoved?.message).toContain('Member m1 head moved from aaaaaaa to bbbbbbb.');
-    expect(headMoved?.message).toContain('fresh review of the current head');
+    expect(row?.resumable).toBe(true);
+    const headMoved = row?.resumeReasons?.find((reason) => reason.code === 'headMovedDuringReview');
+    expect(headMoved?.message).toContain('reviewed at aaaaaaa; the branch moved to bbbbbbb');
+    expect(headMoved?.message).toContain('A new attempt from this checkpoint reviews that same pinned revision');
     // The reviewer-facing wording ban still applies to this text.
     expect(headMoved?.message.toLowerCase()).not.toMatch(/\b(continue|resume|reconnect)\b/);
     const controls = deriveRunControls(undefined, row);
-    expect(controls.canStartFreshAttempt).toBe(false);
+    expect(controls.canStartFreshAttempt).toBe(true);
     expect(controls.freshAttemptReasons).toEqual(row?.resumeReasons);
   });
 
-  it('resumeRun refuses a row whose resumeReasons carry headMoved, even called directly without going through the (already-false) offer — defense in depth', async () => {
+  it('resumeRun proceeds on a row whose resumeReasons carry only a moved-head disclosure — resume is no longer doomed by it', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
     await seedResumableLineage(globalState, harnessRunStore);
-    // Overwrite the seeded row's own resumable offer with the headMoved shape `headMovedReason`
-    // produces — the exact row a degraded settle would have written.
+    // Overwrite the seeded row's own offer with the informational shape `headMovedNotes`
+    // produces — resumable stays true, the note just comes along for the ride.
     const runsStore = new ReviewRunStore(globalState);
     const existing = runsStore.byRef().get(crKey('repo-1', '42'))!;
-    await runsStore.record({ ...existing, resumable: false, resumeReasons: [{ code: 'headMoved', message: 'Member m1 head moved from aaaaaaa to bbbbbbb. A fresh review of the current head is needed.' }] });
+    await runsStore.record({
+      ...existing,
+      resumable: true,
+      resumeReasons: [{ code: 'headMovedDuringReview', message: 'Member m1: reviewed at aaaaaaa; the branch moved to bbbbbbb during the review — inline comments will anchor to the reviewed revision. A new attempt from this checkpoint reviews that same pinned revision — the branch has moved since.' }],
+    });
     const { calls, runners } = trackedRunners();
     const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
 
     const record = runs.resumeRun(crInput('42'), 1);
 
-    expect(record).toBeUndefined();
-    expect(calls).toEqual([]);
+    expect(record).toBeDefined();
+    await vi.waitFor(() => expect(calls).toEqual(['resume']));
   });
 
-  it('resumeRun on an ordinary same-head budget-exhausted row (no headMoved reason) is untouched by the incident fix', async () => {
+  it('resumeRun on an ordinary same-head budget-exhausted row (no head-moved disclosure) is untouched', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
     await seedResumableLineage(globalState, harnessRunStore);
@@ -2663,7 +2675,7 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
 
     const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
-    expect(row?.resumeReasons?.some((reason) => reason.code === 'headMoved') ?? false).toBe(false);
+    expect(row?.resumeReasons?.some((reason) => reason.code === 'headMovedDuringReview') ?? false).toBe(false);
 
     const record = runs.resumeRun(crInput('42'), 1);
 

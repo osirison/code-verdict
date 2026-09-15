@@ -1263,6 +1263,17 @@ describe('resume-from-checkpoint offer on the picker screen (task 14.6)', () => 
     for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
   });
 
+  it('still offers "Start new attempt from checkpoint" alongside an informational moved-head note — a disclosure never degrades this offer', () => {
+    const reasons: Limitation[] = [
+      { code: 'headMovedDuringReview', message: 'Member m1: reviewed at aaaaaaa; the branch moved to bbbbbbb during the review — inline comments will anchor to the reviewed revision. A new attempt from this checkpoint reviews that same pinned revision — the branch has moved since.' },
+    ];
+    const html = agentScreen({ resumable: true, reasons });
+    expect(html).toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('Start new attempt from checkpoint');
+    expect(html).toContain('the branch has moved since');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
   it('shows every stored reason and no button when the checkpoint cannot be carried into a new attempt', () => {
     const reasons: Limitation[] = [
       { code: 'model', message: 'The model changed since the checkpoint was written.' },
@@ -1367,6 +1378,17 @@ describe('fresh-attempt offer on the failure card (budget-exhausted resume featu
     const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 1, code: 'harness.incomplete', freshAttempt: { resumable: false, reasons } });
     expect(html).not.toContain('id="resume-from-checkpoint"');
     expect(html).toContain('The model changed since the checkpoint was written.');
+    for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
+  });
+
+  it('still offers "Start new attempt from checkpoint" alongside an informational moved-head note — a disclosure never degrades this offer', () => {
+    const reasons: Limitation[] = [
+      { code: 'headMovedDuringReview', message: 'Member m1: reviewed at aaaaaaa; the branch moved to bbbbbbb during the review — inline comments will anchor to the reviewed revision. A new attempt from this checkpoint reviews that same pinned revision — the branch has moved since.' },
+    ];
+    const html = failureScreen({ message: 'The review could not be completed.', requestId: 'r1', partialCount: 1, code: 'harness.incomplete', freshAttempt: { resumable: true, reasons } });
+    expect(html).toContain('id="resume-from-checkpoint"');
+    expect(html).toContain('Start new attempt from checkpoint');
+    expect(html).toContain('the branch has moved since');
     for (const pattern of FORBIDDEN) expect(visibleText(html)).not.toMatch(pattern);
   });
 

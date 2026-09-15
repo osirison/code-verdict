@@ -292,17 +292,22 @@ describe('task 8.9 scenarios', () => {
     expect(evaluation.eligible).toBe(true);
   });
 
-  it('changed head: the provider reports a later head, so validated findings are at most partial', async () => {
+  it('changed head: the provider reports a later head, but a review of the pinned revision is still valid — the move is disclosed, never blocked', async () => {
     const harness = await start(FIXTURE.stale);
     expect(harness.head).toEqual({ repoId: FIXTURE.stale.repoId, state: 'resolved', headSha: FIXTURE.stale.laterHeadSha });
     await enumerate(harness);
     classifyAll(harness);
     await inspectAll(harness);
     const evaluation = evaluateCompletion(gate(harness));
-    expect(evaluation.blockers).toEqual(['headChanged']);
-    expect(evaluation.repairable).toBe(false);
-    expect(classifyOutcome(evaluation, 1)).toMatchObject({ kind: 'partialFindings', completeness: 'partial', replacesRetainedReview: false, clean: false });
-    expect(classifyOutcome(evaluation, 0)).toMatchObject({ kind: 'failed', completeness: 'none', clean: false });
+    expect(evaluation.eligible).toBe(true);
+    expect(evaluation.blockers).toEqual([]);
+    expect(evaluation.headMoved).toEqual([{ memberId: MEMBER, snapshotHeadSha: FIXTURE.stale.headSha, currentHeadSha: FIXTURE.stale.laterHeadSha }]);
+    expect(classifyOutcome(evaluation, 1)).toMatchObject({ kind: 'completeFindings', completeness: 'complete', replacesRetainedReview: true, clean: false });
+    // The owner's principle at its sharpest: zero findings still reaches complete clean, with the
+    // move disclosed rather than hidden.
+    const clean = classifyOutcome(evaluation, 0);
+    expect(clean).toMatchObject({ kind: 'completeClean', completeness: 'complete', clean: true });
+    expect(clean.limitations).toEqual([{ code: 'headMovedDuringReview', message: expect.stringContaining('inline comments will anchor to the reviewed revision') }]);
   });
 
   it('unresolved candidates: a repairable candidate blocks completion until repaired or rejected at the repair limit', async () => {

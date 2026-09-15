@@ -402,6 +402,31 @@ describe('composeSummaryBody renders a summary-carried finding like something a 
   });
 });
 
+describe('composeSummaryBody names the reviewed revision when the live head has moved (task: submission disclosure)', () => {
+  const baseReview: Review = {
+    repoId: 'repo', crNumber: '1', agentId: 'agent', headSha: 'abcdef1234567', summary: '',
+    criteria: DEFAULT_CRITERIA, items: [], verdicts: {},
+  };
+
+  it('states the reviewed revision as the first line, with both shas short, when the live head differs', () => {
+    const summary = composeSummaryBody('Summary.', '', baseReview, [], 'zzzzzzz9999999');
+    expect(summary).toBe('Reviewed at `abcdef1`; the branch has since moved to `zzzzzzz`.\n\nSummary.');
+  });
+
+  it('omits the line entirely when the live head matches the reviewed head exactly', () => {
+    const summary = composeSummaryBody('Summary.', '', baseReview, [], 'abcdef1234567');
+    expect(summary).toBe('Summary.');
+  });
+
+  it('omits the line when the live head is unknown (the caller never passed one)', () => {
+    expect(composeSummaryBody('Summary.', '', baseReview)).toBe('Summary.');
+  });
+
+  it('omits the line when there is no review at all — nothing was "reviewed" to name a revision for', () => {
+    expect(composeSummaryBody('Summary.', '', undefined, [], 'zzzzzzz9999999')).toBe('Summary.');
+  });
+});
+
 // A hunk that rewrites part of a function, leaving several statements as
 // unchanged context around two real additions. Widening the candidate
 // universe past added-only lines is what makes a finding on any of these

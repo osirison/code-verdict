@@ -32,7 +32,7 @@ import type { ChangedFileInventory, ManifestEnumerationState } from './harnessIn
 import { DEFAULT_RISK_COVERAGE_RULES, isReserveEligible, requiresInspection, type RiskCoverageRules } from './harnessRiskFloors';
 
 export const COMPLETION_CLAUSES = [
-  'headUnchanged',
+  'headVerified',
   'inventoryCompleteForEveryMember',
   'everyFileClassified',
   'configuredRiskCoverageSatisfied',
@@ -52,6 +52,19 @@ export interface MemberHeadCheck {
   readonly snapshotHeadSha: string;
   /** The pre-completion provider check; `undefined` means it was never performed, which cannot pass. */
   readonly currentHead: CurrentHeadResult | undefined;
+}
+
+/**
+ * One member whose current head resolved to something other than the snapshot it was pinned
+ * to — a fact the host discloses, never blocks on (the owner's principle: a review of revision
+ * X is valid regardless of what the branch did afterward). Emitted only when the check actually
+ * resolved a *different* sha; an unchecked or unresolvable head is a `providerLimit` failure of
+ * `headVerified` instead, never a `HeadMovedNote` — "unknown" is not "moved".
+ */
+export interface HeadMovedNote {
+  readonly memberId: string;
+  readonly snapshotHeadSha: string;
+  readonly currentHeadSha: string;
 }
 
 export interface CitationRevalidationSummary {
@@ -117,6 +130,14 @@ export interface CompletionEvaluation extends CompletionDecision {
   readonly details: readonly CompletionBlockerDetail[];
   /** False when eligible (nothing to repair) or when any failure cannot be cleared by more investigation on this attempt. */
   readonly repairable: boolean;
+  /**
+   * Every member whose verified head moved past its snapshot — populated independently of
+   * `eligible`/`clauses.headVerified`, since a moved head no longer fails that clause (see
+   * `HeadMovedNote`). `classifyOutcome` turns each into a `headMovedDuringReview` limitation on
+   * the outcome, complete or not, so the disclosure survives a completion the gate otherwise
+   * granted.
+   */
+  readonly headMoved: readonly HeadMovedNote[];
 }
 
 const MAX_DETAILS_PER_CLAUSE = 5;
@@ -184,20 +205,26 @@ export function evaluateCompletion(input: CompletionEvaluationInput): Completion
     pushBounded(details, perClause, { blocker, clause, message, repairable, ...where });
   }
 
-  // 1. headUnchanged — one check per member; an unperformed or unresolved check cannot pass.
-  clauses.headUnchanged = true;
+  // 1. headVerified — one check per member; an unperformed or unresolved check cannot pass. A
+  // check that DID resolve, to a sha other than the snapshot, is never a failure: the owner's
+  // principle is that a review of the pinned revision is valid regardless of what the branch did
+  // afterward. That fact is disclosed through `headMoved` instead (see `HeadMovedNote`), which
+  // `classifyOutcome` turns into a `headMovedDuringReview` limitation on the outcome whether or
+  // not the gate otherwise passes.
+  clauses.headVerified = true;
+  const headMoved: HeadMovedNote[] = [];
   const inventoryMembers = input.inventory.members();
   const checkedMembers = new Set(input.heads.map((head) => head.memberId));
   for (const member of inventoryMembers) {
-    if (!checkedMembers.has(member.memberId)) fail('headUnchanged', 'providerLimit', `Head of member ${member.memberId} was not verified before completion.`, { memberId: member.memberId });
+    if (!checkedMembers.has(member.memberId)) fail('headVerified', 'providerLimit', `Head of member ${member.memberId} was not verified before completion.`, { memberId: member.memberId });
   }
   for (const head of input.heads) {
     if (head.currentHead === undefined) {
-      fail('headUnchanged', 'providerLimit', `Head of member ${head.memberId} was not verified before completion.`, { memberId: head.memberId });
+      fail('headVerified', 'providerLimit', `Head of member ${head.memberId} was not verified before completion.`, { memberId: head.memberId });
     } else if (head.currentHead.state !== 'resolved' || head.currentHead.headSha === undefined) {
-      fail('headUnchanged', 'providerLimit', `The provider could not resolve the current head of member ${head.memberId} (${head.currentHead.state}).`, { memberId: head.memberId });
+      fail('headVerified', 'providerLimit', `The provider could not resolve the current head of member ${head.memberId} (${head.currentHead.state}).`, { memberId: head.memberId });
     } else if (head.currentHead.headSha !== head.snapshotHeadSha) {
-      fail('headUnchanged', 'headChanged', `Member ${head.memberId} head moved from ${head.snapshotHeadSha} to ${head.currentHead.headSha}.`, { memberId: head.memberId });
+      headMoved.push(Object.freeze({ memberId: head.memberId, snapshotHeadSha: head.snapshotHeadSha, currentHeadSha: head.currentHead.headSha }));
     }
   }
 
@@ -317,6 +344,7 @@ export function evaluateCompletion(input: CompletionEvaluationInput): Completion
     clauses: Object.freeze(clauses),
     details: Object.freeze(details),
     repairable: !eligible && failures > 0 && unrepairableFailures === 0,
+    headMoved: Object.freeze(headMoved),
   });
 }
 
@@ -466,6 +494,11 @@ export interface ClassifyOutcomeOptions {
 }
 
 const BLOCKER_MESSAGES: Readonly<Record<CompletionBlocker, string>> = Object.freeze({
+  // No longer emitted by `evaluateCompletion` (a moved head disclosures through `headMoved`/
+  // `headMovedDuringReview` instead, never blocks) — kept in the union and this map only because
+  // a run persisted before that change can still carry `code: 'headChanged'` in stored
+  // limitations, and readers of that old data (`reviewRunManager.ts`'s resume-offer helper among
+  // them) still need a real message to show for it.
   headChanged: 'The target head changed after the snapshot was taken.',
   incompleteInventory: 'The changed-file inventory is incomplete.',
   unclassifiedFiles: 'Some changed files were never classified.',
@@ -488,6 +521,24 @@ export function blockerLimitation(blocker: CompletionBlocker): Limitation {
   return { code: blocker, message: BLOCKER_MESSAGES[blocker] };
 }
 
+/** Prefix convention shared with `reviewRunManager.ts`'s resume-offer disclosure (both read a 7-char prefix as "the short sha"). */
+export function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
+
+/**
+ * The truthful, non-blocking disclosure `HeadMovedNote` earns (task: DEMOTE `headChanged` from
+ * completion blocker to limitation). Named `headMovedDuringReview` — distinct from the retired
+ * `headChanged` blocker code above — so a reader can tell a fresh disclosure from an old
+ * unrepairable-denial record by its code alone.
+ */
+function headMovedLimitation(note: HeadMovedNote): Limitation {
+  return {
+    code: 'headMovedDuringReview',
+    message: `Member ${note.memberId}: reviewed at ${shortSha(note.snapshotHeadSha)}; the branch moved to ${shortSha(note.currentHeadSha)} during the review — inline comments will anchor to the reviewed revision.`,
+  };
+}
+
 export function classifyOutcome(evaluation: CompletionEvaluation, findingCount: number, options: ClassifyOutcomeOptions = {}): CompletionOutcome {
   const count = Number.isInteger(findingCount) && findingCount >= 0 ? findingCount : 0;
   const limitations: Limitation[] = [...(options.limitations ?? [])];
@@ -496,6 +547,10 @@ export function classifyOutcome(evaluation: CompletionEvaluation, findingCount: 
     for (const blocker of evaluation.blockers) limitations.push(blockerLimitation(blocker));
     if (options.cancelled === true) limitations.push({ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' });
   }
+  // Disclosed unconditionally, complete or not: a moved head never blocks completion (see
+  // `evaluateCompletion`'s own comment on clause 1), so this must survive on a `completeFindings`/
+  // `completeClean` outcome too, not only alongside a genuine blocker.
+  for (const note of evaluation.headMoved) limitations.push(headMovedLimitation(note));
   // `evaluation.details` is always empty when `eligible` (no clause ever failed to push one), so this
   // key is omitted whenever there is nothing to report — every existing exact-equality assertion on a
   // complete outcome keeps matching a literal with no `blockerDetails` field at all.

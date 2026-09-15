@@ -552,7 +552,7 @@ describe('HarnessAttempt.run over a real multi-member changeset (task 13.6)', ()
     expect(finding.item.spans?.map((span) => span.repoId)).toEqual(['repo-core', 'repo-billing']);
   });
 
-  it('one member\'s head moving mid-review blocks completion and names only that member, while the other member\'s unchanged head and finding are unaffected (mixed head changes)', async () => {
+  it('one member\'s head moving mid-review never blocks completion — the disclosure names only that member, while the other member\'s unchanged head and finding are unaffected (mixed head changes)', async () => {
     const policy = testPolicy();
     const coreConnection = reviewConnection({ repo: CORE, files: ['src/core/main.ts'] });
     // billing's head moves between snapshot capture and the pre-completion check.
@@ -586,11 +586,17 @@ describe('HarnessAttempt.run over a real multi-member changeset (task 13.6)', ()
     expect(result.findings).toHaveLength(2);
     expect(result.findings.map((f) => f.memberId).sort()).toEqual(['billing', 'core']);
 
-    expect(result.outcome.completeness).not.toBe('complete');
-    expect(result.outcome.kind).toBe('partialFindings');
-    const blockerDetails = result.outcome.blockerDetails ?? [];
-    expect(blockerDetails.some((d) => d.memberId === 'billing' && d.blocker === 'headChanged')).toBe(true);
-    expect(blockerDetails.every((d) => d.memberId !== 'core')).toBe(true);
+    // The owner's principle: a review of the pinned revision is valid regardless of what the
+    // branch did afterward — billing's moved head is disclosed, never a blocker, and core's
+    // unchanged head earns no disclosure at all.
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.outcome.kind).toBe('completeFindings');
+    expect(result.outcome.blockerDetails ?? []).toEqual([]);
+    const headMoved = result.outcome.limitations.filter((l) => l.code === 'headMovedDuringReview');
+    expect(headMoved).toHaveLength(1);
+    expect(headMoved[0]?.message).toContain('Member billing');
+    expect(headMoved[0]?.message).toContain('inline comments will anchor to the reviewed revision');
+    expect(headMoved.every((l) => !l.message.includes('Member core'))).toBe(true);
   });
 
   it('a fully investigated, fully clean two-member changeset reaches complete clean with both members exhausted and both heads confirmed unchanged', async () => {

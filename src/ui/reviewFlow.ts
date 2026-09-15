@@ -1685,7 +1685,14 @@ export class ReviewFlowPanel {
         this.ref,
         {
           drafts,
-          summary: composeSummaryBody(this.summaryText, this.finalNote, this.review, withheld),
+          // `this.staleHead` is the freshest live head this panel has actually observed
+          // (`pollHead`'s own comment: identical to `this.cr.headSha` unless a poll already found
+          // it moved further); `this.cr?.headSha` is the fallback for a panel `pollHead` never
+          // ticked in. `composeSummaryBody` states the reviewed revision only when it actually
+          // differs from what was reviewed, so a PR reader knows which commit the findings below
+          // describe. Never re-fetched here — submit posts against the same pinned diff the
+          // reviewer triaged, this only decides whether to disclose that it is pinned.
+          summary: composeSummaryBody(this.summaryText, this.finalNote, this.review, withheld, this.staleHead ?? this.cr?.headSha),
           // The author's own request-for-changes is refused the same way their
           // approval is, and `requestChanges` defaults to true — so the summary
           // screen's disabled checkbox is the notice, this is the enforcement.

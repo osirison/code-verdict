@@ -247,7 +247,7 @@ Alternative rejected: use token consumption or model turn count as progress. Bot
 The model's `requestCompletion` message triggers this predicate:
 
 ```text
-headUnchanged
+headVerified
 AND inventoryCompleteForEveryMember
 AND everyFileClassified
 AND configuredRiskCoverageSatisfied
@@ -261,7 +261,11 @@ AND finalVerificationComplete
 
 If the predicate passes, zero validated findings produces a complete clean review and one or more produces a complete findings review. If it fails and validated findings remain, the run persists a partial result plus coverage and limitation report. If it fails with no retainable finding, the run fails with completeness `none`. Cancellation may preserve already validated findings only as partial and never replace a complete retained review.
 
-Unavailable oversized patches, incomplete provider inventories, exhausted budgets, timeouts, provider limits, and changed heads are named completion blockers. A repairable early completion request returns bounded missing conditions when enough reserved budget remains; otherwise the run finalizes truthfully.
+Unavailable oversized patches, incomplete provider inventories, exhausted budgets, timeouts, and provider limits are named completion blockers. A repairable early completion request returns bounded missing conditions when enough reserved budget remains; otherwise the run finalizes truthfully.
+
+A moved target head is deliberately never one of those blockers. `headVerified` requires only that the host actually checked the current head before completion — an unperformed or unresolvable check is a `providerLimit` blocker, since "unknown" says nothing truthful either way — never that the checked value still matches the snapshot. The owner's principle: a review evaluated against pinned revision X is valid regardless of what the branch did afterward, so a resolved-but-different head is disclosed, not blocked — the outcome carries a `headMovedDuringReview` limitation naming the pinned and moved shas, present whether the gate otherwise passes or fails, and inline comments keep anchoring to the reviewed revision (evidence is never relabelled to a head the model never saw). A resumed attempt from a checkpoint whose branch already moved inherits the identical disclosure, never a refusal: completion still succeeds against that same pin.
+
+Alternative rejected (and reverted): treat a moved head as an unrepairable completion blocker, so an attempt whose branch moved mid-review could only ever finalize as `partial`/`failed`, and a resumed attempt against the same pinned snapshot was refused outright as provably doomed. Multi-hour reviews on active branches then burned repeated fresh budgets against a check no further investigation could ever satisfy, for a fact — the branch moved — that the pinned review's own findings remain entirely valid despite.
 
 Alternative rejected: trust the model's assertion that review is complete. The model cannot know about provider truncation, stale head, unresolved host candidates, or budget reserves unless the host evaluates them.
 

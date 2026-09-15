@@ -218,9 +218,11 @@ export interface FlowViewState {
    * `freshAttempt` (budget-exhausted resume feature): `RunControls.canStartFreshAttempt`/
    * `.freshAttemptReasons` for this same failed run, read fresh at render time — never a
    * render-time snapshot of what the manager decided when the run first failed. Present only when
-   * the manager has a stored checkpoint it actually checked (`resumable: true` renders the new-
-   * attempt offer; `resumable: false` renders `reasons` instead, the same "degrade to the reasons
-   * list" shape `interruptedPrior` already uses). Deliberately its own field, never folded into
+   * the manager has a stored checkpoint it actually checked. `resumable: true` renders the
+   * new-attempt offer and `reasons`, if any, render alongside it as an informational note (a
+   * moved head — `reviewRunManager.ts`'s `headMovedNotes` — never degrades this offer);
+   * `resumable: false` renders `reasons` instead of the offer, the same "degrade to the reasons
+   * list" shape `interruptedPrior` already uses. Deliberately its own field, never folded into
    * `interruptedPrior`: that field's own renderer speaks only of an *interrupted* (crashed) prior
    * attempt, on the `'agent'` picker screen; this one speaks of a *failed* (most commonly
    * budget-exhausted) one, on this same failure card, in wording that says so honestly — see
@@ -249,8 +251,11 @@ export interface FlowViewState {
    * nothing is running now — shown only by the `'agent'` picker screen,
    * before the reviewer starts anything new. `resumable` mirrors
    * `RunControls.canResumeFromCheckpoint`; `reasons` mirrors
-   * `RunControls.resumeReasons`, present only alongside `resumable: false`.
-   * Absent whenever the target's last outcome was not `interrupted` (the
+   * `RunControls.resumeReasons` — present alongside `resumable: false` for a
+   * genuine incompatibility, and also, informationally, alongside
+   * `resumable: true` for a moved-head disclosure only
+   * (`reviewRunManager.ts`'s `headMovedNotes`), which never degrades this
+   * offer. Absent whenever the target's last outcome was not `interrupted` (the
    * ordinary case). Wording here is pinned by
    * `reviewFlowHtml.test.ts`'s own no-reconnect check, mirroring
    * `harnessResume.test.ts`'s: a resumed run is always a new attempt from
@@ -1414,21 +1419,26 @@ function failDetailsList(details: readonly CompletionBlockerDetail[] | undefined
 /**
  * Task 14.6: the `'agent'` picker screen's own banner for a target whose
  * last attempt was `interrupted` — the plain-English fact of what
- * happened, and either the "Start new attempt from checkpoint" offer
- * (rendered as the footer-row button, gated on the same
- * `s.interruptedPrior.resumable`) or every reason the checkpoint itself
- * cannot back one. D13's rule applies here exactly as it does to
- * `harnessResume.ts`'s own narrative strings: an attempt boundary is
- * public and the old attempt stays closed, so nothing below may say
- * "resume", "reconnect", or otherwise imply the reviewer is picking the
- * same session back up rather than starting attempt N+1 from a checkpoint.
+ * happened, the "Start new attempt from checkpoint" offer (rendered as the
+ * footer-row button, gated on `s.interruptedPrior.resumable`), and every
+ * reason attached to that offer: a genuine incompatibility when it is
+ * refused, or an informational disclosure (a moved head —
+ * `reviewRunManager.ts`'s `headMovedNotes`) alongside an offer that still
+ * stands. `limitationsList` renders unconditionally for exactly that reason
+ * — a resumable offer can still carry a note, never a refusal reason (one
+ * of those would already have forced `resumable: false`). D13's rule
+ * applies here exactly as it does to `harnessResume.ts`'s own narrative
+ * strings: an attempt boundary is public and the old attempt stays closed,
+ * so nothing below may say "resume", "reconnect", or otherwise imply the
+ * reviewer is picking the same session back up rather than starting
+ * attempt N+1 from a checkpoint.
  */
 function interruptedPriorNotice(prior: FlowViewState['interruptedPrior']): string {
   if (!prior) return '';
   const sentence = prior.resumable
     ? 'An earlier attempt on this change request was interrupted. Its plan, findings, and coverage so far are available to carry into a new attempt.'
     : 'An earlier attempt on this change request was interrupted, and its checkpoint cannot be carried into a new attempt.';
-  return `<div class="notice"><span>${e(sentence)}</span>${prior.resumable ? '' : limitationsList(prior.reasons ?? [])}</div>`;
+  return `<div class="notice"><span>${e(sentence)}</span>${limitationsList(prior.reasons ?? [])}</div>`;
 }
 
 /**
@@ -1437,16 +1447,18 @@ function interruptedPriorNotice(prior: FlowViewState['interruptedPrior']): strin
  * freshAttempt`) — the plain-English fact of what carries over, and either the "Start new attempt
  * from checkpoint" offer (the actions-row button, gated on the same `offer.resumable`) or every
  * reason the checkpoint itself cannot back one, the identical "degrade to the reasons list" shape
- * `interruptedPriorNotice` uses. Deliberately different wording from that function: this attempt
- * did not crash, it ended on its own (most commonly a budget-exhaustion blocker), so nothing here
- * may call it "interrupted" any more than it may say "resume" or "reconnect" — D13's rule applies
- * to both false statements equally.
+ * `interruptedPriorNotice` uses — reasons render unconditionally there for the identical reason:
+ * a resumable offer can still carry an informational moved-head note (`headMovedNotes`), never a
+ * refusal reason. Deliberately different wording from that function: this attempt did not crash,
+ * it ended on its own (most commonly a budget-exhaustion blocker), so nothing here may call it
+ * "interrupted" any more than it may say "resume" or "reconnect" — D13's rule applies to both
+ * false statements equally.
  */
 function freshAttemptNotice(offer: NonNullable<FlowViewState['runError']>['freshAttempt'], findingCount: number): string {
   if (!offer) return '';
   const carried = findingCount > 0 ? `The ${findingCount} finding${findingCount === 1 ? '' : 's'}, plan, and coverage` : 'The plan and coverage so far';
   const sentence = offer.resumable ? `${carried} carry over into a new attempt with a fresh budget.` : 'A new attempt could not be started from this checkpoint.';
-  return `<div class="notice"><span>${e(sentence)}</span>${offer.resumable ? '' : limitationsList(offer.reasons ?? [])}</div>`;
+  return `<div class="notice"><span>${e(sentence)}</span>${limitationsList(offer.reasons ?? [])}</div>`;
 }
 
 /**

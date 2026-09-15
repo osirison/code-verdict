@@ -52,7 +52,8 @@ Before model work begins, the host SHALL snapshot immutable repository identity,
 #### Scenario: Target head changes after snapshot
 
 - **WHEN** the provider reports a different head revision before final completion
-- **THEN** the attempt cannot complete successfully
+- **THEN** the attempt still completes successfully against the pinned snapshot — a review of the pinned revision is valid regardless of what the branch did afterward
+- **AND** the result states that the head moved, naming the pinned and current revisions
 - **AND** evidence from the old head is not relabelled or reused as evidence for the new head
 
 ### Requirement: The model plans and investigates through bounded host tools
@@ -135,7 +136,7 @@ The host SHALL maintain a complete changed-file inventory and SHALL track classi
 
 ### Requirement: The host decides whether completion is valid
 
-A model completion request SHALL be advisory. The host SHALL grant complete status only after inventory exhaustion or explicit classification, configured risk coverage, resolution of all required fetches and candidate findings, citation validation, a verification and contradiction pass, deduplication, and confirmation that the target head is unchanged.
+A model completion request SHALL be advisory. The host SHALL grant complete status only after inventory exhaustion or explicit classification, configured risk coverage, resolution of all required fetches and candidate findings, citation validation, a verification and contradiction pass, deduplication, and confirmation that the target head was actually checked before completion. A target head that was checked and found to have moved past the pinned snapshot SHALL NOT withhold complete status on that basis alone — a review of the pinned revision is valid regardless of what the branch did afterward — but the result SHALL disclose the move.
 
 #### Scenario: Complete review with findings
 

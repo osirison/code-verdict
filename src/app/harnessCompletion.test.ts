@@ -55,20 +55,22 @@ describe('deterministic completion gate (task 8.7)', () => {
     for (const clause of COMPLETION_CLAUSES) expect(evaluation.clauses[clause]).toBe(true);
   });
 
-  it('fails headUnchanged when the provider reports a different head', () => {
+  it('discloses a moved head instead of failing headVerified when the provider resolves a different head — the owner\'s principle: a review of the pinned revision is valid regardless of what the branch did afterward', () => {
     const evaluation = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'resolved', headSha: 'head-2' } }] }));
-    expect(evaluation.eligible).toBe(false);
-    expect(evaluation.clauses.headUnchanged).toBe(false);
-    expect(evaluation.blockers).toEqual(['headChanged']);
-    expect(evaluation.details[0]).toMatchObject({ blocker: 'headChanged', clause: 'headUnchanged', memberId: 'm1', repairable: false });
-    expect(COMPLETION_CLAUSES.filter((clause) => !evaluation.clauses[clause])).toEqual(['headUnchanged']);
+    expect(evaluation.eligible).toBe(true);
+    expect(evaluation.clauses.headVerified).toBe(true);
+    expect(evaluation.blockers).toEqual([]);
+    expect(evaluation.details).toEqual([]);
+    expect(evaluation.headMoved).toEqual([{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHeadSha: 'head-2' }]);
   });
 
-  it('fails headUnchanged as a provider limit when the head was never checked or cannot be resolved', () => {
+  it('fails headVerified as a provider limit when the head was never checked or cannot be resolved — unknown is not moved, so it is never disclosed as a `headMoved` note', () => {
     expect(evaluateCompletion(passing({ heads: [] })).blockers).toEqual(['providerLimit']);
     expect(evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: undefined }] })).blockers).toEqual(['providerLimit']);
     expect(evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'unavailable' } }] })).blockers).toEqual(['providerLimit']);
-    expect(evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'notFound' } }] })).clauses.headUnchanged).toBe(false);
+    const unresolved = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'notFound' } }] }));
+    expect(unresolved.clauses.headVerified).toBe(false);
+    expect(unresolved.headMoved).toEqual([]);
   });
 
   it('fails inventoryCompleteForEveryMember while a continuation is pending (repairable)', () => {
@@ -220,8 +222,9 @@ describe('deterministic completion gate (task 8.7)', () => {
         ],
       }),
     );
-    expect(evaluation.blockers).toEqual(['headChanged', 'incompleteInventory', 'unclassifiedFiles']);
+    expect(evaluation.blockers).toEqual(['incompleteInventory', 'unclassifiedFiles']);
     expect(evaluation.details.every((detail) => detail.memberId === 'm2')).toBe(true);
+    expect(evaluation.headMoved).toEqual([{ memberId: 'm2', snapshotHeadSha: 'h2', currentHeadSha: 'h3' }]);
   });
 
   it('names the incomplete member in the aggregate outcome without hiding it behind the other member\'s success (task 13.4)', () => {
@@ -407,6 +410,19 @@ describe('outcome classification (task 8.8)', () => {
     expect(outcome).toEqual({ kind: 'completeClean', completeness: 'complete', findingCount: 0, limitations: [], replacesRetainedReview: true, clean: true });
   });
 
+  it('a moved head never blocks completion — the owner\'s principle at its sharpest: zero findings still reaches complete clean, with the move disclosed rather than hidden', () => {
+    const evaluation = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'resolved', headSha: 'head-2' } }] }));
+    const outcome = classifyOutcome(evaluation, 0);
+    expect(outcome).toEqual({
+      kind: 'completeClean',
+      completeness: 'complete',
+      findingCount: 0,
+      limitations: [{ code: 'headMovedDuringReview', message: 'Member m1: reviewed at head-1; the branch moved to head-2 during the review — inline comments will anchor to the reviewed revision.' }],
+      replacesRetainedReview: true,
+      clean: true,
+    });
+  });
+
   it('maps a failing gate with findings to partial findings carrying every blocker as a limitation', () => {
     const evaluation = evaluateCompletion(passing({ unresolved: { unresolvedFetches: 0, unresolvedCandidates: 2 }, budget: { hardExhausted: true, timedOut: false } }));
     const outcome = classifyOutcome(evaluation, 2, { limitations: [{ code: 'budgetNearLimit', message: 'x' }] });
@@ -418,10 +434,12 @@ describe('outcome classification (task 8.8)', () => {
   });
 
   it('never treats incomplete no-findings as clean', () => {
-    const evaluation = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'resolved', headSha: 'other' } }] }));
+    // The mechanism is an unresolved head, not a moved one — a moved head no longer fails the
+    // gate at all (see the previous test), so it can no longer stand in for "incomplete" here.
+    const evaluation = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'notFound' } }] }));
     const outcome = classifyOutcome(evaluation, 0);
     expect(outcome).toMatchObject({ kind: 'failed', completeness: 'none', findingCount: 0, replacesRetainedReview: false, clean: false });
-    expect(outcome.limitations).toEqual([blockerLimitation('headChanged')]);
+    expect(outcome.limitations).toEqual([blockerLimitation('providerLimit')]);
   });
 
   it('keeps validated findings only as partial after cancellation, even when the gate would have passed', () => {
@@ -463,8 +481,14 @@ describe('advisory completion request', () => {
   it('is not repairable when budget is gone or a blocker cannot be worked', () => {
     const repairableGate = evaluateCompletion(passing({ unresolved: { unresolvedFetches: 1, unresolvedCandidates: 0 } }));
     expect(respondToCompletionRequest(repairableGate, { canContinue: false })).toMatchObject({ granted: false, repairable: false });
+    // The mechanism is an unresolved head, not a moved one (see below): a moved head grants now.
+    const unresolvedHead = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'notFound' } }] }));
+    expect(respondToCompletionRequest(unresolvedHead, { canContinue: true })).toMatchObject({ granted: false, repairable: false, blockers: ['providerLimit'] });
+  });
+
+  it('a moved head no longer earns an unrepairable denial — the model-facing request is simply granted', () => {
     const changedHead = evaluateCompletion(passing({ heads: [{ memberId: 'm1', snapshotHeadSha: 'head-1', currentHead: { repoId: 'repo-1', state: 'resolved', headSha: 'x' } }] }));
-    expect(respondToCompletionRequest(changedHead, { canContinue: true })).toMatchObject({ granted: false, repairable: false, blockers: ['headChanged'] });
+    expect(respondToCompletionRequest(changedHead, { canContinue: true })).toEqual({ granted: true });
   });
 });
 

@@ -247,11 +247,30 @@ function renderFindingSection(
   return blocks.join('\n\n');
 }
 
+/** The 7-character prefix convention this module's own `reviewedRevisionLine` (and `harnessCompletion.ts`'s matching helper) both read as "the short sha". */
+function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
+
+/**
+ * One line naming the revision the findings actually describe, present only when the branch has
+ * moved since — so a PR reader arriving after further commits landed knows which revision every
+ * finding below was computed against, rather than assuming the summary describes the tip they see
+ * now. `liveHeadSha` is the caller's best knowledge of the current head at submit time (never
+ * re-fetched here); omitted entirely when it is unknown or matches `review.headSha` exactly —
+ * agreement is the ordinary case and earns no line.
+ */
+function reviewedRevisionLine(review: Review | undefined, liveHeadSha: string | undefined): string {
+  if (!review || liveHeadSha === undefined || liveHeadSha === review.headSha) return '';
+  return `Reviewed at ${markdownCodeSpan(shortSha(review.headSha))}; the branch has since moved to ${markdownCodeSpan(shortSha(liveHeadSha))}.`;
+}
+
 export function composeSummaryBody(
   summaryText: string,
   finalNote: string,
   review?: Review,
   withheldInline: readonly ReviewItem[] = [],
+  liveHeadSha?: string,
 ): string {
   const base = finalNote.trim() === '' ? summaryText : `${summaryText}\n\n---\n\n${finalNote.trim()}`;
   const unanchored = review?.items.filter(
@@ -269,6 +288,7 @@ export function composeSummaryBody(
     'neither its code nor its reported line matches anything currently in the diff.',
   );
   return [
+    reviewedRevisionLine(review, liveHeadSha),
     base,
     outsideDiff === '' ? '' : `## Accepted findings outside the diff\n\n${outsideDiff}`,
     withoutCurrentAnchor === ''

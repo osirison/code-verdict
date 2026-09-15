@@ -102,6 +102,7 @@ function failingEvaluation(): CompletionEvaluation {
       { blocker: 'insufficientRiskCoverage', clause: 'configuredRiskCoverageSatisfied', memberId: 'm1', path: 'src/other.ts', message: 'src/other.ts (high risk) was classified but never inspected.', repairable: true },
     ],
     repairable: true,
+    headMoved: [],
   };
 }
 

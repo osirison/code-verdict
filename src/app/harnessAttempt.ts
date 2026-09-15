@@ -957,7 +957,7 @@ const RESULT_OVERHEAD_FLOOR_BYTES = 1024;
 const PROJECTED_SUBMISSION_BYTES = 1024;
 
 /**
- * Clauses `investigating` can still act on when a turn stops early. `headUnchanged` and the four
+ * Clauses `investigating` can still act on when a turn stops early. `headVerified` and the four
  * `verifying`-only clauses (`everyRetainedCitationValid`, `contradictionPassComplete`,
  * `deduplicationComplete`, `finalVerificationComplete`) have not run yet at this point in the
  * attempt — `refreshHeads`/`runSynthesisVerification` are only ever called from `runVerifying`
@@ -2128,7 +2128,16 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return 'exploration';
   }
 
-  /** The pre-completion head check (D3), refreshed on entry to `verifying` and again in `completing`. Never routed through the dispatcher/model-facing tool catalog — `Connection.getCurrentHead`'s own doc comment: "Used only for the pre-completion head check." */
+  /**
+   * The pre-completion head check (D3), refreshed on entry to `verifying` and again in
+   * `completing`. Never routed through the dispatcher/model-facing tool catalog —
+   * `Connection.getCurrentHead`'s own doc comment: "Used only for the pre-completion head check."
+   * Still worth running even though a resolved-but-different head no longer blocks completion
+   * (`harnessCompletion.ts`'s D11 rewrite): the observation is what lets the gate tell "checked and
+   * unchanged" from "checked and moved" from "never checked" at all, and only the second of those
+   * three is now disclosed rather than refused — an attempt that skipped this call would report
+   * neither.
+   */
   async function refreshHeads(): Promise<void> {
     const heads: MemberHeadCheck[] = [];
     for (const member of options.members) {
