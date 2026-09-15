@@ -285,9 +285,35 @@ export function markIncompatible(checkpoint: PersistedCheckpoint, reason: string
 
 // ---- Snapshot digest (shared by the writer and 11.5's resume-compatibility reader) --
 
+/**
+ * Projects away each member's `rootAgentsPolicy.text`/`textOmittedReason` before hashing.
+ * `rootAgentsPolicy.digest` (a `sha256` of the resolved policy content) already carries that
+ * content's own identity, so the raw text is redundant for a compatibility check — and it cannot be
+ * allowed to participate: `harnessRunStore.ts`'s `writeSnapshot` caps `text` at persistence time,
+ * replacing an over-cap value with `textOmittedReason` on the *stored* copy only, never on the
+ * in-memory snapshot a checkpoint's digest is computed from moments earlier. Without this
+ * projection, that divergence would make `computeSnapshotDigest(storedSnapshot)` disagree with the
+ * `snapshotDigest` its own checkpoint recorded for any member whose policy text was ever capped —
+ * `checkCheckpointIntegrity` would then report "no longer hashes to digest" for a run resume never
+ * actually touched. Excluding both fields keeps capped and uncapped forms of the same snapshot
+ * hashing identically, permanently, regardless of the cap's value. A no-op for every snapshot from
+ * before this field existed (neither key was ever set), so no previously computed digest changes.
+ */
+function digestProjection(snapshot: ReviewRunSnapshot): unknown {
+  return {
+    ...snapshot,
+    members: snapshot.members.map((member) => ({
+      ...member,
+      rootAgentsPolicy: member.rootAgentsPolicy.present
+        ? { ...member.rootAgentsPolicy, text: undefined, textOmittedReason: undefined }
+        : member.rootAgentsPolicy,
+    })),
+  };
+}
+
 /** `snapshotDigest`'s one formula (see the field's own doc comment on `PersistedCheckpoint`) — every producer and every checker calls this rather than inlining `sha256Hex(canonicalStringify(...))` a second time. */
 export function computeSnapshotDigest(snapshot: ReviewRunSnapshot): string {
-  return sha256Hex(canonicalStringify(snapshot));
+  return sha256Hex(canonicalStringify(digestProjection(snapshot)));
 }
 
 // ---- Closing a lost attempt as interrupted (task 11.6, D13) -------------------------

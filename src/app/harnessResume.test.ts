@@ -719,8 +719,48 @@ describe('resumeBudgetModeFor: which resume shape a checkpoint\'s own terminal l
 describe('computeSnapshotDigest round-trip', () => {
   it('the same snapshot always digests the same way, and any field change digests differently', () => {
     const snapshot = testSnapshot();
+    // `testSnapshot()`'s member carries `rootAgentsPolicy: { present: false }` — no `text` for the
+    // digest's own text/textOmittedReason projection to strip — so this stays a faithful check of
+    // the formula on every field the projection does *not* touch.
     expect(computeSnapshotDigest(snapshot)).toBe(sha256Hex(canonicalStringify(snapshot)));
     expect(computeSnapshotDigest({ ...snapshot, personaLabel: 'Different' })).not.toBe(computeSnapshotDigest(snapshot));
+  });
+
+  // The projection this formula relies on (`harnessRunStore.ts`'s persisted-size cap replaces an
+  // over-cap `text` with `textOmittedReason`, on the stored copy only): two snapshots that differ
+  // *only* in which of those two fields a member's `rootAgentsPolicy` carries must still hash
+  // identically, or a capped-on-write snapshot would forever fail its own checkpoint's integrity
+  // check the moment it is read back.
+  it('a member\'s rootAgentsPolicy.text vs. textOmittedReason never changes the digest — the exact divergence a persisted-size cap introduces', () => {
+    const withText = testSnapshot({
+      members: [
+        {
+          ...testSnapshot().members[0]!,
+          rootAgentsPolicy: { present: true, sourceId: 'agents-policy:base:.', digest: 'policy-digest-1', text: 'Full policy text.\n', files: ['agentsMd'] },
+        },
+      ],
+    });
+    const capped = testSnapshot({
+      members: [
+        {
+          ...testSnapshot().members[0]!,
+          rootAgentsPolicy: {
+            present: true,
+            sourceId: 'agents-policy:base:.',
+            digest: 'policy-digest-1',
+            files: ['agentsMd'],
+            textOmittedReason: 'text omitted from snapshot: exceeds 65536 bytes',
+          },
+        },
+      ],
+    });
+    expect(computeSnapshotDigest(withText)).toBe(computeSnapshotDigest(capped));
+    // But an actual identity change (a different `digest`) still changes the hash — the projection
+    // strips text, not the fields that matter for compatibility.
+    const differentIdentity = testSnapshot({
+      members: [{ ...testSnapshot().members[0]!, rootAgentsPolicy: { present: true, sourceId: 'agents-policy:base:.', digest: 'policy-digest-2', text: 'Full policy text.\n', files: ['agentsMd'] } }],
+    });
+    expect(computeSnapshotDigest(differentIdentity)).not.toBe(computeSnapshotDigest(withText));
   });
 });
 

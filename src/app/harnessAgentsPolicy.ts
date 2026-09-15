@@ -31,8 +31,13 @@
  * composed content and a digest), `absent` (the host actually read both
  * files and neither directory entry exists), or `unavailable` (the host
  * could not fully determine presence — capability withheld, connection has
- * no `readFile`, or a read itself failed for at least one file with the
- * other never confirmed present). `ReviewRunAgentsPolicySource` (task 2.2)
+ * no `readFile`, a read itself failed for at least one file with the other
+ * never confirmed present, or a file exists but the read came back
+ * `paginated`/`truncated` against the per-file line cap: a partial file is
+ * exactly the case `unavailable` exists for, since policy text is
+ * authoritative instruction and a silently truncated read would hand the
+ * model a policy framed as complete that might be missing the clause that
+ * mattered). `ReviewRunAgentsPolicySource` (task 2.2)
  * only has two top-level states, so `rootAgentsPolicySourceFor` folds
  * `unavailable` into `present: false` for the snapshot — but, unlike before,
  * it now also carries `unavailableReason` on that fold so an honest
@@ -51,7 +56,7 @@
  * prompt automatically, in any phase. Non-citability itself is enforced by
  * the evidence ledger (task 7.4), not by this module.
  */
-import { investigationResultValue, type FileRangeResult, type InvestigationSource, type InvestigationSourceCapabilities } from '../platform/types';
+import type { FileRangeResult, InvestigationSource, InvestigationSourceCapabilities } from '../platform/types';
 import { DEFAULT_HARNESS_POLICY } from '../domain/harnessPolicy';
 import type { PolicyFileKind, ReviewRunAgentsPolicySource } from '../domain/reviewRunSnapshot';
 import { sha256Hex } from './contentDigest';
@@ -148,11 +153,26 @@ async function fetchFile(
   }
 
   if (result.state === 'notFound') return { ...file, state: 'absent' };
-  const content = investigationResultValue(result)?.text;
-  if (content === undefined) {
+  // `complete` is the only state whose `value.text` is the whole file. `paginated`/`truncated` also
+  // carry a `value.text`, but it is a prefix — `investigationResultValue` would return it just as
+  // readily as a `complete` read's, and folding it into `present` here is exactly the bug this branch
+  // exists to prevent: policy content is authoritative instruction (D7, file header above), so a
+  // partial file silently digested as "present" would hand the model a policy framed as complete that
+  // might omit the clause that mattered. Treated as `unavailable` instead — not a confirmed absence,
+  // and not confirmed content either — so the honest "could not be checked" line and the
+  // `rootPolicyUnavailable` limitation (`harnessRuntime.ts`) both fire exactly as they do for any other
+  // read this resolver could not fully trust.
+  if (result.state === 'paginated' || result.state === 'truncated') {
+    return {
+      ...file,
+      state: 'unavailable',
+      reason: `${file.name} exceeds the ${maxLines}-line read cap (state: "${result.state}"); a partial read cannot be treated as the complete policy.`,
+    };
+  }
+  if (result.state !== 'complete') {
     return { ...file, state: 'unavailable', reason: `${file.name} read returned "${result.state}".` };
   }
-  return { ...file, state: 'present', content };
+  return { ...file, state: 'present', content: result.value.text };
 }
 
 /**

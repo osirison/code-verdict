@@ -262,3 +262,62 @@ describe('CLAUDE.md fallback and companion at each level (owner-mandated)', () =
     expect(chain.levels[0]).toEqual({ directory: '', state: 'unavailable', reason: 'network blip' });
   });
 });
+
+// ---- Truncated/paginated reads never reach the model as complete policy text. A file that exists
+// but whose read stopped short of the end (the per-file line cap) is not "present" — policy content
+// is authoritative instruction, and a partial read framed as complete could be missing the clause
+// that mattered. Folded into `unavailable` instead, so the existing honest "could not be checked"
+// line and `rootPolicyUnavailable` limitation cover it exactly as they cover any other unreadable file. ----
+describe('truncated/paginated policy reads are never digested as present (root-policy authoritative-instruction safety)', () => {
+  function partialResult(state: 'paginated' | 'truncated', text: string): FileRangeResult {
+    const base = { revision: 'base' as const, path: 'AGENTS.md', startLine: 1, endLine: text.split('\n').length, text };
+    return state === 'paginated'
+      ? { snapshot: { repoId: MEMBER.repoId, baseSha: MEMBER.baseSha, headSha: MEMBER.headSha }, state, value: base, cursor: 'more' }
+      : { snapshot: { repoId: MEMBER.repoId, baseSha: MEMBER.baseSha, headSha: MEMBER.headSha }, state, value: base };
+  }
+
+  it('truncated AGENTS.md alone (CLAUDE.md absent): the level is unavailable, not present with partial content', async () => {
+    const source = fakeInvestigationSource({
+      readFile: vi.fn(async (request: FileRangeRequest): Promise<FileRangeResult> => {
+        if (request.path === 'AGENTS.md') return partialResult('truncated', 'First rule of many.\n');
+        return { snapshot: request.snapshot, state: 'notFound', reason: 'No such path: CLAUDE.md' };
+      }),
+    });
+    const resolver = createAgentsPolicyResolver(() => source, { maxLinesPerFile: 500 });
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toMatchObject({ state: 'unavailable', reason: expect.stringContaining('AGENTS.md exceeds the 500-line read cap') });
+    // Partial content itself never survives into the level at all.
+    expect(JSON.stringify(chain.levels[0])).not.toContain('First rule of many.');
+    const fold = rootAgentsPolicySourceFor(chain);
+    expect(fold).toEqual({ present: false, unavailableReason: expect.stringContaining('AGENTS.md exceeds the 500-line read cap') });
+  });
+
+  it('paginated CLAUDE.md alongside complete AGENTS.md: level is present from AGENTS.md only, CLAUDE.md never folded in as content', async () => {
+    const source = fakeInvestigationSource({
+      readFile: vi.fn(async (request: FileRangeRequest): Promise<FileRangeResult> => {
+        if (request.path === 'AGENTS.md') {
+          return { snapshot: request.snapshot, state: 'complete', value: { revision: 'base', path: 'AGENTS.md', startLine: 1, endLine: 1, text: 'Agents policy complete.\n' } };
+        }
+        return partialResult('paginated', 'Claude policy first page only.\n');
+      }),
+    });
+    const resolver = createAgentsPolicyResolver(() => source, { maxLinesPerFile: 200 });
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toMatchObject({ state: 'present', content: 'Agents policy complete.\n', files: ['agentsMd'] });
+    expect(JSON.stringify(chain.levels[0])).not.toContain('Claude policy first page only.');
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({ present: true, text: 'Agents policy complete.\n', files: ['agentsMd'] });
+  });
+
+  it('both truncated: unavailable, naming both files and the cap, neither reason silently dropping the other', async () => {
+    const source = fakeInvestigationSource({
+      readFile: vi.fn(async (request: FileRangeRequest): Promise<FileRangeResult> => partialResult('truncated', `${request.path} partial content\n`)),
+    });
+    const resolver = createAgentsPolicyResolver(() => source, { maxLinesPerFile: 50 });
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    const level = chain.levels[0];
+    expect(level?.state).toBe('unavailable');
+    expect(level?.state === 'unavailable' && level.reason).toContain('AGENTS.md exceeds the 50-line read cap');
+    expect(level?.state === 'unavailable' && level.reason).toContain('CLAUDE.md exceeds the 50-line read cap');
+    expect(rootAgentsPolicySourceFor(chain)).toEqual({ present: false, unavailableReason: expect.stringContaining('exceeds the 50-line read cap') });
+  });
+});

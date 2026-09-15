@@ -48,6 +48,16 @@ export type PolicyFileKind = 'agentsMd' | 'claudeMd';
  * `unavailableReason` undoes that fold for the honest case: present when the host could not
  * determine presence either way (no source, capability withheld, or a read failure), and absent
  * entirely when the host checked both files and genuinely found neither.
+ *
+ * `textOmittedReason` is a second, independent honesty escape hatch, set only by
+ * `harnessRunStore.ts`'s `writeSnapshot` at persistence time — never by the resolver, and never seen
+ * by a live prompt. A snapshot this large is used twice for very different purposes: fed once, in
+ * memory, straight into the bootstrap envelope (`harnessAttempt.ts`'s `rootPoliciesFor`, uncapped —
+ * that path is unaffected), and written once to the run store's on-disk record, which persists every
+ * retained attempt's own full copy with no size discipline of its own. `text` beyond the store's
+ * per-field byte cap is replaced with this reason at write time so a large `AGENTS.md`/`CLAUDE.md`
+ * cannot inflate the stored record without limit; identity (`sourceId`/`digest`/`files`/`identical`)
+ * is always kept either way, so a capped record is still distinguishable from a merely-absent one.
  */
 export type ReviewRunAgentsPolicySource =
   | {
@@ -57,6 +67,7 @@ export type ReviewRunAgentsPolicySource =
       readonly text?: string;
       readonly files?: readonly PolicyFileKind[];
       readonly identical?: boolean;
+      readonly textOmittedReason?: string;
     }
   | { readonly present: false; readonly unavailableReason?: string };
 

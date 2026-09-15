@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import type { ContradictedFindingRecord } from './harnessAttempt';
-import { buildCheckpoint, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
+import { buildCheckpoint, computeSnapshotDigest, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
+import { checkCheckpointIntegrity } from './harnessResume';
 import { createHarnessRunStore, type HarnessRunStore, type RetentionPolicy } from './harnessRunStore';
 import type { TrackedCandidate, ValidatedFinding, CitedEvidenceRef } from './harnessCandidateValidation';
 import { evidenceProducerOf, type LedgerEvidenceSource } from './harnessEvidenceLedger';
@@ -405,6 +406,97 @@ describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, dige
     expect(runStore.readSnapshot('never-written', 1)).toBeUndefined();
     expect(runStore.checkpointsFor('never-written')).toEqual([]);
     expect(runStore.latestCheckpoint('never-written')).toBeUndefined();
+  });
+});
+
+// ---- Persisted root-policy text stays byte-bounded (6784d7c's fix let a real AGENTS.md/CLAUDE.md
+// reach a snapshot's rootAgentsPolicy.text; writeSnapshot itself must not let that grow the stored
+// record without limit). ----
+describe('HarnessRunStore: writeSnapshot caps a persisted rootAgentsPolicy.text at 64 KiB per member', () => {
+  const OVER_CAP_TEXT = 'x'.repeat(64 * 1024 + 1);
+  const UNDER_CAP_TEXT = 'Small repository policy.\n';
+
+  function memberWithPolicy(memberId: string, policyText: string): ReviewRunSnapshot['members'][number] {
+    return {
+      ...testSnapshot().members[0]!,
+      memberId,
+      rootAgentsPolicy: { present: true, sourceId: `agents-policy:base1:.:${memberId}`, digest: `policy-digest-${memberId}`, text: policyText, files: ['agentsMd'] },
+    };
+  }
+
+  it('a policy text at or under the cap round-trips byte-identical', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', UNDER_CAP_TEXT)] });
+    await runStore.writeSnapshot(snapshot);
+    expect(runStore.readSnapshot('lineage-1', 1)).toEqual(snapshot);
+  });
+
+  it('a policy text over the cap is replaced with textOmittedReason on the stored copy; identity fields survive', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', OVER_CAP_TEXT)] });
+    await runStore.writeSnapshot(snapshot);
+
+    const stored = runStore.readSnapshot('lineage-1', 1);
+    const storedPolicy = stored?.members[0]?.rootAgentsPolicy;
+    expect(storedPolicy).toMatchObject({
+      present: true,
+      sourceId: 'agents-policy:base1:.:m1',
+      digest: 'policy-digest-m1',
+      files: ['agentsMd'],
+      textOmittedReason: expect.stringContaining('exceeds 65536 bytes'),
+    });
+    expect(storedPolicy && 'text' in storedPolicy ? (storedPolicy as { text?: string }).text : undefined).toBeUndefined();
+
+    // The caller's own in-memory snapshot — what a live attempt still reads from — is never mutated.
+    expect(snapshot.members[0]?.rootAgentsPolicy).toMatchObject({ text: OVER_CAP_TEXT });
+  });
+
+  it('two members sharing the same over-cap policy each get their own textOmittedReason (cap-only: no cross-member dedup)', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({
+      members: [memberWithPolicy('m1', OVER_CAP_TEXT), memberWithPolicy('m2', OVER_CAP_TEXT)],
+    });
+    await runStore.writeSnapshot(snapshot);
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members).toHaveLength(2);
+    for (const member of stored.members) {
+      expect(member.rootAgentsPolicy).toMatchObject({ present: true, textOmittedReason: expect.any(String) });
+    }
+  });
+
+  it('a present:false rootAgentsPolicy (absent or unavailable) is untouched by the cap', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({
+      members: [{ ...testSnapshot().members[0]!, rootAgentsPolicy: { present: false, unavailableReason: 'This source does not support pinned file reads.' } }],
+    });
+    await runStore.writeSnapshot(snapshot);
+    expect(runStore.readSnapshot('lineage-1', 1)).toEqual(snapshot);
+  });
+
+  // The invariant the cap depends on: a checkpoint's `snapshotDigest` is computed from the live,
+  // uncapped in-memory snapshot the moment a checkpoint is built; `checkCheckpointIntegrity` later
+  // recomputes the same formula from whatever `readSnapshot` returns — the *capped* stored copy for
+  // any member whose policy text was over the bound. Without `computeSnapshotDigest`'s own
+  // text/textOmittedReason projection (`harnessCheckpoint.ts`), those two would disagree for every
+  // such run, and a resume that never actually diverged would be refused as "no longer hashes to
+  // digest". This is the real writeSnapshot -> writeCheckpoint -> readSnapshot round trip, not the
+  // formula tested in isolation (`harnessResume.test.ts`'s own `computeSnapshotDigest round-trip`).
+  it('an over-cap policy text never breaks checkCheckpointIntegrity — the digest is computed the same way before and after capping', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', OVER_CAP_TEXT)] });
+
+    // Mirrors the real call order (`harnessRuntime.ts`): the checkpoint's digest is computed from
+    // the snapshot still in memory, uncapped, *before* `writeSnapshot` ever runs.
+    const digestAtBuildTime = computeSnapshotDigest(snapshot);
+    const built = buildCheckpoint(checkpointInput({ snapshotDigest: digestAtBuildTime }), DEFAULT_HARNESS_POLICY);
+
+    await runStore.writeSnapshot(snapshot);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ textOmittedReason: expect.any(String) }); // sanity: the cap actually fired
+    const latest = runStore.latestCheckpoint('lineage-1')!;
+    expect(checkCheckpointIntegrity(stored, latest)).toEqual([]);
   });
 });
 

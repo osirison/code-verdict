@@ -161,7 +161,10 @@ async function traceCall(
  * and response-body lines for one request always land in the sink in order — the deliberate
  * trade-off this makes is a real one: the caller's own promise does not resolve until the clone's
  * body has been read, so tracing costs a small delay on every traced call, not only a hypothetical
- * one. Accepted because this only ever runs behind `codeVerdict.trace.api`, off by default and
+ * one. The trade-off is a memory cost too, not only latency: `cloned.text()` materializes the
+ * *entire* response body before `formatTracedBody`'s own `MAX_TRACED_BODY_BYTES` cap ever sees it —
+ * a large uncapped response is fully held in memory here even though only its first slice is ever
+ * printed. Accepted because this only ever runs behind `codeVerdict.trace.api`, off by default and
  * switched on by a developer already choosing to trade a little latency for a channel with
  * everything in it, in the order it happened.
  */

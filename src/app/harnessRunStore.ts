@@ -110,7 +110,7 @@ import {
   type RunLifecycle,
 } from '../domain/harnessLifecycle';
 import type { HarnessPolicy } from '../domain/harnessPolicy';
-import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
+import type { ReviewRunMemberSnapshot, ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 
 // ---- Keys ------------------------------------------------------------------------
 
@@ -976,6 +976,64 @@ async function enforceTerminalAttemptHistory(
 }
 
 /**
+ * Persisted-size bound for one member's `rootAgentsPolicy.text` (root-policy snapshot-size
+ * discipline, following 6784d7c's fix that first let root `AGENTS.md`/`CLAUDE.md` content reach a
+ * snapshot at all). Before that change this field was digest-only, near-zero bytes; a repository's
+ * actual policy file can run to hundreds of kilobytes within the resolver's own read cap
+ * (`harnessAgentsPolicy.ts`'s `maxLinesPerFile`), and `writeSnapshot` below persists one full copy
+ * per member sharing a repository/base and again per attempt this store retains — unbounded, that is
+ * exactly the kind of per-write growth the workspace-storage blob this module exists to bound cannot
+ * absorb. 64 KiB comfortably fits any policy file a real repository would hand-maintain while
+ * capping the pathological case.
+ *
+ * A module constant, not a `HarnessPolicy` field: every other 11.4 bound here is versioned per run
+ * because it shapes what a *reviewer* configured for that run's own retention; this one is a
+ * storage-layer housekeeping limit on a field the reviewer never sees or tunes, so it does not need
+ * a call site to thread a policy value through just to read it back unchanged.
+ */
+const MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES = 64 * 1024;
+
+/**
+ * Caps `text` on a `present` root policy that exceeds the byte bound above, replacing it with
+ * `textOmittedReason` — never on `text` itself, which stays exactly as resolved. Only the *persisted*
+ * copy `writeSnapshot` is about to write goes through this; the snapshot object a live attempt is
+ * already using in memory (its own `rootPoliciesFor`, `harnessAttempt.ts`) is untouched, since this
+ * runs on a shallow copy the caller builds separately (see `writeSnapshot`) and reads a value it
+ * never mutates. `sourceId`/`digest`/`files`/`identical` always survive uncapped: they are the
+ * identity a resumed attempt or a dashboard render still needs, and none of them can grow unbounded
+ * the way free-form file content can.
+ *
+ * Deliberately cap-only, not deduplicated across members that happen to share the same
+ * `repoId`/`baseSha`/`digest` (a monorepo changeset where every member reads the same root policy).
+ * True deduplication needs an indirection this snapshot shape does not have — a member would have to
+ * carry a reference to another member's `rootAgentsPolicy` rather than its own value, which every
+ * reader of `ReviewRunMemberSnapshot` (`harnessAttempt.ts`'s `rootPoliciesFor` included) would then
+ * have to resolve, and getting that resolution wrong silently is a correctness risk this pass has no
+ * way to test as thoroughly as it can test a pure byte cap. The cap alone already turns unbounded
+ * per-member growth into a bound of (member count) × 64 KiB per retained attempt, which is the
+ * concrete number this fix exists to put in place; full dedup is deferred rather than shipped
+ * half-verified.
+ */
+function capPersistedRootPolicyText(source: ReviewRunMemberSnapshot['rootAgentsPolicy']): ReviewRunMemberSnapshot['rootAgentsPolicy'] {
+  if (!source.present || source.text === undefined) return source;
+  const bytes = Buffer.byteLength(source.text, 'utf8');
+  if (bytes <= MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES) return source;
+  return {
+    present: true,
+    sourceId: source.sourceId,
+    digest: source.digest,
+    ...(source.files !== undefined ? { files: source.files } : {}),
+    ...(source.identical !== undefined ? { identical: source.identical } : {}),
+    textOmittedReason: `text omitted from snapshot: exceeds ${MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES} bytes (was ${bytes} bytes)`,
+  };
+}
+
+/** The snapshot `writeSnapshot` actually persists: every member's `rootAgentsPolicy` capped, nothing else touched. A new object throughout — the caller's own in-memory snapshot (still feeding the live attempt) is never mutated. */
+function snapshotForPersistence(snapshot: ReviewRunSnapshot): ReviewRunSnapshot {
+  return { ...snapshot, members: snapshot.members.map((member) => ({ ...member, rootAgentsPolicy: capPersistedRootPolicyText(member.rootAgentsPolicy) })) };
+}
+
+/**
  * Closures, not an object-literal `this`: a caller that destructures
  * `{ writeCheckpoint }` off the returned store (a common pattern for
  * injecting one method as a collaborator, e.g. into `HarnessAttemptOptions`)
@@ -986,7 +1044,8 @@ export function createHarnessRunStore(store: KeyValueStore, options: HarnessRunS
     const lineageId = snapshot.lineageId as LineageId;
     const runId = snapshot.runId as RunId;
     const existing = readLineageRaw(store, lineageId) ?? emptyLineageRecord(runId, lineageId);
-    const next: PersistedLineageRecord = { ...existing, snapshots: { ...existing.snapshots, [String(snapshot.attempt)]: snapshot } };
+    const persisted = snapshotForPersistence(snapshot);
+    const next: PersistedLineageRecord = { ...existing, snapshots: { ...existing.snapshots, [String(snapshot.attempt)]: persisted } };
     await store.update(lineageKey(lineageId), next);
     await registerLineageInRunIndex(store, runId, lineageId);
   }

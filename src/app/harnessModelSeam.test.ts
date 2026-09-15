@@ -305,6 +305,20 @@ describe('Repository policy rendering — AGENTS.md/CLAUDE.md content and honest
     expect(prompt).toContain('root AGENTS.md present (sourceId agents-policy:base-1:., non-citable)');
     expect(prompt).toContain('content omitted: Root policy text omitted');
   });
+
+  // A truncated/paginated file read (`harnessAgentsPolicy.ts`'s `fetchFile`) folds to this same
+  // `unavailable` shape rather than a `present` one carrying a partial `text` — policy content is
+  // authoritative instruction, so a partial file rendered as complete could be missing the clause
+  // that mattered. This is that fold's render, verified with the reason text the resolver actually
+  // produces, and a check that no partial content ever reaches the prompt.
+  it('truncated read (folded to unavailable by the resolver): "could not be checked" naming the cap, never the partial text', () => {
+    const prompt = promptWithRootPolicy({
+      present: false,
+      unavailableReason: 'AGENTS.md exceeds the 500-line read cap (state: "truncated"); a partial read cannot be treated as the complete policy.',
+    });
+    expect(prompt).toContain('root policy could not be checked: AGENTS.md exceeds the 500-line read cap (state: "truncated")');
+    expect(prompt).not.toContain('no root AGENTS.md or CLAUDE.md');
+  });
 });
 
 describe('createLiveModelSeam (task 15.7)', () => {
