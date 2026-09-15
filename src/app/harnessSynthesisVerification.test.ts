@@ -77,6 +77,56 @@ function accept(ledger: EvidenceLedger, raw: Record<string, unknown>): Validated
   return outcome.finding;
 }
 
+/**
+ * Builds a `ValidatedFinding` directly, bypassing `validateCandidate` — the shape a resumed
+ * attempt's checkpoint seeds verbatim (`harnessCandidateValidation.ts`'s `CandidateTrackerOptions.
+ * seed` doc comment) or an attempt from before the validation-time width check existed. `
+ * revalidateFindings` re-checks member/head/digest resolution on a resume but never re-measures
+ * citation width, so this exact shape — an accepted finding whose primary citation is wider than
+ * `MAX_EVIDENCE_EXCERPT_CHARS` — is exactly what `selectEvidenceExcerpt`'s auto-window fallback
+ * exists for; `validateCandidate` itself now refuses it (repairably) at submission, so this helper,
+ * not `accept`, is how this module's own tests still construct it.
+ */
+function findingWithCitation(
+  source: LedgerEvidenceSource,
+  path: string,
+  citedRange: { startLine: number; endLine: number },
+  item: { line: number; endLine?: number },
+  candidateId: string,
+): ValidatedFinding {
+  const primary = {
+    sourceId: source.sourceId,
+    digest: source.digest,
+    origin: source.origin,
+    memberId: 'm1',
+    repositoryId: 'repo-1',
+    baseSha: 'base-1',
+    headSha: 'head-1',
+    path,
+    range: citedRange,
+  };
+  return {
+    candidateId,
+    memberId: 'm1',
+    routing: 'inline',
+    item: {
+      id: candidateId,
+      file: path,
+      anchored: true,
+      line: item.line,
+      endLine: item.endLine,
+      severity: 'minor',
+      category: 'errorHandling',
+      confidence: 90,
+      title: 'A default title',
+      body: 'A default body.',
+      code: '',
+    },
+    provenance: { protocolProvenance: 'harness', citations: [{ sourceId: primary.sourceId, digest: primary.digest, path, range: citedRange }], validatedAt: NOW },
+    evidence: { repositoryId: 'repo-1', baseSha: 'base-1', headSha: 'head-1', primary, supporting: [] },
+  };
+}
+
 // ---- Stage 1: deduplicateFindings ----------------------------------------------------
 
 describe('deduplicateFindings (task 10.6, stage 1)', () => {
@@ -385,10 +435,15 @@ describe('evidence excerpt anchoring', () => {
     expect(directive).toContain('@@ -1,120 +1,120 @@');
   });
 
-  it('a cited range larger than the budget is not truncated: no model call at all, the finding kept, the stage incomplete', async () => {
+  it('a cited range larger than the budget, whose own claim line spans it too (no narrower anchor to fall back to), is not truncated: no model call at all, the finding kept, the stage incomplete', async () => {
     const ledger = makeLedger();
     const source = registerDiff(ledger, 'src/big.ts', bigPatch(120), 120);
-    const finding = accept(ledger, candidateRaw({ candidateId: 'cand-huge' }, source, 'src/big.ts', 1, 120));
+    // `findingWithCitation`, not `accept`: `validateCandidate` now refuses this citation width
+    // repairably at submission (see `harnessCandidateValidation.test.ts`) — this represents a
+    // finding that reached this stage some other way (a resumed attempt's seeded checkpoint; see
+    // the helper's own doc comment), which is exactly the case the auto-window fallback cannot
+    // help either, since the claim's own line span (1-120) is exactly as wide as the citation.
+    const finding = findingWithCitation(source, 'src/big.ts', { startLine: 1, endLine: 120 }, { line: 1, endLine: 120 }, 'cand-huge');
     const seam = recordingSeam();
 
     const result = await runContradictionChecks([finding], context(seam, ledger));
@@ -403,10 +458,34 @@ describe('evidence excerpt anchoring', () => {
     expect(result.unverified[0]?.reason).toContain('4000-character excerpt budget');
   });
 
+  it('a cited range larger than the budget, but whose own claim line is narrower and inside it, auto-windows around the claim line with a disclosure — never the old unavailable outcome', async () => {
+    const ledger = makeLedger();
+    const source = registerDiff(ledger, 'src/big.ts', bigPatch(120), 120);
+    // The real diagnosed shape: the model cited the whole 1-120 file as primary evidence but its own
+    // `item.line` (60-61) — the specific claim — is a narrow, well inside the cited range.
+    const finding = findingWithCitation(source, 'src/big.ts', { startLine: 1, endLine: 120 }, { line: 60, endLine: 61 }, 'cand-wide-anchored');
+    const seam = recordingSeam();
+
+    const result = await runContradictionChecks([finding], context(seam, ledger));
+
+    // A model call DID happen this time — the check ran, unlike the no-anchor case above.
+    expect(seam.calls).toBe(1);
+    expect(result.complete).toBe(true);
+    expect(result.unverified).toHaveLength(0);
+    const directive = seam.directives[0] as string;
+    expect(directive).toContain("const value60 = 'marker-60-");
+    expect(directive).toContain("const value61 = 'marker-61-");
+    // Discloses the substitution honestly rather than claiming this window holds the full citation.
+    expect(directive).toContain('is 8543 characters, over the 4000-character excerpt budget, so it could not be shown in full.');
+    expect(directive).toContain("centered on the claim's own reported line src/big.ts:60-61");
+    expect(directive).not.toContain(`containing the cited file lines src/big.ts:1-120`);
+  });
+
   it('skipping an unshowable excerpt does not spend the shared repair allowance the next finding needs', async () => {
     const ledger = makeLedger();
     const source = registerDiff(ledger, 'src/big.ts', bigPatch(120), 120);
-    const unshowable = accept(ledger, candidateRaw({ candidateId: 'cand-a-huge' }, source, 'src/big.ts', 1, 120));
+    // `findingWithCitation`, not `accept`: see the adjacent test's own comment.
+    const unshowable = findingWithCitation(source, 'src/big.ts', { startLine: 1, endLine: 120 }, { line: 1, endLine: 120 }, 'cand-a-huge');
     const malformed = accept(ledger, candidateRaw({ candidateId: 'cand-b-garbage' }, source, 'src/big.ts', 10, 11));
     const seam = scriptedSeam(() => 'not a verdict at all');
 
@@ -680,7 +759,9 @@ describe('createSynthesisVerification (the injected SynthesisVerificationRunner)
     // 120 lines of ~68 characters: past the excerpt budget, and the citation covers all of it.
     const patch = ['@@ -1,120 +1,120 @@', ...Array.from({ length: 120 }, (_, i) => `+const value${i + 1} = '${'x'.repeat(40)}';`)].join('\n');
     const source = registerDiff(ledger, 'src/p3.ts', patch, 120);
-    const finding = accept(ledger, candidateRaw({ candidateId: 'cand-p4' }, source, 'src/p3.ts', 1, 120));
+    // `findingWithCitation`, not `accept`: see `describe('evidence excerpt anchoring')`'s own tests
+    // for why — `validateCandidate` now refuses a citation this wide, repairably, at submission.
+    const finding = findingWithCitation(source, 'src/p3.ts', { startLine: 1, endLine: 120 }, { line: 1, endLine: 120 }, 'cand-p4');
     const seam = scriptedSeam(() => {
       throw new Error('no verdict may be asked for evidence that cannot be shown');
     });

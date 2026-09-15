@@ -232,6 +232,45 @@ describe('validateCandidate (task 7.6)', () => {
     expect(mixed).toMatchObject({ state: 'repairable', reasons: [{ code: 'supporting[0]:pathMissing' }] });
   });
 
+  describe('primary citation width (task: validation-time excerpt-budget cap)', () => {
+    function bigDiffPage(path: string, lineCount: number): DiffPageResult {
+      const lines = [`@@ -1,${lineCount} +1,${lineCount} @@`];
+      for (let i = 1; i <= lineCount; i += 1) lines.push(`+const value${i} = 'marker-${i}-${'x'.repeat(40)}';`);
+      return { state: 'complete', snapshot: SNAP1, value: { path, patch: lines.join('\n'), positions: [{ path, side: 'new', line: 1, endLine: lineCount }] } };
+    }
+
+    it('returns repairable, naming the exact width and budget, when the primary citation is wider than the contradiction-check excerpt budget — the diagnosed shape (a whole new-file citation for a one-line claim), caught at submission instead of after three silent verification passes', () => {
+      const fixture = setup();
+      const wide = fixture.ledger.registerDiffPage('m1', bigDiffPage('src/big.ts', 120));
+      if (!wide.ok) throw new Error('setup failed');
+      const outcome = validateCandidate(
+        candidate(fixture, { file: 'src/big.ts', line: 60, endLine: 61, citations: { primary: cite(wide.source, 'src/big.ts', 1, 120) }, code: undefined }),
+        fixture.context,
+      );
+      expect(outcome).toMatchObject({ state: 'repairable', reasons: [{ code: 'citationTooWide' }] });
+      const message = outcome.state === 'repairable' ? (outcome.reasons[0]?.message ?? '') : '';
+      // The identical wording (and the identical 4,000-character number) `selectEvidenceExcerpt`
+      // would otherwise only report hours later, at the contradiction-check stage — one shared
+      // message builder, never two that could drift apart.
+      expect(message).toContain('are 8543 characters on their own, past the 4000-character excerpt budget');
+      expect(message).toContain('Resubmit candidate cand-1 (same id) citing at most 4000 characters');
+    });
+
+    it('accepts once the same candidate resubmits a citation narrow enough to fit the excerpt budget — the repaired shape none of the incident\'s 12 candidates ever reached', () => {
+      const fixture = setup();
+      const wide = fixture.ledger.registerDiffPage('m1', bigDiffPage('src/big.ts', 120));
+      if (!wide.ok) throw new Error('setup failed');
+      const finding = accepted(fixture, { file: 'src/big.ts', line: 60, endLine: 61, citations: { primary: cite(wide.source, 'src/big.ts', 55, 65) }, code: undefined });
+      expect(finding.evidence.primary.range).toEqual({ startLine: 55, endLine: 65 });
+    });
+
+    it('still accepts an ordinary citation whose cited bytes are well within the excerpt budget — this check only ever refuses width, never a citation this small', () => {
+      const fixture = setup();
+      const finding = accepted(fixture);
+      expect(finding.evidence.primary.range).toEqual({ startLine: 12, endLine: 12 });
+    });
+  });
+
   it('rejects when any citation is rejected, even if another is only repairable', () => {
     const fixture = setup();
     const outcome = validateCandidate(candidate(fixture, {

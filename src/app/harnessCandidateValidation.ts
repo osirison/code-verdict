@@ -8,8 +8,13 @@
  * `validateCandidate` is the host side of `submitCandidateFinding`: it takes
  * a model-supplied candidate as `unknown`, checks schema, criteria, member
  * identity, citations (through `./harnessCitations`, never by refetching),
- * revision binding, location, citable status, and primary-target
- * eligibility, and returns exactly one of `accepted | repairable | rejected`
+ * revision binding, location, citable status, primary citation width (the
+ * same `MAX_EVIDENCE_EXCERPT_CHARS` the contradiction check will hold it to
+ * — `./harnessSynthesisVerification`'s `measureCitedSpanChars`, imported
+ * rather than a second bound, and repairable rather than rejected, so a
+ * model that cited an entire file for a one-line claim is told to narrow it
+ * while investigation budget still remains, not hours later), and
+ * primary-target eligibility, and returns exactly one of `accepted | repairable | rejected`
  * with bounded public reasons. An accepted candidate becomes a
  * `ValidatedFinding`: a `ReviewItem` the existing triage/submit path already
  * understands, routed `inline` or `summary`, plus audit provenance
@@ -51,6 +56,7 @@ import { DEFAULT_HARNESS_POLICY } from '../domain/harnessPolicy';
 import { ALL_CATEGORIES, type Category, type ReviewItem, type Severity } from '../domain/types';
 import { quotedTextAppearsIn, resolveCandidateCitations, type CitationResolution, type ResolvedCitation } from './harnessCitations';
 import { normalizeEvidencePath, normalizeEvidenceRange, type EvidenceLedger, type EvidenceOrigin } from './harnessEvidenceLedger';
+import { citationTooWideReason, MAX_EVIDENCE_EXCERPT_CHARS, measureCitedSpanChars } from './harnessSynthesisVerification';
 
 export type FindingRouting = 'inline' | 'summary';
 
@@ -277,6 +283,20 @@ export function validateCandidate(raw: unknown, context: CandidateValidationCont
       rejected.push({ code: 'locationMismatch', message: `Candidate names ${candidate.file} but its primary evidence is ${primary.cited.path}.` });
     } else if (candidateRange.startLine < primary.location.range.startLine || candidateRange.endLine > primary.location.range.endLine) {
       rejected.push({ code: 'locationOutsideEvidence', message: `Lines ${candidateRange.startLine}-${candidateRange.endLine} of ${candidate.file} were not in the primary evidence returned to the model.` });
+    }
+    // Task (incident fix): catches an oversized primary citation the moment the model submits it,
+    // rather than only at the contradiction-check stage hours later (`selectEvidenceExcerpt`'s own
+    // `unavailable` branch in `harnessSynthesisVerification.ts`) — by then the model has moved on and
+    // the guidance to resubmit narrower routinely goes unacted on. Repairable, never rejected: the
+    // candidate itself may be sound, only its citation is wider than the check can show, and the
+    // model can narrow it while investigation budget still remains (D9's own stated rationale for
+    // validating at submission time at all). `measureCitedSpanChars` returns `undefined` when the
+    // width cannot be honestly measured here (an unindexably large payload, or a citation this pass
+    // cannot anchor) — that is not evidence of a problem, so it is never treated as one; the
+    // contradiction-check stage still has its own `unavailable` fallback for those cases.
+    const citedChars = measureCitedSpanChars(primary.source, primary.cited.path, primary.cited.range);
+    if (citedChars !== undefined && citedChars > MAX_EVIDENCE_EXCERPT_CHARS) {
+      repairable.push({ code: 'citationTooWide', message: citationTooWideReason(candidate.candidateId, primary.cited.path, citedChars, MAX_EVIDENCE_EXCERPT_CHARS) });
     }
     // `quotedTextAppearsIn`, not a substring of the whole payload: a diff page's bytes carry a
     // `+`/`-`/space prefix on every line, so a model quoting consecutive lines as they read in the

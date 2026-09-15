@@ -1339,9 +1339,57 @@ function timeLine(activity: readonly ActivityEvent[] | undefined, elapsedMs: num
   return `<div class="coverage-line">time: ${parts.map(e).join(' · ')}</div>`;
 }
 
+/**
+ * Below this many same-code, same-candidate-attributed limitations, each still renders its own full
+ * chip (task: banner aggregation) — the wall this collapses is a *streak* of near-identical
+ * paragraphs, not the ordinary case of one or two unrelated ones.
+ */
+const LIMITATION_AGGREGATE_THRESHOLD = 3;
+
+/**
+ * The one-line summary for `code`, naming every candidate id compactly, or `undefined` for any code
+ * this function does not know how to describe truthfully for every member of the group — those
+ * codes are never aggregated (`limitationsList` below), no matter how many share the run, rather
+ * than risk misdescribing one of them with a sentence written for a different code.
+ */
+function limitationAggregateSummary(code: string, candidateIds: readonly string[]): string | undefined {
+  if (code !== 'unverifiableCitation') return undefined;
+  return `${candidateIds.length} findings could not be checked for contradiction: citations wider than the excerpt budget (list: ${candidateIds.join(', ')})`;
+}
+
+/**
+ * Task: banner aggregation — an incident where a single run's twelve near-identical
+ * `unverifiableCitation` paragraphs made this card an unreadable wall (each one repeats the same
+ * boilerplate sentence; only the candidate id differs). Three or more limitations that share both a
+ * `code` `limitationAggregateSummary` knows how to describe and a `candidateId` collapse into that
+ * one summary line, which still lists every id — the ids are what a reviewer might act on, the
+ * repeated boilerplate is not. Every other limitation — a different code, an under-threshold count,
+ * or one with no `candidateId` to attribute it to — renders its own chip exactly as before this
+ * change.
+ */
 function limitationsList(limitations: readonly Limitation[]): string {
   if (limitations.length === 0) return '';
-  return `<div class="limitations">${limitations.map((l) => `<div class="limitation-chip">${e(l.message)}</div>`).join('')}</div>`;
+  const idsByCode = new Map<string, string[]>();
+  for (const limitation of limitations) {
+    if (limitation.candidateId === undefined) continue;
+    const ids = idsByCode.get(limitation.code);
+    if (ids) ids.push(limitation.candidateId);
+    else idsByCode.set(limitation.code, [limitation.candidateId]);
+  }
+  const summarizedCodes = new Set<string>();
+  const chips: string[] = [];
+  for (const limitation of limitations) {
+    const ids = limitation.candidateId !== undefined ? idsByCode.get(limitation.code) : undefined;
+    const summary = ids && ids.length >= LIMITATION_AGGREGATE_THRESHOLD ? limitationAggregateSummary(limitation.code, ids) : undefined;
+    if (summary !== undefined) {
+      if (summarizedCodes.has(limitation.code)) continue;
+      summarizedCodes.add(limitation.code);
+      chips.push(`<div class="limitation-chip">${e(summary)}</div>`);
+      continue;
+    }
+    chips.push(`<div class="limitation-chip">${e(limitation.message)}</div>`);
+  }
+  return `<div class="limitations">${chips.join('')}</div>`;
 }
 
 /** Bounded so one changeset with hundreds of uninspected files cannot turn the fail card into a wall of text. */

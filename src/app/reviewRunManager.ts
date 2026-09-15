@@ -783,6 +783,41 @@ function mintHarnessId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString('hex')}`;
 }
 
+/**
+ * Incident fix: a `headChanged` blocker in the attempt that just failed, turned into the same
+ * `Limitation` shape `checkCheckpointIntegrity`'s own reasons use — so `completeAttempt`'s
+ * checkpoint offer can fold it into `resumeReasons` through the existing incompatibility-reasons
+ * display rather than a parallel one, and `resumeRun` can refuse on the same `code` in its own
+ * defense-in-depth check below. Never the word "resume"/"continue"/"reconnect" — the reviewer-facing
+ * wording ban applies to this text like any other.
+ *
+ * `blocker === 'headChanged'` (rather than the `headUnchanged` clause) is deliberate: `headUnchanged`
+ * also fails when the head check was never performed or could not be resolved
+ * (`harnessCompletion.ts`'s `evaluateCompletion`), neither of which says anything about the pinned
+ * snapshot itself being stale — only an *observed move* means every future resume of this exact
+ * checkpoint is provably doomed the same way.
+ */
+function headMovedReason(blockerDetails: readonly CompletionBlockerDetail[] | undefined): Limitation | undefined {
+  const detail = blockerDetails?.find((entry) => entry.blocker === 'headChanged');
+  if (!detail) return undefined;
+  return { code: 'headMoved', message: `${detail.message} A fresh review of the current head is needed; this checkpoint's pinned revision cannot reach completion.` };
+}
+
+/**
+ * Same purpose as `headMovedReason` above, for `sweepInterruptedRuns`'s own live-terminal-checkpoint
+ * branch: it has only the persisted checkpoint's bounded `Limitation`s to consult (D13: a checkpoint
+ * never retains the richer per-member `CompletionBlockerDetail[]`), not a live `HarnessAttemptResult`
+ * — so the generic blocker message (`harnessCompletion.ts`'s `BLOCKER_MESSAGES.headChanged`) is all
+ * there is to report, never a member id or a moved-to SHA. The same degrade still applies for the
+ * identical reason: this checkpoint's pinned snapshot already proved unrepairably stale once, and a
+ * resume never re-pins it.
+ */
+function headMovedReasonFromLimitations(limitations: readonly Limitation[]): Limitation | undefined {
+  const limitation = limitations.find((entry) => entry.code === 'headChanged');
+  if (!limitation) return undefined;
+  return { code: 'headMoved', message: `${limitation.message} A fresh review of the current head is needed; this checkpoint's pinned revision cannot reach completion.` };
+}
+
 /** The `RunLifecycle` -> `RunPhase` collapse `harnessActivityProjection.ts` uses internally (not exported there) — needed here only for `buildProjection`'s manager-authored fallback below, which has no activity log to reduce. */
 function activePhaseFor(lifecycle: RunLifecycle): RunProjection['phase'] {
   switch (lifecycle) {
@@ -966,6 +1001,14 @@ export class ReviewRunManager {
 
     const stored = this.runs.byRef().get(crKey(input.target.ref.repoId, input.target.ref.number));
     if (!stored?.lineageId) return undefined;
+    // Defense in depth, against `headMovedReason`'s own degrade above (`completeAttempt`'s
+    // checkpoint-offer computation): a lineage whose last live settle already observed the branch
+    // move past its pinned snapshot can never complete from that snapshot no matter how many fresh
+    // attempts are started against it — a resume never re-pins to the live head — so this refuses
+    // even a caller that reached this method without going through `deriveRunControls`'s offer at
+    // all (a stale UI paint, a race, a direct call). The reviewer's own path forward is unchanged: a
+    // fresh `trigger()` reads the live head and starts a new lineage.
+    if (stored.resumeReasons?.some((reason) => reason.code === 'headMoved')) return undefined;
     const lineageId = stored.lineageId as LineageId;
     const checkpoint = this.harnessRunStore.latestCheckpoint(lineageId);
     if (!checkpoint) return undefined;
@@ -1666,7 +1709,21 @@ export class ReviewRunManager {
     const latestOwnCheckpoint = this.harnessRunStore.latestCheckpoint(record.lineageId);
     if (latestOwnCheckpoint) {
       const storedSnapshot = this.harnessRunStore.readSnapshot(record.lineageId, latestOwnCheckpoint.attempt);
-      const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latestOwnCheckpoint) : undefined;
+      const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latestOwnCheckpoint) : undefined;
+      // Incident fix: `checkCheckpointIntegrity` above compares only pinned snapshots (this
+      // method's own doc comment on why the live head/model/policy dimensions are ordinarily
+      // deferred to a reviewer's actual click, `decideResume`, inside `assembleResumeAttempt`). But
+      // a resume of this lineage never re-pins to the live head — only a fresh `trigger()` does —
+      // so a `headChanged` blocker this attempt already hit against the *same* pinned snapshot every
+      // future resume of it inherits is not a transient click-time fact, it is a permanent property
+      // of this checkpoint: every resume from it is provably doomed by the identical unrepairable
+      // blocker before it even starts. `headMovedReason` pulls that one dimension forward into this
+      // offer (the manager has just-finished live connection access right here, unlike the
+      // activation sweep, which never does) so the offer degrades the moment it can be known false,
+      // rather than after a reviewer burns a full fresh budget re-discovering it — the incident this
+      // fix answers had four such burns in a row.
+      const headMoved = headMovedReason(result.outcome.blockerDetails);
+      const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : headMoved ? [...integrityReasons, headMoved] : integrityReasons;
       checkpointOffer = {
         lineageId: record.lineageId,
         resumable: reasons ? reasons.length === 0 : false,
@@ -2163,7 +2220,13 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
         let terminalResumeReasons: readonly Limitation[] | undefined;
         if (latest.projection.lifecycle === 'failed') {
           const storedSnapshot = harnessRunStore.readSnapshot(lineageId, latest.attempt);
-          const reasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
+          const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
+          // Incident fix, mirroring `completeAttempt`'s own `headMovedReason` degrade above: this
+          // branch exists for the identical live-`failed` settle, only reached here because the
+          // extension host stopped before that branch's own write could land — so it needs the
+          // identical check, from whatever the persisted checkpoint's own limitations still show.
+          const headMoved = headMovedReasonFromLimitations(latest.projection.limitations);
+          const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : headMoved ? [...integrityReasons, headMoved] : integrityReasons;
           terminalResumable = reasons ? reasons.length === 0 : false;
           if (reasons && reasons.length > 0) terminalResumeReasons = reasons;
         }

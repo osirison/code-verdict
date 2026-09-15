@@ -13,7 +13,6 @@ import {
   type SynthesisVerificationRunner,
 } from './harnessAttempt';
 import { createSynthesisVerification } from './harnessSynthesisVerification';
-import type { CompletionRequestResponse } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
 import { PromptCeilingExceededError, type InvestigationMapMember, type InvestigationSubmission } from './harnessModelSeam';
@@ -281,11 +280,6 @@ function sourceRefFrom(result: HostToolResult): { sourceId: string; digest: stri
   return { sourceId: result.sourceId, digest: result.digest };
 }
 
-function completionResponseFrom(result: HostToolResult): CompletionRequestResponse {
-  if (result.state !== 'complete' || result.content.tool !== 'requestCompletion') throw new Error(`Expected a requestCompletion result, got ${JSON.stringify(result)}.`);
-  return result.content.response;
-}
-
 function candidateSubmissionMessage(candidateId: string, path: string, ref: { sourceId: string; digest: string }): unknown {
   return {
     kind: 'candidateSubmission',
@@ -335,6 +329,22 @@ function bigDiffPageResult(path: string, lineCount: number): DiffPageResult {
   const lines = [`@@ -1,${lineCount} +1,${lineCount} @@`];
   for (let i = 1; i <= lineCount; i += 1) lines.push(`+const value${i} = 'marker-${i}-${'x'.repeat(40)}';`);
   return { snapshot: SNAPSHOT_REF, state: 'complete', value: { path, patch: lines.join('\n'), positions: [{ path, side: 'new', line: 1, endLine: lineCount }] } };
+}
+
+/**
+ * A diff page whose declared citable range (`positions`) is real, but whose patch text carries no
+ * `@@` hunk structure at all — one opaque physical line, past the excerpt budget. `measureCitedSpanChars`
+ * (validation time) and `selectEvidenceExcerpt` (contradiction-check time) both walk the identical
+ * hunk parser to anchor a citation, and both come back unable to locate one here — never a width
+ * problem, so the validation-time width cap (task: this fix's item 1) has nothing to catch: the
+ * candidate is accepted, and only later found unverifiable for "could not be located", the one
+ * `unavailable` cause this fix leaves untouched (`harnessSynthesisVerification.test.ts`'s own
+ * matching unit-level test). The no-progress-bound tests below need exactly this shape, now that a
+ * WIDE-BUT-LOCATABLE citation (`bigDiffPageResult`) no longer reaches an accepted, unverifiable
+ * state at all.
+ */
+function opaqueDiffPageResult(path: string, byteLength: number): DiffPageResult {
+  return { snapshot: SNAPSHOT_REF, state: 'complete', value: { path, patch: 'z'.repeat(byteLength), positions: [{ path, side: 'new', line: 1, endLine: 3 }] } };
 }
 
 /** Passes every verification clause without asking the model — the collaborator's own concern (task 10.6) is not this pass's job to implement. */
@@ -1597,57 +1607,47 @@ describe('HarnessAttempt.run (10.9: the real 10.6 collaborator, end to end — a
 });
 
 describe('HarnessAttempt.run (the no-progress bound: a citation stuck past the excerpt window cannot hold completion hostage forever)', () => {
-  it('the diagnosed morning shape — a wide-span candidate plus a stream of new submissions — terminates within the bound, denies with actionable guidance meanwhile, and is eventually granted with a truthful limitation naming the candidate', async () => {
-    let file2Ref: { sourceId: string; digest: string } | undefined;
-    let file3Ref: { sourceId: string; digest: string } | undefined;
+  it('the diagnosed morning shape, post-fix — a whole-file citation for a one-line claim is refused repairably the moment it is submitted, naming the exact width and budget, and a same-id narrower resubmission is accepted and verified normally: the no-progress bound never gets a chance to fire at all', async () => {
+    // Before the validation-time width cap (task: this fix), this exact citation shape —
+    // `cand-wide` citing all 120 lines of a new file — was *accepted* at submission, reached
+    // `verifying` unverifiable, and rode the no-progress bound to a truthful-but-late limitation
+    // (37 identical denials in production; the streak cap in ~3). Now it is never accepted with
+    // this citation at all: `validateCandidate` refuses it repairably, at the same investigating-
+    // phase turn it was submitted, with the identical wording `selectEvidenceExcerpt` used to only
+    // report hours later. See `harnessCandidateValidation.test.ts`'s own `citationTooWide` tests
+    // for the collaborator-level coverage; this is the same shape through the real attempt loop.
+    let file1Ref: { sourceId: string; digest: string } | undefined;
     const connection = reviewConnection({
-      files: ['file1.ts', 'file2.ts', 'file3.ts'],
-      readDiff: async (request) => (request.path === 'file1.ts' ? bigDiffPageResult('file1.ts', 120) : diffPageResult(request.path)),
+      files: ['file1.ts'],
+      readDiff: async () => bigDiffPageResult('file1.ts', 120),
     });
-
-    const submitWide: ScriptEntry = (call) => messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', sourceRefFrom(call.toolResults[0] as HostToolResult), 1, 120));
-    const readFile2: ScriptEntry = () => messages(readDiffMessage('file2.ts'));
-    const captureFile2ThenReadFile3: ScriptEntry = (call) => {
-      file2Ref = sourceRefFrom(call.toolResults[0] as HostToolResult); // this turn's own single readDiffMessage('file2.ts') result
-      return messages(readDiffMessage('file3.ts'));
+    const submitWide: ScriptEntry = (call) => {
+      file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref, 1, 120));
     };
-    const captureFile3ThenStop: ScriptEntry = (call) => {
-      file3Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
-      return STOP_TURN;
+    const respondToRepair: ScriptEntry = (call) => {
+      const outcome = outcomeFor(call.toolResults, 'cand-wide');
+      if (!outcome) throw new Error('expected a submitCandidateFinding result for cand-wide');
+      expect(outcome.state).toBe('repairable');
+      expect(outcome.reasons.some((reason) => reason.startsWith('citationTooWide:'))).toBe(true);
+      expect(outcome.reasons.some((reason) => reason.includes('8543 characters on their own, past the 4000-character excerpt budget'))).toBe(true);
+      expect(outcome.reasons.some((reason) => reason.includes('Resubmit candidate cand-wide (same id) citing at most 4000 characters'))).toBe(true);
+      return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref as { sourceId: string; digest: string }, 10, 11));
     };
-
-    // Every model-turn result the verifying phase's own turns (not the contradiction pass's own
-    // internal `askModel` calls, handled generically below) actually receive, captured by turn
-    // index — index 2 is what arrives at the turn right after the first `requestCompletion`, i.e.
-    // that request's own denial.
-    const verifyingTurnResults: (readonly HostToolResult[])[] = [];
     const respondToVerifying: ScriptEntry = (call) => {
       if (call.repairInstruction !== undefined) {
-        // The contradiction pass's own directive (`buildContradictionDirective`) — never sent for
-        // `cand-wide`, whose span is skipped before any model call. Always answers "not contradicted"
-        // so `cand-b`/`cand-c` survive verification cleanly on every re-run.
+        // The contradiction pass's own directive, now reachable for `cand-wide` at all because its
+        // accepted citation (10-11) fits the excerpt window — never `unavailable`.
         const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
         if (!match) throw new Error(`unexpected verifying repairInstruction shape: ${call.repairInstruction}`);
         return JSON.stringify({ candidateId: match[1], contradicted: false });
       }
-      verifyingTurnResults.push(call.toolResults);
-      switch (verifyingTurnResults.length - 1) {
-        case 0:
-          return messages(candidateSubmissionMessage('cand-b', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
-        case 1:
-          return COMPLETION_TURN;
-        case 2:
-          return messages(candidateSubmissionMessage('cand-c', 'file3.ts', file3Ref as { sourceId: string; digest: string }));
-        case 3:
-          return COMPLETION_TURN;
-        default:
-          throw new Error('ran out of scripted verifying turns — the bound did not end the phase when expected');
-      }
+      return COMPLETION_TURN;
     };
 
     const seam = scriptedModelSeam({
       planning: [PLAN_TURN],
-      investigating: [messages(readDiffMessage('file1.ts')), submitWide, readFile2, captureFile2ThenReadFile3, captureFile3ThenStop],
+      investigating: [messages(readDiffMessage('file1.ts')), submitWide, respondToRepair, STOP_TURN],
       verifying: [respondToVerifying],
     });
     const attempt = createHarnessAttempt({
@@ -1660,34 +1660,12 @@ describe('HarnessAttempt.run (the no-progress bound: a citation stuck past the e
 
     const result = await attempt.run();
 
-    // Terminated within the bound: exactly two `requestCompletion` turns happened (index 1 and 3
-    // above) rather than the production run's 37 identical refusals, and the second one was granted.
-    expect(verifyingTurnResults).toHaveLength(4);
-
-    // The first denial (streak at 2 of the bound's 3) still blocks completion exactly as an ordinary
-    // repairable `contradictionPending` always has, and names the stuck candidate with the actionable
-    // repair rather than one opaque aggregate boolean.
-    const firstDenial = completionResponseFrom(verifyingTurnResults[2]?.[0] as HostToolResult);
-    expect(firstDenial.granted).toBe(false);
-    if (!firstDenial.granted) {
-      expect(firstDenial.repairable).toBe(true);
-      expect(firstDenial.blockers).toContain('contradictionPending');
-      const detail = firstDenial.missingConditions.find((d) => d.blocker === 'contradictionPending');
-      expect(detail?.message).toContain('cand-wide');
-      expect(detail?.message).toContain('4000-character excerpt budget');
-      expect(detail?.message).toContain('Resubmit candidate cand-wide');
-      expect(detail?.message).toContain('4000 characters');
-    }
-
-    // The bound then closes the candidate out rather than refusing forever: completion is granted,
-    // carrying a truthful limitation that names the candidate — never silently dropped, never
-    // silently called fully verified.
     expect(result.lifecycle).toBe('succeeded');
     expect(result.outcome.completeness).toBe('complete');
-    expect(result.findings.map((f) => f.candidateId).sort()).toEqual(['cand-b', 'cand-c', 'cand-wide']);
-    const limitation = result.outcome.limitations.find((l) => l.code === 'unverifiableCitation');
-    expect(limitation?.message).toContain('cand-wide');
-    expect(limitation?.message).toContain('3 attempts');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-wide']);
+    // Verified for real — the no-progress bound (`MAX_UNVERIFIABLE_CONTRADICTION_STREAK`) never had
+    // a candidate to act on, because none was ever accepted unverifiable in the first place.
+    expect(result.outcome.limitations.some((l) => l.code === 'unverifiableCitation')).toBe(false);
   });
 
   it('a candidate that narrows its citation after the guidance gets verified normally, never reaching the bound', async () => {
@@ -1744,13 +1722,19 @@ describe('HarnessAttempt.run (the no-progress bound: a citation stuck past the e
 describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming model without further submissions cannot idle past it either)', () => {
   it('finding 1 — a burst of one submission followed only by requestCompletion spam (no further submissions, so passesStale never returns) terminates within the denial bound and is granted with a truthful limitation', async () => {
     let file1Ref: { sourceId: string; digest: string } | undefined;
+    // `opaqueDiffPageResult`, not `bigDiffPageResult`: this candidate must still be *accepted* with
+    // an unverifiable citation, to drive the no-progress bound this test targets — a wide-but-
+    // locatable citation no longer reaches that state at all (the validation-time width cap, this
+    // fix's item 1, refuses it repairably at submission instead; see the diagnosed-morning-shape
+    // test above). This shape is unlocatable rather than oversized, which the width cap cannot and
+    // should not catch (`opaqueDiffPageResult`'s own doc comment).
     const connection = reviewConnection({
       files: ['file1.ts'],
-      readDiff: async () => bigDiffPageResult('file1.ts', 120),
+      readDiff: async () => opaqueDiffPageResult('file1.ts', 5_000),
     });
     const submitWide: ScriptEntry = (call) => {
       file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
-      return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref, 1, 120));
+      return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref, 1, 3));
     };
 
     // Unlike the interleaved shapes above, every verifying turn here is a bare `requestCompletion`
@@ -1875,7 +1859,19 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
     expect(result.outcome.limitations.some((l) => l.code === 'contradictionCheckExhausted')).toBe(false);
   });
 
-  it('finding 1/3 — genuine progress (a changing reason every round) never trips either counter, even across more rounds than the bound', async () => {
+  // `finding 1/3` used to be "genuine progress (a changing reason every round) never trips either
+  // counter": repeated resubmissions of the same candidateId, each still past the excerpt budget
+  // but a different width, so `selectEvidenceExcerpt` reported a genuinely different reason every
+  // round and neither no-progress counter (`unverifiedContradictionStreak`/`deniedContradictionStreak`)
+  // ever advanced. That shape is no longer reachable at all: the validation-time width cap (this
+  // fix's item 1) refuses every one of those oversized resubmissions repairably, at submission,
+  // before the candidate is ever accepted — so it never reaches `verifying` unverifiable in the
+  // first place, and the "reason changes every round" mechanic has nothing left to exercise. What
+  // repeated oversized resubmissions hit instead is the ordinary validation repair allowance
+  // (`protocolRepairsPerPhase`), a bound that now closes this exact shape out in attempt 1 rather
+  // than after three full verification passes — a strictly stronger guarantee, tested below in its
+  // own right.
+  it('a citation that never narrows across repeated resubmissions is bounded by the validation repair allowance — rejected once repairs are exhausted, never reaching an accepted-but-unverifiable state at all', async () => {
     let file1Ref: { sourceId: string; digest: string } | undefined;
     const connection = reviewConnection({
       files: ['file1.ts'],
@@ -1886,22 +1882,14 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
       return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', file1Ref, 1, 120));
     };
 
-    // A resubmission and a `requestCompletion` cannot share one turn (the protocol refuses a
-    // `completionRequest` batched with a candidate submission), so each of the four rounds below is
-    // two turns: resubmit the SAME candidateId with a citation still well past the excerpt budget
-    // but a DIFFERENT number of characters every time (120, then 100, then 90, then 80 cited
-    // lines — a changed reason every round, by `selectEvidenceExcerpt`'s own character count), then
-    // ask for completion. Both counters must reset on every one of these rounds (four, one more
-    // than the bound), because a real re-run precedes each denial and reports a genuinely different
-    // candidate state each time. Only the final round narrows into the excerpt window for real and
-    // is granted.
+    // `testPolicy()`'s default `protocolRepairsPerPhase` is 2: the first submission (investigating,
+    // above) draws no repair yet (`repairs: 0`), and each of these three resubmissions — still well
+    // past the excerpt budget every time — draws one more (1, then 2, then 3), the last one over the
+    // allowance, which closes the candidate `rejected` mid-turn rather than leaving it `unresolved`
+    // forever.
     let verifyingTurns = 0;
     const respondToVerifying: ScriptEntry = (call) => {
-      if (call.repairInstruction !== undefined) {
-        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
-        if (!match) throw new Error(`unexpected verifying repairInstruction shape: ${call.repairInstruction}`);
-        return JSON.stringify({ candidateId: match[1], contradicted: false });
-      }
+      if (call.repairInstruction !== undefined) throw new Error('no contradiction check should ever run: cand-wide is never accepted');
       verifyingTurns += 1;
       const ref = file1Ref as { sourceId: string; digest: string };
       switch (verifyingTurns) {
@@ -1917,12 +1905,8 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
           return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', ref, 1, 80));
         case 6:
           return COMPLETION_TURN;
-        case 7:
-          return messages(candidateSubmissionMessageAt('cand-wide', 'file1.ts', ref, 10, 11));
-        case 8:
-          return COMPLETION_TURN;
         default:
-          throw new Error('ran out of scripted verifying turns — a counter tripped when it should not have');
+          throw new Error('ran out of scripted verifying turns — the repair allowance did not close the candidate out when expected');
       }
     };
 
@@ -1941,10 +1925,12 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
 
     const result = await attempt.run();
 
+    // Rejected, not accepted-then-retired: no finding ships for `cand-wide`, and none of the
+    // no-progress-bound limitations ever fire, because the candidate never reached the state either
+    // bound acts on.
     expect(result.lifecycle).toBe('succeeded');
     expect(result.outcome.completeness).toBe('complete');
-    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-wide']);
-    // Verified for real on the fourth round — never through the bound, on either counter.
+    expect(result.findings).toEqual([]);
     expect(result.outcome.limitations.some((l) => l.code === 'unverifiableCitation')).toBe(false);
     expect(result.outcome.limitations.some((l) => l.code === 'contradictionCheckExhausted')).toBe(false);
   });

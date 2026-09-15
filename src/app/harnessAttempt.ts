@@ -2164,6 +2164,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     const limitation: Limitation = Object.freeze({
       code: label.code,
       message: `Candidate ${candidateId} could not be checked for contradiction after ${MAX_UNVERIFIABLE_CONTRADICTION_STREAK} attempts because ${label.describe}: ${reason}`,
+      // Task: banner aggregation — the one field `reviewFlowHtml.ts`'s `limitationsList` needs to
+      // collapse a run of these into one summary line without regexing the candidate id back out of
+      // `message`'s prose.
+      candidateId,
     });
     retiredUnverifiableCandidates.set(candidateId, { limitation, reason, cause });
     extraLimitations.push(limitation);

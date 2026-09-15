@@ -345,8 +345,13 @@ export const CONTRADICTION_CHECK_MARKER = 'harness-contradiction-check-v1';
  * decides. Until that existed this pass assembled its own prompt text and handed it to `askModel`
  * without the ceiling ever applying — the cap was measured there, reported, and the over-cap text
  * sent regardless.
+ *
+ * Exported so `harnessCandidateValidation.ts` can reject an oversized primary citation the moment
+ * a candidate is submitted, against the identical number this module will hold it to hours later —
+ * one constant, imported, never a second 4,000 typed into a second file that could quietly drift
+ * from this one.
  */
-const MAX_EVIDENCE_EXCERPT_CHARS = 4_000;
+export const MAX_EVIDENCE_EXCERPT_CHARS = 4_000;
 
 /**
  * The most UTF-8 bytes one UTF-16 code unit of a JavaScript string can cost. Three: a BMP
@@ -423,6 +428,16 @@ export type EvidenceExcerpt =
       readonly totalLines: number;
       /** The diff side the cited file lines are numbered on, when the payload is a patch. */
       readonly side?: 'old' | 'new';
+      /**
+       * Present only when the citation itself was wider than `maxExcerptChars` and this window was
+       * built instead around the finding's own `item.line`/`endLine` — its most specific pointer to
+       * the defect — rather than around the full cited range. A named, disclosed relaxation of "only
+       * ever show what was cited" (design.md D9): see `selectEvidenceExcerpt`'s doc comment for why
+       * this is defensible on the same design's own terms, and `buildContradictionDirective` for how
+       * the disclosure reaches the verifier. `citedChars` is the full citation's own measured width,
+       * for the same "name the real number" reason `citationTooWideReason` states it.
+       */
+      readonly claimLineFallback?: { readonly citedChars: number; readonly maxExcerptChars: number };
     }
   /** The cited bytes cannot be shown honestly. The caller must skip the check, not shrink the evidence. */
   | { readonly kind: 'unavailable'; readonly reason: string };
@@ -544,10 +559,117 @@ function expandWindow(index: LineIndex, anchor: LineSpan, maxExcerptChars: numbe
 }
 
 /**
- * Chooses the bytes of `source` the contradiction check is allowed to see for
- * `finding`. Never truncates the cited lines themselves: a payload that does
- * not fit and a citation that cannot be located both come back `unavailable`,
- * and the caller skips the check rather than asking about the wrong bytes.
+ * Named and actionable, not just descriptive (task: "the model has no signal that this specific
+ * block is unfixable"). Shared by `selectEvidenceExcerpt`'s own `unavailable` branch and
+ * `harnessCandidateValidation.ts`'s validation-time width check, so a citation gets the identical
+ * wording whether it is refused the moment it is submitted or hours later at the contradiction
+ * check — one message, never two copies that could drift apart.
+ */
+export function citationTooWideReason(candidateId: string, path: string, citedChars: number, maxExcerptChars: number): string {
+  return (
+    `The cited lines of ${path} are ${citedChars} characters on their own, past the ${maxExcerptChars}-character excerpt budget, so they cannot be shown in full. ` +
+    `Resubmit candidate ${candidateId} (same id) citing at most ${maxExcerptChars} characters — a narrower line range within ${path} — so the contradiction check can run.`
+  );
+}
+
+/** One `locateCitedSpan` result: the physical span plus, for a patch, which side it was found on. */
+interface CitedSpanLocation {
+  readonly anchor: LineSpan;
+  readonly side?: 'old' | 'new';
+}
+
+/**
+ * The physical span of `content` (already indexed as `index`) that anchors `range` of `path`
+ * inside `source` — the one anchoring rule this module uses, shared by `selectEvidenceExcerpt`
+ * (the full citation) and its own auto-window fallback (`finding.item.line`/`endLine`), so both
+ * ever locate a span the same way rather than risking two measurements that disagree. `undefined`
+ * only when no line of the patch carries a number on either side at all (`anchorInPatch`'s own
+ * doc comment), or the payload is not line-aligned with `range` (`anchorInLineAlignedPayload`'s).
+ */
+function locateCitedSpan(content: string, index: LineIndex, source: LedgerEvidenceSource, path: string, range: { readonly startLine: number; readonly endLine: number }): CitedSpanLocation | undefined {
+  if (source.kind !== 'diff') {
+    const anchor = anchorInLineAlignedPayload(index, source, range);
+    return anchor ? { anchor } : undefined;
+  }
+  // The side is on the returned span, not on the citation: `CitedEvidenceRef` does not keep it.
+  // `locationContaining` is the same rule that accepted this citation at validation time, so the
+  // span found here is the span the citation was proved to sit inside — never a different one.
+  const location = locationContaining(source, path, range);
+  const sides: readonly ('old' | 'new')[] = location?.side ? [location.side] : ['new', 'old'];
+  for (const side of sides) {
+    const anchor = anchorInPatch(content, range, side);
+    if (anchor) return { anchor, side };
+  }
+  return undefined;
+}
+
+/**
+ * The character size of the physical span that anchors `range` of `path` inside `source`'s exact
+ * bytes — the identical measurement `selectEvidenceExcerpt` performs, exported so
+ * `harnessCandidateValidation.ts` can catch an oversized citation the moment a model submits it,
+ * against the same anchor this module will use hours later, rather than a second measurement that
+ * could disagree.
+ *
+ * `undefined` means the span could not be honestly measured here (the payload has more lines than
+ * this pass will walk to index, or the citation could not be anchored) — validation lets these
+ * through unblocked, on the same honesty rule this whole module follows: a check that cannot
+ * measure a citation must not refuse it on a guess. The contradiction-check stage still reports its
+ * own `unavailable` reason later if the problem persists there.
+ */
+export function measureCitedSpanChars(source: LedgerEvidenceSource, path: string, range: { readonly startLine: number; readonly endLine: number }, maxExcerptChars: number = MAX_EVIDENCE_EXCERPT_CHARS): number | undefined {
+  const content = source.exactContent;
+  if (content.length <= maxExcerptChars) return content.length;
+  const index = indexLines(content);
+  if (!index) return undefined;
+  const located = locateCitedSpan(content, index, source, path, range);
+  if (!located) return undefined;
+  return spanChars(index, located.anchor.first, located.anchor.last);
+}
+
+/**
+ * Anchors the finding's own `item.line`/`endLine` — the auto-window fallback's target when the full
+ * citation is too wide to show — inside `source`, on the same diff `side` the full citation was
+ * already found on (never re-derived: a range that validation proved sits inside an already-
+ * anchored citation is numbered on that identical side, so asking `locateCitedSpan` a second time
+ * could only ever agree, or, on some `anchorInPatch` bracket-edge case, quietly disagree and pick a
+ * different one). `undefined` when the item's own range does not sit inside the cited range
+ * (defensive — validation already enforces this for every ordinarily-constructed finding) or cannot
+ * itself be anchored.
+ */
+function claimLineAnchor(
+  content: string,
+  index: LineIndex,
+  source: LedgerEvidenceSource,
+  primary: CitedEvidenceRef,
+  item: { readonly line: number; readonly endLine?: number },
+  side: 'old' | 'new' | undefined,
+): LineSpan | undefined {
+  const range = { startLine: item.line, endLine: item.endLine ?? item.line };
+  if (range.startLine < primary.range.startLine || range.endLine > primary.range.endLine) return undefined;
+  if (source.kind !== 'diff') return anchorInLineAlignedPayload(index, source, range);
+  return side ? anchorInPatch(content, range, side) : undefined;
+}
+
+/**
+ * Chooses the bytes of `source` the contradiction check is allowed to see for `finding`. Never
+ * truncates the cited lines themselves: a payload that does not fit and a citation that cannot be
+ * located both come back `unavailable`, and the caller skips the check rather than asking about the
+ * wrong bytes.
+ *
+ * **The one named exception (task: auto-window fallback).** When the cited range itself is wider
+ * than `maxExcerptChars` — every one of it, not a slice — this used to always return `unavailable`.
+ * D9's own rule is "never ask about bytes the model did not cite", and a raw citation this wide
+ * cannot be honestly windowed around *itself*. But `finding.item.line`/`endLine` is not a bytes-the-
+ * host-invented location: it is the model's own most specific pointer to the defect, submitted in
+ * the same candidate, and validation already proved it sits inside the cited range
+ * (`harnessCandidateValidation.ts`'s `locationOutsideEvidence` check). So when that line anchors to
+ * a span that itself fits the budget, this builds the window around *that* instead of giving up —
+ * and `buildContradictionDirective` discloses the substitution in its own words, exactly the same
+ * device the ordinary window's "absence from this window is not evidence against the claim"
+ * disclaimer already uses to keep a partial view honest. A citation with no usable line anchor (the
+ * line itself cannot be located, or its own span is still too wide) keeps the original `unavailable`
+ * outcome — this fallback only ever narrows what would otherwise be refused outright, never widens
+ * what would otherwise be shown.
  */
 export function selectEvidenceExcerpt(finding: ValidatedFinding, source: LedgerEvidenceSource, maxExcerptChars: number = MAX_EVIDENCE_EXCERPT_CHARS): EvidenceExcerpt {
   const primary = finding.evidence.primary;
@@ -559,43 +681,34 @@ export function selectEvidenceExcerpt(finding: ValidatedFinding, source: LedgerE
     return { kind: 'unavailable', reason: `Cited evidence for ${primary.path} has more than ${MAX_INDEXED_EVIDENCE_LINES} lines, past what this pass will walk to locate a citation.` };
   }
 
-  // The side is on the returned span, not on the citation: `CitedEvidenceRef`
-  // does not keep it. `locationContaining` is the same rule that accepted this
-  // citation at validation time, so the span found here is the span the
-  // citation was proved to sit inside — never a different one.
-  const location = locationContaining(source, primary.path, primary.range);
-  const sides: readonly ('old' | 'new')[] = location?.side ? [location.side] : ['new', 'old'];
-  let anchor: LineSpan | undefined;
-  let side: 'old' | 'new' | undefined;
-  if (source.kind === 'diff') {
-    for (const candidate of sides) {
-      anchor = anchorInPatch(content, primary.range, candidate);
-      if (anchor) {
-        side = candidate;
-        break;
-      }
-    }
-  } else {
-    anchor = anchorInLineAlignedPayload(index, source, primary.range);
-  }
-  if (!anchor) {
+  const located = locateCitedSpan(content, index, source, primary.path, primary.range);
+  if (!located) {
     return { kind: 'unavailable', reason: `Lines ${primary.range.startLine}-${primary.range.endLine} of ${primary.path} could not be located inside the exact bytes returned for this evidence, so no window around them can be shown.` };
   }
+  const { anchor, side } = located;
 
   const citedChars = spanChars(index, anchor.first, anchor.last);
   if (citedChars > maxExcerptChars) {
+    const claimAnchor = claimLineAnchor(content, index, source, primary, finding.item, side);
+    if (claimAnchor && spanChars(index, claimAnchor.first, claimAnchor.last) <= maxExcerptChars) {
+      const window = expandWindow(index, claimAnchor, maxExcerptChars);
+      return {
+        kind: 'window',
+        text: content.slice(index.starts[window.first - 1] as number, lineEnd(index, window.last)),
+        firstLine: window.first,
+        lastLine: window.last,
+        totalLines: index.lineCount,
+        side,
+        claimLineFallback: { citedChars, maxExcerptChars },
+      };
+    }
     // Named and actionable, not just descriptive (task: "the model has no signal that this
     // specific block is unfixable"). This is the one `unavailable` reason a resubmission can
     // actually cure — the span itself, not the file, is what is too big — so it is the one that
     // names the fix in terms of the real number just enforced, never a hardcoded guess. The other
     // `unavailable` branches in this function (unindexable file, unlocatable citation) do not get
     // this treatment: narrowing the citation would not help either of those.
-    return {
-      kind: 'unavailable',
-      reason:
-        `The cited lines of ${primary.path} are ${citedChars} characters on their own, past the ${maxExcerptChars}-character excerpt budget, so they cannot be shown in full. ` +
-        `Resubmit candidate ${finding.candidateId} (same id) citing at most ${maxExcerptChars} characters — a narrower line range within ${primary.path} — so the contradiction check can run.`,
-    };
+    return { kind: 'unavailable', reason: citationTooWideReason(finding.candidateId, primary.path, citedChars, maxExcerptChars) };
   }
 
   const window = expandWindow(index, anchor, maxExcerptChars);
@@ -641,11 +754,22 @@ export function buildContradictionDirective(finding: ValidatedFinding, excerpt: 
   const evidenceHeader =
     excerpt.kind === 'whole'
       ? ['Cited evidence (the exact bytes already returned to you for this source; do not re-read the file):']
-      : [
-          'Cited evidence (a window of the exact bytes already returned to you for this source, around the cited lines; do not re-read the file):',
-          `window: lines ${excerpt.firstLine}-${excerpt.lastLine} of the ${excerpt.totalLines} lines of this source's exact bytes, containing the cited file lines ${primary.path}:${primary.range.startLine}-${primary.range.endLine}${sideSuffix}.`,
-          'Judge only the bytes below. The rest of this source exists and was not included, so text missing from this window is not evidence against the claim.',
-        ];
+      : excerpt.claimLineFallback
+        ? [
+            'Cited evidence (a window of the exact bytes already returned to you for this source; do not re-read the file):',
+            // Never the "containing the cited file lines" sentence the ordinary window uses below:
+            // that would claim this window holds the full citation, which is exactly what this
+            // fallback exists because it does not. Named honestly instead — see `selectEvidenceExcerpt`'s
+            // own doc comment for why this substitution is made at all.
+            `The full citation (${primary.path}:${primary.range.startLine}-${primary.range.endLine}) is ${excerpt.claimLineFallback.citedChars} characters, over the ${excerpt.claimLineFallback.maxExcerptChars}-character excerpt budget, so it could not be shown in full.`,
+            `window: lines ${excerpt.firstLine}-${excerpt.lastLine} of the ${excerpt.totalLines} lines of this source's exact bytes, centered on the claim's own reported line ${primary.path}:${finding.item.line}${finding.item.endLine !== undefined ? `-${finding.item.endLine}` : ''}${sideSuffix}, not on the full citation.`,
+            'Judge only the bytes below. The rest of the citation exists and was not included, so text missing from this window is not evidence against the claim.',
+          ]
+        : [
+            'Cited evidence (a window of the exact bytes already returned to you for this source, around the cited lines; do not re-read the file):',
+            `window: lines ${excerpt.firstLine}-${excerpt.lastLine} of the ${excerpt.totalLines} lines of this source's exact bytes, containing the cited file lines ${primary.path}:${primary.range.startLine}-${primary.range.endLine}${sideSuffix}.`,
+            'Judge only the bytes below. The rest of this source exists and was not included, so text missing from this window is not evidence against the claim.',
+          ];
   return [
     CONTRADICTION_CHECK_MARKER,
     `candidateId: ${finding.candidateId}`,

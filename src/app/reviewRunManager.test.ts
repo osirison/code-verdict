@@ -2318,6 +2318,38 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     },
   );
 
+  it('the sweep\'s own live-terminal-checkpoint branch degrades the fresh-attempt offer the same way completeAttempt\'s live settle does, when the terminal checkpoint\'s own limitations already show a headChanged blocker', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    let log = createActivityLog(SWEEP_RUN_ID, SWEEP_LINEAGE_ID, 1);
+    log = appendActivityEvent(
+      log,
+      {
+        kind: 'terminalResult',
+        lifecycle: 'failed',
+        completeness: 'none',
+        // The generic blocker-mapped shape `classifyOutcome`'s `blockerLimitation` writes — a
+        // checkpoint (D13) never retains the richer per-member `CompletionBlockerDetail`.
+        limitations: [{ code: 'headChanged', message: 'The target head changed after the snapshot was taken.' }],
+      },
+      { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
+    );
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot, { reason: 'attemptFailed', activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    const row = new ReviewRunStore(globalState).list()[0]!;
+    expect(row.resumable).toBe(false);
+    const headMoved = row.resumeReasons?.find((reason) => reason.code === 'headMoved');
+    expect(headMoved?.message).toContain('The target head changed after the snapshot was taken.');
+    expect(headMoved?.message).toContain('fresh review of the current head');
+    expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(false);
+  });
+
   it('a richer row a faster new run already recorded for the target survives the terminal-checkpoint branch too', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
@@ -2564,6 +2596,79 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     const controls = deriveRunControls(undefined, row);
     expect(controls.canStartFreshAttempt).toBe(false);
     expect(controls.freshAttemptReasons).toEqual(row?.resumeReasons);
+  });
+
+  // ---- Incident fix: a headChanged blocker degrades the fresh-attempt offer at settle time ----
+
+  it('a live failed settle whose own outcome carries an unrepairable headChanged blocker records resumable: false, naming the moved head — never a bare "resumable: true" a reviewer could burn a budget against', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const { pending, optionsOf, runners } = controllableAttempts();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    runs.trigger(crInput('42'), 1);
+    const { lineageId, runId } = optionsOf.get('!42')!.identity;
+    // The stored checkpoint's own integrity is otherwise sound (same snapshot/checkpoint pairing
+    // the passing "writes lineageId/resumable" test above uses) — only the live outcome's own
+    // headChanged blocker should be what degrades this offer.
+    const snapshot = sweepSnapshot({ runId, lineageId, attempt: 1 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const checkpoint = buildCheckpoint(
+      sweepCheckpointInput(snapshot, { runId, lineageId, reason: 'attemptFailed', activityEvents: terminalActivityEvents('failed', runId, lineageId) }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await harnessRunStore.writeCheckpoint(checkpoint, DEFAULT_HARNESS_POLICY);
+
+    const blockerDetails: readonly CompletionBlockerDetail[] = [
+      { blocker: 'headChanged', clause: 'headUnchanged', memberId: 'm1', message: 'Member m1 head moved from aaaaaaa to bbbbbbb.', repairable: false },
+    ];
+    pending.get('!42')!.resolve(failedResult('Head moved from the pinned revision.', '!42', 1, blockerDetails));
+    await vi.waitFor(() => expect(new ReviewRunStore(globalState).list().length).toBe(1));
+
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row?.resumable).toBe(false);
+    const headMoved = row?.resumeReasons?.find((reason) => reason.code === 'headMoved');
+    expect(headMoved?.message).toContain('Member m1 head moved from aaaaaaa to bbbbbbb.');
+    expect(headMoved?.message).toContain('fresh review of the current head');
+    // The reviewer-facing wording ban still applies to this text.
+    expect(headMoved?.message.toLowerCase()).not.toMatch(/\b(continue|resume|reconnect)\b/);
+    const controls = deriveRunControls(undefined, row);
+    expect(controls.canStartFreshAttempt).toBe(false);
+    expect(controls.freshAttemptReasons).toEqual(row?.resumeReasons);
+  });
+
+  it('resumeRun refuses a row whose resumeReasons carry headMoved, even called directly without going through the (already-false) offer — defense in depth', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    // Overwrite the seeded row's own resumable offer with the headMoved shape `headMovedReason`
+    // produces — the exact row a degraded settle would have written.
+    const runsStore = new ReviewRunStore(globalState);
+    const existing = runsStore.byRef().get(crKey('repo-1', '42'))!;
+    await runsStore.record({ ...existing, resumable: false, resumeReasons: [{ code: 'headMoved', message: 'Member m1 head moved from aaaaaaa to bbbbbbb. A fresh review of the current head is needed.' }] });
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const record = runs.resumeRun(crInput('42'), 1);
+
+    expect(record).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+
+  it('resumeRun on an ordinary same-head budget-exhausted row (no headMoved reason) is untouched by the incident fix', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await seedResumableLineage(globalState, harnessRunStore);
+    const { calls, runners } = trackedRunners();
+    const runs = new ReviewRunManager({ workspaceState: memoryStore(), globalState, runners, cancelGrace: () => new Promise<void>(() => {}) });
+
+    const row = new ReviewRunStore(globalState).byRef().get(crKey('repo-1', '42'));
+    expect(row?.resumeReasons?.some((reason) => reason.code === 'headMoved') ?? false).toBe(false);
+
+    const record = runs.resumeRun(crInput('42'), 1);
+
+    expect(record).toBeDefined();
+    await vi.waitFor(() => expect(calls).toEqual(['resume']));
   });
 
   it('resumeRun on a budget-exhausted row mints attempt N+1 and routes through the factory\'s resume, exactly as for an interrupted lineage', async () => {

@@ -1285,6 +1285,50 @@ describe('resume-from-checkpoint offer on the picker screen (task 14.6)', () => 
     const html = agentScreen({ resumable: true });
     expect(html).toContain('id="run"');
   });
+
+  describe('banner aggregation (task: three or more near-identical unverifiableCitation limitations collapse into one line)', () => {
+    function unverifiable(candidateId: string): Limitation {
+      return {
+        code: 'unverifiableCitation',
+        candidateId,
+        message: `Candidate ${candidateId} could not be checked for contradiction after 3 attempts because its cited evidence could not be excerpted for the contradiction check: The cited lines of src/big.ts are 8543 characters on their own, past the 4000-character excerpt budget.`,
+      };
+    }
+
+    it('3 or more limitations sharing a code and each attributed to a candidate collapse into one summary line naming every id, never the repeated boilerplate', () => {
+      const reasons: Limitation[] = [unverifiable('cand-a'), unverifiable('cand-b'), unverifiable('cand-c')];
+      const html = agentScreen({ resumable: false, reasons });
+
+      expect(html).toContain('3 findings could not be checked for contradiction: citations wider than the excerpt budget (list: cand-a, cand-b, cand-c)');
+      // The per-candidate boilerplate paragraph itself is gone — collapsed, not merely joined.
+      expect(html).not.toContain('could not be checked for contradiction after 3 attempts because');
+      expect(html.match(/limitation-chip/g)?.length).toBe(1);
+    });
+
+    it('only 2 sharing the code — under the threshold — still renders each in full, verbatim', () => {
+      const reasons: Limitation[] = [unverifiable('cand-a'), unverifiable('cand-b')];
+      const html = agentScreen({ resumable: false, reasons });
+
+      expect(html).toContain('Candidate cand-a could not be checked for contradiction');
+      expect(html).toContain('Candidate cand-b could not be checked for contradiction');
+      expect(html).not.toContain('findings could not be checked for contradiction: citations wider than the excerpt budget');
+      expect(html.match(/limitation-chip/g)?.length).toBe(2);
+    });
+
+    it('mixed codes: 3+ unverifiableCitation aggregate, a different code alongside them still renders verbatim on its own', () => {
+      const reasons: Limitation[] = [
+        unverifiable('cand-a'),
+        unverifiable('cand-b'),
+        unverifiable('cand-c'),
+        { code: 'headChanged', message: 'Member m1 head moved from aaaaaaa to bbbbbbb.' },
+      ];
+      const html = agentScreen({ resumable: false, reasons });
+
+      expect(html).toContain('3 findings could not be checked for contradiction: citations wider than the excerpt budget (list: cand-a, cand-b, cand-c)');
+      expect(html).toContain('Member m1 head moved from aaaaaaa to bbbbbbb.');
+      expect(html.match(/limitation-chip/g)?.length).toBe(2);
+    });
+  });
 });
 
 /**

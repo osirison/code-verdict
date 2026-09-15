@@ -179,7 +179,8 @@ function parseArray<T>(raw: unknown, parseItem: (item: unknown) => T | undefined
 function parseLimitation(raw: unknown): Limitation | undefined {
   if (!isRecord(raw)) return undefined;
   if (typeof raw.code !== 'string' || typeof raw.message !== 'string') return undefined;
-  return { code: raw.code, message: raw.message };
+  if (raw.candidateId !== undefined && typeof raw.candidateId !== 'string') return undefined;
+  return { code: raw.code, message: raw.message, ...(raw.candidateId !== undefined ? { candidateId: raw.candidateId } : {}) };
 }
 
 function parseLimitations(raw: unknown): readonly Limitation[] | undefined {

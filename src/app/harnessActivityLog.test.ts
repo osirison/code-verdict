@@ -112,6 +112,26 @@ describe('appendActivityEvent (tasks 5.1/5.2)', () => {
     expect(event.plan.items[1]).not.toHaveProperty('memberId');
   });
 
+  it('carries a limitation\'s candidateId through sanitization, and leaves one with no candidateId without one (task: banner aggregation)', () => {
+    const log = appendActivityEvent(
+      createActivityLog('run-1', 'lineage-1', 1),
+      {
+        kind: 'terminalResult',
+        lifecycle: 'failed',
+        completeness: 'partial',
+        limitations: [
+          { code: 'unverifiableCitation', message: 'Candidate cand-a could not be checked for contradiction.', candidateId: 'cand-a' },
+          { code: 'headChanged', message: 'The target head changed after the snapshot was taken.' },
+        ],
+      },
+      context(0, '2026-09-01T00:00:00.000Z'),
+    );
+    const event = log.events[0];
+    if (event?.kind !== 'terminalResult') throw new Error('expected terminalResult');
+    expect(event.limitations[0]).toEqual({ code: 'unverifiableCitation', message: 'Candidate cand-a could not be checked for contradiction.', candidateId: 'cand-a' });
+    expect(event.limitations[1]).not.toHaveProperty('candidateId');
+  });
+
   it('fails closed on a plan item with a blank memberId', () => {
     const plan = { revision: 1, items: [{ id: 'p1', description: 'x', state: 'pending' as const, memberId: '  ' }] };
     const log = createActivityLog('run-1', 'lineage-1', 1);

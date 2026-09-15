@@ -50,6 +50,16 @@ export type RunPhase = (typeof RUN_PHASES)[number];
 export interface Limitation {
   code: string;
   message: string;
+  /**
+   * The candidate this limitation names, when it names exactly one (task: banner aggregation —
+   * a run with three or more same-`code` limitations sharing this field can collapse them into one
+   * summary line that still lists every id, rather than repeating each one's near-identical
+   * boilerplate paragraph in full). Absent for every limitation that is not about one specific
+   * candidate (budget, coverage, provider limits) and for a limitation persisted before this field
+   * existed — never guessed from `message` text at render time, only ever set where the limitation
+   * is actually constructed (`harnessAttempt.ts`'s `retireUnverifiableCandidate`).
+   */
+  candidateId?: string;
 }
 
 interface ActivityEventBase {

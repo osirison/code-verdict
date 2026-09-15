@@ -141,7 +141,13 @@ function sanitizeLimitations(limitations: readonly Limitation[]): readonly Limit
     if (!/^[A-Za-z][A-Za-z0-9]*$/.test(limitation.code)) return undefined; // fail closed: a code is a short token, not free text
     const message = sanitizePublicText(limitation.message);
     if (message === undefined) return undefined;
-    cleaned.push({ code: limitation.code, message });
+    // `candidateId` (task: banner aggregation) is model-supplied text, same trust level as
+    // `message` — put through the identical `sanitizePublicText` pass rather than assumed clean,
+    // and dropped (not fail-closed) when it fails: a limitation this module already accepted must
+    // not be discarded over an attribution field that only ever narrows how it renders, never what
+    // it says.
+    const candidateId = limitation.candidateId === undefined ? undefined : sanitizePublicText(limitation.candidateId);
+    cleaned.push({ code: limitation.code, message, ...(candidateId !== undefined ? { candidateId } : {}) });
   }
   return cleaned;
 }
