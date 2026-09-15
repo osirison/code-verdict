@@ -81,7 +81,7 @@ function world(options: { attempt?: number; attachmentPath?: string; changedPath
   const outcomes = {
     diff: ledger.registerDiffPage('m1', diffPage()),
     callerSource: ledger.registerFileRange('m1', caller()),
-    policy: ledger.registerAgentsPolicy('m1', { directory: '', state: 'present', sourceId: 'agents-policy:base-1:.', digest: sha256Hex(policyText), content: policyText, citable: false }),
+    policy: ledger.registerAgentsPolicy('m1', { directory: '', state: 'present', sourceId: 'agents-policy:base-1:.', digest: sha256Hex(policyText), content: policyText, citable: false, files: ['agentsMd'] }),
     intent: ledger.registerChangeRequestDetail('m1', { state: 'complete', snapshot: SNAP, value: INTENT_DETAIL }),
     attachmentSource: ledger.registerAttachment('m1', attachment(options.attachmentPath ?? 'deploy/roles.yaml'), sha256Hex(attachment('x').content)),
   };

@@ -35,7 +35,7 @@ function setup(): { ledger: EvidenceLedger; diff: LedgerEvidenceSource; file: Le
   const diff = ledger.registerDiffPage('m1', diffPage(SNAP1));
   const file = ledger.registerFileRange('m2', fileRange(SNAP2));
   const content = 'Never cite me.';
-  const policy = ledger.registerAgentsPolicy('m1', { directory: '', state: 'present', sourceId: 'agents-policy:base-1:.', digest: sha256Hex(content), content, citable: false });
+  const policy = ledger.registerAgentsPolicy('m1', { directory: '', state: 'present', sourceId: 'agents-policy:base-1:.', digest: sha256Hex(content), content, citable: false, files: ['agentsMd'] });
   const detail = ledger.registerChangeRequestDetail('m1', {
     state: 'complete',
     snapshot: SNAP1,

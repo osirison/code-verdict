@@ -93,6 +93,11 @@ function fakeConnection(methods: Partial<Connection & InvestigationOperations>):
     resolveThread: notImplemented,
     replyToThread: notImplemented,
     approve: notImplemented,
+    // A genuine "no root policy here" default: this file's scenarios are tuned byte-budget
+    // measurements unrelated to root-policy resolution, so an unconfigured connection must render
+    // the short, honest absence line rather than a longer "could not be checked" one that would
+    // silently perturb every deliberately tight byte-ceiling assertion below.
+    readFile: async (request) => ({ snapshot: request.snapshot, state: 'notFound', reason: 'not present in this fixture' }),
     ...methods,
   };
 }

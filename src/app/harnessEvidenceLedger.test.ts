@@ -388,6 +388,7 @@ describe('citable status by source category (task 7.4)', () => {
     digest: sha256Hex(content),
     content,
     citable: false,
+    files: ['agentsMd'],
   });
 
   it('exposes the allowlist explicitly and only those origins are citable', () => {

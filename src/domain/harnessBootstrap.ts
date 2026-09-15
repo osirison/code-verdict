@@ -36,6 +36,7 @@ import type { InvestigationCursor, NormalizedDetail } from '../platform/types';
 import type { Criteria } from './criteria';
 import type { EffortLevel } from './effort';
 import { HOST_TOOL_DEFINITIONS } from './harnessTools';
+import type { PolicyFileKind } from './reviewRunSnapshot';
 
 export type BootstrapSectionKind = 'changeRequestDetails' | 'issueDetails';
 
@@ -177,12 +178,32 @@ export const HOST_TOOL_CATALOG: readonly BootstrapToolSchema[] = HOST_TOOL_DEFIN
   description: definition.description,
 }));
 
-/** Root `AGENTS.md` presence, digest, and composed text — see the file header for why this is authoritative, not untrusted. */
+/**
+ * Root `AGENTS.md`/`CLAUDE.md` presence, digest, and composed text — see the file header for why
+ * this is authoritative, not untrusted.
+ *
+ * `text` is what actually reaches the model as the "Repository policy" content: `harnessAttempt.ts`'s
+ * `rootPoliciesFor` copies it straight off the snapshot's already-resolved `rootAgentsPolicy`, and
+ * `harnessModelSeam.ts`'s `renderAuthoritative` prints it under that heading whenever it is defined.
+ * `files`/`identical` say which of the two files it came from, for the same render to name correctly
+ * ("AGENTS.md present" vs "CLAUDE.md present" vs "AGENTS.md and CLAUDE.md present (identical/differ)").
+ *
+ * `textOmittedReason` and `unavailableReason` are the two honesty escape hatches `fitBootstrapToModel`
+ * (`../app/harnessBootstrapBudget.ts`) and the resolver (`../app/harnessAgentsPolicy.ts`) use,
+ * respectively, when there is something to say about content that is not itself shown: the former
+ * when `text` existed but had to be dropped to fit the model's input limit, the latter when
+ * `present` is `false` because the host could not determine presence at all — as opposed to a
+ * confirmed absence, which carries neither field.
+ */
 export interface BootstrapPolicySource {
   readonly present: boolean;
   readonly sourceId?: string;
   readonly digest?: string;
   readonly text?: string;
+  readonly files?: readonly PolicyFileKind[];
+  readonly identical?: boolean;
+  readonly textOmittedReason?: string;
+  readonly unavailableReason?: string;
 }
 
 /**
@@ -287,6 +308,40 @@ export function withMinimalToolDescriptions(envelope: BootstrapEnvelope): Bootst
     authoritative: {
       ...envelope.authoritative,
       toolCatalog: envelope.authoritative.toolCatalog.map((tool) => ({ ...tool, description: '' })),
+    },
+  };
+}
+
+/**
+ * A third, last-resort shrink tactic added alongside the root-policy content fix: drop the
+ * composed policy `text` for every member that carries one, keeping identity (`sourceId`/`digest`/
+ * `files`/`identical`) and recording why the text is missing. Tried only after both existing
+ * tactics above, on the theory that a repository's own authoritative conventions are worth more
+ * bootstrap space than untrusted-section detail or tool-description prose — but an envelope that
+ * still does not fit must degrade this too rather than fail outright while ordinary bootstrap
+ * content survives untouched. Never a silent truncation: a member whose text is dropped keeps its
+ * exact identity line, and `harnessModelSeam.ts`'s `renderAuthoritative` states the omission inline
+ * rather than mid-sentence-cutting the policy prose itself.
+ */
+export function withPolicyTextOmitted(envelope: BootstrapEnvelope, reason: string): BootstrapEnvelope {
+  return {
+    ...envelope,
+    authoritative: {
+      ...envelope.authoritative,
+      rootPolicies: envelope.authoritative.rootPolicies.map((entry) => {
+        if (entry.source.text === undefined) return entry;
+        return {
+          memberId: entry.memberId,
+          source: {
+            present: entry.source.present,
+            sourceId: entry.source.sourceId,
+            digest: entry.source.digest,
+            files: entry.source.files,
+            identical: entry.source.identical,
+            textOmittedReason: reason,
+          },
+        };
+      }),
     },
   };
 }

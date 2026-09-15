@@ -798,12 +798,18 @@ export function createEvidenceLedger(
     registerAgentsPolicy(memberId, level) {
       const member = memberFor(memberId);
       if (!member) return refuse('unknownMember', `Member ${memberId} is not part of this run.`);
-      if (level.state !== 'present') return refuse('notModelVisible', `An "${level.state}" AGENTS.md level has no content.`);
+      if (level.state !== 'present') return refuse('notModelVisible', `An "${level.state}" policy level has no content.`);
       if (sha256Hex(level.content) !== level.digest) {
-        return refuse('digestMismatch', 'AGENTS.md level digest does not match its content.');
+        return refuse('digestMismatch', 'Policy level digest does not match its content.');
       }
-      const path = normalizeEvidencePath(level.directory === '' ? 'AGENTS.md' : `${level.directory}/AGENTS.md`);
-      if (!path) return refuse('invalidPath', `AGENTS.md directory is not usable: ${level.directory}`);
+      // `path` names whichever file(s) actually backed this level's content, `AGENTS.md`-then-
+      // `CLAUDE.md` order — a joined name when both contributed, never a hardcoded `AGENTS.md` that
+      // would misdescribe a `CLAUDE.md`-only or both-files level. Purely descriptive: `locations` is
+      // always `[]` below, since this content is never citable at any location (D7).
+      const fileNames = level.files.map((kind) => (kind === 'agentsMd' ? 'AGENTS.md' : 'CLAUDE.md'));
+      const fileName = fileNames.join('+');
+      const path = normalizeEvidencePath(level.directory === '' ? fileName : `${level.directory}/${fileName}`);
+      if (!path) return refuse('invalidPath', `Policy directory is not usable: ${level.directory}`);
       return append(member, {
         kind: 'file',
         origin: 'agentsPolicy',

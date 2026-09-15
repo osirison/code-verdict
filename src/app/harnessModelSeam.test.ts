@@ -228,6 +228,85 @@ describe('renderModelPrompt (task 15.7)', () => {
   });
 });
 
+/**
+ * Repository policy content actually reaching the rendered first prompt (the fix this whole
+ * change is about — the tracer's finding was that presence/identity reached the prompt but the
+ * text never did). `## Repository policy` is part of `authoritative`, so it is on every phase's
+ * prompt from `planning` onward exactly like the rest of `authoritative` — `planning` is used
+ * below only because it is the first phase a real attempt ever asks the model anything in.
+ */
+describe('Repository policy rendering — AGENTS.md/CLAUDE.md content and honest absent/unavailable/fit-degraded lines', () => {
+  function promptWithRootPolicy(source: BuildBootstrapEnvelopeInput['rootPolicies'][number]['source']): string {
+    return renderModelPrompt({
+      policy: DEFAULT_HARNESS_POLICY,
+      investigation: [],
+      submissions: [],
+      phase: 'planning',
+      repairInstruction: undefined,
+      toolResults: [],
+      envelope: envelope({ rootPolicies: [{ memberId: 'm1', source }] }),
+    });
+  }
+
+  it('AGENTS.md only: identity naming the one file, and the exact policy text, under the Repository policy heading', () => {
+    const prompt = promptWithRootPolicy({ present: true, sourceId: 'agents-policy:base-1:.', digest: 'digest-1', text: 'Never log secrets.', files: ['agentsMd'] });
+    expect(prompt).toContain('## Repository policy');
+    expect(prompt).toContain('root AGENTS.md present (sourceId agents-policy:base-1:., non-citable)');
+    // The tool catalog legitimately mentions CLAUDE.md in `resolvePolicy`'s description regardless
+    // of this member's own policy state — the negative check is scoped to the Repository policy
+    // section itself, not the whole prompt.
+    const repositoryPolicySection = prompt.slice(prompt.indexOf('## Repository policy'), prompt.indexOf('## Review criteria'));
+    expect(repositoryPolicySection).not.toContain('CLAUDE.md');
+    expect(prompt).toContain('Never log secrets.');
+    expect(prompt).toContain('authoritative instruction, non-citable');
+  });
+
+  it('CLAUDE.md only: identity naming CLAUDE.md as the fallback, and its exact text', () => {
+    const prompt = promptWithRootPolicy({ present: true, sourceId: 'agents-policy:base-1:.', digest: 'digest-2', text: 'Prefer small, focused commits.', files: ['claudeMd'] });
+    expect(prompt).toContain('root CLAUDE.md present (sourceId agents-policy:base-1:., non-citable)');
+    expect(prompt).not.toContain('AGENTS.md present');
+    expect(prompt).toContain('Prefer small, focused commits.');
+  });
+
+  it('both present and differing: both named, marked "differ", and both texts appear', () => {
+    const prompt = promptWithRootPolicy({
+      present: true,
+      sourceId: 'agents-policy:base-1:.',
+      digest: 'digest-3',
+      text: '--- AGENTS.md (repository root)\nNo secrets in logs.\n\n--- CLAUDE.md (repository root)\nPrefer small commits.',
+      files: ['agentsMd', 'claudeMd'],
+      identical: false,
+    });
+    expect(prompt).toContain('root AGENTS.md and CLAUDE.md present (sourceId agents-policy:base-1:., differ, non-citable)');
+    expect(prompt).toContain('No secrets in logs.');
+    expect(prompt).toContain('Prefer small commits.');
+  });
+
+  it('both present and identical: marked "identical", content shown once', () => {
+    const prompt = promptWithRootPolicy({ present: true, sourceId: 'agents-policy:base-1:.', digest: 'digest-4', text: 'Shared convention text.', files: ['agentsMd', 'claudeMd'], identical: true });
+    expect(prompt).toContain('root AGENTS.md and CLAUDE.md present (sourceId agents-policy:base-1:., identical, non-citable)');
+    expect(prompt.match(/Shared convention text\./g)).toHaveLength(1);
+  });
+
+  it('confirmed absent: the honest two-file absent line, naming neither as unchecked', () => {
+    const prompt = promptWithRootPolicy({ present: false });
+    expect(prompt).toContain('no root AGENTS.md or CLAUDE.md');
+    expect(prompt).not.toContain('could not be checked');
+  });
+
+  it('unavailable: a distinguishable "could not be checked" line, never confused with a confirmed absence', () => {
+    const prompt = promptWithRootPolicy({ present: false, unavailableReason: 'This source does not support pinned file reads.' });
+    expect(prompt).toContain('root policy could not be checked: This source does not support pinned file reads.');
+    expect(prompt).not.toContain('no root AGENTS.md or CLAUDE.md');
+  });
+
+  it('fit-degraded: identity survives, content is explicitly stated as omitted, never silently missing', () => {
+    const prompt = promptWithRootPolicy({ present: true, sourceId: 'agents-policy:base-1:.', digest: 'digest-5', files: ['agentsMd'], textOmittedReason: "Root policy text omitted: the bootstrap envelope did not fit the model's input limit." });
+    expect(prompt).toContain('root AGENTS.md present (sourceId agents-policy:base-1:., non-citable)');
+    expect(prompt).toContain('content omitted: Root policy text omitted');
+  });
+});
+
 describe('createLiveModelSeam (task 15.7)', () => {
   it('renders the prompt and returns the raw reply text untouched', async () => {
     const runTurn = vi.fn(async (prompt: string) => {

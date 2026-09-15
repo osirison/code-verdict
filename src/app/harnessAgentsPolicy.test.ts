@@ -124,7 +124,7 @@ describe('AGENTS.md chain resolution (task 6.3)', () => {
     expect(chain.levels).toEqual([{ directory: '', state: 'unavailable', reason: 'network blip' }]);
   });
 
-  it('folds the root level into the fixed snapshot shape, and folds unavailable to present:false', async () => {
+  it('folds the root level into the fixed snapshot shape, carrying the composed text, and folds unavailable to present:false plus a reason', async () => {
     const { source } = fakeSource();
     const resolver = createAgentsPolicyResolver(() => source);
     const present = await resolver.resolveChain(MEMBER, 'charge.ts');
@@ -132,11 +132,13 @@ describe('AGENTS.md chain resolution (task 6.3)', () => {
       present: true,
       sourceId: expect.stringContaining('agents-policy:'),
       digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      text: expect.stringContaining('Never log secrets.'),
+      files: ['agentsMd'],
     });
 
     const unavailableResolver = createAgentsPolicyResolver(() => undefined);
     const unavailable = await unavailableResolver.resolveChain(MEMBER, 'charge.ts');
-    expect(rootAgentsPolicySourceFor(unavailable)).toEqual({ present: false });
+    expect(rootAgentsPolicySourceFor(unavailable)).toEqual({ present: false, unavailableReason: expect.any(String) });
   });
 
   it('classifies every present level as non-citable authoritative instruction', async () => {
@@ -159,5 +161,104 @@ describe('AGENTS.md chain resolution (task 6.3)', () => {
     expect(level?.state === 'present' && level.content).toBe(forged);
     expect(level?.state === 'present' && level.sourceId).toBe(`agents-policy:${MEMBER.baseSha}:.`);
     expect(rootAgentsPolicySourceFor(chain).present).toBe(true);
+  });
+});
+
+// ---- CLAUDE.md fallback and companion (owner-mandated: "if any or both exists it needs to
+// understand the principles that guide the repo") — the full six-case matrix at the root level. ----
+describe('CLAUDE.md fallback and companion at each level (owner-mandated)', () => {
+  it('AGENTS.md only: its content alone, one file named', async () => {
+    const { source, readFile } = fakeSource({ 'AGENTS.md': 'Agents-only policy.\n' });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    const root = chain.levels[0];
+    expect(root).toMatchObject({ state: 'present', content: 'Agents-only policy.\n', files: ['agentsMd'] });
+    expect(root?.state === 'present' && root.identical).toBeUndefined();
+    // Both files are always checked — never skipped because the first check already succeeded.
+    expect(readFile.mock.calls.map(([request]) => (request as FileRangeRequest).path).sort()).toEqual(['AGENTS.md', 'CLAUDE.md']);
+    expect(rootAgentsPolicySourceFor(chain)).toEqual({
+      present: true,
+      sourceId: expect.any(String),
+      digest: expect.any(String),
+      text: 'Agents-only policy.\n',
+      files: ['agentsMd'],
+    });
+  });
+
+  it('CLAUDE.md only: its content alone, picked up as the fallback', async () => {
+    const { source } = fakeSource({ 'CLAUDE.md': 'Claude-only policy.\n' });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    const root = chain.levels[0];
+    expect(root).toMatchObject({ state: 'present', content: 'Claude-only policy.\n', files: ['claudeMd'] });
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({ present: true, text: 'Claude-only policy.\n', files: ['claudeMd'] });
+  });
+
+  it('both present and byte-identical: deduplicated to one copy, marked identical, same digest as either file alone', async () => {
+    const sameText = 'Shared policy text.\n';
+    const { source } = fakeSource({ 'AGENTS.md': sameText, 'CLAUDE.md': sameText });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    const root = chain.levels[0];
+    expect(root).toMatchObject({ state: 'present', content: sameText, files: ['agentsMd', 'claudeMd'], identical: true });
+    const soloAgents = await createAgentsPolicyResolver(() => fakeSource({ 'AGENTS.md': sameText }).source).resolveChain(MEMBER, 'charge.ts');
+    const soloLevel = soloAgents.levels[0];
+    expect(root?.state).toBe('present');
+    expect(soloLevel?.state).toBe('present');
+    if (root?.state === 'present' && soloLevel?.state === 'present') {
+      expect(root.digest).toBe(soloLevel.digest);
+    }
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({ present: true, identical: true, files: ['agentsMd', 'claudeMd'] });
+  });
+
+  it('both present and different: both included, marked not identical, and each file is named in the composed text', async () => {
+    const { source } = fakeSource({ 'AGENTS.md': 'Agents rule: no secrets.\n', 'CLAUDE.md': 'Claude rule: no TODOs.\n' });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    const root = chain.levels[0];
+    expect(root?.state === 'present' && root.identical).toBe(false);
+    expect(root?.state === 'present' && root.files).toEqual(['agentsMd', 'claudeMd']);
+    expect(root?.state === 'present' && root.content).toContain('no secrets.');
+    expect(root?.state === 'present' && root.content).toContain('no TODOs.');
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({ present: true, identical: false });
+  });
+
+  it('both absent: a genuine, checked absence — never confused with a failed check', async () => {
+    const { source, readFile } = fakeSource({});
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toEqual({ directory: '', state: 'absent' });
+    expect(readFile.mock.calls.map(([request]) => (request as FileRangeRequest).path).sort()).toEqual(['AGENTS.md', 'CLAUDE.md']);
+    expect(rootAgentsPolicySourceFor(chain)).toEqual({ present: false });
+  });
+
+  it('unavailable: neither file could be confirmed present or absent — folds to present:false with a stated reason, distinct from a genuine absence', async () => {
+    const resolver = createAgentsPolicyResolver(() => undefined);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toMatchObject({ state: 'unavailable' });
+    const fold = rootAgentsPolicySourceFor(chain);
+    expect(fold.present).toBe(false);
+    expect(!fold.present && fold.unavailableReason).toEqual(expect.any(String));
+  });
+
+  it('one file present, one file unavailable: still present overall — reading one policy is not nothing', async () => {
+    const source = fakeInvestigationSource({
+      readFile: vi.fn(async (request: FileRangeRequest): Promise<FileRangeResult> => {
+        if (request.path === 'AGENTS.md') {
+          return { snapshot: request.snapshot, state: 'complete', value: { revision: request.revision, path: request.path, startLine: 1, endLine: 1, text: 'Agents policy.\n' } };
+        }
+        throw new Error('CLAUDE.md read failed');
+      }),
+    });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toMatchObject({ state: 'present', content: 'Agents policy.\n', files: ['agentsMd'] });
+  });
+
+  it('dedupes an identical unavailable reason from both files rather than repeating it', async () => {
+    const source = fakeInvestigationSource({ readFile: vi.fn().mockRejectedValue(new Error('network blip')) });
+    const resolver = createAgentsPolicyResolver(() => source);
+    const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
+    expect(chain.levels[0]).toEqual({ directory: '', state: 'unavailable', reason: 'network blip' });
   });
 });

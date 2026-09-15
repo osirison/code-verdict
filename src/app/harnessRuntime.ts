@@ -527,10 +527,10 @@ async function buildCandidateAssembly(
     }
   }
 
-  // Root `AGENTS.md` identity is a fixed, bounded, host-initiated read (one per member, never
-  // model-choosable) that belongs to assembling authoritative context, not to the investigation a
-  // reviewer might scope to the merge request — so it resolves against the source's own declared
-  // capabilities, never the narrowed ones the model is gated on. Deliberate:
+  // Root `AGENTS.md`/`CLAUDE.md` identity and content is a fixed, bounded, host-initiated read (two
+  // files per member, never model-choosable) that belongs to assembling authoritative context, not
+  // to the investigation a reviewer might scope to the merge request — so it resolves against the
+  // source's own declared capabilities, never the narrowed ones the model is gated on. Deliberate:
   // `scopeInvestigationToChangedFiles` narrows what the *model* can go read, not this one-shot host
   // fact-gathering step.
   //
@@ -557,6 +557,19 @@ async function buildCandidateAssembly(
       return rootAgentsPolicySourceFor(chain);
     }),
   );
+  // Honest-absent-line requirement: a root policy the host could not check at all (no source,
+  // capability withheld, or a failed read) is a materially different fact than a repository that
+  // genuinely has neither file, and the reviewer must be told the principles were never actually
+  // read — not merely shown an identical "no root AGENTS.md or CLAUDE.md" line. Pushed only for the
+  // `unavailableReason` fold, never for a confirmed absence.
+  for (const [index, policy] of rootPolicies.entries()) {
+    if (!policy.present && policy.unavailableReason !== undefined) {
+      selectionLimitations.push({
+        code: 'rootPolicyUnavailable',
+        message: `${revalidatedMembers[index]!.memberId}: root policy could not be checked: ${policy.unavailableReason}`,
+      });
+    }
+  }
 
   for (const [index, member] of revalidatedMembers.entries()) {
     const selection = selections[index]!;

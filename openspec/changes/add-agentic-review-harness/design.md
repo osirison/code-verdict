@@ -102,7 +102,7 @@ Alternative rejected: encode partial as another lifecycle state. Cancellation, f
 - Thinking-effort level and rendered instruction digest
 - Criteria and extra-instruction digest
 - Context-control selections, auto-context enablement, explicit attachment content digests, and member ownership
-- Root base-revision `AGENTS.md` source identity or explicit absence
+- Root base-revision `AGENTS.md`/`CLAUDE.md` source identity and composed text, or explicit absence (owner-mandated: `CLAUDE.md` is a fallback and companion when `AGENTS.md` is missing or when both exist)
 - Provider investigation capability signature
 - Host tool-contract and harness-policy versions
 
@@ -116,7 +116,7 @@ Bootstrap has a fixed authoritative envelope and a collection of reopenable cont
 
 Reopenable sections contain normalized full linked-issue details and normalized full change-request details: metadata, title, body, commits, review discussion, labels, check summaries, and relationships. They exclude the patch and full CI logs. Each section has an identifier, digest, complete/truncated state, and retrieval cursor. Large sections contribute a bounded summary and retrieval reference to bootstrap; the exact details remain available through host tools.
 
-The bootstrap builder counts tokens against the selected model. It first replaces reopenable content with references, then shortens non-normative descriptions without removing field identities or trust boundaries. If the minimum authoritative envelope still exceeds the input limit, no model request is made. The run fails with completeness `none`, a bootstrap-overflow limitation, and no claim of investigation.
+The bootstrap builder counts tokens against the selected model. It first replaces reopenable content with references, then shortens non-normative descriptions, then — last, since it is authoritative instruction the repository owner wrote — drops composed root-policy text down to identity plus a stated reason, all without removing field identities or trust boundaries. If the minimum authoritative envelope still exceeds the input limit, no model request is made. The run fails with completeness `none`, a bootstrap-overflow limitation, and no claim of investigation.
 
 All author-controlled text is wrapped as untrusted data with explicit source type and boundary. Model-visible host contracts never share a delimiter or authority channel with issue, change-request, commit, discussion, file, diff, or attachment content.
 
@@ -153,7 +153,7 @@ The initial tool catalog is host-owned and versioned:
 | `readFile` | Member, explicit base or head SHA, path, bounded line range | Revision-pinned supporting source |
 | `searchRepository` | Member, explicit base or head SHA, query, path scope, cursor | Bounded unchanged or changed source discovery |
 | `searchDiff` | Member, base/head, query, path scope, cursor | Bounded discovery inside changed content |
-| `resolvePolicy` | Member, changed path | Applicable root-to-leaf base-revision `AGENTS.md` chain |
+| `resolvePolicy` | Member, changed path | Applicable root-to-leaf base-revision `AGENTS.md`/`CLAUDE.md` chain |
 | `getChangeRequestDetails` | Member, section, cursor | Reopen normalized target details |
 | `getIssueDetails` | Member, issue identity, section, cursor | Reopen normalized linked-issue details |
 | `submitCandidateFinding` | Candidate plus source citations | Incremental schema and evidence validation |
@@ -175,7 +175,7 @@ Alternative rejected: give the model a shell or unrestricted workspace search. N
 
 GitLab, GitHub, and fixture providers implement the same conformance suite. A provider that cannot guarantee a capability declares it unavailable; neutral code never substitutes current branch data or infers completeness from a short response. Existing `ScmError.rateLimited` metadata supplies `Retry-After` or reset guidance to the dispatcher.
 
-Root and nested `AGENTS.md` resolution uses repeated provider `readFile` operations at the base SHA. The host walks repository-root to changed-file directory, records explicit absence, merges policy in order, and caches by member/base/path. Policy is authoritative instruction but remains non-citable.
+Root and nested `AGENTS.md`/`CLAUDE.md` resolution uses repeated provider `readFile` operations at the base SHA. The host walks repository-root to changed-file directory, checking both files at each level — `CLAUDE.md` is a fallback and companion, never a silent alias: an `AGENTS.md`-only or `CLAUDE.md`-only level uses that file's content; a level with both uses one deduplicated copy when they are byte-identical and both, clearly named, when they differ. The host records explicit absence only when both files are confirmed absent at a level, merges policy in order, and caches by member/base/path. The composed root-level identity and text (not identity alone) travel into the run snapshot and reach the model's very first prompt, framed as authoritative instruction that remains non-citable; a level the host could not fully check (as opposed to one it checked and found empty) is reported as unavailable, distinguishably, rather than folded into the same "no policy" line.
 
 Alternative rejected: download a platform-specific review bundle. A monolithic bundle recreates the context-limit problem, prevents bounded retries, and pushes GitHub/GitLab shapes above the provider layer.
 
@@ -202,7 +202,7 @@ interface EvidenceSource {
 
 `sourceId` is stable inside the lineage and identifies one immutable payload; `digest` verifies the exact bytes. A resume may import a persisted source only when its exact content is retained and its digest and snapshot still match. Otherwise the new attempt refetches it and records a new source linked to the prior metadata. Findings store source identifier, digest, and location so validation never resolves against a later read by path alone.
 
-Only exact evidence returned to the model is eligible. Bootstrap summaries, omitted pages, unavailable ranges, intent, and `AGENTS.md` policy cannot support findings. Explicit citable attachments from the context-controls change enter as `attachment` sources bound to their snapshot digest. Other repository reads are citable only as supporting source.
+Only exact evidence returned to the model is eligible. Bootstrap summaries, omitted pages, unavailable ranges, intent, and `AGENTS.md`/`CLAUDE.md` policy cannot support findings. Explicit citable attachments from the context-controls change enter as `attachment` sources bound to their snapshot digest. Other repository reads are citable only as supporting source.
 
 Diff evidence can establish a changed line as an inline primary target. Unchanged base/head evidence may corroborate behavior involving changed code but cannot become an unannounced primary target. An explicit attachment may be a primary out-of-diff target and follows the upstream summary-routing rule.
 

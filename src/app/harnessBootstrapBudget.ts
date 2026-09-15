@@ -17,6 +17,7 @@
 import {
   estimateEnvelopeLength,
   withMinimalToolDescriptions,
+  withPolicyTextOmitted,
   withSectionsSummarized,
   type BootstrapEnvelope,
 } from '../domain/harnessBootstrap';
@@ -40,11 +41,22 @@ function renderForCounting(envelope: BootstrapEnvelope): string {
   return JSON.stringify(envelope);
 }
 
+/** Stated once here so both the shrink call and the render-time reason (`harnessModelSeam.ts`) agree on the same wording. */
+export const POLICY_TEXT_OMITTED_REASON = "Root policy text omitted: the bootstrap envelope did not fit the model's input limit even after summarizing sections and shortening tool descriptions.";
+
 /**
- * Tries the full envelope, then D4's two shrink tactics in order — replace
- * reopenable sections with their summaries, then shorten non-normative tool
- * descriptions — and fails closed with a `bootstrapOverflow` limitation
+ * Tries the full envelope, then three shrink tactics in order — replace
+ * reopenable sections with their summaries, shorten non-normative tool
+ * descriptions, then (new) drop the composed root-policy text down to
+ * identity only — and fails closed with a `bootstrapOverflow` limitation
  * (D4's own term) when even the minimal authoritative envelope does not fit.
+ *
+ * Policy text is tried last, after both existing tactics: it is authoritative
+ * instruction the repository owner wrote, worth more bootstrap space than
+ * reopenable-section detail or tool-description prose, so it is the last
+ * thing dropped rather than the first — but it is dropped, truthfully
+ * (`withPolicyTextOmitted` marks exactly why), rather than let a large
+ * `AGENTS.md`/`CLAUDE.md` sink an otherwise-fitting bootstrap outright.
  */
 export async function fitBootstrapToModel(input: BootstrapBudgetInput): Promise<BootstrapFitResult> {
   if (input.maxInputTokens === undefined) {
@@ -54,7 +66,8 @@ export async function fitBootstrapToModel(input: BootstrapBudgetInput): Promise<
 
   const summarized = withSectionsSummarized(input.envelope);
   const minimal = withMinimalToolDescriptions(summarized);
-  const attempts: readonly BootstrapEnvelope[] = [input.envelope, summarized, minimal];
+  const policyTrimmed = withPolicyTextOmitted(minimal, POLICY_TEXT_OMITTED_REASON);
+  const attempts: readonly BootstrapEnvelope[] = [input.envelope, summarized, minimal, policyTrimmed];
 
   let lastUsedTokens: number | undefined;
   for (const attempt of attempts) {

@@ -62,14 +62,19 @@
  *   no pending/queued fetch state for `UnresolvedWork.unresolvedFetches` to
  *   count.
  * - *Bootstrap `rootPolicies`* is built from `snapshot.members[i].rootAgentsPolicy`
- *   (already resolved into the immutable snapshot, D3) rather than a fresh
- *   `resolvePolicy` dispatch: `resolvePolicy`'s `allowedPhases` does not
- *   include `bootstrap` (`harnessTools.ts`), so a bootstrap-phase dispatch of
- *   it would be refused `phaseNotAllowed`. `BootstrapPolicySource.text` is
- *   optional, so the envelope is honest either way. One entry is built per
- *   member (task 15.1) — an earlier version of this function collapsed the
- *   whole envelope to `options.members[0]`'s policy alone, silently dropping
- *   every other changeset member's root `AGENTS.md` identity from bootstrap.
+ *   (already resolved into the immutable snapshot, D3, and now carrying the
+ *   composed `AGENTS.md`/`CLAUDE.md` text itself, not just identity) rather
+ *   than a fresh `resolvePolicy` dispatch: `resolvePolicy`'s `allowedPhases`
+ *   does not include `bootstrap` (`harnessTools.ts`), so a bootstrap-phase
+ *   dispatch of it would be refused `phaseNotAllowed` — the snapshot's own
+ *   already-resolved text is what makes the content reach the model at all,
+ *   without needing a bootstrap-legal fetch. `BootstrapPolicySource.text` is
+ *   still optional, for an older snapshot that only ever recorded identity;
+ *   the envelope is honest either way (identity-only line, no content
+ *   claimed). One entry is built per member (task 15.1) — an earlier version
+ *   of this function collapsed the whole envelope to `options.members[0]`'s
+ *   policy alone, silently dropping every other changeset member's root
+ *   policy identity from bootstrap.
  * - *Issue-detail bootstrap sections are never fetched.* `getIssueDetails`
  *   needs an explicit `issueRepoId`, which
  *   `ReviewRunContextSelections.linkedItemIdsIncluded` does not carry (only
@@ -3186,17 +3191,17 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       .join(' | ');
   }
 
-  /** One `AGENTS.md` root-policy identity per member (task 15.1 fix — see the file header). */
+  /** One root-policy identity-plus-text per member (task 15.1 fix — see the file header). */
   function rootPoliciesFor(): readonly BootstrapMemberRootPolicy[] {
     return options.members.map((member): BootstrapMemberRootPolicy => {
       const resolved = snapshotMember(member.memberId).rootAgentsPolicy;
-      // `text` is optional on `BootstrapPolicySource`: the snapshot (D3) carries only identity
-      // (sourceId/digest), never content, and `resolvePolicy` is not bootstrap-legal (its
-      // `allowedPhases` excludes `bootstrap`, `harnessTools.ts`) — presence/identity is honest
-      // without a fresh fetch here.
+      // Straight passthrough of the snapshot's own already-resolved shape: `resolvePolicy` is not
+      // bootstrap-legal (its `allowedPhases` excludes `bootstrap`, `harnessTools.ts`), so this is
+      // never re-fetched here — `text`/`files`/`identical` ride along exactly as the snapshot
+      // carries them, which is what lets root policy content reach the model without a fresh fetch.
       const source: BootstrapPolicySource = resolved.present
-        ? { present: true, sourceId: resolved.sourceId, digest: resolved.digest }
-        : { present: false };
+        ? { present: true, sourceId: resolved.sourceId, digest: resolved.digest, text: resolved.text, files: resolved.files, identical: resolved.identical }
+        : { present: false, unavailableReason: resolved.unavailableReason };
       return { memberId: member.memberId, source };
     });
   }

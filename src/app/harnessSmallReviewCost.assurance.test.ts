@@ -512,11 +512,12 @@ async function runScenario(script: (prompt: string) => Promise<string>, connecti
     getChangeRequestDetails: async (request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> => ({ snapshot: request.snapshot, state: 'complete', value: smallDetail() }),
     listChangedFiles: async (request: ChangedFileManifestRequest): Promise<ChangedFileManifestResult> => ({ snapshot: request.snapshot, state: 'complete', value: CHANGED_FILES.map(manifestEntry) }),
     readDiff: async (request: DiffPageRequest): Promise<DiffPageResult> => diffPageResult(request.path),
-    // The root (and, absent a policy fix, per-directory) AGENTS.md probe always reports absent —
-    // this fixture has no policy file — and any other path (the "wandering" scripts' target)
+    // The root (and, absent a policy fix, per-directory) AGENTS.md/CLAUDE.md probe always reports
+    // absent — this fixture has neither policy file, and both are checked at every level (the
+    // CLAUDE.md fallback/companion fix) — and any other path (the "wandering" scripts' target)
     // reports real content, so a successful off-merge-request read is observable when it happens.
     readFile: async (request) => {
-      if (request.path.endsWith('AGENTS.md')) return { snapshot: request.snapshot, state: 'notFound' };
+      if (request.path.endsWith('AGENTS.md') || request.path.endsWith('CLAUDE.md')) return { snapshot: request.snapshot, state: 'notFound' };
       return { snapshot: request.snapshot, state: 'complete', value: { revision: request.revision, path: request.path, startLine: request.startLine, endLine: request.endLine, text: `// content of ${request.path}, unrelated to this change\n` } };
     },
     searchRepository: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [{ path: UNRELATED_FILE, line: 1, excerpt: 'a repository-wide match' }] }),
@@ -564,8 +565,9 @@ const SCOPED_POLICY = normalizeHarnessPolicy({ scopeInvestigationToChangedFiles:
  * Measured (asserted below, not assumed): 1 model turn to plan, 5 to investigate (3 reads, 1
  * submission, 1 stop), 1 compact contradiction check, 1 to verify — 8 model calls total, 7 of them
  * carrying the full envelope. Provider calls: 1 change-request detail fetch, 2 manifest pages, 3
- * `readDiff`, 1 `readFile` (the root `AGENTS.md` probe bootstrap always makes) and 2 `getCurrentHead`
- * checks (verifying + completing) — 9 provider calls, of which exactly 1 (`readFile`) is off the
+ * `readDiff`, 2 `readFile` (the root `AGENTS.md`/`CLAUDE.md` probe bootstrap always makes — both
+ * checked, never one skipped because the other succeeded or failed) and 2 `getCurrentHead`
+ * checks (verifying + completing) — 10 provider calls, of which exactly 2 (`readFile`) are off the
  * merge request, by design (D7: policy is authoritative context, not investigation).
  *
  * The second manifest page is not a second page of files: it is a second
@@ -595,10 +597,10 @@ describe('measuring a small review before any fix (reproducing the pre-fix, unre
       // the provider investigation path.
       listChangedFiles: 1,
       readDiff: 3,
-      readFile: 1, // the root AGENTS.md probe — never per-file, never repeated
+      readFile: 2, // the root AGENTS.md AND CLAUDE.md probes — never per-file, never repeated
       getCurrentHead: 2, // refreshed on entry to verifying, and again on entry to completing (D3)
     });
-    expect(before.offMrCalls).toBe(1); // exactly the root AGENTS.md probe
+    expect(before.offMrCalls).toBe(2); // exactly the two root policy probes
 
     // Model turns: 1 planning + 5 investigating (3 reads, 1 submission, 1 stop) + 1 compact
     // contradiction check + 1 verifying completionRequest.
@@ -688,7 +690,7 @@ describe('after a reviewer scopes investigation to changed files — same behavi
     // KB, not hundreds of bytes. If a change adds bytes and does not remove turns, this is the
     // wrong place to relax; take it out of the text instead.
     expect(after.modelTurns.length).toBeLessThanOrEqual(8);
-    expect(after.offMrCalls).toBeLessThanOrEqual(1);
+    expect(after.offMrCalls).toBeLessThanOrEqual(2); // the two root policy probes (AGENTS.md, CLAUDE.md)
     expect(after.totalBytesSent).toBeLessThan(87_000);
   });
 
@@ -799,12 +801,12 @@ describe('cause B — repository-wide reads (confirmed real, but only when the m
       getChangeRequestDetails: 1,
       listChangedFiles: 1,
       readDiff: 3,
-      readFile: 2, // the root AGENTS.md probe, AND the unrelated file the model asked to read
+      readFile: 3, // the root AGENTS.md and CLAUDE.md probes, AND the unrelated file the model asked to read
       searchRepository: 1, // the unscoped, whole-repository search
       getCurrentHead: 2,
     });
-    // 3 off-merge-request calls now: the root policy probe, the unrelated file, and the unscoped search.
-    expect(result.offMrCalls).toBe(3);
+    // 4 off-merge-request calls now: the two root policy probes, the unrelated file, and the unscoped search.
+    expect(result.offMrCalls).toBe(4);
     expect(result.providerCalls.some((call) => call.method === 'readFile' && call.path === UNRELATED_FILE && call.classification === 'off-mr')).toBe(true);
     expect(result.providerCalls.some((call) => call.method === 'searchRepository' && call.classification === 'off-mr')).toBe(true);
   });
@@ -818,9 +820,9 @@ describe('cause B — repository-wide reads (confirmed real, but only when the m
 
     // The provider itself is never touched for either withheld tool — not merely "refused with an
     // error", genuinely never dispatched.
-    expect(result.providerCallsByMethod.readFile).toBe(1); // only the root AGENTS.md probe
+    expect(result.providerCallsByMethod.readFile).toBe(2); // only the two root policy probes (AGENTS.md, CLAUDE.md)
     expect(result.providerCallsByMethod.searchRepository).toBeUndefined();
-    expect(result.offMrCalls).toBe(1);
+    expect(result.offMrCalls).toBe(2);
 
     // The model DOES get told, in its very next prompt, exactly why — a refusal, not silence.
     const readFileRefusal = result.modelTurns.find((turn) => turn.prompt.includes('tool=readFile') && turn.prompt.includes('code=capabilityUnavailable'));
@@ -833,7 +835,7 @@ describe('cause B — repository-wide reads (confirmed real, but only when the m
 // ---- Cause A, measured: the AGENTS.md walk is bounded, not automatic, and never "dozens" ---------
 
 describe('cause A — the nested AGENTS.md walk (refuted as an automatic cost; bounded even when the model asks per file)', () => {
-  it('when the model calls resolvePolicy once per changed file across 3 different directories, the shared ancestors are fetched once — 7 readFile calls total, nowhere near "dozens"', async () => {
+  it('when the model calls resolvePolicy once per changed file across 3 different directories, the shared ancestors are fetched once — 14 readFile calls total, nowhere near "dozens"', async () => {
     const result = await runScenario(resolvePolicyPerFileScript(), {}, UNSCOPED_POLICY);
 
     expect(result.lifecycle).toBe('succeeded');
@@ -844,23 +846,26 @@ describe('cause A — the nested AGENTS.md walk (refuted as an automatic cost; b
     //   FILE_A ('', 'src', 'src/services')      -> 3 new directories
     //   FILE_B ('', 'src', 'src/utils')          -> 1 new ('', 'src' already cached from FILE_A)
     //   FILE_C ('', 'src', 'src/api', 'src/api/routes') -> 2 new ('', 'src' already cached)
-    // = 1 + 3 + 1 + 2 = 7, not 1 read per ancestor per file with no sharing (which would be 10),
-    // and nowhere near "dozens".
-    expect(result.providerCallsByMethod.readFile).toBe(7);
-    expect(result.providerCallsByMethod.readFile).toBeLessThan(12);
+    // = 1 + 3 + 1 + 2 = 7 distinct directory levels, not 1 read per ancestor per file with no
+    // sharing (which would be 10 levels) — and each level now checks two files (`AGENTS.md`, then
+    // `CLAUDE.md`, the owner-mandated fallback/companion fix), so 7 levels x 2 files = 14 reads,
+    // still nowhere near "dozens".
+    expect(result.providerCallsByMethod.readFile).toBe(14);
+    expect(result.providerCallsByMethod.readFile).toBeLessThan(24);
 
-    // Every readFile call this scenario makes is for an AGENTS.md path — resolvePolicy never reads
-    // changed-file content itself, only policy files, so all 7 are off the merge request by
+    // Every readFile call this scenario makes is for a policy path — resolvePolicy never reads
+    // changed-file content itself, only policy files, so all 14 are off the merge request by
     // definition (D7: policy is authoritative context, never investigation of the change).
     const readFileCalls = result.providerCalls.filter((call) => call.method === 'readFile');
     expect(readFileCalls.every((call) => call.classification === 'off-mr')).toBe(true);
-    expect(result.offMrCalls).toBe(7);
+    expect(result.offMrCalls).toBe(14);
 
-    // No directory is fetched twice within the attempt's own resolver: 6 distinct directories were
-    // asked for across the 3 resolvePolicy calls ('', 'src', 'src/services', 'src/utils', 'src/api',
-    // 'src/api/routes'), plus the 1 separate bootstrap-time root read — 7 total, never 7 * anything.
+    // No directory level is fetched twice within the attempt's own resolver: 6 distinct directories
+    // were asked for across the 3 resolvePolicy calls ('', 'src', 'src/services', 'src/utils',
+    // 'src/api', 'src/api/routes'), plus the 1 separate bootstrap-time root level — 7 levels total,
+    // never 7 * anything beyond the fixed two-file-per-level check.
     const distinctDirectoriesImplied = 6;
-    expect(result.providerCallsByMethod.readFile).toBe(distinctDirectoriesImplied + 1);
+    expect(result.providerCallsByMethod.readFile).toBe((distinctDirectoriesImplied + 1) * 2);
   });
 
   it('scoping investigation to changed files also refuses resolvePolicy (it rides on fileReads) — the walk never happens at all', async () => {
@@ -872,8 +877,8 @@ describe('cause A — the nested AGENTS.md walk (refuted as an automatic cost; b
 
     // Only the bootstrap-time root probe remains — every model-requested resolvePolicy call is
     // refused before it ever reaches `Connection.readFile`.
-    expect(result.providerCallsByMethod.readFile).toBe(1);
-    expect(result.offMrCalls).toBe(1);
+    expect(result.providerCallsByMethod.readFile).toBe(2); // AGENTS.md and CLAUDE.md, the one level ever checked
+    expect(result.offMrCalls).toBe(2);
 
     const refusals = result.modelTurns.filter((turn) => turn.prompt.includes('tool=resolvePolicy') && turn.prompt.includes('code=capabilityUnavailable'));
     expect(refusals.length).toBe(CHANGED_FILES.length);
@@ -920,8 +925,8 @@ describe('run diagnostics time breakdown — driven end to end with known, injec
         return diffPageResult(request.path);
       },
       readFile: async (request) => {
-        if (request.path.endsWith('AGENTS.md')) {
-          tick += 77; // untracked: the bootstrap-only probe, never dispatched through the timed seam
+        if (request.path.endsWith('AGENTS.md') || request.path.endsWith('CLAUDE.md')) {
+          tick += 77; // untracked: the bootstrap-only probe (now two checks per level), never dispatched through the timed seam
           return { snapshot: request.snapshot, state: 'notFound' };
         }
         tick += 50;

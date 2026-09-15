@@ -167,7 +167,7 @@ export const HOST_TOOL_DEFINITIONS: readonly HostToolDefinition[] = Object.freez
     allowedPhases: READ_PHASES,
     idempotent: true,
     requiredScope: 'Member, changed path',
-    description: 'Applicable root-to-leaf base-revision AGENTS.md chain.',
+    description: 'Applicable root-to-leaf base-revision AGENTS.md/CLAUDE.md chain.',
   },
   {
     name: 'getChangeRequestDetails',

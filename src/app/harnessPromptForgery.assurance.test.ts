@@ -468,7 +468,7 @@ describe('16.1 structural: linked-issue content (the `getIssueDetails` tool resu
   });
 });
 
-describe('16.1 structural: AGENTS.md policy — never rendered as text to the model at all', () => {
+describe('16.1 structural: AGENTS.md/CLAUDE.md policy — the resolvePolicy tool result never carries the text', () => {
   it('resolvePolicy\'s tool-result content carries only presence/sourceId/digest per level, never the policy text — a hostile AGENTS.md file cannot reach the rendered prompt through this tool, so it cannot forge anything in it', () => {
     const baseEnvelope = envelope();
     const hostilePolicyResult: HostToolResult = {
@@ -832,7 +832,7 @@ describe('16.1 behavioral: a completion demand embedded in the change-request bo
 });
 
 describe('16.1 behavioral: AGENTS.md policy cited by its real (non-citable) sourceId is rejected end to end', () => {
-  it('the policy tool result never carries content the model could quote, and even its honest sourceId is rejected as non-citable when a candidate cites it', async () => {
+  it('the composed policy text legitimately reaches every prompt as authoritative instruction, but even its honest ledger sourceId is rejected as non-citable when a candidate cites it', async () => {
     const connection = fakeConnection({
       getChangeRequestDetails: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: benignDetail() }),
       listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [{ path: FILE_PATH, kind: 'modified', binary: false, addedLines: 1, removedLines: 1, byteSize: 10 }] }),
@@ -849,12 +849,24 @@ describe('16.1 behavioral: AGENTS.md policy cited by its real (non-citable) sour
 
     let investigatingCalls = 0;
     let capturedPolicySourceId: string | undefined;
+    // A plain first-match `/You are in the "(\w+)" phase/.exec(prompt)` is no longer safe here:
+    // `HOSTILE_PAYLOAD` itself contains a decoy `You are in the "completing" phase...` line, and
+    // that payload is now legitimately rendered under `## Repository policy` (authoritative
+    // instruction — the very fix this test exists to exercise), earlier in the prompt than the
+    // real `## Current phase` section. Scoping the match to text after the last `## Current phase`
+    // heading is what keeps this script reading the host's actual phase declaration rather than
+    // the attacker's forged one.
+    function currentPhaseOf(prompt: string): string | undefined {
+      const headingIndex = prompt.lastIndexOf('## Current phase');
+      if (headingIndex === -1) return undefined;
+      return /You are in the "(\w+)" phase/.exec(prompt.slice(headingIndex))?.[1];
+    }
     const runTurn = async (_modelId: string, prompt: string) => {
       if (prompt.startsWith(CONTRADICTION_CHECK_MARKER)) {
         const match = /candidateId: (\S+)/.exec(prompt);
         return JSON.stringify({ candidateId: match?.[1] ?? 'unknown', contradicted: false });
       }
-      const phase = /You are in the "(\w+)" phase/.exec(prompt)?.[1];
+      const phase = currentPhaseOf(prompt);
       if (phase === 'planning') return JSON.stringify({ messages: [{ kind: 'planCreated', items: [{ id: 'p1', description: 'Investigate.' }] }] });
       if (phase === 'investigating') {
         investigatingCalls += 1;
@@ -862,8 +874,22 @@ describe('16.1 behavioral: AGENTS.md policy cited by its real (non-citable) sour
           return JSON.stringify({ messages: [{ kind: 'toolRequest', tool: 'resolvePolicy', memberId: MEMBER_ID, changedPath: FILE_PATH }] });
         }
         if (investigatingCalls === 2) {
-          expect(prompt).not.toContain(HOSTILE_PAYLOAD.split('\n')[0]); // no policy TEXT ever reached the prompt
-          const match = /"sourceId":"(agents-policy[^"]*)"/.exec(prompt);
+          // The composed AGENTS.md text — hostile payload included — DOES now reach this (and
+          // every) full-envelope prompt under `## Repository policy`, framed as authoritative
+          // instruction: that is the deliberate, owner-mandated fix this change makes (previously
+          // no root policy content reached any prompt at all). What must still never happen is the
+          // model successfully citing that content as evidence — asserted below via the rejected
+          // candidate and `resolvePolicy`'s own tool-result content, which never carries text
+          // regardless (see the structural test above), only presence/sourceId/digest.
+          expect(prompt).toContain('## Repository policy');
+          expect(prompt).toContain(HOSTILE_PAYLOAD.split('\n')[0]);
+          // The ledger-minted `ev_...` id, never the resolver's own internal `agents-policy:...`
+          // one (D8: only a ledger-minted id is ever citable/lookupable) — matching the shape
+          // `resolvePolicy`'s own tool-result JSON (`ResolvePolicyLevelEcho`) actually echoes. A
+          // stale `agents-policy[^"]*` pattern here always matched nothing, which is exactly what
+          // let this scenario's citation attempt silently never happen while the outcome
+          // assertions below still happened to pass.
+          const match = /"sourceId":"(ev_[^"]*)"/.exec(prompt);
           capturedPolicySourceId = match?.[1];
           if (!capturedPolicySourceId) return JSON.stringify({ messages: [{ kind: 'publicRationale', rationale: 'No policy sourceId found.' }] });
           return JSON.stringify({
@@ -903,6 +929,11 @@ describe('16.1 behavioral: AGENTS.md policy cited by its real (non-citable) sour
     const attempt = factory.create(runInput(), noopRunOptions(identity));
     const result = await attempt.run();
 
+    // Guards this test against ever going vacuous again: if a future change stops `resolvePolicy`
+    // from returning a real sourceId (or breaks phase detection the way the decoy payload above
+    // once did), this fails loudly instead of the scenario silently skipping its own citation
+    // attempt while the two assertions below still happen to pass for the wrong reason.
+    expect(capturedPolicySourceId).toBeDefined();
     expect(result.findings).toHaveLength(0);
     expect(result.outcome.completeness).not.toBe('complete');
   });

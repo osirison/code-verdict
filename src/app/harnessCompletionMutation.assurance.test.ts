@@ -135,6 +135,10 @@ function fakeConnection(methods: Partial<Connection & InvestigationOperations>):
     resolveThread: notImplemented,
     replyToThread: notImplemented,
     approve: notImplemented,
+    // A genuine "no root policy here" default: this file's scenarios are about completion-gate
+    // clauses, not root-policy resolution, so an unconfigured connection must not surface a
+    // `rootPolicyUnavailable` limitation and pollute every "alone" assertion below.
+    readFile: async (request) => ({ snapshot: request.snapshot, state: 'notFound', reason: 'not present in this fixture' }),
     ...methods,
   };
 }

@@ -22,7 +22,7 @@ The host SHALL assign an immutable source identifier and digest to every exact e
 
 ### Requirement: Trust and citation authority are explicit
 
-Author-controlled issue text, change-request text, commit messages, discussions, repository files, diffs, and attachments SHALL be treated as untrusted content and isolated from host instructions and tool contracts. Intent context and applicable `AGENTS.md` policy SHALL be non-citable. Diff evidence and reviewer-selected explicit citable attachments SHALL be citable.
+Author-controlled issue text, change-request text, commit messages, discussions, repository files, diffs, and attachments SHALL be treated as untrusted content and isolated from host instructions and tool contracts. Intent context and applicable `AGENTS.md`/`CLAUDE.md` policy SHALL be non-citable, even though its composed text is shown to the model as authoritative instruction. Diff evidence and reviewer-selected explicit citable attachments SHALL be citable.
 
 #### Scenario: Author text imitates an instruction or source label
 
@@ -32,7 +32,7 @@ Author-controlled issue text, change-request text, commit messages, discussions,
 
 #### Scenario: Finding cites intent or policy
 
-- **WHEN** a candidate finding cites a linked issue, change-request description, commit message, review discussion, or `AGENTS.md` policy as its source location
+- **WHEN** a candidate finding cites a linked issue, change-request description, commit message, review discussion, or `AGENTS.md`/`CLAUDE.md` policy as its source location
 - **THEN** host validation rejects that citation
 - **AND** the candidate cannot become a validated finding
 

@@ -58,9 +58,12 @@ import type { RunPhase } from '../domain/harnessActivity';
 import type {
   BootstrapAttachmentSection,
   BootstrapEnvelope,
+  BootstrapMemberRootPolicy,
   BootstrapMemberSections,
+  BootstrapPolicySource,
   BootstrapToolSchema,
 } from '../domain/harnessBootstrap';
+import type { PolicyFileKind } from '../domain/reviewRunSnapshot';
 import type { RiskLevel } from '../domain/harnessCoverage';
 import { HOST_TOOL_NAMES, type HostToolName } from '../domain/harnessTools';
 import { SEVERITY_ORDER } from '../domain/criteria';
@@ -326,6 +329,46 @@ const CRITERIA_MEANINGS = [
   'concludes the code is correct describes no defect — do not submit it.',
 ].join('\n');
 
+const POLICY_FILE_NAMES: Readonly<Record<PolicyFileKind, string>> = { agentsMd: 'AGENTS.md', claudeMd: 'CLAUDE.md' };
+
+/** Names exactly which file(s) a present root policy came from — the five render shapes the honest-absent/CLAUDE.md-fallback design requires. */
+function describePresentPolicyFiles(source: BootstrapPolicySource): string {
+  const names = (source.files ?? []).map((kind) => POLICY_FILE_NAMES[kind]);
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  if (names.length === 1) return names[0]!;
+  // Defensive only: a `present: true` source with no recorded file name never comes from this
+  // resolver, but an older-shaped record must still render something honest rather than throw.
+  return 'root policy';
+}
+
+/**
+ * One member's `## Repository policy` line(s). Five distinguishable shapes, matched to the design:
+ * `AGENTS.md` only, `CLAUDE.md` only, both (naming whether they agreed), a genuinely confirmed
+ * absence of both, and "could not be checked" for a resolution failure — never folded into the same
+ * text the way absent and unavailable used to be. When content is present it is rendered right after
+ * the identity line, framed as authoritative instruction the model must follow but can never cite
+ * (D7) — the same non-citable framing the identity-only line already carried, now covering the
+ * content it introduces. A fit-time omission (`textOmittedReason`) states plainly that content was
+ * dropped and why, rather than silently shipping identity alone with no explanation.
+ */
+function renderRootPolicy(entry: BootstrapMemberRootPolicy): string {
+  const { memberId, source } = entry;
+  if (!source.present) {
+    return source.unavailableReason !== undefined
+      ? `- ${memberId}: root policy could not be checked: ${source.unavailableReason}`
+      : `- ${memberId}: no root AGENTS.md or CLAUDE.md`;
+  }
+  const agreementNote = (source.files?.length ?? 0) === 2 ? `${source.identical ? 'identical' : 'differ'}, ` : '';
+  const identity = `- ${memberId}: root ${describePresentPolicyFiles(source)} present (sourceId ${source.sourceId}, ${agreementNote}non-citable)`;
+  if (source.text !== undefined) {
+    return `${identity}\n[root policy text — ${memberId} — authoritative instruction, non-citable]\n${source.text}`;
+  }
+  if (source.textOmittedReason !== undefined) {
+    return `${identity} — content omitted: ${source.textOmittedReason}`;
+  }
+  return identity;
+}
+
 function renderAuthoritative(envelope: BootstrapEnvelope): string {
   const { authoritative } = envelope;
   const members = authoritative.members
@@ -359,9 +402,7 @@ function renderAuthoritative(envelope: BootstrapEnvelope): string {
       return `- memberId ${member.memberId}: repoId ${member.repoId}${numberPart}`;
     })
     .join('\n');
-  const rootPolicies = authoritative.rootPolicies
-    .map((entry) => `- ${entry.memberId}: ${entry.source.present ? `root AGENTS.md present (sourceId ${entry.source.sourceId}, non-citable)` : 'no root AGENTS.md'}`)
-    .join('\n');
+  const rootPolicies = authoritative.rootPolicies.map(renderRootPolicy).join('\n');
   const categories = authoritative.criteria.categories.join(', ');
   return [
     `## Persona`,

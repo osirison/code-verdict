@@ -23,10 +23,42 @@ import type { AttemptNumber, LineageId, RunId } from './harnessLifecycle';
 
 export type ReviewRunTargetKind = 'cr' | 'changeset';
 
-/** An `AGENTS.md` chain always starts at a member's own base-revision root. */
+/**
+ * Which repository-policy file a resolved level's content came from. A level checks both, in this
+ * order — `AGENTS.md` first, then `CLAUDE.md` — so `CLAUDE.md` serves as a fallback and companion,
+ * never a silent alternative name for the same file: either can exist alone, or both can exist and
+ * differ, and the reviewer is told which case held (owner-mandated: repo conventions are picked up
+ * from whichever of the two files the repository actually uses).
+ */
+export type PolicyFileKind = 'agentsMd' | 'claudeMd';
+
+/**
+ * An `AGENTS.md`/`CLAUDE.md` chain always starts at a member's own base-revision root.
+ *
+ * `present: true` now carries the composed root-policy `text` (not just its identity) — the change
+ * that lets it reach the first model prompt at all — plus which file(s) it came from and, when both
+ * exist, whether they agreed. `text`/`files`/`identical` are optional for one reason: a snapshot
+ * written before this field existed recorded identity alone, and it is read that way (absent `text`
+ * renders the identity-only line). Whether that text actually survives into a given turn's envelope
+ * is a later, fit-time decision `BootstrapPolicySource` (`harnessBootstrap.ts`) makes and records —
+ * this snapshot field always carries the full text the host resolved, never a fitted one.
+ *
+ * `present: false` used to fold two different situations — a directory the host actually checked and
+ * found empty, and a directory the host could not check at all — into one indistinguishable line.
+ * `unavailableReason` undoes that fold for the honest case: present when the host could not
+ * determine presence either way (no source, capability withheld, or a read failure), and absent
+ * entirely when the host checked both files and genuinely found neither.
+ */
 export type ReviewRunAgentsPolicySource =
-  | { readonly present: true; readonly sourceId: string; readonly digest: string }
-  | { readonly present: false };
+  | {
+      readonly present: true;
+      readonly sourceId: string;
+      readonly digest: string;
+      readonly text?: string;
+      readonly files?: readonly PolicyFileKind[];
+      readonly identical?: boolean;
+    }
+  | { readonly present: false; readonly unavailableReason?: string };
 
 /**
  * What a recorded `baseSha` means (`add-local-git-investigation` design.md

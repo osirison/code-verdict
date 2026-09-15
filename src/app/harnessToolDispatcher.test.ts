@@ -646,7 +646,7 @@ describe('resolvePolicy (task 9.4)', () => {
         memberId: member.memberId,
         baseSha: member.baseSha,
         path: changedPath,
-        levels: [{ directory: '', state: 'present', sourceId: 'agents-policy:base1:.', digest, content, citable: false }],
+        levels: [{ directory: '', state: 'present', sourceId: 'agents-policy:base1:.', digest, content, citable: false, files: ['agentsMd'] }],
       }),
     };
     const { dispatcher, ledger } = setup(makeMember(fakeConnection({ readFile: notImplemented })), { agentsPolicyResolver: resolver });

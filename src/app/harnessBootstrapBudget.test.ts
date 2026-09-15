@@ -88,8 +88,8 @@ describe('fitBootstrapToModel (task 6.6)', () => {
     expect(!result.ok && result.completeness).toBe('none');
     expect(!result.ok && result.limitation.code).toBe('bootstrapOverflow');
     expect(!result.ok && result.limitation.message).toContain('bootstrap envelope');
-    // Every shrink tactic was tried (3 attempts: full, summarized, minimal) before giving up.
-    expect(countTokens).toHaveBeenCalledTimes(3);
+    // Every shrink tactic was tried (4 attempts: full, summarized, minimal, policy-text-omitted) before giving up.
+    expect(countTokens).toHaveBeenCalledTimes(4);
   });
 
   it('fails closed rather than guessing a fit when the model cannot be asked to count at all', async () => {
@@ -98,5 +98,36 @@ describe('fitBootstrapToModel (task 6.6)', () => {
     expect(result.ok).toBe(false);
     expect(!result.ok && result.completeness).toBe('none');
     expect(!result.ok && result.limitation.message).toContain('Could not determine');
+  });
+
+  it('drops root-policy text (down to identity plus a stated reason) as the last shrink tactic, after summarizing sections and shortening tool descriptions', async () => {
+    const countTokens = charBasedCounter();
+    // A small envelope apart from one member's oversized root-policy text: the first two shrink
+    // tactics (section summaries, tool descriptions) cannot help here at all, so this proves the
+    // *third* tactic is what actually gets this envelope to fit, not merely present in the loop.
+    const withBigPolicy = buildBootstrapEnvelope({
+      members: [{ memberId: 'm1', repoId: 'repo-1', baseSha: 'base-1', headSha: 'head-1' }],
+      personaLabel: 'Default review',
+      agentInstructions: 'You are a code review agent. Review ONLY the diffs below.',
+      criteria: DEFAULT_CRITERIA,
+      effort: 'medium',
+      effortInstruction: 'Review effort instruction: reason through the diff before reporting.',
+      contextDeclaration: 'Auto-context: title, description. No explicit attachments.',
+      rootPolicies: [{ memberId: 'm1', source: { present: true, sourceId: 'agents-policy:base-1:.', digest: 'digest-1', text: 'x'.repeat(50_000), files: ['agentsMd'] } }],
+      toolContractVersion: '1',
+      harnessPolicyVersion: '1',
+      memberSections: [{ memberId: 'm1', changeRequestDetails: buildBootstrapSection({ kind: 'changeRequestDetails', sectionId: 'cr:1', detail: detail(50), digest: 'd1', providerState: 'complete', maxInlineChars: 1_000_000 }), issueDetails: [] }],
+    });
+    const fullTokens = await charBasedCounter()(JSON.stringify(withBigPolicy));
+    const minimalTokens = await charBasedCounter()(JSON.stringify(withBigPolicy)); // sections/tool descriptions do not shrink this envelope at all
+    const result = await fitBootstrapToModel({ envelope: withBigPolicy, maxInputTokens: Math.floor(minimalTokens / 4), countTokens });
+    expect(fullTokens).toBe(minimalTokens); // confirms the first two tactics really do nothing here
+    expect(result.ok).toBe(true);
+    expect(countTokens).toHaveBeenCalledTimes(4);
+    const source = result.ok ? result.envelope.authoritative.rootPolicies[0]!.source : undefined;
+    expect(source?.text).toBeUndefined();
+    expect(source?.sourceId).toBe('agents-policy:base-1:.');
+    expect(source?.digest).toBe('digest-1');
+    expect(source?.textOmittedReason).toContain("did not fit the model's input limit");
   });
 });
