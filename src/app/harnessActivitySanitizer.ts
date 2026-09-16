@@ -743,12 +743,25 @@ export type SanitizedMetadata = Readonly<Record<string, SanitizedMetadataValue>>
  * `toolOutput` are all the key this is trying to catch. `message` deliberately does not match
  * `messages` — `sanitizeErrorReason` reads `metadata.message`, and a one-line error message is the
  * public fact this module exists to let through.
+ *
+ * `prompttext` and `reasoningtext` are their own entries rather than folded into the bare `prompt`/
+ * `reasoning` suffixes. Each of those alone only ever matched a key that *ends* in the word —
+ * `systemPrompt`, `rawPrompt`, `modelReasoning` — so `promptText`, `prompt_text`, `systemPromptText`
+ * and `reasoningText` fell straight through the suffix test (normalized, `promptText` becomes
+ * `prompttext`, which ends in `text`, not `prompt`) and reached `sanitizePublicText` as ordinary
+ * text instead of being dropped whole. Matching the word wherever it sits, rather than only at the
+ * tail, was tried and reverted: it also turns `promptTokens` (a count) and `outputFormat` (a
+ * descriptor) into raw-content hits, which is the exact regression `harnessActivitySanitizer.test.ts`'s
+ * "keeps an ordinary fact whose name merely contains a secret word" case exists to catch. A second,
+ * more specific suffix per reported word closes the gap without reopening that one.
  */
 const RAW_CONTENT_KEY_SUFFIXES: readonly string[] = [
   'prompt',
+  'prompttext',
   'response',
   'messages',
   'reasoning',
+  'reasoningtext',
   'chainofthought',
   'thinking',
   'arguments',

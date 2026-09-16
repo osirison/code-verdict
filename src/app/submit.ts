@@ -128,7 +128,7 @@ export function composeCommentDrafts(
         filePath: providerRelativePath(item.file, workspaceRootLabel),
         line: anchorLine,
         endLine,
-        side: verified ? textMatch.side : 'new',
+        side,
         oldLine,
         refs: anchorRefs,
       },

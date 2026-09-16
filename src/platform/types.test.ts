@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   investigationResultValue,
+  isFetchableObjectSourceUrl,
   type ChangedFileManifestResult,
   type ChangeRequestDetailResult,
   type FileRangeResult,
@@ -32,6 +33,28 @@ describe('InvestigationResult shape (task 3.2)', () => {
       // No `value` key exists to be mistaken for an empty successful payload.
       expect('value' in result).toBe(false);
     }
+  });
+});
+
+describe('isFetchableObjectSourceUrl', () => {
+  it('accepts a plain http location when no credential travels with it', () => {
+    expect(isFetchableObjectSourceUrl('http://git.example.internal/acme/core.git')).toBe(true);
+    expect(isFetchableObjectSourceUrl('http://git.example.internal/acme/core.git', false)).toBe(true);
+  });
+
+  it('refuses a plain http location the moment a credential is going to be attached to it', () => {
+    expect(isFetchableObjectSourceUrl('http://git.example.internal/acme/core.git', true)).toBe(false);
+  });
+
+  it('still accepts https regardless of whether a credential travels with it', () => {
+    expect(isFetchableObjectSourceUrl('https://git.example.internal/acme/core.git', true)).toBe(true);
+    expect(isFetchableObjectSourceUrl('https://git.example.internal/acme/core.git', false)).toBe(true);
+  });
+
+  it('still refuses userinfo and non-http(s) transports regardless of the credential flag', () => {
+    expect(isFetchableObjectSourceUrl('https://user:pass@git.example.internal/acme/core.git', true)).toBe(false);
+    expect(isFetchableObjectSourceUrl('ext::sh -c evil', true)).toBe(false);
+    expect(isFetchableObjectSourceUrl('not a url', true)).toBe(false);
   });
 });
 

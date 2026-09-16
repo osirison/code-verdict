@@ -139,6 +139,37 @@ describe('appendActivityEvent (tasks 5.1/5.2)', () => {
     expect(rejected).toBe(log);
   });
 
+  it('fails closed on a plan item id carrying a control character, consistent with the protocol\'s own identifier rule', () => {
+    const plan = { revision: 1, items: [{ id: 'p1\np2', description: 'x', state: 'pending' as const }] };
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const rejected = appendActivityEvent(log, planCreatedFact(plan), context(0, '2026-09-01T00:00:00.000Z'));
+    expect(rejected).toBe(log);
+  });
+
+  it('fails closed on a plan item id with leading or trailing whitespace', () => {
+    const plan = { revision: 1, items: [{ id: ' p1', description: 'x', state: 'pending' as const }] };
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const rejected = appendActivityEvent(log, planCreatedFact(plan), context(0, '2026-09-01T00:00:00.000Z'));
+    expect(rejected).toBe(log);
+  });
+
+  it('fails closed on a plan item memberId carrying a control character', () => {
+    const plan = { revision: 1, items: [{ id: 'p1', description: 'x', state: 'pending' as const, memberId: 'core\t1' }] };
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const rejected = appendActivityEvent(log, planCreatedFact(plan), context(0, '2026-09-01T00:00:00.000Z'));
+    expect(rejected).toBe(log);
+  });
+
+  it('fails closed on toolCompleted/toolFailed metadata carrying a memberId with a control character', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const rejected = appendActivityEvent(
+      log,
+      { kind: 'toolCompleted', tool: 'readFile', summary: 'ok', memberId: 'core\n1' },
+      context(0, '2026-09-01T00:00:00.000Z'),
+    );
+    expect(rejected).toBe(log);
+  });
+
   it('rejects a fact whose required text sanitizes to nothing', () => {
     const log = createActivityLog('run-1', 'lineage-1', 1);
     const rejected = appendActivityEvent(
@@ -243,6 +274,55 @@ describe('mergeActivityEvents (tasks 5.1/5.2 — out-of-order and duplicate deli
     // so a redelivering transport that repeats a whole batch is still a true no-op.
     const twice = mergeActivityEvents(once, [resumingEvent(1, '2026-09-01T00:00:01.000Z'), resumingEvent(1, '2026-09-01T00:00:01.000Z')]);
     expect(twice).toBe(once);
+  });
+
+  /**
+   * `mergeActivityEvents` used to check only identity and sequence
+   * uniqueness, never routing an incoming event's fact through the same
+   * `sanitizeFact` pass `appendActivityEvent` applies — so a
+   * `planItemStateChanged` event naming an item no plan in this log ever
+   * declared, which `appendActivityEvent` refuses outright, was accepted
+   * verbatim through this path. It has zero production callers today (only
+   * this test exercises it), but the module's own header claims nothing
+   * unsanitized can reach the log, which this closes for real.
+   */
+  it('drops an incoming event that fails the same fail-closed validation appendActivityEvent applies, without failing the rest of the batch', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const unknownItem: ActivityEvent = {
+      ...base,
+      sequence: 1,
+      occurredAt: '2026-09-01T00:00:01.000Z',
+      elapsedMs: 1000,
+      kind: 'planItemStateChanged',
+      itemId: 'no-such-plan-item',
+      state: 'completed',
+    };
+    const merged = mergeActivityEvents(log, [unknownItem, resumingEvent(2, '2026-09-01T00:00:02.000Z')]);
+    expect(merged.events).toHaveLength(1);
+    expect(merged.events[0]).toMatchObject({ kind: 'resuming', sequence: 2 });
+  });
+
+  it('validates a planItemStateChanged event against a plan that arrives earlier in the same batch, not only against what was already stored', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const planEvent: ActivityEvent = {
+      ...base,
+      sequence: 1,
+      occurredAt: '2026-09-01T00:00:01.000Z',
+      elapsedMs: 1000,
+      kind: 'planCreated',
+      plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect auth', state: 'pending' }] },
+    };
+    const stateEvent: ActivityEvent = {
+      ...base,
+      sequence: 2,
+      occurredAt: '2026-09-01T00:00:02.000Z',
+      elapsedMs: 2000,
+      kind: 'planItemStateChanged',
+      itemId: 'p1',
+      state: 'completed',
+    };
+    const merged = mergeActivityEvents(log, [planEvent, stateEvent]);
+    expect(merged.events.map((e) => e.kind)).toEqual(['planCreated', 'planItemStateChanged']);
   });
 
   it('drops an event from another attempt so attempt boundaries are never crossed', () => {

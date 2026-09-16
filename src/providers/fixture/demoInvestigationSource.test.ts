@@ -53,18 +53,73 @@ describe('the demo pod\'s sample investigation source', () => {
       const seen = new Set<string>();
       let cursor: string | undefined;
       let pages = 0;
+      let lastState: string | undefined;
       for (let i = 0; i < 10; i++) {
         const result = await source.listChangedFiles({ snapshot: snapshot(harnessFixtures.HUGE_REVIEW_DIFF.headSha), cursor });
         pages++;
         for (const f of investigationResultValue(result) ?? []) seen.add(f.path);
-        if (result.state !== 'paginated') {
-          expect(result.state).toBe('complete');
-          break;
-        }
+        lastState = result.state;
+        if (result.state !== 'paginated') break;
         cursor = result.cursor;
       }
+      // Asserted unconditionally, not only inside the loop's break branch: a
+      // source that keeps returning 'paginated' forever must fail this test,
+      // not exhaust the 10-iteration cap and pass anyway.
+      expect(lastState).toBe('complete');
       expect(pages).toBeGreaterThan(2);
       expect(seen.size).toBe(harnessFixtures.HUGE_REVIEW_FILE_COUNT);
+    });
+  });
+
+  describe('search pagination (huge fixture)', () => {
+    it('slices searchRepository to the declared page bound and terminates complete without dropping matches', async () => {
+      const source = sampleSource();
+      const bound = DEMO_INVESTIGATION_CAPABILITIES.repositorySearch.pageBound!.maxPageSize;
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+      let pages = 0;
+      let lastState: string | undefined;
+      for (let i = 0; i < 20; i++) {
+        const result = await source.searchRepository({
+          snapshot: snapshot(harnessFixtures.HUGE_REVIEW_DIFF.headSha),
+          revision: 'head',
+          query: 'e',
+          cursor,
+        });
+        const value = investigationResultValue(result) ?? [];
+        expect(value.length).toBeLessThanOrEqual(bound);
+        pages++;
+        for (const m of value) seen.add(`${m.path}:${m.line}`);
+        lastState = result.state;
+        if (result.state !== 'paginated') break;
+        cursor = result.cursor;
+      }
+      expect(lastState).toBe('complete');
+      expect(pages).toBeGreaterThan(1);
+      // Every module file contributes two matching lines ("export const ...e...").
+      expect(seen.size).toBe(harnessFixtures.HUGE_REVIEW_FILE_COUNT * 2);
+    });
+
+    it('slices searchDiff to the declared page bound and terminates complete without dropping matches', async () => {
+      const source = sampleSource();
+      const bound = DEMO_INVESTIGATION_CAPABILITIES.diffSearch.pageBound!.maxPageSize;
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+      let pages = 0;
+      let lastState: string | undefined;
+      for (let i = 0; i < 20; i++) {
+        const result = await source.searchDiff({ snapshot: snapshot(harnessFixtures.HUGE_REVIEW_DIFF.headSha), query: 'e', cursor });
+        const value = investigationResultValue(result) ?? [];
+        expect(value.length).toBeLessThanOrEqual(bound);
+        pages++;
+        for (const m of value) seen.add(`${m.position.path}:${m.position.line}`);
+        lastState = result.state;
+        if (result.state !== 'paginated') break;
+        cursor = result.cursor;
+      }
+      expect(lastState).toBe('complete');
+      expect(pages).toBeGreaterThan(1);
+      expect(seen.size).toBe(harnessFixtures.HUGE_REVIEW_FILE_COUNT * 2);
     });
   });
 

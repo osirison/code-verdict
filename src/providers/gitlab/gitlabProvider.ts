@@ -607,8 +607,15 @@ export class GitLabConnection implements Connection {
       return { state: 'unavailable', reason: `The project's object location could not be read (${toScmError(e).kind}).` };
     }
     const fetchUrl = project.http_url_to_repo ?? `${project.web_url}.git`;
-    if (!isFetchableObjectSourceUrl(fetchUrl)) {
-      return { state: 'unavailable', reason: 'The project reports no ordinary HTTP or HTTPS clone location.' };
+    const authorization = gitAuthorizationHeaderValue(this.credential);
+    if (!isFetchableObjectSourceUrl(fetchUrl, authorization !== undefined)) {
+      return {
+        state: 'unavailable',
+        reason:
+          authorization === undefined
+            ? 'The project reports no ordinary HTTP or HTTPS clone location.'
+            : 'The project reports a plain-HTTP clone location, which cannot carry this connection\'s credential.',
+      };
     }
     // The branch this merge request targets, which is what the merge base is
     // computed against locally. It is a fact about the merge request rather
@@ -623,7 +630,6 @@ export class GitLabConnection implements Connection {
       // merge request that targets a release branch.
       target = undefined;
     }
-    const authorization = gitAuthorizationHeaderValue(this.credential);
     return {
       state: 'available',
       descriptor: {

@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { investigationResultValue } from '../../platform/types';
 import { createGitHubProvider } from './githubProvider';
 import { makeFakeGitHubFetch } from './fakeGitHub';
+import type { FetchLike } from './http';
 import { toNormalizedDetail } from './mappers';
 import type { GhPull } from './mappers';
 
@@ -75,6 +76,82 @@ describe('github provider detail retrieval', () => {
     expect(value?.title).toBe('Tenants can exhaust the shared bucket');
     expect(value?.discussion[0]?.body).toContain('retry envelope');
     expect(value?.unavailableSections).toEqual(expect.arrayContaining(['commits', 'checkSummaries', 'relationships']));
+  });
+
+  it('toNormalizedDetail marks checkSummaries unavailable when the caller reports the rollup truncated', () => {
+    const pull: GhPull = {
+      number: 1, title: 't', body: null, state: 'open',
+      head: { ref: 'a', sha: 'x' }, base: { ref: 'main', sha: 'y' }, user: { login: 'you' },
+      html_url: 'x', updated_at: 'x',
+    };
+    expect(toNormalizedDetail(pull, [], [], [], true).unavailableSections).toEqual(['checkSummaries']);
+    expect(toNormalizedDetail(pull, [], [], [], false).unavailableSections).toEqual([]);
+  });
+
+  /** A response shaped exactly like `PR_ROLLUP_QUERY` answers, one page's worth of `contexts`. */
+  function rollupPage(nodes: unknown[], hasNextPage: boolean, endCursor: string | null) {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            commits: {
+              nodes: [{
+                commit: {
+                  statusCheckRollup: { state: 'SUCCESS', contexts: { pageInfo: { hasNextPage, endCursor }, nodes } },
+                },
+              }],
+            },
+          },
+        },
+      },
+    };
+  }
+
+  /**
+   * Wraps the real fake so every request but the single-PR rollup query answers exactly as it
+   * always has; the rollup query answers with `pages` in order, repeating the last one for any call
+   * past the end (which only matters for the page-cap test below, where every page keeps declaring
+   * another one outstanding).
+   */
+  function fetchWithRollupPages(pages: ReturnType<typeof rollupPage>[]): FetchLike & { calls: number } {
+    const base = makeFakeGitHubFetch();
+    let calls = 0;
+    const impl = (async (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => {
+      const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as { query?: string }) : undefined;
+      if (url.endsWith('/graphql') && body && /pullRequest\(number:/.test(body.query ?? '') && /statusCheckRollup/.test(body.query ?? '')) {
+        const page = pages[Math.min(calls, pages.length - 1)] as ReturnType<typeof rollupPage>;
+        calls += 1;
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => page, text: async () => JSON.stringify(page) };
+      }
+      return base(url, init);
+    }) as FetchLike;
+    Object.defineProperty(impl, 'calls', { get: () => calls });
+    return impl as FetchLike & { calls: number };
+  }
+
+  it('walks every page of contexts and merges them into one rollup, without reporting checkSummaries unavailable', async () => {
+    const fetchImpl = fetchWithRollupPages([
+      rollupPage([{ __typename: 'CheckRun', databaseId: 1, name: 'unit', conclusion: 'SUCCESS', status: 'COMPLETED' }], true, 'c1'),
+      rollupPage([{ __typename: 'CheckRun', databaseId: 2, name: 'lint', conclusion: 'SUCCESS', status: 'COMPLETED' }], false, null),
+    ]);
+    const conn = createGitHubProvider(fetchImpl).connect(CONFIG);
+    const result = await conn.getChangeRequestDetails!({ snapshot: snapshot(), number: '2841' });
+    const value = investigationResultValue(result);
+    expect(value?.checkSummaries.map((c) => c.name).sort()).toEqual(['lint', 'unit']);
+    expect(value?.unavailableSections).toEqual([]);
+    expect(fetchImpl.calls).toBe(2);
+  });
+
+  it('stops at the page cap and reports checkSummaries unavailable rather than silently truncating', async () => {
+    // Every page declares another one outstanding, so a source with no page limit at all would
+    // paginate forever — this is what the cap in `checkRollupForPull` protects against.
+    const fetchImpl = fetchWithRollupPages([rollupPage([{ __typename: 'CheckRun', databaseId: 1, name: 'ci', conclusion: 'SUCCESS', status: 'COMPLETED' }], true, 'more')]);
+    const conn = createGitHubProvider(fetchImpl).connect(CONFIG);
+    const result = await conn.getChangeRequestDetails!({ snapshot: snapshot(), number: '2841' });
+    const value = investigationResultValue(result);
+    expect(value?.unavailableSections).toEqual(['checkSummaries']);
+    // One request per page, capped — never an unbounded walk.
+    expect(fetchImpl.calls).toBe(5);
   });
 
   it('toNormalizedDetail derives the neutral Part-of: relationship from the pull request body', () => {

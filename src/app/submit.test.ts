@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseAgentReviewResponse } from '../domain/agentResponse';
-import { resolveAnchor } from '../domain/anchor';
+import { documentCandidates, resolveAnchor } from '../domain/anchor';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { diffAnchorCandidates } from '../domain/diffHunks';
 import { createReview, setVerdict } from '../domain/reviewState';
@@ -645,6 +645,27 @@ describe('mandate A: a finding on a context or removed line anchors inline', () 
     const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
     expect(composed.drafts).toEqual([]);
     expect(composed.withheld.map((i) => i.id)).toEqual(['no-evidence']);
+  });
+
+  it('normalizes a verified text match\'s undefined side to \'new\' on the drafted anchor, not only on the internal side variable', () => {
+    // `documentCandidates` never sets `side` at all — the haystack a plain
+    // open editor gives, as opposed to a diff's old/new-tagged hunks — so a
+    // verified match against it is exactly the case where `textMatch.side`
+    // is `undefined` and the raw `verified ? textMatch.side : 'new'`
+    // expression diverges from the normalized `side` variable used
+    // everywhere else in this function.
+    const file = ['fn shared() {}', '', 'fn resolve_click_space() -> bool {', '    false', '}'].join('\n');
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [itemAt('doc-match', 3, 'fn resolve_click_space() -> bool {')],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'doc-match', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => documentCandidates(file));
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor.side).toBe('new');
   });
 });
 

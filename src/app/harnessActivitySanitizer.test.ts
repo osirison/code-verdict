@@ -690,4 +690,15 @@ describe('sanitizeMetadata: key rules that do not depend on having enumerated th
       outputFormat: 'json',
     });
   });
+
+  // `prompt` alone only matches a key ENDING in the word (`systemPrompt`), so a key that puts
+  // another word after it (`promptText`, `prompt_text`, `systemPromptText`) used to fall through
+  // to `sanitizePublicText` as ordinary text instead of being dropped whole — measured against the
+  // real function on `sanitizeErrorReason`'s only caller, an arbitrary caught exception whose
+  // property names the harness does not control.
+  for (const key of ['promptText', 'prompt_text', 'systemPromptText', 'reasoningText']) {
+    it(`drops raw model content under ${key}, not just under a key ending in the bare word "prompt"`, () => {
+      expect(JSON.stringify(sanitizeMetadata({ [key]: 'raw blob text' }))).not.toContain('raw blob');
+    });
+  }
 });

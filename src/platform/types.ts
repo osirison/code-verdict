@@ -787,15 +787,24 @@ export type ObjectSourceResult =
  * Userinfo is refused for a second reason: a credential belongs in the
  * descriptor's own header value, never in a URL. Git echoes URLs in its error
  * text, and that text is a model-visible channel.
+ *
+ * `hasAuthorizationHeader` names the *other* place a credential travels: the
+ * descriptor's `authorizationHeaderValue`. A plain `http:` location has no
+ * transport-level confidentiality at all, so a caller that is about to attach
+ * an `Authorization` header passes `true` here and gets refused before the
+ * header value ever reaches a socket — a self-hosted forge without TLS is a
+ * real, reachable configuration, not a hypothetical one, and there is no
+ * localhost or development carve-out: a plain-HTTP instance is exactly the
+ * case this refuses.
  */
-export function isFetchableObjectSourceUrl(url: string): boolean {
+export function isFetchableObjectSourceUrl(url: string, hasAuthorizationHeader = false): boolean {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
     return false;
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && !hasAuthorizationHeader)) return false;
   return parsed.username === '' && parsed.password === '' && parsed.host !== '';
 }
 

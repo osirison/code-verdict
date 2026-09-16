@@ -153,7 +153,11 @@ export function parseCandidateFinding(raw: unknown): { candidate: CandidateFindi
   if (!memberId) reasons.push({ code: 'schema', message: 'memberId is required.' });
   const file = typeof raw.file === 'string' ? normalizeEvidencePath(raw.file) : undefined;
   if (!file) reasons.push({ code: 'schema', message: 'file must be a usable repository-relative path.' });
-  const range = normalizeEvidenceRange(raw.line, raw.endLine);
+  // The model-facing protocol documents optional fields as "omitted or sent as
+  // null; both mean absent" — endLine is one of them, so a literal null must
+  // be treated the same as an omitted field, not rejected as a bad integer.
+  const rawEndLine = raw.endLine === null ? undefined : raw.endLine;
+  const range = normalizeEvidenceRange(raw.line, rawEndLine);
   if (!range) reasons.push({ code: 'schema', message: 'line/endLine must be positive integers with endLine >= line.' });
   // Naming the legal values is what makes a rejection recoverable. Without them a model can only
   // guess at the next spelling, and the phase's repair budget is two attempts.
@@ -194,7 +198,7 @@ export function parseCandidateFinding(raw: unknown): { candidate: CandidateFindi
       memberId: memberId as string,
       file: file as string,
       line: (range as { startLine: number }).startLine,
-      endLine: raw.endLine === undefined ? undefined : (range as { endLine: number }).endLine,
+      endLine: rawEndLine === undefined ? undefined : (range as { endLine: number }).endLine,
       severity: raw.severity as Severity,
       category: raw.category as Category,
       confidence: raw.confidence as number,

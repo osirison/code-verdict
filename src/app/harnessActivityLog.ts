@@ -24,6 +24,7 @@ import type { ActivityCallMetadata, ActivityEvent, Limitation, PlanItem, RunPhas
 import { isResultCompleteness, isRunLifecycle } from '../domain/harnessLifecycle';
 import type { AttemptNumber, LineageId, RunId } from '../domain/harnessLifecycle';
 import { sanitizePublicText } from './harnessActivitySanitizer';
+import { isEchoableIdentifier } from '../domain/harnessProtocol';
 
 /** Mirrors `ActivityEventBase` (`../domain/harnessActivity`, not exported there) — every event kind carries these. */
 interface ActivityEventCommonFields {
@@ -86,11 +87,20 @@ function sanitizePlanItems(items: readonly PlanItem[]): readonly PlanItem[] | un
   const cleaned: PlanItem[] = [];
   const ids = new Set<string>();
   for (const item of items) {
-    if (item.id.trim() === '' || ids.has(item.id)) return undefined; // fail closed: empty or duplicate id
+    // The same echoability rule the model-facing protocol enforces on every
+    // identifier it parses (`domain/harnessProtocol.ts`'s `isEchoableIdentifier`):
+    // no control characters, no leading or trailing whitespace. That parser is
+    // the one real path a model-supplied id reaches this module through today,
+    // and it already rejects a control character or edge whitespace before a
+    // plan is ever created — but this module's own header promises nothing
+    // unsanitized can reach the log short of hand-constructing an event, and a
+    // checkpoint read from disk is exactly that other path (`harnessRunStore.ts`'s
+    // `parsePlanItem` only type-checks `id`, it does not echo-check it).
+    if (item.id.trim() === '' || ids.has(item.id) || !isEchoableIdentifier(item.id)) return undefined; // fail closed: empty, duplicate, or unechoable id
     if (!isPlanItemState(item.state)) return undefined;
     const description = sanitizePublicText(item.description);
     if (description === undefined) return undefined;
-    if (item.memberId !== undefined && item.memberId.trim() === '') return undefined; // fail closed: present-but-blank member id
+    if (item.memberId !== undefined && (item.memberId.trim() === '' || !isEchoableIdentifier(item.memberId))) return undefined; // fail closed: present-but-blank or unechoable member id
     ids.add(item.id);
     cleaned.push({ id: item.id, description, state: item.state, ...(item.memberId !== undefined ? { memberId: item.memberId } : {}) });
   }
@@ -119,7 +129,7 @@ function sanitizeCallMetadata(fact: ActivityCallMetadata): { ok: false } | { ok:
   const retryWaitMs = sanitizeOptionalNonNegativeFinite(fact.retryWaitMs);
   const retryCount = sanitizeOptionalNonNegativeFinite(fact.retryCount);
   if (!durationMs.ok || !bytesSent.ok || !bytesReceived.ok || !retryWaitMs.ok || !retryCount.ok) return { ok: false };
-  if (fact.memberId !== undefined && fact.memberId.trim() === '') return { ok: false };
+  if (fact.memberId !== undefined && (fact.memberId.trim() === '' || !isEchoableIdentifier(fact.memberId))) return { ok: false };
   if (fact.resultState !== undefined && !/^[A-Za-z][A-Za-z0-9]*$/.test(fact.resultState)) return { ok: false };
   return {
     ok: true,
@@ -315,17 +325,37 @@ export function appendActivityEvent(log: ActivityLog, fact: ActivityFact, contex
 export function mergeActivityEvents(log: ActivityLog, incoming: readonly ActivityEvent[]): ActivityLog {
   const stored = new Set(log.events.map((event) => event.sequence));
   const claimed = new Map<number, ActivityEvent>();
+  // Seeded from the stored log and grown as a `planCreated`/`planRevised`
+  // event is accepted below, so a batch that rehydrates a plan and a state
+  // change on it together validates the state change against the plan it
+  // arrived with, not only against what was already on disk.
+  const knownIds = knownPlanItemIds(log.events);
   for (const event of incoming) {
     if (event.runId !== log.runId || event.lineageId !== log.lineageId || event.attempt !== log.attempt) continue;
     if (stored.has(event.sequence)) continue;
-    const first = claimed.get(event.sequence);
+    // Every incoming event is put through the same fail-closed sanitization
+    // `appendActivityEvent` applies to a caller-supplied fact — this module's
+    // own header promises nothing unsanitized reaches the log, and a
+    // transport that can redeliver or reorder is not a more trustworthy
+    // source than a caller. An event that does not sanitize cleanly is
+    // dropped rather than accepted verbatim; it is not the same failure as
+    // two different facts sharing a sequence, so it does not refuse the rest
+    // of the batch.
+    const { runId, lineageId, attempt, sequence, occurredAt, phase, elapsedMs, ...rawFact } = event;
+    const sanitized = sanitizeFact(rawFact as ActivityFact, () => knownIds);
+    if (!sanitized) continue;
+    const sanitizedEvent = { runId, lineageId, attempt, sequence, occurredAt, phase, elapsedMs, ...sanitized } as ActivityEvent;
+    if (sanitizedEvent.kind === 'planCreated' || sanitizedEvent.kind === 'planRevised') {
+      for (const item of sanitizedEvent.plan.items) knownIds.add(item.id);
+    }
+    const first = claimed.get(sequence);
     if (first === undefined) {
-      claimed.set(event.sequence, event);
+      claimed.set(sequence, sanitizedEvent);
       continue;
     }
     // Fail closed: one sequence, two different facts. Nothing here can tell which the run actually
     // produced, so the batch is refused whole rather than resolved by arrival order.
-    if (canonicalStringify(first) !== canonicalStringify(event)) return log;
+    if (canonicalStringify(first) !== canonicalStringify(sanitizedEvent)) return log;
   }
   if (claimed.size === 0) return log;
   const merged = [...log.events, ...claimed.values()].sort((a, b) => a.sequence - b.sequence);

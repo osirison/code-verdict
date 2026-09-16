@@ -411,12 +411,24 @@ export interface GhCompareResult {
   merge_base_commit?: { sha?: string };
 }
 
-/** Keeps context and added lines, drops removed lines and hunk headers — a deterministic head-revision approximation, never invented file content (same technique as the GitLab provider; GitHub's patch format has no binary marker line to skip). */
+/**
+ * Keeps context and added lines, drops removed lines, hunk headers, and
+ * file-level metadata lines (`diff --git`, `index`, `---`/`+++`, the
+ * no-newline marker) — a deterministic head-revision approximation, never
+ * invented file content (same technique as the GitLab provider; GitHub's
+ * patch format has no binary marker line to skip).
+ *
+ * Every content line in a unified diff carries a leading `+`/`-`/` ` prefix
+ * character; the metadata lines below never do, which is what tells them
+ * apart from an added or context line that happens to start with the same
+ * words.
+ */
 export function linesFromUnifiedDiff(patch: string): string[] {
   const lines: string[] = [];
   for (const raw of patch.split('\n')) {
     if (raw.startsWith('@@')) continue;
-    if (raw.startsWith('-')) continue;
+    if (raw.startsWith('-')) continue; // removed lines, and the unprefixed '--- a/…' file header alike
+    if (raw.startsWith('diff --git ') || raw.startsWith('index ') || raw.startsWith('+++ ') || raw.startsWith('\\ No newline at end of file')) continue;
     lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
   }
   return lines;
@@ -471,11 +483,19 @@ function partOfRelationship(body: string | null | undefined): NormalizedRelation
   return match ? [{ kind: 'partOf', ref: match[1] as string }] : [];
 }
 
+/**
+ * `checksTruncated` is `checkRollupForPull`'s own signal that GitHub's `contexts` cursor still had
+ * more pages after `MAX_CHECK_ROLLUP_PAGES` — an honest partial list, not the complete one
+ * `checkSummaries`' own doc comment promises. It lands on `unavailableSections` rather than being
+ * folded silently into `checkSummaries`, the same way a truncated issue detail already reports
+ * itself (`toNormalizedDetailFromIssue` below).
+ */
 export function toNormalizedDetail(
   pull: GhPull,
   commits: readonly GhPullCommit[],
   discussion: ThreadNote[],
   checkSummaries: NormalizedCheckSummary[],
+  checksTruncated = false,
 ): NormalizedDetail {
   return {
     title: pull.title,
@@ -485,7 +505,7 @@ export function toNormalizedDetail(
     discussion,
     checkSummaries,
     relationships: partOfRelationship(pull.body),
-    unavailableSections: [],
+    unavailableSections: checksTruncated ? ['checkSummaries'] : [],
   };
 }
 

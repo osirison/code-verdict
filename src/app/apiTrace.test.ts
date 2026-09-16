@@ -206,6 +206,46 @@ describe('tracedFetch', () => {
     expect(bodyLine).toContain('150000 bytes total');
   });
 
+  it('never buffers a response whose own declared content-length exceeds the tracing buffer cap', async () => {
+    const s = sink();
+    setApiTraceSink(s);
+    const cloneText = vi.fn(async () => 'irrelevant — must never be read');
+    const res: TracedResponseLike = {
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (name.toLowerCase() === 'content-length' ? '20000000' : null) },
+      clone: () => ({ text: cloneText }),
+    };
+
+    await tracedFetch(okFetch(res))('https://api.example.test/items');
+
+    expect(cloneText).not.toHaveBeenCalled();
+    const bodyLine = s.lines.find((l) => l.includes('response body'));
+    expect(bodyLine).toContain('not traced');
+    expect(bodyLine).toContain('20000000');
+  });
+
+  it('still buffers and traces a response under the content-length guard, even when it is over the display cap', async () => {
+    const s = sink();
+    setApiTraceSink(s);
+    const big = 'x'.repeat(150_000);
+
+    await tracedFetch(okFetch(response(200, { 'content-length': String(big.length) }, big)))('https://api.example.test/items');
+
+    const bodyLine = s.lines.find((l) => l.includes('response body')) as string;
+    expect(bodyLine).toContain('150000 bytes total');
+  });
+
+  it('still buffers a response with no content-length header at all, per the module\'s own accepted trade-off', async () => {
+    const s = sink();
+    setApiTraceSink(s);
+
+    await tracedFetch(okFetch(response(200, {}, '{"ok":true}')))('https://api.example.test/items');
+
+    const bodyLine = s.lines.find((l) => l.includes('response body'));
+    expect(bodyLine).toContain('{"ok":true}');
+  });
+
   it('redacts a secret embedded in the response body, not only the URL', async () => {
     const s = sink();
     setApiTraceSink(s);

@@ -50,6 +50,7 @@ import type { ConnectionConfig } from '../platform/provider';
 import type { ChangeRequestRef } from '../platform/types';
 import { createGitHubProvider } from './github/githubProvider';
 import { makeFakeGitHubFetch } from './github/fakeGitHub';
+import type { FetchLike } from './github/http';
 import { createGitLabProvider } from './gitlab/gitlabProvider';
 import { makeFakeGitLabFetch } from './gitlab/fakeGitLab';
 import { fixtureProvider } from './fixture/fixtureProvider';
@@ -272,5 +273,60 @@ describe('the descriptor’s credential reaches no other sink (task 2.6)', () =>
     // credential a remote can reject in its own way, and "no credential" must
     // be indistinguishable from never having been asked for one.
     expect('authorizationHeaderValue' in result.descriptor).toBe(false);
+  });
+});
+
+/** Answers exactly the two GET requests `getObjectSource` makes, with a stub `FetchLike`. */
+function fetchLikeAnswering(repoBody: Record<string, unknown>, detailBody: Record<string, unknown>): FetchLike {
+  return async (url: string) => {
+    const body = url.includes('/pulls/') || url.includes('/merge_requests/') ? detailBody : repoBody;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    };
+  };
+}
+
+describe('a plain-HTTP clone location refuses to carry a credential (task 6.19 hardening)', () => {
+  it('GitHub: refuses when the repository reports an http:// clone location and this connection holds a credential', async () => {
+    const fetchImpl = fetchLikeAnswering(
+      { html_url: 'http://git.self-hosted.example/acme/core', clone_url: 'http://git.self-hosted.example/acme/core.git' },
+      { base: { ref: 'main' } },
+    );
+    const conn = createGitHubProvider(fetchImpl).connect(GITHUB_CONFIG);
+    const result = await conn.getObjectSource!(GITHUB_CR);
+
+    expect(result.state).toBe('unavailable');
+    if (result.state !== 'unavailable') return;
+    expect(result.reason).toContain('plain-HTTP');
+  });
+
+  it('GitHub: still accepts the same http:// clone location when the connection carries no credential', async () => {
+    const fetchImpl = fetchLikeAnswering(
+      { html_url: 'http://git.self-hosted.example/acme/core', clone_url: 'http://git.self-hosted.example/acme/core.git' },
+      { base: { ref: 'main' } },
+    );
+    const conn = createGitHubProvider(fetchImpl).connect({ instanceUrl: 'https://github.com', credential: { kind: 'none' } });
+    const result = await conn.getObjectSource!(GITHUB_CR);
+
+    expect(result.state).toBe('available');
+    if (result.state !== 'available') return;
+    expect(result.descriptor.fetchUrl).toBe('http://git.self-hosted.example/acme/core.git');
+  });
+
+  it('GitLab: refuses when the project reports an http:// clone location and this connection holds a credential', async () => {
+    const fetchImpl = fetchLikeAnswering(
+      { web_url: 'http://git.self-hosted.example/hve/platform/core', http_url_to_repo: 'http://git.self-hosted.example/hve/platform/core.git' },
+      { target_branch: 'main' },
+    );
+    const conn = createGitLabProvider(fetchImpl).connect(GITLAB_CONFIG);
+    const result = await conn.getObjectSource!(GITLAB_CR);
+
+    expect(result.state).toBe('unavailable');
+    if (result.state !== 'unavailable') return;
+    expect(result.reason).toContain('plain-HTTP');
   });
 });

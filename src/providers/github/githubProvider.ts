@@ -273,9 +273,18 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }`;
 
-/** The same rollup shape as `CHECKS_QUERY`, scoped to one pull request — used by `getChangeRequestDetails` (task 4.6), which needs every check, not just the one worth linking to. */
+/**
+ * The same rollup shape as `CHECKS_QUERY`, scoped to one pull request — used by `getChangeRequestDetails`
+ * (task 4.6), which needs every check, not just the one worth linking to.
+ *
+ * `contexts` carries its own `pageInfo` and `after` cursor, which the fixed `first: 20` this used to
+ * be sent with did not: a pull request with a 21st check had no way even to detect that one was cut,
+ * let alone report it, and `toCheckSummariesFromRollup` — documented as "every check on the change
+ * request" — mapped the truncated 20 as if they were all of them. `checkRollupForPull` below walks
+ * this cursor across `MAX_CHECK_ROLLUP_PAGES` pages before it will accept a truncated answer.
+ */
 const PR_ROLLUP_QUERY = `
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       commits(last: 1) {
@@ -283,7 +292,8 @@ query($owner: String!, $repo: String!, $number: Int!) {
           commit {
             statusCheckRollup {
               state
-              contexts(first: 20) {
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   __typename
                   ... on CheckRun { databaseId name conclusion status permalink summary }
@@ -297,6 +307,15 @@ query($owner: String!, $repo: String!, $number: Int!) {
     }
   }
 }`;
+
+/**
+ * How many `contexts` pages `checkRollupForPull` will walk for one pull request before it accepts a
+ * truncated rollup rather than reporting the source honestly. 100 per page (`PR_ROLLUP_QUERY`'s own
+ * `first: 100`) times 5 is 500 checks, which is past anything a real check suite runs — GitHub's own
+ * UI paginates far short of that — while still bounding the pathological case to five requests
+ * rather than an unbounded walk.
+ */
+const MAX_CHECK_ROLLUP_PAGES = 5;
 
 
 
@@ -400,18 +419,50 @@ export class GitHubConnection implements Connection {
     }
   }
 
-  private async checkRollupForPull(ref: ChangeRequestRef): Promise<GqlRollup | null | undefined> {
+  /**
+   * Walks `contexts`' own cursor across up to `MAX_CHECK_ROLLUP_PAGES` pages, merging every page's
+   * nodes into one rollup so `toCheckSummariesFromRollup` never sees a page boundary. `truncated` is
+   * true only when the walk stopped at the page cap with more still declared outstanding — the
+   * caller's signal to say so on `NormalizedDetail` rather than reporting the partial list as
+   * complete.
+   */
+  private async checkRollupForPull(ref: ChangeRequestRef): Promise<{ rollup: GqlRollup | null | undefined; truncated: boolean }> {
     const { owner, repo } = splitRepoId(ref.repoId);
+    let cursor: string | undefined;
+    let rollup: GqlRollup | null | undefined;
+    const nodes: NonNullable<NonNullable<GqlRollup['contexts']>['nodes']> = [];
+    // Merges every page's nodes onto the first page's rollup (its non-`contexts` fields, like
+    // `state`, describe the commit rather than any one page and do not change between pages).
+    const merged = (): GqlRollup | null | undefined => (rollup == null ? rollup : { ...rollup, contexts: { nodes } });
     try {
-      const data = await this.http.graphql<{
-        repository?: {
-          pullRequest?: { commits?: { nodes?: Array<{ commit?: { statusCheckRollup?: GqlRollup | null } } | null> } } | null;
-        } | null;
-      }>(PR_ROLLUP_QUERY, { owner, repo, number: Number(ref.number) });
-      return data.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+      for (let page = 0; page < MAX_CHECK_ROLLUP_PAGES; page += 1) {
+        const data = await this.http.graphql<{
+          repository?: {
+            pullRequest?: {
+              commits?: {
+                nodes?: Array<{
+                  commit?: {
+                    statusCheckRollup?: (GqlRollup & { contexts?: { pageInfo?: { hasNextPage: boolean; endCursor: string | null } } }) | null;
+                  } | null;
+                } | null>;
+              } | null;
+            } | null;
+          } | null;
+        }>(PR_ROLLUP_QUERY, { owner, repo, number: Number(ref.number), cursor });
+        const pageRollup = data.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+        if (page === 0) rollup = pageRollup;
+        nodes.push(...(pageRollup?.contexts?.nodes ?? []));
+        const pageInfo = pageRollup?.contexts?.pageInfo;
+        if (!pageInfo?.hasNextPage) return { rollup: merged(), truncated: false };
+        cursor = pageInfo.endCursor ?? undefined;
+        // A host declaring more pages with no cursor to fetch them by cannot be walked further.
+        if (cursor === undefined) return { rollup: merged(), truncated: true };
+      }
+      // The cap was hit with more still declared outstanding: an honest partial rollup, not a silent one.
+      return { rollup: merged(), truncated: true };
     } catch {
       // Checks are decoration on the detail; a repository whose checks cannot be read must still return the rest.
-      return undefined;
+      return { rollup: undefined, truncated: false };
     }
   }
 
@@ -427,7 +478,7 @@ export class GitHubConnection implements Connection {
       }
       throw e;
     }
-    const [commits, threads, rollup] = await Promise.all([
+    const [commits, threads, checkRollup] = await Promise.all([
       this.http.getAll<GhPullCommit>(`${this.prPath(ref)}/commits`),
       this.fetchThreads(ref),
       this.checkRollupForPull(ref),
@@ -436,7 +487,7 @@ export class GitHubConnection implements Connection {
     return {
       snapshot,
       state: 'complete',
-      value: toNormalizedDetail(pull, commits, discussion, toCheckSummariesFromRollup(rollup)),
+      value: toNormalizedDetail(pull, commits, discussion, toCheckSummariesFromRollup(checkRollup.rollup), checkRollup.truncated),
     };
   }
 
@@ -501,8 +552,15 @@ export class GitHubConnection implements Connection {
       return { state: 'unavailable', reason: `The repository's object location could not be read (${toScmError(e).kind}).` };
     }
     const fetchUrl = repo.clone_url ?? `${repo.html_url}.git`;
-    if (!isFetchableObjectSourceUrl(fetchUrl)) {
-      return { state: 'unavailable', reason: 'The repository reports no ordinary HTTP or HTTPS clone location.' };
+    const authorization = gitAuthorizationHeaderValue(this.credential);
+    if (!isFetchableObjectSourceUrl(fetchUrl, authorization !== undefined)) {
+      return {
+        state: 'unavailable',
+        reason:
+          authorization === undefined
+            ? 'The repository reports no ordinary HTTP or HTTPS clone location.'
+            : 'The repository reports a plain-HTTP clone location, which cannot carry this connection\'s credential.',
+      };
     }
     // The branch this pull request targets, which is what the merge base is
     // computed against locally. It is a fact about the pull request and lives
@@ -518,7 +576,6 @@ export class GitHubConnection implements Connection {
       // pull request that targets a release branch.
       target = undefined;
     }
-    const authorization = gitAuthorizationHeaderValue(this.credential);
     return {
       state: 'available',
       descriptor: {

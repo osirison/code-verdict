@@ -352,7 +352,7 @@ function boundedString(value: unknown, maxLen: number = MAX_PROTOCOL_STRING_LENG
  * display. Rejecting interior whitespace would reject `"id": "inspect auth flow"`, a plan item id
  * a model legitimately writes, and no identifier the host itself mints contains one.
  */
-function isEchoableIdentifier(value: string): boolean {
+export function isEchoableIdentifier(value: string): boolean {
   if (value.trim() !== value) return false;
   // Deliberately no regex control-char class here, for the reason `shortEcho` below records: that
   // escape sequence has round-tripped through tooling as raw control bytes, which makes git treat

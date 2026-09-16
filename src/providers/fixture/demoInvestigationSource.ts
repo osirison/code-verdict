@@ -330,7 +330,10 @@ export function createDemoInvestigationSource(simulation: DemoInvestigationSimul
       if (simulation.investigationRateLimited) throw investigationRateLimitedError();
       const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
       if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
-      return { snapshot: request.snapshot, state: 'complete', value: searchScenario(scenario, request.query, request.pathScope) };
+      const bound = DEMO_INVESTIGATION_CAPABILITIES.repositorySearch.pageBound?.maxPageSize ?? DEMO_INVESTIGATION_CAPABILITIES.pagination.maxPageSize;
+      const { page, nextCursor } = paginate(searchScenario(scenario, request.query, request.pathScope), request.cursor, bound);
+      if (nextCursor) return { snapshot: request.snapshot, state: 'paginated', value: page, cursor: nextCursor };
+      return { snapshot: request.snapshot, state: 'complete', value: page };
     },
 
     async searchDiff(request: DiffSearchRequest): Promise<DiffSearchResult> {
@@ -349,11 +352,14 @@ export function createDemoInvestigationSource(simulation: DemoInvestigationSimul
           reason: `${declinedInScope.length} file(s) in this comparison were enumerated without diff content and could not be searched`,
         };
       }
-      const value: DiffSearchMatch[] = searchScenario(scenario, request.query, request.pathScope).map((m) => ({
+      const matches: DiffSearchMatch[] = searchScenario(scenario, request.query, request.pathScope).map((m) => ({
         position: { path: m.path, side: 'new', line: m.line },
         excerpt: m.excerpt,
       }));
-      return { snapshot: request.snapshot, state: 'complete', value };
+      const bound = DEMO_INVESTIGATION_CAPABILITIES.diffSearch.pageBound?.maxPageSize ?? DEMO_INVESTIGATION_CAPABILITIES.pagination.maxPageSize;
+      const { page, nextCursor } = paginate(matches, request.cursor, bound);
+      if (nextCursor) return { snapshot: request.snapshot, state: 'paginated', value: page, cursor: nextCursor };
+      return { snapshot: request.snapshot, state: 'complete', value: page };
     },
   };
 }

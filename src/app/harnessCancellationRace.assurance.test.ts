@@ -618,9 +618,23 @@ function hostileConnection(files: readonly string[]): { connection: Connection; 
   };
 }
 
-function realHarnessFactory(connection: Connection, onCheckpointCapture: (info: CheckpointInfo) => void): ReviewHarnessFactory {
-  const build = (_input: RunInput, options: HarnessAttemptRunOptions) =>
-    createHarnessAttempt({
+/**
+ * `attemptSettled` exposes the real attempt's own `run()` promise, captured at the moment
+ * `ReviewRunManager` starts it — not through the manager, which stops tracking this run the moment
+ * its cancel grace expires. Awaiting it is what lets the hostile-pair test below know the
+ * late-arriving read's entire downstream processing (the dispatcher's post-await discard, the
+ * attempt's run to its own `cancelled` terminus) has genuinely finished, deterministically, instead
+ * of guessing with a fixed real-clock wait. A rejection is swallowed here — its value is not this
+ * helper's concern, only its timing — and the test's own assertions on `checkpoints`/`workspaceState`
+ * still see whatever the attempt actually did.
+ */
+function realHarnessFactory(
+  connection: Connection,
+  onCheckpointCapture: (info: CheckpointInfo) => void,
+): ReviewHarnessFactory & { attemptSettled: () => Promise<void> } {
+  let settled: Promise<void> = Promise.resolve();
+  const build = (_input: RunInput, options: HarnessAttemptRunOptions) => {
+    const attempt = createHarnessAttempt({
       snapshot: testSnapshot(),
       members: [member(connection)],
       modelSeam: scriptedModelSeam({
@@ -637,7 +651,18 @@ function realHarnessFactory(connection: Connection, onCheckpointCapture: (info: 
         return options.onCheckpoint?.(info);
       },
     });
-  return { create: build, createDemo: build, resume: build };
+    const originalRun = attempt.run.bind(attempt);
+    attempt.run = () => {
+      const result = originalRun();
+      settled = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
+    return attempt;
+  };
+  return { create: build, createDemo: build, resume: build, attemptSettled: () => settled };
 }
 
 function memoryStore(): KeyValueStore {
@@ -667,10 +692,11 @@ describe('16.5: hostile pair, proved end to end through a real attempt and a rea
     const checkpoints: CheckpointInfo[] = [];
     let expireGrace: (() => void) | undefined;
     const workspaceState = memoryStore();
+    const harnessFactory = realHarnessFactory(connection, (info) => checkpoints.push(info));
     const runs = new ReviewRunManager({
       workspaceState,
       globalState: memoryStore(),
-      runners: realHarnessFactory(connection, (info) => checkpoints.push(info)),
+      runners: harnessFactory,
       cancelGrace: () => new Promise<void>((resolve) => { expireGrace = resolve; }),
     });
 
@@ -705,7 +731,11 @@ describe('16.5: hostile pair, proved end to end through a real attempt and a rea
     // happened, and task 12.4's late-result guard means none of that resurrects or overwrites the
     // record, or produces a second write to storage.
     resolveReadDiff('src/a.ts');
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Deterministic, not a fixed real-clock wait: this is the real attempt's own `run()` promise,
+    // captured by `realHarnessFactory` at the moment the manager started it — so this awaits the
+    // late-arriving read's entire downstream processing genuinely finishing, however long that
+    // actually takes, rather than a guess that 10ms is enough.
+    await harnessFactory.attemptSettled();
     expect(runs.get(record.key)).toBeUndefined();
     expect(workspaceState.get(draftKeyFor({ repoId: 'repo-1', number: '42' }))).toBeUndefined();
     expect(workspaceState.get(partialDraftKeyFor({ repoId: 'repo-1', number: '42' }))).toBeUndefined();

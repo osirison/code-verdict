@@ -192,6 +192,12 @@ describe('validateCandidate (task 7.6)', () => {
     expect(parseCandidateFinding(candidate(fixture, { code: 42 }))).toMatchObject({ reasons: [{ code: 'schema' }] });
   });
 
+  it('treats a literal endLine: null the same as an omitted endLine, per the protocol\'s "may be omitted or sent as null" rule', () => {
+    const fixture = setup();
+    const parsed = parseCandidateFinding(candidate(fixture, { endLine: null }));
+    expect(parsed).toMatchObject({ candidate: { line: 12, endLine: undefined } });
+  });
+
   it('rejects an unknown member before touching citations', () => {
     const fixture = setup();
     expect(validateCandidate(candidate(fixture, { memberId: 'm9' }), fixture.context)).toMatchObject({ state: 'rejected', reasons: [{ code: 'unknownMember' }] });

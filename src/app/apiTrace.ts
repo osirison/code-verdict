@@ -167,8 +167,24 @@ async function traceCall(
  * printed. Accepted because this only ever runs behind `codeVerdict.trace.api`, off by default and
  * switched on by a developer already choosing to trade a little latency for a channel with
  * everything in it, in the order it happened.
+ *
+ * One cheap guard runs before any of that, when the host is honest enough to offer it: a
+ * `content-length` header naming a response past `MAX_BUFFERED_TRACED_BODY_BYTES` is read for free
+ * (it is already in memory as part of the headers) and skips `clone()` entirely, not only the read —
+ * a real `Response.clone()` tees the underlying stream, so a clone nobody reads still buffers the
+ * whole body as the caller's own read drains it, and checking the header only after cloning would
+ * not have avoided the memory cost this guard exists to avoid. So the one pathological case this can
+ * see coming — a multi-megabyte diff or attachment a host declares its size for up front — never
+ * gets cloned at all. A response with no `content-length` (chunked transfer, or a host that omits
+ * it) has no free size to check and still clones and buffers whole, which is the remaining cost this
+ * module's doc comment already accepts.
  */
 async function emitResponseBody(sink: ApiTraceSink, now: () => number, id: number, res: TracedResponseLike): Promise<void> {
+  const declaredLength = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BUFFERED_TRACED_BODY_BYTES) {
+    emit(sink, now, () => `[${id}] response body not traced: declared content-length ${String(declaredLength)} bytes exceeds the ${String(MAX_BUFFERED_TRACED_BODY_BYTES)}-byte tracing buffer cap`);
+    return;
+  }
   const cloned = res.clone?.();
   if (!cloned) return;
   try {
@@ -286,6 +302,15 @@ function messageOf(e: unknown): string {
  * a posted review body, a GraphQL response) while still bounding the pathological case.
  */
 const MAX_TRACED_BODY_BYTES = 100_000;
+
+/**
+ * The cheap pre-buffering guard `emitResponseBody` applies before it ever calls `cloned.text()`.
+ * Deliberately far above `MAX_TRACED_BODY_BYTES` — most of a normal response this large is going to
+ * be omitted from the printed line anyway — because this cap exists to stop the pathological case
+ * (a multi-megabyte diff or attachment) from being buffered at all, not to second-guess what is
+ * still a perfectly ordinary body worth reading and formatting in full.
+ */
+const MAX_BUFFERED_TRACED_BODY_BYTES = 10_000_000;
 
 /**
  * Redacts, then bounds — never the other way round, so a secret that happens to sit past the byte
