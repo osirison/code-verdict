@@ -161,7 +161,7 @@ import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
 import type { HarnessModelSeam, SynthesisVerificationInput, SynthesisVerificationOutput, SynthesisVerificationRunner, UnverifiedFindingRecord } from './harnessAttempt';
 import type { CitedEvidenceRef, ValidatedFinding } from './harnessCandidateValidation';
 import { sanitizePublicText } from './harnessActivitySanitizer';
-import { MAX_TURN_RAW_BYTES } from '../domain/harnessProtocol';
+import { MAX_TURN_RAW_BYTES, findValueEnd, stripCodeFence } from '../domain/harnessProtocol';
 import type { SourceCitation } from '../domain/harnessEvidence';
 import { parseHunks } from '../domain/diffHunks';
 import { locationContaining } from './harnessCitations';
@@ -861,22 +861,59 @@ export interface ContradictionVerdict {
   readonly reason?: string;
 }
 
+function tryParseJsonObject(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parses the one JSON value that opens at character 0 of `text` — never a value found by
+ * searching. This used to fall back to `trimmed.indexOf('{')..trimmed.lastIndexOf('}')`, choosing
+ * whatever `{...}` span happened to be first-open-to-last-close anywhere in the reply. That is the
+ * exact heuristic `../domain/harnessProtocol.ts`'s `extractJsonValue` documents replacing, with
+ * production incident data: a model that narrates a hypothetical or example answer as a complete,
+ * valid JSON object before its real, differently-formatted conclusion gets the hypothetical parsed
+ * as the answer — measured at 68 silent wrong answers per 5000 realistic replies (1.4%) for the
+ * closest surviving variant of that family. This module's own header claims "the same fail-closed
+ * discipline `../domain/harnessProtocol.ts` uses"; reusing `findValueEnd` rather than
+ * reimplementing a search is what makes that claim true instead of aspirational.
+ *
+ * A tail after the value closes is tolerated — mirroring `extractJsonValue`'s own tolerance for
+ * the identical live bug there (a valid object followed by stray trailing bytes) — because nothing
+ * past a value that closes and parses is a second candidate: there is exactly one position, and it
+ * is character 0.
+ */
+function parseAnchoredJsonObject(text: string): unknown {
+  if (text[0] !== '{') return undefined;
+  const end = findValueEnd(text, 0);
+  if (end === undefined) return undefined;
+  return tryParseJsonObject(text.slice(0, end + 1));
+}
+
+/**
+ * Extracts the verdict reply's one JSON object. Trimmed-whole first (the common case: the model
+ * followed the "reply with exactly one JSON object and nothing else" instruction exactly), then a
+ * markdown fence stripped via `stripCodeFence` — which refuses to strip, and so falls through to
+ * the anchored attempt below and fails loudly, when the captured content itself contains an
+ * interior fence marker, exactly the guard that stops a fenced worked example from being handed
+ * over as the fenced real turn — then the anchored, position-0 parse. No step ever searches the
+ * text for a `{` to start from; `parseAnchoredJsonObject`'s own comment is where that discipline is
+ * argued.
+ */
 function extractJsonObject(raw: string): unknown {
   const trimmed = raw.trim();
-  const attempts: string[] = [trimmed];
-  const fenced = /^```[a-zA-Z]*\n?([\s\S]*?)\n?```$/.exec(trimmed);
-  if (fenced) attempts.push((fenced[1] ?? '').trim());
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start >= 0 && end > start) attempts.push(trimmed.slice(start, end + 1));
-  for (const attempt of attempts) {
-    try {
-      return JSON.parse(attempt) as unknown;
-    } catch {
-      continue;
-    }
+  const whole = tryParseJsonObject(trimmed);
+  if (whole !== undefined) return whole;
+  const unfenced = stripCodeFence(trimmed);
+  if (unfenced !== trimmed) {
+    const fencedWhole = tryParseJsonObject(unfenced);
+    if (fencedWhole !== undefined) return fencedWhole;
+    return parseAnchoredJsonObject(unfenced);
   }
-  return undefined;
+  return parseAnchoredJsonObject(trimmed);
 }
 
 /**

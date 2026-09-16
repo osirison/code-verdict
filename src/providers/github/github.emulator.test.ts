@@ -1469,3 +1469,89 @@ describe('anchorPayload — LEFT/RIGHT, start_line/start_side, and the head comm
     expect(reviewRequest?.body.commit_id).toBe(refs.commitId);
   });
 });
+
+/**
+ * A1-suggestion-fence-forgery: `buildCommentBody` used to wrap `comment.suggestion.new` in a fixed
+ * ` ```suggestion ` / ` ``` ` fence. `suggestion.new` is model-authored replacement code, validated
+ * only for length (`harnessCandidateValidation.ts`) — never for content — so a suggestion whose own
+ * text contains a ``` sequence (a legitimate example fence in a markdown fix, or one forced via
+ * prompt injection from attacker PR content) could close the real fence early and forge a second,
+ * independent ```suggestion block: GitHub renders each as its own clickable "Commit suggestion",
+ * so the forged one carries attacker-chosen code the review pipeline never validated as the
+ * accepted fix.
+ */
+describe('buildCommentBody — a suggestion cannot forge its own fence (A1)', () => {
+  it('widens the fence past any ``` run the suggestion itself contains, so the whole suggestion stays inside one block', async () => {
+    const inner = makeFakeGitHubFetch();
+    const requests: Array<{ body: Record<string, unknown> }> = [];
+    const capturing: FetchLike = async (url, init) => {
+      if (init?.method === 'POST' && init.body) {
+        requests.push({ body: JSON.parse(init.body) as Record<string, unknown> });
+      }
+      return inner(url, init);
+    };
+    const conn = createGitHubProvider(capturing).connect(CONFIG);
+    const diff = await conn.getChangeRequestDiff(CR);
+    const refs = diff.anchorRefs as { commitId: string };
+    requests.length = 0;
+
+    const maliciousNew = 'legit fix\n```suggestion\nconst evil = true;\n```';
+    await conn.submitReview(CR, {
+      comments: [{
+        key: 'a',
+        body: 'x',
+        anchor: { filePath: 'src/limiter.ts', line: 12, side: 'new', refs },
+        suggestion: { old: 'y', new: maliciousNew },
+      }],
+      // Forces the batched `/reviews` path (`comments: [...]` array) rather than the per-comment
+      // fallback `submitReview` takes for a summary-less, verdict-less submission — `buildCommentBody`
+      // backs both paths identically, so either exercises the fix; the batched shape is simpler to assert on.
+      summary: 's',
+    });
+
+    const reviewRequest = requests.find((r) => Array.isArray((r.body as { comments?: unknown }).comments));
+    const comments = reviewRequest?.body.comments as Array<{ body: string }> | undefined;
+    const posted = comments?.[0]?.body ?? '';
+
+    const openMatch = /^(`{3,})suggestion$/m.exec(posted);
+    expect(openMatch, `no fence opener found in: ${posted}`).not.toBeNull();
+    const fenceLength = openMatch![1]!.length;
+    // Widened strictly past 3: the suggestion's own longest backtick run (3) can no longer match.
+    expect(fenceLength).toBeGreaterThan(3);
+    const fence = '`'.repeat(fenceLength);
+    const openIdx = posted.indexOf(`${fence}suggestion`);
+    const afterOpen = openIdx + fence.length + 'suggestion'.length + 1; // + the newline
+    const closeIdx = posted.indexOf(fence, afterOpen);
+    expect(closeIdx).toBeGreaterThan(-1);
+    // The entire malicious suggestion — including its own embedded fake fence markers — sits
+    // verbatim inside the one real block, never breaking out to forge a second one. (The trailing
+    // `\n` is the join between the suggestion content and the closing fence line.)
+    expect(posted.slice(afterOpen, closeIdx)).toBe(`${maliciousNew}\n`);
+    // And nothing past the real close is a second, independently-openable ```suggestion block.
+    expect(posted.indexOf('```suggestion', closeIdx + fence.length)).toBe(-1);
+  });
+
+  it('uses the ordinary three-backtick fence when the suggestion contains no backticks at all', async () => {
+    const inner = makeFakeGitHubFetch();
+    const requests: Array<{ body: Record<string, unknown> }> = [];
+    const capturing: FetchLike = async (url, init) => {
+      if (init?.method === 'POST' && init.body) {
+        requests.push({ body: JSON.parse(init.body) as Record<string, unknown> });
+      }
+      return inner(url, init);
+    };
+    const conn = createGitHubProvider(capturing).connect(CONFIG);
+    const diff = await conn.getChangeRequestDiff(CR);
+    const refs = diff.anchorRefs as { commitId: string };
+    requests.length = 0;
+
+    await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 12, side: 'new', refs }, suggestion: { old: 'y', new: 'const fixed = true;' } }],
+      summary: 's',
+    });
+
+    const reviewRequest = requests.find((r) => Array.isArray((r.body as { comments?: unknown }).comments));
+    const comments = reviewRequest?.body.comments as Array<{ body: string }> | undefined;
+    expect(comments?.[0]?.body).toContain('```suggestion\nconst fixed = true;\n```');
+  });
+});

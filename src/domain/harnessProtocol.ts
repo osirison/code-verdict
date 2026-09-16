@@ -412,9 +412,14 @@ type OptionalStringResult = { readonly ok: true; readonly value: string | undefi
  * JSON has no `undefined`, so a model that decides not to send an optional value writes `null` —
  * and a model asked to omit a string often writes `""` instead. Both used to be hard failures on
  * every optional field in this protocol: `cursor`, `section`, `pathScope`, `memberId`, `itemId`,
- * `suggestion` and their neighbours. Each rejection discarded the whole turn, and several reported
- * the field as *required* when it had plainly been supplied, so the model could not tell what to
- * change and burned the phase's repair budget guessing.
+ * `suggestion`, a plan item's own `state`, `checkpointSuggestion.reason`,
+ * `completionRequest.rationale`, and their neighbours. Each rejection discarded the whole turn, and
+ * several reported the field as *required* when it had plainly been supplied, so the model could
+ * not tell what to change and burned the phase's repair budget guessing. Plan item `state` and the
+ * two owned-text fields were the last holdouts — gated by a raw `!== undefined`/`=== undefined`
+ * check for as long as this doc comment named every OTHER optional field as fixed, which made the
+ * roster false by omission; they are fixed now specifically so this list stays a true inventory
+ * rather than aspirational.
  *
  * Required fields are unaffected: `null` and `""` still fail there, which is the honest answer,
  * and their messages now say "is required" only when the field really is absent.
@@ -1010,7 +1015,7 @@ function parsePlanItemInputs(rawItems: unknown): PlanItemInputsResult {
     const description = typeof rawItem.description === 'string' ? rawItem.description : undefined;
     if (!id.ok || description === undefined) return { ok: false };
     let state: PlanItemState | undefined;
-    if (rawItem.state !== undefined) {
+    if (!isAbsent(rawItem.state)) {
       if (!isPlanItemState(rawItem.state)) return { ok: false };
       state = rawItem.state;
     }
@@ -1110,7 +1115,11 @@ function parseCandidateSubmission(raw: unknown): MessageParseResult {
  * rather than failing the message closed.
  */
 function parseOwnedShortText(value: unknown): { readonly ok: true; readonly value: string | undefined } | { readonly ok: false } {
-  if (value === undefined) return { ok: true, value: undefined };
+  // `isAbsent`, not a raw `=== undefined` check: this was the same gap the plan item `state`
+  // field had (see `isAbsent`'s own doc comment) — a model sending the protocol's own documented
+  // "omitted" spellings, `null` or `""`, for `checkpointSuggestion.reason` /
+  // `completionRequest.rationale` was rejected as unusable text instead of treated as absent.
+  if (isAbsent(value)) return { ok: true, value: undefined };
   if (typeof value !== 'string' || value.length > MAX_PUBLIC_TEXT_LENGTH) return { ok: false };
   const sanitized = sanitizePublicText(value);
   return sanitized === undefined ? { ok: false } : { ok: true, value: sanitized };
@@ -1310,8 +1319,12 @@ const FENCE_MARKER = '```';
  * the trade this file makes every time. What the residual does not touch: single backticks, which
  * are how a model ordinarily quotes an identifier, are unaffected — the test is for a run of
  * three — and a single fenced turn with no fence marker inside it still parses with zero repairs.
+ *
+ * Exported for a second consumer, `../app/harnessSynthesisVerification.ts`'s contradiction-verdict
+ * parser, which used to strip a fence with its own unguarded regex — vulnerable to exactly the
+ * first-fence-to-last-fence capture this function's own guard exists to refuse.
  */
-function stripCodeFence(text: string): string {
+export function stripCodeFence(text: string): string {
   const match = CODE_FENCE_PATTERN.exec(text);
   if (!match) return text;
   const content = match[1] ?? '';
@@ -1348,8 +1361,16 @@ function stripCodeFence(text: string): string {
  * bounds the character count too). No separate cap is imposed here, deliberately: a second bound
  * could only ever fire on input the byte guard already rejected, and firing it would report an
  * oversized turn as an unterminated one.
+ *
+ * Exported for a second consumer: `../app/harnessSynthesisVerification.ts`'s contradiction-verdict
+ * parser used to fall back to `trimmed.indexOf('{')..trimmed.lastIndexOf('}')` — exactly the
+ * discarded, unsafe heuristic this function's own doc comment replaced two rules ago (see
+ * `extractJsonValue`'s comment below for the full history), letting a model's hypothetical or
+ * example verdict, stated as a complete JSON object ahead of its real prose conclusion, be parsed
+ * as the answer. Anchoring the scan at position 0 rather than searching for a decoy anywhere in
+ * the reply needed exactly this function, not a reimplementation of it.
  */
-function findValueEnd(text: string, start: number): number | undefined {
+export function findValueEnd(text: string, start: number): number | undefined {
   let depth = 0;
   let inString = false;
   let escaped = false;

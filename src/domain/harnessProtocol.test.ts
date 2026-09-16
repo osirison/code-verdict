@@ -63,6 +63,42 @@ describe('parseModelTurn: every message kind round-trips', () => {
     expect(msg.plan.items[1]).not.toHaveProperty('memberId');
   });
 
+  // null-norm-plan-item-state: `state` used to be gated by a raw `rawItem.state !== undefined`
+  // check, unlike its own sibling `memberId` two lines below (which already routes through
+  // `optionalIdentifierText` -> `isAbsent`) — so a model spelling "omitted" the protocol's own
+  // documented way, `state: null`, lost the entire items array with a message that never named
+  // `state` as the problem. `state: null` must parse exactly like `state` omitted altogether.
+  it('planCreated treats a plan item\'s state:null as omitted, the same as state left out entirely, and defaults it to pending', () => {
+    const withNull = parseModelTurn(
+      turnText([{ kind: 'planCreated', items: [{ id: 'p1', description: 'Inspect auth', state: null }] }]),
+      { phase: 'planning' },
+    );
+    expect(withNull.ok, `state:null should parse: ${JSON.stringify(withNull)}`).toBe(true);
+    const [msg] = okMessages(withNull);
+    if (msg?.kind !== 'planCreated') throw new Error('expected planCreated');
+    expect(msg.plan.items[0]).toEqual({ id: 'p1', description: 'Inspect auth', state: 'pending' });
+  });
+
+  it('planRevised also treats a plan item\'s state:null as omitted', () => {
+    const previousPlan = createPlan([{ id: 'p1', description: 'Inspect auth' }]);
+    const outcome = parseModelTurn(
+      turnText([{ kind: 'planRevised', items: [{ id: 'p1', description: 'Inspect auth', state: null }], rationale: 'Revising after a fresh read' }]),
+      { phase: 'planning', previousPlan },
+    );
+    expect(outcome.ok, `state:null should parse: ${JSON.stringify(outcome)}`).toBe(true);
+    const [msg] = okMessages(outcome);
+    if (msg?.kind !== 'planRevised') throw new Error('expected planRevised');
+    expect(msg.plan.items[0]?.state).toBe('pending');
+  });
+
+  it('still rejects a plan item whose state is a genuinely invalid, non-absent value', () => {
+    const outcome = parseModelTurn(
+      turnText([{ kind: 'planCreated', items: [{ id: 'p1', description: 'Inspect auth', state: 'bogus' }] }]),
+      { phase: 'planning' },
+    );
+    expect(outcome.ok).toBe(false);
+  });
+
   it('rejects a plan item whose memberId is not a well-formed string', () => {
     const outcome = parseModelTurn(
       turnText([{ kind: 'planCreated', items: [{ id: 'p1', description: 'Inspect auth', memberId: 42 }] }]),
@@ -239,6 +275,27 @@ describe('parseModelTurn: every message kind round-trips', () => {
     expect(withReason[0]).toEqual({ kind: 'checkpointSuggestion', reason: 'Good pause point after this unit' });
     const withoutReason = okMessages(parseModelTurn(turnText([{ kind: 'checkpointSuggestion' }]), { phase: 'investigating' }));
     expect(withoutReason[0]).toEqual({ kind: 'checkpointSuggestion' });
+  });
+
+  // Audit sibling of null-norm-plan-item-state: `parseOwnedShortText` (backing
+  // `checkpointSuggestion.reason` and `completionRequest.rationale`) gated absence with a raw
+  // `value === undefined` check, so a model spelling "omitted" either of this protocol's own
+  // documented ways — `null`, or the empty string `optionalIdentifierText`'s sibling fields
+  // already tolerate — was rejected as "must be usable text" instead of treated as absent.
+  it('checkpointSuggestion treats reason:null and reason:"" as omitted, not as unusable text', () => {
+    for (const reason of [null, '']) {
+      const outcome = parseModelTurn(turnText([{ kind: 'checkpointSuggestion', reason }]), { phase: 'investigating' });
+      expect(outcome.ok, `reason ${JSON.stringify(reason)} should parse: ${JSON.stringify(outcome)}`).toBe(true);
+      expect(okMessages(outcome)[0]).toEqual({ kind: 'checkpointSuggestion' });
+    }
+  });
+
+  it('completionRequest treats rationale:null and rationale:"" as omitted, not as unusable text', () => {
+    for (const rationale of [null, '']) {
+      const outcome = parseModelTurn(turnText([{ kind: 'completionRequest', memberId: 'm1', rationale }]), { phase: 'verifying' });
+      expect(outcome.ok, `rationale ${JSON.stringify(rationale)} should parse: ${JSON.stringify(outcome)}`).toBe(true);
+      expect(okMessages(outcome)[0]).toEqual({ kind: 'completionRequest', memberId: 'm1' });
+    }
   });
 
   it('completionRequest round-trips mirroring RequestCompletionToolRequest plus optional rationale', () => {

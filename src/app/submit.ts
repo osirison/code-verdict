@@ -29,6 +29,29 @@ import type { Review, ReviewItem } from '../domain/types';
 import { isReviewItemAnchored } from '../domain/types';
 import { providerRelativePath } from './modelVisiblePath';
 
+/**
+ * Neutralizes `item.body` against forging its own markdown code fence, without touching anything
+ * else about it: the body is model-authored prose that is posted close to verbatim (inline `code`
+ * spans, bold, links all meant to survive), so the blunt fix — `escapeMarkdownText`, which
+ * backslash-escapes every single backtick and would flatten every legitimate inline code
+ * reference — is too broad. Only a run of three or more fence characters is dangerous: backtick
+ * runs (```) and tilde runs (~~~) are the two sequences CommonMark/GFM read as a fence delimiter
+ * (block-level fences and long-delimiter inline code spans alike — a mixed run of both characters
+ * is neither and stays untouched), so a bare ```suggestion...``` (or plain ``` or ~~~) sequence
+ * sitting in a finding's own free text becomes a second, independently applyable "Commit
+ * suggestion" the instant the comment posts — reachable through nothing more than an ordinary
+ * accept-and-submit, no `suggestion` field or `applyFix` toggle involved. Backslash-escaping every
+ * character of the run (mirroring `escapeMarkdownText`'s own per-character technique, one directory
+ * up in `../domain/markdownSafety.ts`) keeps every fence-character byte the reader sees — nothing
+ * is stripped or rewritten — while CommonMark fence recognition requires the line's fence
+ * characters to be literal and unescaped, and a code span's delimiter run must be unescaped
+ * backticks too: escaping every character in the run, not just its first, also stops the
+ * remaining (n-1)-length tail from pairing into a stray inline span elsewhere in the same body.
+ */
+function neutralizeCodeFences(text: string): string {
+  return text.replace(/`{3,}|~{3,}/g, (run) => run.replace(/[`~]/g, '\\$&'));
+}
+
 export interface CommentDraftComposition {
   drafts: ReviewCommentDraft[];
   withheld: ReviewItem[];
@@ -41,6 +64,20 @@ export function composeCommentDrafts(
   anchorRefs: AnchorRefs,
   candidatesFor: (file: string) => readonly AnchorCandidate[] | undefined,
   workspaceRootLabel?: string,
+  /**
+   * A finding's file's old path, in provider spelling, present only when the file was renamed —
+   * `undefined` both for an unrenamed file and for a caller that has not wired this in yet.
+   * `AnchorCandidate` (`../domain/anchor.ts`) carries no path at all, so nothing inside this
+   * function can otherwise learn a file's pre-rename name; the caller is the only place that still
+   * has the real `FileDiff` (and its own `oldPath`) in hand when it builds `candidatesFor`. GitLab's
+   * `buildPosition` (`../providers/gitlab/mappers.ts`) reads `anchor.oldPath ?? anchor.filePath`
+   * specifically to resolve a renamed-and-edited file's diff position — never
+   * `providerRelativePath` this value again, unlike `item.file`: it is already the provider's own
+   * spelling straight off `FileDiff.oldPath`, and re-mapping it a second time would double-map it.
+   * Optional and additive so every existing caller keeps compiling and behaving exactly as it does
+   * today (old_path silently defaulting to new_path on a rename) until it is updated to pass one.
+   */
+  oldPathFor?: (file: string) => string | undefined,
 ): CommentDraftComposition {
   const drafts: ReviewCommentDraft[] = [];
   const withheld: ReviewItem[] = [];
@@ -123,13 +160,14 @@ export function composeCommentDrafts(
     const headline = [`**${escapeMarkdownText(item.title)}**`, ...findingMetaParts(item)].join(' · ');
     drafts.push({
       key: item.id,
-      body: `${headline}\n\n${item.body}`,
+      body: `${headline}\n\n${neutralizeCodeFences(item.body)}`,
       anchor: {
         filePath: providerRelativePath(item.file, workspaceRootLabel),
         line: anchorLine,
         endLine,
         side,
         oldLine,
+        oldPath: oldPathFor?.(item.file),
         refs: anchorRefs,
       },
       // A suggestion replaces a line's content — meaningless on the old side
@@ -206,7 +244,7 @@ function renderFindingBlock(item: ReviewItem, withheldReason?: string): string {
     `${markdownCodeSpan(item.file)}, line ${item.line}`,
   ];
   if (withheldReason) parts.push(`**Withheld:** ${escapeMarkdownText(withheldReason)}`);
-  parts.push(item.body);
+  parts.push(neutralizeCodeFences(item.body));
   return parts.join('\n\n');
 }
 

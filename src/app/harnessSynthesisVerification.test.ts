@@ -274,6 +274,43 @@ describe('buildContradictionDirective / parseContradictionVerdict', () => {
     expect(parseContradictionVerdict('not json at all', 'cand-1')).toBeUndefined();
   });
 
+  // Reproduces the decoy-JSON probe: a model narrating a hypothetical/example verdict as a
+  // complete, valid JSON object bearing the correct candidateId, ahead of its real, differently
+  // -formatted conclusion. The parser used to fall back to `indexOf('{')..lastIndexOf('}')` over
+  // the whole reply — exactly the heuristic `../domain/harnessProtocol.ts`'s own doc comment
+  // documents replacing after measuring 68 silent wrong answers per 5000 realistic replies — so the
+  // decoy's braces, being the only complete `{...}` span, were accepted as the verdict.
+  it('never accepts a hypothetical/example verdict stated before the real, unparseable conclusion', () => {
+    const raw = 'Let\'s consider: if this were wrong we\'d say '
+      + '{"candidateId":"cand-1","contradicted":true,"reason":"hypothetically wrong"}. '
+      + 'But actually ... the real conclusion is that this is NOT contradicted ... [truncated, no trailing JSON]';
+    expect(parseContradictionVerdict(raw, 'cand-1')).toBeUndefined();
+  });
+
+  it('still parses a reply whose one JSON value is followed by stray trailing bytes', () => {
+    const raw = `${verdictJson('cand-1', false)}]}`;
+    expect(parseContradictionVerdict(raw, 'cand-1')).toEqual({ contradicted: false });
+  });
+
+  it('still parses a single fenced verdict, and refuses (rather than mis-selects) a fence enclosing more than one JSON-shaped block', () => {
+    const fenced = ['```json', verdictJson('cand-1', false), '```'].join('\n');
+    expect(parseContradictionVerdict(fenced, 'cand-1')).toEqual({ contradicted: false });
+
+    // Two JSON-shaped values inside one fence: the decoy first, the real (differently-worded, so
+    // it alone cannot be confused for the decoy) conclusion second. The interior ``` guard this
+    // shares with `stripCodeFence` must refuse to strip — never silently hand over the decoy.
+    const doubleFenced = [
+      '```json',
+      '{"candidateId":"cand-1","contradicted":true,"reason":"decoy"}',
+      '```',
+      'actual reply:',
+      '```json',
+      verdictJson('cand-1', false),
+      '```',
+    ].join('\n');
+    expect(parseContradictionVerdict(doubleFenced, 'cand-1')).toBeUndefined();
+  });
+
   it('accepts a well-formed verdict, sanitizing the reason when contradicted', () => {
     const ok = parseContradictionVerdict(verdictJson('cand-1', true, 'The evidence shows the opposite.'), 'cand-1');
     expect(ok).toEqual({ contradicted: true, reason: 'The evidence shows the opposite.' });

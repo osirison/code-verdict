@@ -135,11 +135,31 @@ const HOST: HostDescriptor = {
 /** Errors after which posting the remaining comments cannot succeed. */
 const ABORT_KINDS = new Set(['auth', 'insufficientScope', 'rateLimited', 'network']);
 
+/**
+ * Picks a fence for a model-authored suggestion that the suggestion's own bytes cannot forge: a
+ * run of backticks one longer than the longest backtick run already inside `text`, mirroring
+ * `evidenceFence` (`../../app/harnessSynthesisVerification.ts`) and `markdownCodeSpan`
+ * (`../../domain/markdownSafety.ts`)'s identical widening technique — neither is reused directly
+ * (the same divergence `evidenceFence`'s own comment explains): this fence must delimit multi-line
+ * code verbatim, never collapsing or escaping a byte of it, which rules out `markdownCodeSpan`
+ * (single-line code spans) as much as it ruled out `evidenceFence` there. A fixed ``` fence lets
+ * `comment.suggestion.new` containing its own ``` sequence — a legitimate example fence in a
+ * markdown fix, or a prompt-injected one — close early and forge a second, independent
+ * ```suggestion block; GitHub renders each as its own clickable "Commit suggestion", so a forged
+ * one carries attacker-chosen code the review pipeline never validated as the accepted fix.
+ */
+function suggestionFence(text: string): string {
+  const runs = text.match(/`+/g) ?? [];
+  const longestRun = runs.reduce((max, run) => Math.max(max, run.length), 0);
+  return '`'.repeat(Math.max(3, longestRun + 1));
+}
+
 /** GitHub renders a suggestion from a fenced block, same syntax as GitLab. */
 function buildCommentBody(comment: ReviewCommentDraft): string {
   const parts = [comment.body];
   if (comment.suggestion) {
-    parts.push(['```suggestion', comment.suggestion.new, '```'].join('\n'));
+    const fence = suggestionFence(comment.suggestion.new);
+    parts.push([`${fence}suggestion`, comment.suggestion.new, fence].join('\n'));
   }
   if (comment.footer) parts.push(comment.footer);
   return parts.join('\n\n');

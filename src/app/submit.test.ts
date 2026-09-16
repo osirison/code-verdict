@@ -186,6 +186,71 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(composed.withheld).toEqual([]);
   });
 
+  // A2-body-fence-forgery: `item.body` used to be embedded raw into every accepted finding's
+  // posted comment body. `item.body` is free-form model text (`boundedString(raw.body, false)` —
+  // length-capped only, no content restriction), so a bare ```suggestion...``` sequence sitting in
+  // a finding's own body — a legitimate example fence, or prompt-injected — became a second,
+  // independently applyable "Commit suggestion" purely from an ordinary accept-and-submit: no
+  // `suggestion` field or `applyFix` toggle involved, unlike A1's narrower path.
+  it('neutralizes a ```suggestion fence embedded in an accepted finding\'s own body', () => {
+    const maliciousBody = 'Fix the auth check.\n```suggestion\nconst bypass = true;\n```';
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [{ id: 'inj', file: 'src/diff.ts', line: 4, severity: 'major', category: 'security', confidence: 90, title: 'Injected fence', body: maliciousBody, code: 'bad();' }],
+    }, { diffPaths: ['src/diff.ts'] });
+    let review = createReview({ repoId: 'repo', crNumber: '1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'inj', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => [{ line: 4, text: 'bad();' }]);
+    const posted = composed.drafts[0]?.body ?? '';
+    // The content is still there, readable — only the fence markers are defused.
+    expect(posted).toContain('const bypass = true;');
+    expect(posted).not.toMatch(/^```suggestion$/m);
+    expect(posted).toContain('\\`\\`\\`suggestion');
+  });
+
+  it('neutralizes a ```suggestion fence embedded in a summary-carried (withheld/outside-diff) finding\'s body', () => {
+    const maliciousBody = 'Fix the schema check.\n```suggestion\nconst bypass = true;\n```';
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [{ id: 'inj', file: 'docs/evidence.md', line: 12, severity: 'minor', category: 'docs', confidence: 85, title: 'Injected fence', body: maliciousBody, code: 'stale text' }],
+    }, { diffPaths: [], attachmentManifest: [{ path: 'docs/evidence.md', ranges: [{ startLine: 12, endLine: 12 }] }] });
+    let review = createReview({ repoId: 'repo', crNumber: '1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'inj', 'accepted', false);
+
+    const summary = composeSummaryBody('Review summary.', '', review);
+    expect(summary).toContain('const bypass = true;');
+    expect(summary).not.toMatch(/^```suggestion$/m);
+    expect(summary).toContain('\\`\\`\\`suggestion');
+  });
+
+  // gitlab-anchor-oldpath-never-set: `DiffAnchor.oldPath` used to never be set from
+  // `composeCommentDrafts`, so GitLab always posted a renamed file's comments with
+  // `old_path == new_path`. `oldPathFor` is additive and optional — every existing caller that
+  // does not pass it keeps today's behavior (`oldPath` stays `undefined`) exactly as before.
+  it('threads a supplied old path onto the anchor for a renamed file, and leaves it undefined when no callback is given', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [{ id: 'renamed', file: 'src/auth/token.ts', line: 4, severity: 'major', category: 'security', confidence: 90, title: 'Renamed file finding', body: 'Body', code: 'bad();' }],
+    }, { diffPaths: ['src/auth/token.ts'] });
+    let review = createReview({ repoId: 'repo', crNumber: '1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'renamed', 'accepted', false);
+
+    const withoutCallback = composeCommentDrafts(review, 'Agent', 'you', refs, () => [{ line: 4, text: 'bad();' }]);
+    expect(withoutCallback.drafts[0]?.anchor.oldPath).toBeUndefined();
+
+    const withCallback = composeCommentDrafts(
+      review, 'Agent', 'you', refs,
+      () => [{ line: 4, text: 'bad();' }],
+      undefined,
+      (file) => (file === 'src/auth/token.ts' ? 'src/auth/legacy.ts' : undefined),
+    );
+    expect(withCallback.drafts[0]?.anchor.oldPath).toBe('src/auth/legacy.ts');
+  });
+
   it.each([
     ['no matching code', [{ line: 9, text: 'realAddedLine();' }]],
     ['no added lines', []],

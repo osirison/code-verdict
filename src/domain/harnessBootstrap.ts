@@ -60,10 +60,31 @@ export interface BootstrapSection {
   readonly content: NormalizedDetail | string;
 }
 
+/**
+ * Collapses an embedded line break in a single-line untrusted value into a space before it is
+ * interpolated into this module's own `## `-headed section text. `detail.title` reaches
+ * `summarizeNormalizedDetail` with no schema layer upstream to reject a raw newline (provider
+ * mappers pass it straight through — `github/mappers.ts`, `gitlab/mappers.ts` — and this module's
+ * own header names title among the "author-controlled" content the isolation is meant to hold),
+ * and the sibling inline-detail path (`buildBootstrapSection`'s `fitsInline` branch) is safe only
+ * by accident: it `JSON.stringify`s the whole `NormalizedDetail`, which escapes a newline as the
+ * two literal characters `\n` rather than emitting one. This summary path has no such stringify
+ * step, so a title carrying a real newline reproduces verbatim — forging a fake `## `/`### ` line
+ * inside `BootstrapSection.content`, structurally indistinguishable from the module's own section
+ * headers once it renders. A value must not be able to open its own section: collapsing the break
+ * to a space keeps the title's content unchanged and readable while making that structurally
+ * impossible, the same newline-collapse step `escapeMarkdownText` uses
+ * (`./markdownSafety.ts`) — kept local here rather than imported, matching `evidenceFence`'s own
+ * precedent (`../app/harnessSynthesisVerification.ts`) of a small mirrored helper over a shared one.
+ */
+function neutralizeLineBreaks(text: string): string {
+  return text.replace(/\r\n|\r|\n|\u2028|\u2029|\u0085/g, ' ');
+}
+
 /** A truthful, bounded stand-in for a section too large to inline — counts and named omissions, never invented prose. */
 export function summarizeNormalizedDetail(detail: NormalizedDetail): string {
   const parts = [
-    `Title: ${detail.title}`,
+    `Title: ${neutralizeLineBreaks(detail.title)}`,
     `${detail.commits.length} commit(s), ${detail.discussion.length} discussion note(s), `
       + `${detail.labels.length} label(s), ${detail.checkSummaries.length} check summary(ies), `
       + `${detail.relationships.length} relationship(s).`,
