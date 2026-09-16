@@ -418,17 +418,38 @@ export interface GhCompareResult {
  * invented file content (same technique as the GitLab provider; GitHub's
  * patch format has no binary marker line to skip).
  *
- * Every content line in a unified diff carries a leading `+`/`-`/` ` prefix
- * character; the metadata lines below never do, which is what tells them
- * apart from an added or context line that happens to start with the same
- * words.
+ * Metadata lines occur only before the first hunk header (`@@`). Content lines
+ * carry a leading `+`/`-`/` ` prefix; once the first `@@` is seen, lines are
+ * classified solely by their prefix. The `\ No newline at end of file` marker
+ * can appear after hunks and is skipped wherever it occurs.
  */
 export function linesFromUnifiedDiff(patch: string): string[] {
   const lines: string[] = [];
+  let seenFirstHunk = false;
   for (const raw of patch.split('\n')) {
-    if (raw.startsWith('@@')) continue;
-    if (raw.startsWith('-')) continue; // removed lines, and the unprefixed '--- a/…' file header alike
-    if (raw.startsWith('diff --git ') || raw.startsWith('index ') || raw.startsWith('+++ ') || raw.startsWith('\\ No newline at end of file')) continue;
+    // Hunk headers
+    if (raw.startsWith('@@')) {
+      seenFirstHunk = true;
+      continue;
+    }
+    // Removed lines
+    if (raw.startsWith('-')) continue;
+    // Metadata lines (only before the first hunk)
+    if (!seenFirstHunk) {
+      if (
+        raw.startsWith('diff --git ') ||
+        raw.startsWith('index ') ||
+        raw.startsWith('--- ') ||
+        raw.startsWith('+++ ')
+      ) {
+        continue;
+      }
+    }
+    // The no-newline marker can appear anywhere after a hunk
+    if (raw.startsWith('\\ No newline at end of file')) {
+      continue;
+    }
+    // Content lines: strip the +/-/space prefix if present
     lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
   }
   return lines;

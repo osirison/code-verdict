@@ -38,4 +38,14 @@ describe('linesFromUnifiedDiff', () => {
     const patch = ['--- a/src/util.ts', '+++ b/src/util.ts', '@@ -1,1 +1,1 @@', ' same content'].join('\n');
     expect(linesFromUnifiedDiff(patch)).toEqual(['same content']);
   });
+
+  it('preserves a genuine added line that starts with ++', () => {
+    const patch = ['@@ -1,1 +1,2 @@', ' context', '+++ b/something'].join('\n');
+    expect(linesFromUnifiedDiff(patch)).toEqual(['context', '++ b/something']);
+  });
+
+  it('still drops no-newline marker after hunks', () => {
+    const patch = ['@@ -1,1 +1,2 @@', ' context', '+added', '\\ No newline at end of file'].join('\n');
+    expect(linesFromUnifiedDiff(patch)).toEqual(['context', 'added']);
+  });
 });
