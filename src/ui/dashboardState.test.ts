@@ -125,6 +125,46 @@ describe('AI review pill', () => {
   });
 });
 
+// changeset-dashboard-ignores-active-run: the per-CR `rows` array already outranks a retained outcome
+// with a live run (`aiPill`'s own "a run in flight outranks every recorded outcome" rule); the
+// `changesets` band never consulted `activeRuns` at all, even though the extension populates it under
+// exactly this key (`runKeyForChangeset`) and the changeset panel this card opens already shows the
+// running screen at the same instant.
+describe('changesets band reflects an in-flight review', () => {
+  function changesetData(): PodData {
+    return {
+      pod,
+      changeRequests: [
+        { ...cr('1'), description: 'Part-of: #10' },
+        { ...cr('2'), description: 'Part-of: #10' },
+      ],
+      workItems: [],
+      ciRuns: [],
+      fetchedAt: Date.parse('2026-08-25T12:00:00.000Z'),
+    };
+  }
+
+  it('a running changeset review is reflected on the dashboard card, not just its pre-run label', () => {
+    const withoutActive = toViewState(changesetData(), now, new Set(), undefined, new Map());
+    // Sanity: detection actually produced the changeset this test is about.
+    expect(withoutActive.changesets).toHaveLength(1);
+    expect(withoutActive.changesets?.[0]).toMatchObject({ id: 'trailer:10', state: '2 to review', stateClass: 'pill-warn' });
+
+    const active = new Map([['changeset:trailer:10', projection('investigating')]]);
+    const withActive = toViewState(changesetData(), now, new Set(), undefined, new Map(), active);
+    // The live lifecycle wins over the pre-run "N to review" label — the same precedence the per-CR
+    // pill already gives a run in flight.
+    expect(withActive.changesets?.[0]?.id).toBe('trailer:10');
+    expect(withActive.changesets?.[0]?.state).not.toBe('2 to review');
+  });
+
+  it('a changeset with no active run keeps its ordinary blocked/to-review/ready label untouched', () => {
+    const active = new Map([['changeset:some-other-id', projection('investigating')]]);
+    const state = toViewState(changesetData(), now, new Set(), undefined, new Map(), active);
+    expect(state.changesets?.[0]).toMatchObject({ state: '2 to review', stateClass: 'pill-warn' });
+  });
+});
+
 describe('AI review coverage', () => {
   it('counts rows on this dashboard, never the whole history — the numerator could outrun the denominator', () => {
     // Two entries for change requests that are not open rows here: another

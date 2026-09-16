@@ -920,6 +920,25 @@ async function registerLineageInRunIndex(store: KeyValueStore, runId: RunId, lin
   await store.update(runIndexKey(runId), index);
 }
 
+/**
+ * harness-lineage-keys-never-deleted fix: the other half of `registerLineageInRunIndex` —
+ * `enforceTerminalAttemptHistory`'s own call site, below, is the only place a lineage record can
+ * ever become an empty husk (every attempt's snapshot/checkpoints/marker aged out), so this is the
+ * only place removal is ever needed. Deletes the run-index key outright once its `lineageIds` list
+ * empties, rather than leaving a `{schemaVersion, runId, lineageIds: []}` husk of its own.
+ */
+async function removeLineageFromRunIndex(store: KeyValueStore, runId: RunId, lineageId: LineageId): Promise<void> {
+  const existing = readRunIndexRaw(store, runId);
+  if (!existing) return;
+  const remaining = existing.lineageIds.filter((id) => id !== lineageId);
+  if (remaining.length === existing.lineageIds.length) return;
+  if (remaining.length === 0) {
+    await store.update(runIndexKey(runId), undefined);
+    return;
+  }
+  await store.update(runIndexKey(runId), { ...existing, lineageIds: remaining });
+}
+
 /** Orders by `occurredAt`, then `checkpointId` as a deterministic tiebreaker (two checkpoints can share a timestamp). */
 function byOccurredAt(a: PersistedCheckpoint, b: PersistedCheckpoint): number {
   if (a.occurredAt !== b.occurredAt) return a.occurredAt < b.occurredAt ? -1 : 1;
@@ -1009,12 +1028,25 @@ async function enforceTerminalAttemptHistory(
     if (!record) continue;
     const nextSnapshots = { ...record.snapshots };
     for (const attempt of attempts) delete nextSnapshots[String(attempt)];
-    const next: PersistedLineageRecord = {
-      ...record,
-      snapshots: nextSnapshots,
-      checkpoints: record.checkpoints.filter((checkpoint) => !attempts.has(checkpoint.attempt)),
-      terminalAttempts: record.terminalAttempts.filter((marker) => !attempts.has(marker.attempt)),
-    };
+    const nextCheckpoints = record.checkpoints.filter((checkpoint) => !attempts.has(checkpoint.attempt));
+    const nextTerminalAttempts = record.terminalAttempts.filter((marker) => !attempts.has(marker.attempt));
+    // harness-lineage-keys-never-deleted fix: a lineage every attempt of which has now aged out of
+    // terminal-attempt history — no snapshot, no checkpoint, no terminal marker left — has nothing
+    // resumable by construction (`writeSnapshot`/`writeCheckpoint` never persist a record this empty;
+    // it can only be reached by evicting every attempt a non-empty one ever had). Left as a
+    // `{schemaVersion, runId, lineageId, snapshots:{}, checkpoints:[], terminalAttempts:[]}` husk, the
+    // key would never be reclaimed: nothing else in this module or the wider codebase ever deletes a
+    // lineage or run-index key (this module's own `MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES` doc comment
+    // names exactly this per-write growth class for a sibling field). Deleting it here is a
+    // consequence of the age-out bound this function already enforces, never a new eager prune of
+    // live state — a lineage reaches this branch only once every attempt it ever had has already,
+    // individually, aged out above.
+    if (Object.keys(nextSnapshots).length === 0 && nextCheckpoints.length === 0 && nextTerminalAttempts.length === 0) {
+      await store.update(lineageKey(lineageId), undefined);
+      await removeLineageFromRunIndex(store, runId, lineageId);
+      continue;
+    }
+    const next: PersistedLineageRecord = { ...record, snapshots: nextSnapshots, checkpoints: nextCheckpoints, terminalAttempts: nextTerminalAttempts };
     await store.update(lineageKey(lineageId), next);
   }
 }

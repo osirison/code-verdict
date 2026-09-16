@@ -494,7 +494,17 @@ export function describeResumeStart(priorAttempt: AttemptNumber, newAttempt: Att
 export type ResumeBudgetMode = 'carryForward' | 'fresh';
 
 export function resumeBudgetModeFor(checkpoint: PersistedCheckpoint): ResumeBudgetMode {
-  return checkpoint.projection.lifecycle === 'failed' && checkpoint.reason === 'phaseBoundary' ? 'fresh' : 'carryForward';
+  // resume-budget-mode-trusts-projection-not-intendedTerminal fix: trust a writer's own declared
+  // `intendedTerminal.lifecycle` over `projection.lifecycle` here too — the same rule commit 256423c
+  // already applied to `isCheckpointTerminal`, the marker gate, and `closeLeftoverInFlightEntry`, for
+  // the identical reason (`harnessCheckpoint.ts`'s own `IntendedTerminal` doc comment: a late/
+  // out-of-order activity event can misclassify a genuinely terminal checkpoint's re-derived
+  // projection). The `runPersisting` writer this function exists to classify goes through that same
+  // `compactActivity`/`reduceActivity` pipeline, so its `projection.lifecycle` is exactly the field
+  // that fix's own reasoning says can drift from the truth — reading it unconditionally would defeat
+  // "resume with a fresh budget" for a genuinely budget-exhausted attempt whose projection drifted.
+  const lifecycle = checkpoint.intendedTerminal?.lifecycle ?? checkpoint.projection.lifecycle;
+  return lifecycle === 'failed' && checkpoint.reason === 'phaseBoundary' ? 'fresh' : 'carryForward';
 }
 
 /**

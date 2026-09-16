@@ -6,6 +6,7 @@ import { deriveStats, repoIdsOf, repoLabel } from '../app/podQuery';
 import type { PodData } from '../app/podQuery';
 import { detectChangesets } from '../app/changesets';
 import type { ChangesetDetectionOptions } from '../app/changesets';
+import { runKeyForChangeset } from '../app/retainedReview';
 import type { ReviewRun } from '../app/reviewRuns';
 import { getProvider } from '../platform/registry';
 import type { RunProjection } from '../domain/harnessActivity';
@@ -273,13 +274,24 @@ export function toViewState(
     changesets: changesets.map((changeset) => {
       const blocked = changeset.members.filter((member) => member.ci?.status === 'failed').length;
       const toReview = changeset.members.filter((member) => !submittedRefs.has(`${member.ref.repoId}!${member.ref.number}`)).length;
+      // changeset-dashboard-ignores-active-run fix: a running review outranks its recorded outcome
+      // here exactly the way `aiPill` already outranks a per-CR row's retained outcome above ("A run
+      // in flight outranks every recorded outcome because it is about to replace one") — the band
+      // was the one place on this screen that never consulted `activeRuns` at all, even though the
+      // extension populates it under this exact key (`runKeyForChangeset`) and the changeset panel
+      // this card opens already shows the live run at the same instant. `DashboardRow['changesets']`
+      // has no separate lifecycle slot (`dashboardHtml.ts`'s own type, off this fix's file list) —
+      // the label/pill string this band already renders is enough to say it plainly. `pill-warn`
+      // (not a fourth class the type does not carry): neither success nor failure, the same register
+      // "N to review" already uses.
+      const active = activeRuns.get(runKeyForChangeset(changeset.id));
       return {
         id: changeset.id,
         name: changeset.name,
         memberCount: changeset.members.length,
         projectCount: new Set(changeset.members.map((member) => member.ref.repoId)).size,
-        state: blocked > 0 ? `${blocked} blocked` : toReview > 0 ? `${toReview} to review` : 'ready to merge',
-        stateClass: blocked > 0 ? 'pill-bad' as const : toReview > 0 ? 'pill-warn' as const : 'pill-ok' as const,
+        state: active ? runLifecycleLabel(active.lifecycle) : blocked > 0 ? `${blocked} blocked` : toReview > 0 ? `${toReview} to review` : 'ready to merge',
+        stateClass: active ? ('pill-warn' as const) : blocked > 0 ? ('pill-bad' as const) : toReview > 0 ? ('pill-warn' as const) : ('pill-ok' as const),
       };
     }),
     rows,

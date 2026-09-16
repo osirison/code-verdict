@@ -94,7 +94,7 @@ import type { KeyValueStore } from './storage';
 import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './harnessAttempt';
 import type { CompletionBlockerDetail, CompletionEvaluation } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
-import { closeCheckpointAsTerminal, isCheckpointTerminal } from './harnessCheckpoint';
+import { closeCheckpointAsTerminal, isCheckpointTerminal, type PersistedCheckpoint } from './harnessCheckpoint';
 import type { ActivityFact } from './harnessActivityLog';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { checkCheckpointIntegrity, closeAttemptAsInterrupted, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
@@ -1248,6 +1248,7 @@ export class ReviewRunManager {
         // own crude fallback.
         runId: record.runId,
         lineageId: record.lineageId,
+        attempt: record.attempt,
       }),
     );
     void this.executeAttempt(record.key);
@@ -1291,6 +1292,7 @@ export class ReviewRunManager {
       startedAt: new Date(this.now()).toISOString(),
       runId: record.runId,
       lineageId: record.lineageId,
+      attempt: record.attempt,
     });
   }
 
@@ -1420,7 +1422,55 @@ export class ReviewRunManager {
       // reaching here is `HarnessAttempt.run()` genuinely escaping mid-attempt — the shape
       // `run_5a1f8b5f150e7050fb742e5bebc080dc` took — where the store's own terminal write may not
       // have landed even though this settle is about to report `failed` in memory.
-      this.settle(current, { lifecycle: 'failed', failure }, { verifyStoreTerminalBeforeClearingMarker: true });
+      //
+      // F1 / self-closed-crash-never-recorded-to-dashboard fix: before that settle, recover whatever
+      // `finalizeEscapedError` (`harnessAttempt.ts`) already validated and wrote — the ordinary,
+      // designed-for case, not the rarer double-failure one — so this crash records exactly like a
+      // live `completeAttempt` failure would have (`recoverEscapedCrash`'s own doc comment), instead
+      // of silently discarding every already-accepted finding and never reaching `ReviewRunStore` at
+      // all.
+      const recovered = this.recoverEscapedCrash(current);
+      if (recovered) {
+        const identity = reviewIdentityFor(current.input.target);
+        const ranAt = new Date(this.now()).toISOString();
+        if (recovered.partial) {
+          const review = createReview({
+            repoId: identity.repoId,
+            crNumber: identity.crNumber,
+            agentId: current.input.agent.id,
+            modelId: current.input.modelId,
+            effort: current.input.effort,
+            criteria: current.input.criteria,
+            response: recovered.partial,
+          });
+          const partialRecord = retainedFromRun({
+            review,
+            ranAt,
+            agentId: current.input.agent.id,
+            agentLabel: current.input.agentLabel,
+            modelId: current.input.modelId,
+            candidates: recovered.partial.candidates,
+            filesRead: undefined,
+            attachmentWarnings: current.attachmentWarnings,
+            completeness: recovered.completeness,
+            limitations: recovered.limitations,
+            protocolProvenance: recovered.checkpoint.plan ? 'harness' : undefined,
+            lineageId: current.lineageId,
+            attempt: current.attempt,
+            activity: recovered.checkpoint.activity,
+          });
+          await this.deps.workspaceState.update(partialRecordKeyFor(current.input.target), partialRecord);
+          if (!this.isSettleable(key)) return;
+        }
+        const checkpointOffer = this.computeCheckpointOffer(current, recovered.limitations);
+        await this.recordPartialHistory(identity, current.input.agentLabel, recovered.partial?.items.length ?? 0, ranAt, recovered.limitations, checkpointOffer);
+        if (!this.isSettleable(key)) return;
+      }
+      this.settle(
+        current,
+        { lifecycle: 'failed', failure, completeness: recovered?.completeness ?? 'none', limitations: recovered?.limitations ?? [], partialResult: recovered?.partial },
+        { verifyStoreTerminalBeforeClearingMarker: true },
+      );
     }
   }
 
@@ -1593,6 +1643,77 @@ export class ReviewRunManager {
     };
   }
 
+  /**
+   * cancel-vs-succeed-completeAttempt-race fix: `completeAttempt` decides once, synchronously, at
+   * entry whether the reviewer already asked this run to stop — but `cancel()` can land during any
+   * of `completeAttempt`'s own later awaits too (`verifyOrRecoverTerminalWrite`, either
+   * `workspaceState.update`), and `'cancelling'` is not a terminal lifecycle, so `isSettleable`'s own
+   * guard does not catch it. Hoisted so every await point can re-apply the SAME reclassification
+   * (never a second definition of it): reads the CURRENT record for `key`, never a snapshot a caller
+   * captured earlier, because that is exactly what changes across an await. Mirrors `HarnessAttempt`'s
+   * own cancellation-completeness split (`runPersisting`'s `cancelledNow` branch) — whatever the
+   * attempt validated is kept, only ever as an explicit partial, never as a replacing success.
+   */
+  private reclassifyIfCancelling(key: string, result: HarnessAttemptResult): HarnessAttemptResult {
+    const current = this.records.get(key);
+    if (current?.lifecycle !== 'cancelling' || result.lifecycle === 'cancelled') return result;
+    return {
+      ...result,
+      lifecycle: 'cancelled',
+      outcome: {
+        ...result.outcome,
+        completeness: result.findings.length > 0 ? 'partial' : 'none',
+        replacesRetainedReview: false,
+      },
+    };
+  }
+
+  /**
+   * Shared by `completeAttempt`'s live `failed` branch and `executeAttempt`'s crash-catch recovery
+   * (F1/self-closed-crash-never-recorded-to-dashboard fix, below): the same stored-checkpoint-
+   * integrity offer, computed once from a lineage's own latest checkpoint rather than duplicated at
+   * both call sites. See `RunControls.canStartFreshAttempt`'s own doc comment for what this offer is.
+   */
+  private computeCheckpointOffer(record: RunRecord, limitations: readonly Limitation[]): { lineageId?: string; resumable?: boolean; resumeReasons?: readonly Limitation[] } {
+    const latestOwnCheckpoint = this.harnessRunStore.latestCheckpoint(record.lineageId);
+    if (!latestOwnCheckpoint) return {};
+    const storedSnapshot = this.harnessRunStore.readSnapshot(record.lineageId, latestOwnCheckpoint.attempt);
+    const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latestOwnCheckpoint) : undefined;
+    const notes = headMovedNotes(limitations);
+    const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : notes.length > 0 ? [...integrityReasons, ...notes] : integrityReasons;
+    return {
+      lineageId: record.lineageId,
+      resumable: integrityReasons ? integrityReasons.length === 0 : false,
+      resumeReasons: reasons && reasons.length > 0 ? reasons : undefined,
+    };
+  }
+
+  /**
+   * F1 / self-closed-crash-never-recorded-to-dashboard fix: when `HarnessAttempt.run()` genuinely
+   * rejects mid-attempt, `harnessAttempt.ts`'s own `finalizeEscapedError` writes a best-effort
+   * terminal checkpoint recording whatever candidates the model had already validated — the ordinary,
+   * designed-for case per that function's own doc comment — before rethrowing. `executeAttempt`'s
+   * generic catch used to settle this as a bare `failed` with `completeness: 'none'` and no findings,
+   * discarding exactly what `finalizeEscapedError` just took pains to preserve, and never wrote a
+   * `ReviewRunStore` row at all (this crash's own `settle()` call clears the in-flight marker once it
+   * confirms the store's terminal write landed, so no later sweep ever revisits the lineage either).
+   * This recovers that checkpoint — completeness, accepted findings, limitations — so the crash
+   * settles and records exactly like a live `completeAttempt` failure would have. Returns `undefined`
+   * only when there is genuinely nothing to recover: no checkpoint at all, or one that never reached a
+   * terminal state (the store write itself also failed — the rarer double-failure case
+   * `sweepInterruptedRuns`'s own markerless backstop still exists to catch, unchanged by this fix).
+   */
+  private recoverEscapedCrash(record: RunRecord): { checkpoint: PersistedCheckpoint; completeness: ResultCompleteness; partial?: AgentReviewResponse; limitations: readonly Limitation[] } | undefined {
+    const checkpoint = this.harnessRunStore.latestCheckpoint(record.lineageId, record.attempt);
+    if (!checkpoint || !isCheckpointTerminal(checkpoint)) return undefined;
+    const items = checkpoint.candidates.filter((candidate) => candidate.state === 'accepted' && candidate.finding !== undefined).map((candidate) => candidate.finding!.item);
+    const completeness = checkpoint.intendedTerminal?.completeness ?? (items.length > 0 ? 'partial' : 'none');
+    const limitations = checkpoint.projection.limitations;
+    const partial: AgentReviewResponse | undefined =
+      items.length > 0 ? { schemaVersion: '1', agentId: record.input.agent.id, agentLabel: record.input.agentLabel, headSha: headShaFor(record.input.target), items, candidates: [] } : undefined;
+    return { checkpoint, completeness, partial, limitations };
+  }
+
   private async completeAttempt(key: string, rawResult: HarnessAttemptResult): Promise<void> {
     // An entry guard of its own, not only reliance on `executeAttempt`'s own
     // pre-call check: this keeps "never touch storage for a record that
@@ -1614,18 +1735,12 @@ export class ReviewRunManager {
     // only as a partial (D11), through exactly the same path below a
     // genuinely cooperative cancellation already takes — never as a
     // replacing success.
-    const result: HarnessAttemptResult =
-      record.lifecycle === 'cancelling' && rawResult.lifecycle !== 'cancelled'
-        ? {
-            ...rawResult,
-            lifecycle: 'cancelled',
-            outcome: {
-              ...rawResult.outcome,
-              completeness: rawResult.findings.length > 0 ? 'partial' : 'none',
-              replacesRetainedReview: false,
-            },
-          }
-        : rawResult;
+    //
+    // cancel-vs-succeed-completeAttempt-race fix: this decision is not made only once, here, any
+    // more — `reclassifyIfCancelling` is re-applied after every await below that could let a cancel()
+    // land, because this single entry check used to be the ONLY one, and a cancel arriving during
+    // `verifyOrRecoverTerminalWrite` or either `workspaceState.update` sailed straight past it.
+    let result = this.reclassifyIfCancelling(key, rawResult);
     const items = result.findings.map((finding) => finding.item);
 
     // Fix 2 (universal settle verification): before this attempt's own genuinely terminal outcome
@@ -1637,6 +1752,11 @@ export class ReviewRunManager {
     // silently clearing the in-flight marker over an unconfirmed terminal state.
     const terminalWriteCheck = await this.verifyOrRecoverTerminalWrite(record, result);
     if (!this.isSettleable(key)) return;
+    // Re-check point (cancel-vs-succeed-completeAttempt-race fix): a cancel() landing during the
+    // await just above is otherwise invisible — `isSettleable` alone does not catch it, because
+    // `cancelling` is not terminal. Nothing between here and the retained-review write below is
+    // itself async, so this one re-check covers that whole stretch.
+    result = this.reclassifyIfCancelling(key, result);
     const limitations = terminalWriteCheck.limitation ? [...result.outcome.limitations, terminalWriteCheck.limitation] : result.outcome.limitations;
 
     if (result.lifecycle === 'succeeded') {
@@ -1696,13 +1816,64 @@ export class ReviewRunManager {
         // same write-before-notify discipline as the retained-review write
         // just above.
         await this.deps.workspaceState.update(partialRecordKeyFor(input.target), undefined);
-        // Cancelled (or otherwise moved off an active phase) while that
-        // write was in flight: the reviewer asked for this run to stop, and
-        // `cancel` has already settled the record and freed its slot. The
-        // retained review is written either way — the work was done and
-        // paid for — but the run must not also report itself as succeeded.
+        // Cancelled (or otherwise moved off an active phase) while either write above was in
+        // flight: the reviewer asked for this run to stop, so `cancel` has already released its
+        // slot. The retained review is written either way — the work was done and paid for — but
+        // the run must not also report itself as succeeded (cancel-vs-succeed-completeAttempt-race
+        // fix): re-check the reclassification, not only `isSettleable`, which does not see
+        // `cancelling` at all.
         if (!this.isSettleable(key)) return;
-        this.settle(
+        result = this.reclassifyIfCancelling(key, result);
+        if (result.lifecycle !== 'succeeded') {
+          const partial = items.length > 0 ? response : undefined;
+          const settled = this.settle(
+            record,
+            { lifecycle: 'cancelled', completeness: result.outcome.completeness, limitations, partialResult: partial, completionEvaluation: result.completionEvaluation },
+            { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+          );
+          if (settled && partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, limitations);
+          return;
+        }
+        // succeeded-settle-before-history-write fix: the durable run-history row lands BEFORE
+        // `settle()` clears the in-flight marker, mirroring the `failed` branch's own pre-settle
+        // ordering below (`recordPartialHistory`'s own doc comment) — so a process death between
+        // the two leaves the marker in place for the next activation's sweep to find, rather than a
+        // marker already gone with nothing durable left to backfill it from. Read-modify-write with
+        // no `await` between the pair inside `ReviewRunStore.record` itself, per the contract in
+        // `storage.ts` — two runs can finish in the same tick.
+        await this.runs.record({
+          repoId: identity.repoId,
+          crNumber: identity.crNumber,
+          outcome: response.items.length === 0 ? 'clean' : 'findings',
+          findingCount: response.items.length,
+          agentLabel: input.agentLabel,
+          ranAt,
+        });
+        if (!this.isSettleable(key)) return;
+        // One more re-check (cancel-vs-succeed-completeAttempt-race fix): a cancel() landing during
+        // the write just above must not settle as `succeeded`, and — because that write already
+        // durably landed a `'findings'`/`'clean'` row a moment ago — must correct it, the same way
+        // `ReviewRunStore` always resolves two writes on one target: latest wins.
+        result = this.reclassifyIfCancelling(key, result);
+        if (result.lifecycle !== 'succeeded') {
+          const partial = response.items.length > 0 ? response : undefined;
+          const settled = this.settle(
+            record,
+            { lifecycle: 'cancelled', completeness: result.outcome.completeness, limitations, partialResult: partial, completionEvaluation: result.completionEvaluation },
+            { terminalWriteConfirmed: terminalWriteCheck.confirmed },
+          );
+          // Unconditional on `partial` (unlike every other `recordPartialHistory` call site in this
+          // method): the `runs.record` write a few lines above this branch already landed a
+          // 'findings'/'clean' row for what looked, at that moment, like a completed run — the
+          // `reclassifyIfCancelling` re-check just above caught a cancel() that arrived during that
+          // very write. That row is on the books either way, so silence here (the `partial`-gated
+          // form every earlier branch uses, where no such row exists yet) would leave a *cancelled*
+          // run reporting itself 'clean'/'findings' in history. `findingCount: 0` when `partial` is
+          // undefined mirrors the zero-items case `runs.record` itself just handled.
+          if (settled) await this.recordPartialHistory(identity, input.agentLabel, partial?.items.length ?? 0, ranAt, limitations);
+          return;
+        }
+        const settled = this.settle(
           record,
           {
             lifecycle: 'succeeded',
@@ -1713,17 +1884,10 @@ export class ReviewRunManager {
           },
           { terminalWriteConfirmed: terminalWriteCheck.confirmed },
         );
-
-        // Read-modify-write with no `await` between the pair, per the
-        // contract in `storage.ts` — two runs can finish in the same tick.
-        await this.runs.record({
-          repoId: identity.repoId,
-          crNumber: identity.crNumber,
-          outcome: response.items.length === 0 ? 'clean' : 'findings',
-          findingCount: response.items.length,
-          agentLabel: input.agentLabel,
-          ranAt,
-        });
+        // Gated on `settle`'s own return (cancel-vs-succeed-completeAttempt-race fix): a refused
+        // settle must never be followed by a "review ready" toast — `onRunRecorded` fires only for
+        // the `runs.record` write above, which already landed and needs no further gating of its own.
+        if (!settled) return;
         this.deps.onRunRecorded?.();
         this.deps.onReviewReady?.({
           ref: input.target.kind === 'cr' ? input.target.ref : undefined,
@@ -1799,7 +1963,7 @@ export class ReviewRunManager {
       if (!this.isSettleable(key)) return;
     }
     if (result.lifecycle === 'cancelled') {
-      this.settle(
+      const settled = this.settle(
         record,
         {
           lifecycle: 'cancelled',
@@ -1810,7 +1974,7 @@ export class ReviewRunManager {
         },
         { terminalWriteConfirmed: terminalWriteCheck.confirmed },
       );
-      if (partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, limitations);
+      if (settled && partial) await this.recordPartialHistory(identity, input.agentLabel, partial.items.length, ranAt, limitations);
       return;
     }
     // 'failed', or (structurally unreachable from a live `.run()` — see this
@@ -1831,31 +1995,10 @@ export class ReviewRunManager {
     // ordering) — `settle()`'s notify is what makes a panel re-render and read `controlsFor`, and
     // the offer must already be in the row that read sees, not arrive on some later, unrelated
     // repaint. Computed and recorded even at zero findings: the offer's value is the plan and
-    // coverage a resumed attempt reuses, not only the findings.
-    let checkpointOffer: { lineageId?: string; resumable?: boolean; resumeReasons?: readonly Limitation[] } = {};
-    const latestOwnCheckpoint = this.harnessRunStore.latestCheckpoint(record.lineageId);
-    if (latestOwnCheckpoint) {
-      const storedSnapshot = this.harnessRunStore.readSnapshot(record.lineageId, latestOwnCheckpoint.attempt);
-      const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latestOwnCheckpoint) : undefined;
-      // `checkCheckpointIntegrity` above compares only pinned snapshots (this method's own doc
-      // comment on why the live head/model/policy dimensions are ordinarily deferred to a
-      // reviewer's actual click, `decideResume`, inside `assembleResumeAttempt`) — genuine
-      // incompatibilities only, model changed or repository mismatch, still `resumable: false`
-      // here exactly as before. A moved head is no longer one of them: completion succeeds
-      // against the pinned snapshot regardless of what the branch did afterward, so
-      // `headMovedNotes` folds the disclosure `result.outcome.limitations` already carries into
-      // `resumeReasons` as an informational note alongside `resumable: true`, never as a reason
-      // this offer degrades to `false` — the manager has just-finished live connection access
-      // right here, unlike the activation sweep, which never does, so this is where the note is
-      // freshest.
-      const notes = headMovedNotes(limitations);
-      const reasons: readonly Limitation[] | undefined = integrityReasons === undefined ? undefined : notes.length > 0 ? [...integrityReasons, ...notes] : integrityReasons;
-      checkpointOffer = {
-        lineageId: record.lineageId,
-        resumable: integrityReasons ? integrityReasons.length === 0 : false,
-        resumeReasons: reasons && reasons.length > 0 ? reasons : undefined,
-      };
-    }
+    // coverage a resumed attempt reuses, not only the findings. `computeCheckpointOffer` is the same
+    // helper `executeAttempt`'s crash-catch recovery now shares (F1/self-closed-crash fix) — one
+    // definition of the offer, not two.
+    const checkpointOffer = this.computeCheckpointOffer(record, limitations);
     await this.recordPartialHistory(identity, input.agentLabel, partial?.items.length ?? 0, ranAt, limitations, checkpointOffer);
     if (!this.isSettleable(key)) return;
     this.settle(
@@ -1984,7 +2127,7 @@ export class ReviewRunManager {
        */
       readonly terminalWriteConfirmed?: boolean;
     },
-  ): void {
+  ): boolean {
     let current = this.records.get(record.key) ?? record;
     // Skipped entirely for `cancelled`: `waiting`/`paused`/`resuming` already
     // have a *direct* edge to `cancelling` in the table, and cancelling a
@@ -2026,7 +2169,14 @@ export class ReviewRunManager {
       waitReason: undefined,
     };
     const applied = this.transition(current, outcome.lifecycle, patch);
-    if (!applied) return; // already terminal — a late settlement, structurally refused (12.4)
+    // Returned to the caller (cancel-vs-succeed-completeAttempt-race fix): `completeAttempt` must
+    // never follow a REFUSED settle with `this.runs.record`/`onRunRecorded`/`onReviewReady` — the
+    // exact shape of the bug this return value exists to prevent. A refusal here is not only "already
+    // terminal" any more: `outcome.lifecycle` can also be illegal from the record's CURRENT state for
+    // a subtler reason — `cancelling`'s only legal edge is to `cancelled` (`buildLegalRunTransitions`),
+    // so a `'succeeded'` outcome arriving after a cancel() landed mid-`completeAttempt` is refused
+    // here too, even though the record is not yet terminal.
+    if (!applied) return false;
 
     // Task 14.7: `onReviewReady` already covers `succeeded` (including a
     // `succeeded` result that is only `partial` — see that callback's own
@@ -2081,6 +2231,7 @@ export class ReviewRunManager {
     // whole message. Only a failure has to survive until someone reads it.
     if (outcome.lifecycle !== 'failed') this.records.delete(record.key);
     this.pump();
+    return true;
   }
 
   private patch(key: string, patch: Partial<RunRecord>): void {
@@ -2215,6 +2366,18 @@ export interface InFlightRun {
    */
   runId?: string;
   lineageId?: string;
+  /**
+   * This marker's own attempt number, mirroring `RunRecord.attempt` at the moment `start()`/
+   * `resumeStart()` wrote it. Optional for the same backward-compatibility reason `runId`/
+   * `lineageId` are: a pre-existing persisted entry parses with this absent. Without it,
+   * `closeLeftoverInFlightEntry` cannot tell a resumed attempt's own still-unconfirmed marker apart
+   * from a stale marker whose lineage already carries an EARLIER attempt's own terminal checkpoint —
+   * `harnessRunStore.latestCheckpoint(lineageId)` returns whichever attempt wrote last, not
+   * necessarily this marker's own, and a resumed attempt that dies before its first checkpoint
+   * leaves exactly that mismatch. See that function's own doc comment for the corrupted-row this
+   * closes.
+   */
+  attempt?: number;
 }
 
 const IN_FLIGHT_KEY = 'codeVerdict.inFlightRuns';
@@ -2235,6 +2398,26 @@ export class InFlightRunStore {
 
   async remove(key: string): Promise<void> {
     const all = this.list().filter((entry) => entry.key !== key);
+    await this.store.update(IN_FLIGHT_KEY, all);
+  }
+
+  /**
+   * Removes exactly the given keys, leaving every other entry untouched — the scoped counterpart to
+   * `clear()` that `sweepInterruptedRuns` now uses instead. `clear()` itself stays (a test/legacy
+   * convenience) but is no longer safe for the sweep to call: the sweep's own `leftover` snapshot is
+   * read at the top of a long `await`-laden loop, and a fresh `trigger()`/`resumeRun()` admitted by a
+   * live `ReviewRunManager` while that loop is still running writes its own marker under a DIFFERENT
+   * key in the meantime (`extension.ts` never awaits the sweep before the UI becomes interactive —
+   * "the promise is captured, not fired-and-forgotten... the sweep itself still starts at this exact
+   * point in activation"). An unconditional `clear()` at the end would silently wipe that live
+   * marker along with the leftovers it actually processed — read the whole list fresh here (never the
+   * stale `leftover` snapshot) and drop only the processed keys, so any entry added after the sweep
+   * started reading survives.
+   */
+  async removeMany(keys: readonly string[]): Promise<void> {
+    if (keys.length === 0) return;
+    const drop = new Set(keys);
+    const all = this.list().filter((entry) => !drop.has(entry.key));
     await this.store.update(IN_FLIGHT_KEY, all);
   }
 
@@ -2365,6 +2548,21 @@ async function closeLeftoverInFlightEntry(entry: InFlightRun, runs: ReviewRunSto
     // rather than skip) — then straight to clearing the leftover marker with every other entry
     // once the loop ends, never through `closeAttemptAsInterrupted` or the generic `interrupted`
     // row built below, both of which are for a genuinely nonterminal checkpoint only.
+    if (latest && isCheckpointTerminal(latest) && entry.attempt !== undefined && latest.attempt !== entry.attempt) {
+      // Narrowed finding (resume-erasure-unscoped-latestcheckpoint, downgraded to minor): this
+      // marker's own attempt never wrote a checkpoint of its own — `latestCheckpoint(lineageId)`
+      // returned an EARLIER attempt's already-terminal one instead (most commonly: attempt N was
+      // interrupted and correctly closed by an earlier sweep pass or by `start()`'s own Fix 3, the
+      // reviewer resumed it as attempt N+1, and attempt N+1 itself died before its first checkpoint).
+      // Re-deriving a row from attempt N's checkpoint under THIS marker's later `startedAt` would
+      // silently overwrite (via `recordIfFresher`'s own freshness rule) whatever correct row attempt
+      // N's own close already wrote — for an `interrupted` lifecycle specifically, `truthfulTerminalRow`
+      // reports no `resumable`/`lineageId` at all, so the overwrite would erase a still-genuine
+      // resume-from-checkpoint offer. Nothing new happened under attempt N+1 worth recording — the
+      // existing row already reflects the last attempt that actually ran — so this leaves it alone
+      // rather than re-deriving a less-informative one from data that is not this marker's own.
+      return;
+    }
     if (latest && isCheckpointTerminal(latest)) {
       const findingCount = acceptedFindingCount(latest.candidates);
       // `isCheckpointTerminal` above already trusts a declared `intendedTerminal` over
@@ -2447,7 +2645,10 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
   for (const entry of leftover) {
     await closeLeftoverInFlightEntry(entry, runs, harnessRunStore, policy, now);
   }
-  if (leftover.length > 0) await inFlight.clear();
+  // Scoped removal, never `clear()`: see `InFlightRunStore.removeMany`'s own doc comment — a live
+  // trigger's marker written under a different key while this loop's awaits were still running must
+  // survive, not be wiped by an unconditional clear of the whole list.
+  if (leftover.length > 0) await inFlight.removeMany(leftover.map((entry) => entry.key));
 
   // The broadened half of task 12.7's own promise ("every persisted nonterminal attempt" — this
   // function's own header): a lineage `harnessRunStore` still shows live can carry no leftover

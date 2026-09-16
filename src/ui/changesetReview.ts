@@ -922,6 +922,15 @@ export class ChangesetReviewPanel {
         }
         this.deps.runs.cancel(this.runKey());
         return;
+      case 'pauseRun':
+        // changeset-panel-no-live-controls fix: the button only renders when `runControls.canPause`
+        // is true (`state()`'s own derivation, mirroring `ReviewFlowPanel`) — `pause()` is its own
+        // no-op guard against a state change racing the click, so nothing extra is needed here.
+        this.deps.runs.pause(this.runKey());
+        return;
+      case 'resumeRun':
+        this.deps.runs.resume(this.runKey());
+        return;
       case 'retryRun': case 'rerun': void this.run(); return;
       case 'usePartial':
         this.deps.runs.acknowledge(this.runKey());
@@ -1366,6 +1375,9 @@ export class ChangesetReviewPanel {
     const contextEntries = this.members.flatMap((member) => (member.context
       ? [{ context: member.context, label: `${member.projectPath} · ${vocabulary.formatCrRef(member.ref.number)}` }]
       : []));
+    // changeset-panel-no-live-controls fix: the one derivation `runControls` below reads — see that
+    // field's own comment for why `ref` is `undefined`.
+    const runControls = this.deps.runs.controlsFor(this.runKey(), undefined);
     const state: FlowViewState = {
       vocabulary,
       screen: this.screen,
@@ -1410,6 +1422,16 @@ export class ChangesetReviewPanel {
       // ordered activity — never a fixed step list or a fragment count.
       runProjection: this.runRecord?.projection,
       runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      // changeset-missing-live-counts-line fix: the same live findings/model-turns cue commit
+      // 602a827 added to `ReviewFlowPanel` for the identical incident ("a healthy run sitting in
+      // verifying read as looping because nothing on screen said which phase it had reached") — read
+      // off the identical `RunRecord.checkpoint` type both panels share, never a second definition.
+      runCounts: this.runRecord?.checkpoint
+        ? {
+            findings: this.runRecord.checkpoint.candidates.filter((candidate) => candidate.state === 'accepted').length,
+            modelTurnsUsed: this.runRecord.checkpoint.budget.modelTurnsUsed,
+          }
+        : undefined,
       runStartedAt: this.runRecord?.startedAt,
       // `partialCount` reads `RunRecord.partialResult` — `settle`'s own field for exactly this
       // (`reviewRunManager.ts`, generic across target kinds) — never a hardcoded 0: a failed
@@ -1420,6 +1442,18 @@ export class ChangesetReviewPanel {
         ? { ...this.runRecord.failure, partialCount: this.runRecord.partialResult?.items.length ?? 0 }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
+      // changeset-panel-no-live-controls fix: the same live pause/resume/cancel derivation
+      // `ReviewFlowPanel` already reads — `undefined` for `ref` because a changeset target has no
+      // per-ref stored `ReviewRun` to consult (`ReviewRunManager.controlsFor`'s own doc comment: "pass
+      // `undefined` for a changeset key and only the live branch can ever apply"), so this offer is
+      // never the resume-from-checkpoint one (that stays structurally absent for a changeset target,
+      // by design — a changeset never sets `interruptedPrior`/`runError.freshAttempt` either).
+      // Without this field, `runControlsRow` (the shared renderer both panels call) rendered nothing
+      // past `queued`: a running changeset review had no way to pause or stop itself from its own
+      // panel at all.
+      runControls: this.runRecord
+        ? { canPause: runControls.canPause, canResume: runControls.canResume, canCancel: runControls.canCancel }
+        : undefined,
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
         ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }

@@ -433,6 +433,43 @@ describe('a run completes with nobody watching', () => {
     expect(recorded[0]).toMatchObject({ repoId: 'repo-1', crNumber: '2841', outcome: 'findings', findingCount: 2 });
   });
 
+  // succeeded-settle-before-history-write: the durable `ReviewRunStore` row (what the dashboard/run
+  // history reads) must land BEFORE `settle()` clears the `InFlightRunStore` marker — a process death
+  // in between the two used to leave the marker gone (nothing left for a future sweep to backfill
+  // from) with the history row never having landed, permanently hiding a genuinely succeeded run from
+  // run history. Observed here as write ORDER on the underlying store, not merely "both eventually
+  // land" — the two are independent async writes and only their order makes the invariant true.
+  it('the ReviewRunStore write lands before the InFlightRunStore marker is cleared, so a death in between leaves the marker for the next sweep to find rather than a lost history row', async () => {
+    const globalState = memoryStore();
+    const writes: string[] = [];
+    const instrumented: KeyValueStore = {
+      get: globalState.get,
+      keys: globalState.keys,
+      update: async (key, value) => {
+        if (key === 'codeVerdict.reviewRuns') writes.push('reviewRuns');
+        if (key === 'codeVerdict.inFlightRuns') writes.push('inFlightRuns');
+        await globalState.update(key, value);
+      },
+    };
+    const runs = new ReviewRunManager({
+      workspaceState: memoryStore(),
+      globalState: instrumented,
+      runners: instantRunners(2, 0),
+      cancelGrace: () => new Promise<void>(() => {}),
+    });
+
+    runs.trigger(crInput('2841'), 3);
+    await vi.waitFor(() => expect(writes).toContain('inFlightRuns'));
+
+    const reviewRunsIndex = writes.indexOf('reviewRuns');
+    const inFlightClearIndex = writes.lastIndexOf('inFlightRuns');
+    // Two `inFlightRuns` writes happen in total (the `add` at admission, the `remove` at settle) —
+    // this asserts against the LAST one, the marker-clearing write, which is the one that matters:
+    // once it lands, nothing will ever revisit this lineage again.
+    expect(reviewRunsIndex).toBeGreaterThanOrEqual(0);
+    expect(reviewRunsIndex).toBeLessThan(inFlightClearIndex);
+  });
+
   it('writes a clean run as a record rather than as a deletion', async () => {
     const { runs, workspaceState, globalState } = manager({
       runners: instantRunners(0),
@@ -857,6 +894,108 @@ describe('reviewer-initiated cancellation keeps validated findings (D11\'s cance
     expect(new ReviewRunStore(globalState).list()).toEqual([
       expect.objectContaining({ outcome: 'partial', findingCount: 2 }),
     ]);
+  });
+
+  // cancel-vs-succeed-completeAttempt-race: unlike the test above (cancel lands BEFORE the succeeded
+  // result even arrives, so `completeAttempt`'s own entry-time reclassification already catches it),
+  // this cancels DURING `completeAttempt`'s own retained-review write — the exact window the blocker
+  // finding traced (`verifyOrRecoverTerminalWrite`, or either `workspaceState.update`) — which a
+  // single entry-time check cannot see because `cancelling` is not a terminal lifecycle.
+  it('cancel() landing during the retained-review write settles the record as cancelled, never a false "review ready"/"findings" broadcast', async () => {
+    const { pending, runners } = controllableAttempts();
+    const ready: unknown[] = [];
+    const globalState = memoryStore();
+    const baseWorkspace = memoryStore();
+    const recordKey = 'codeVerdict.draft.repo-1!2841';
+    let releaseWrite: (() => void) | undefined;
+    const workspaceState: KeyValueStore = {
+      get: baseWorkspace.get,
+      update: async (key, value) => {
+        if (key === recordKey) {
+          // Blocks exactly the retained-review write `completeAttempt` makes before `settle()` —
+          // the reviewer's cancel is issued while this is still pending, below.
+          await new Promise<void>((resolve) => { releaseWrite = resolve; });
+        }
+        await baseWorkspace.update(key, value);
+      },
+    };
+    const runs = new ReviewRunManager({
+      workspaceState,
+      globalState,
+      runners,
+      onReviewReady: (info) => ready.push(info),
+      cancelGrace: () => new Promise<void>(() => {}),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(2, '!2841'));
+    await vi.waitFor(() => expect(releaseWrite).toBeDefined());
+    // The record is still mid-flight (not yet 'cancelling') at this exact instant — this is the race
+    // window a single entry-time check misses.
+    expect(runs.get(record.key)?.lifecycle).not.toBe('cancelling');
+    runs.cancel(record.key);
+    releaseWrite!();
+
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    // No false "review ready" toast, and the dashboard row must never claim 'findings' for a run the
+    // reviewer stopped.
+    expect(ready).toHaveLength(0);
+    const rows = new ReviewRunStore(globalState).list();
+    const row = rows.find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+    expect(row?.outcome).not.toBe('findings');
+    expect(row).toMatchObject({ outcome: 'partial', findingCount: 2 });
+  });
+
+  // Second window of the same race, one step later: cancel() lands during the `runs.record` write
+  // itself (checkpoint C, after the retained-review/partial-clear writes above have already landed),
+  // and the underlying result has zero findings. The correction this method makes for that window
+  // must not be gated on `partial` existing — the earlier branch's `if (settled && partial)` form is
+  // right for a row that was never written, but here `runs.record` already landed a 'clean' row a
+  // moment before the reclassify caught the cancel, so silence would leave a cancelled run reporting
+  // itself clean in history.
+  it('cancel() landing during the run-history write corrects a just-written "clean" row to partial, even with zero findings', async () => {
+    const { pending, runners } = controllableAttempts();
+    const ready: unknown[] = [];
+    const globalState = memoryStore();
+    let releaseWrite: (() => void) | undefined;
+    const runsHistoryKey = 'codeVerdict.reviewRuns';
+    let sawFirstRecordWrite = false;
+    const delayedGlobalState: KeyValueStore = {
+      get: globalState.get,
+      update: async (key, value) => {
+        if (key === runsHistoryKey && !sawFirstRecordWrite) {
+          sawFirstRecordWrite = true;
+          // Blocks exactly the `runs.record` write `completeAttempt` makes before its second
+          // reclassify check — the reviewer's cancel is issued while this is still pending, below.
+          await new Promise<void>((resolve) => { releaseWrite = resolve; });
+        }
+        await globalState.update(key, value);
+      },
+    };
+    const runs = new ReviewRunManager({
+      workspaceState: memoryStore(),
+      globalState: delayedGlobalState,
+      runners,
+      onReviewReady: (info) => ready.push(info),
+      cancelGrace: () => new Promise<void>(() => {}),
+    });
+
+    const record = runs.trigger(crInput('2841'), 3);
+    pending.get('!2841')!.resolve(succeededResult(0, '!2841'));
+    await vi.waitFor(() => expect(releaseWrite).toBeDefined());
+    expect(runs.get(record.key)?.lifecycle).not.toBe('cancelling');
+    runs.cancel(record.key);
+    releaseWrite!();
+
+    await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+    expect(ready).toHaveLength(0);
+    const rows = new ReviewRunStore(globalState).list();
+    const row = rows.find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+    // Never the 'clean' row the succeeded path wrote a moment earlier — a cancelled run, corrected.
+    expect(row?.outcome).not.toBe('clean');
+    expect(row).toMatchObject({ outcome: 'partial', findingCount: 0 });
   });
 });
 
@@ -1518,6 +1657,97 @@ describe('the in-flight record and the interrupted sweep', () => {
       // Not confirmed in storage, so the marker survives for the next activation sweep — same
       // not-confirmed contract as the "no checkpoint at all" case, reached here via a throw instead.
       expect(new InFlightRunStore(baseGlobalState).list()).toHaveLength(1);
+    },
+  );
+
+  // F1 / self-closed-crash-never-recorded-to-dashboard: a genuine escape from `HarnessAttempt.run()`
+  // (`executeAttempt`'s generic catch, not a resolved `HarnessAttemptResult`) whose own best-effort
+  // terminal write (`finalizeEscapedError`, simulated here by writing a terminal checkpoint directly)
+  // already landed used to discard every already-validated finding and never write a `ReviewRunStore`
+  // row at all — the marker was cleared (the write is confirmed) with nothing else recovered.
+  it(
+    "a genuine crash (HarnessAttempt.run() rejects) whose best-effort terminal checkpoint already " +
+      'carries an accepted finding is recovered into the settled record and a dashboard row, not ' +
+      'discarded as a bare failed/none/no-row outcome',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState, workspaceState } = manager({ runners });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+
+      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+      const snapshot = fixtureHarnessSnapshot(record.runId, record.lineageId);
+      await harnessRunStore.writeSnapshot(snapshot);
+      const finding: ValidatedFinding = {
+        candidateId: 'cand-1',
+        memberId: 'm1',
+        routing: 'inline',
+        item: { id: 'cand-1', file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A validated finding', body: 'Body.', code: '' },
+        provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
+        evidence: { repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, primary: { sourceId: 'ev_a', digest: 'x', origin: 'diffPage', memberId: 'm1', repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, path: 'file1.ts', range: { startLine: 1, endLine: 1 } }, supporting: [] },
+      };
+      const candidate: TrackedCandidate = { candidateId: 'cand-1', state: 'accepted', repairs: 0, reasons: [], finding };
+      let log = createActivityLog(record.runId, record.lineageId, 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'verifying', elapsedMs: 1000 },
+      );
+      // `finalizeEscapedError`'s own shape: a genuine terminal write, `intendedTerminal` declared,
+      // never `'attemptFailed'`'s crash-catch-all reason for a checkpoint like this one — this is
+      // `harnessAttempt.ts`'s own doc comment's exact case, simulated at the store level here since
+      // this suite drives the manager, not a real `HarnessAttempt`.
+      const built = buildCheckpoint(
+        {
+          checkpointId: 'ckpt-1',
+          runId: record.runId,
+          lineageId: record.lineageId,
+          attempt: 1,
+          phase: 'verifying',
+          reason: 'attemptFailed',
+          occurredAt: '2026-01-01T00:05:00.000Z',
+          elapsedMs: 1000,
+          snapshotDigest: computeSnapshotDigest(snapshot),
+          activityEvents: log.events,
+          evidenceSources: [],
+          candidates: [candidate],
+          contradicted: [],
+          budget: ZERO_BUDGET,
+          coverage: [],
+          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+          retry: INITIAL_RETRY_STATE,
+          intendedTerminal: { lifecycle: 'failed', completeness: 'partial' },
+        },
+        DEFAULT_HARNESS_POLICY,
+      );
+      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+
+      // The genuine crash: `HarnessAttempt.run()` rejects outright, reaching `executeAttempt`'s
+      // generic catch — never a resolved `HarnessAttemptResult`.
+      pending.get('!2841')!.reject(Object.assign(new Error('unhandled escape'), { requestId: 'req-crash' }));
+      await vi.waitFor(() => expect(runs.get(record.key)?.status).toBe('failed'));
+
+      // Recovered onto the settled record — never `completeness: 'none'`/an empty `partialResult`.
+      const settled = runs.get(record.key)!;
+      expect(settled.completeness).toBe('partial');
+      expect(settled.partialResult?.items).toHaveLength(1);
+      expect(settled.partialResult?.items[0]?.id).toBe('cand-1');
+
+      // A truthful `ReviewRunStore` row exists — the exact thing the pre-fix crash-catch never wrote,
+      // permanently hiding this run from the dashboard/run history.
+      const rows = new ReviewRunStore(globalState).list();
+      const row = rows.find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+      expect(row).toMatchObject({ outcome: 'partial', findingCount: 1 });
+
+      // The durable partial record is reachable too — the same key a "Use N partial findings" button
+      // reads back, never only the in-memory record.
+      const partial = readRetained(workspaceState.get<SessionDraft>(partialDraftKeyFor({ repoId: 'repo-1', number: '2841' })), { partial: true });
+      expect(partial?.draft.review.items).toHaveLength(1);
+
+      // The marker itself still clears normally: `finalizeEscapedError`'s own write is confirmed
+      // terminal, so there is nothing left for a future sweep to find.
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
     },
   );
 
@@ -2604,6 +2834,58 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     });
   }
 
+  // The completeness critic's confirmed race class: `sweepInterruptedRuns` used to clear the WHOLE
+  // `InFlightRunStore` list unconditionally once its own (possibly long, `await`-laden) loop finished
+  // — `extension.ts` never awaits the sweep before the UI becomes interactive ("the promise is
+  // captured, not fired-and-forgotten"), so a fresh trigger's own marker, written under a different
+  // key while the sweep was still mid-loop, was silently wiped by that final `clear()`.
+  // `InFlightRunStore.removeMany` fixes this by removing only the keys the sweep actually processed.
+  it("a live trigger's marker written while the sweep is still processing an earlier leftover entry survives — the sweep removes only the keys it actually processed, never the whole list", async () => {
+    const globalState = memoryStore();
+    const snapshot = sweepSnapshot();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    // Only delays the SWEEP's own write below, never the setup writes just above.
+    let sweepStarted = false;
+    let releaseWrite: (() => void) | undefined;
+    const delayedGlobalState: KeyValueStore = {
+      get: globalState.get,
+      keys: globalState.keys,
+      update: async (key, value) => {
+        if (sweepStarted && key.startsWith('codeVerdict.harness.lineage.') && releaseWrite === undefined) {
+          // Opens a window, below, for a live trigger's own marker to land on the shared store while
+          // this leftover entry's own sweep processing is still in flight.
+          await new Promise<void>((resolve) => { releaseWrite = resolve; });
+        }
+        await globalState.update(key, value);
+      },
+    };
+    const delayedHarnessRunStore = createHarnessRunStore(delayedGlobalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+
+    sweepStarted = true;
+    const swept = sweepInterruptedRuns(delayedGlobalState, { harnessRunStore: delayedHarnessRunStore });
+    await vi.waitFor(() => expect(releaseWrite).toBeDefined());
+
+    // A fresh, unrelated trigger's own marker — standing in for `ReviewRunManager.start()`'s own
+    // `InFlightRunStore.add` — lands on the same underlying store while the sweep's loop is still
+    // mid-flight.
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!99', podId: 'pod-a', refLabel: '!99', repoId: 'repo-1', crNumber: '99',
+      startedAt: '2026-01-02T00:00:01.000Z', runId: 'run-live', lineageId: 'lineage-live', attempt: 1,
+    });
+
+    releaseWrite!();
+    await swept;
+
+    // The leftover entry the sweep actually processed is gone, but the live marker written mid-sweep
+    // survives — never wiped by an unconditional clear of the whole list.
+    expect(new InFlightRunStore(globalState).list()).toEqual([expect.objectContaining({ key: 'repo-1!99' })]);
+  });
+
   it('interruption: closes an unattached nonterminal checkpoint as interrupted, and records its validated finding count', async () => {
     const globalState = memoryStore();
     const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
@@ -2683,6 +2965,53 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     await sweepInterruptedRuns(globalState, { harnessRunStore });
 
     expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ resumable: true });
+  });
+
+  // resume-erasure-unscoped-latestcheckpoint (downgraded to minor by the refuter's narrowed
+  // reproduction): `InFlightRun` now carries the marker's own `attempt` number so
+  // `closeLeftoverInFlightEntry` can tell "this checkpoint IS this marker's own attempt" apart from
+  // "this checkpoint belongs to an earlier attempt this marker's own attempt never got as far as
+  // writing one of its own" — without that, the second case silently re-derived and overwrote the
+  // first attempt's still-correct `resumable: true` row with a bare `{outcome:'interrupted'}`, purely
+  // because the second marker's later `startedAt` outran the first row's `ranAt` under
+  // `recordIfFresher`'s freshness rule.
+  it('resume-erasure-unscoped-latestcheckpoint: a resumed attempt that dies before its own checkpoint does not erase the prior attempt\'s correct resumable row', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const built = buildCheckpoint(sweepCheckpointInput(snapshot), DEFAULT_HARNESS_POLICY);
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    // Attempt 1's own leftover marker, correctly scoped.
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!42', podId: 'pod-a', refLabel: '!42', repoId: 'repo-1', crNumber: '42',
+      startedAt: '2026-01-01T00:05:00.000Z', runId: SWEEP_RUN_ID, lineageId: SWEEP_LINEAGE_ID, attempt: 1,
+    });
+
+    // First activation: attempt 1's genuinely nonterminal checkpoint is closed as interrupted, and
+    // its sound stored checkpoint earns a resumable row.
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+    const before = new ReviewRunStore(globalState).list()[0];
+    expect(before).toMatchObject({ outcome: 'interrupted', resumable: true, lineageId: SWEEP_LINEAGE_ID });
+
+    // The reviewer resumes: attempt 2 mints a fresh marker under the same key/lineage, scoped to
+    // attempt 2 — but the extension host stops before attempt 2 ever writes its own first checkpoint,
+    // so `harnessRunStore.latestCheckpoint(lineageId)` still returns attempt 1's own, now-terminal one.
+    await new InFlightRunStore(globalState).add({
+      key: 'repo-1!42', podId: 'pod-a', refLabel: '!42', repoId: 'repo-1', crNumber: '42',
+      startedAt: '2026-01-03T00:00:00.000Z', runId: SWEEP_RUN_ID, lineageId: SWEEP_LINEAGE_ID, attempt: 2,
+    });
+
+    // The next activation's sweep finds attempt 2's own leftover marker.
+    await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    // The prior, still-correct resumable row must survive untouched — never silently overwritten
+    // with attempt 2's later timestamp and a bare `{outcome:'interrupted'}` that drops the offer.
+    const after = new ReviewRunStore(globalState).list()[0];
+    expect(after).toMatchObject({ outcome: 'interrupted', resumable: true, lineageId: SWEEP_LINEAGE_ID });
+    expect(after?.ranAt).toBe(before?.ranAt);
+    // And attempt 2's own now-stale marker is still cleared, same as any other swept entry.
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
   });
 
   it('incompatible restart: marks a non-resumable interrupted run when the stored checkpoint fails integrity', async () => {

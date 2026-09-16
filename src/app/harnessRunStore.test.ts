@@ -815,6 +815,48 @@ describe('HarnessRunStore (11.4): each HarnessPolicy bound triggers eviction at 
     expect(runStore.readSnapshot('lineage-b', 1)).toBeDefined();
   });
 
+  // harness-lineage-keys-never-deleted: the test above proves the lineage's CONTENTS are gone; this
+  // proves the lineage's own persisted KEY (and the run index's entry for it) are gone too, not left
+  // behind as a permanent `{schemaVersion, runId, lineageId, snapshots:{}, checkpoints:[],
+  // terminalAttempts:[]}` husk — the unbounded-growth class this fix closes.
+  it('a lineage every attempt of which has aged out of terminal-attempt history has its own key deleted, and the run index key too once it empties', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, terminalAttemptHistoryCount: 1 };
+    const store = jsonMemoryStore();
+    const runStore = createHarnessRunStore(store, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-only', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-only',
+        lineageId: 'lineage-only',
+        occurredAt: '2026-01-01T00:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-only', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+    expect(store.keys?.()).toContain('codeVerdict.harness.lineage.lineage-only');
+
+    // A second, later terminal attempt on a DIFFERENT lineage under the same target (runId) is what
+    // triggers re-evaluation of the count bound and evicts `lineage-only` entirely — every attempt it
+    // ever had.
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-newer', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-newer',
+        lineageId: 'lineage-newer',
+        occurredAt: '2026-01-01T12:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-newer', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+
+    // The husk is gone — not merely empty — so a long-lived workspace's single blob does not grow one
+    // permanent, never-reclaimed key per review ever run.
+    expect(store.keys?.()).not.toContain('codeVerdict.harness.lineage.lineage-only');
+    expect(runStore.listLineages().map((l) => l.lineageId)).not.toContain('lineage-only');
+    expect(runStore.lineageKeyCount()).toBe(1); // only lineage-newer's own key remains
+  });
+
   it('terminalAttemptHistoryMaxAgeDays evicts using the injected clock: an attempt older than the window is dropped even under the count bound', async () => {
     const policy: RetentionPolicy = { ...GENEROUS_RETENTION, terminalAttemptHistoryCount: 10, terminalAttemptHistoryMaxAgeDays: 1 };
     let nowMs = Date.parse('2026-01-01T00:00:00.000Z');

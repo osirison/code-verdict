@@ -716,6 +716,27 @@ describe('resumeBudgetModeFor: which resume shape a checkpoint\'s own terminal l
     expect(buildResumePayload(checkpoint).budgetMode).toBe('carryForward');
   });
 
+  // resume-budget-mode-trusts-projection-not-intendedTerminal: `resumeBudgetModeFor` was the one
+  // remaining reader of terminal state on `PersistedCheckpoint` still trusting `projection.lifecycle`
+  // unconditionally, rather than a declared `intendedTerminal` first — the same drift-prone field
+  // `isCheckpointTerminal`/the marker gate/`closeLeftoverInFlightEntry` were already fixed to distrust
+  // (`IntendedTerminal`'s own doc comment: a late/out-of-order activity event can misclassify a
+  // genuinely terminal checkpoint's re-derived projection). Reading it here would silently downgrade a
+  // genuinely budget-exhausted resume to `carryForward`, defeating the fresh-budget feature.
+  it('trusts a declared intendedTerminal over a drifted projection.lifecycle: a genuine phaseBoundary failure whose projection misclassified as still-active is still fresh, never silently downgraded to carryForward', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = testCheckpoint(snapshot, {
+      reason: 'phaseBoundary',
+      // The writer's own declaration: this attempt genuinely ended `failed`/`partial`.
+      intendedTerminal: { lifecycle: 'failed', completeness: 'partial' },
+      // The re-derived projection disagrees — exactly the documented drift class — and stays
+      // whatever `testCheckpoint`'s own default is (`'investigating'`, an ACTIVE lifecycle).
+    });
+    expect(checkpoint.projection.lifecycle).toBe('investigating'); // sanity: genuinely drifted
+    expect(resumeBudgetModeFor(checkpoint)).toBe('fresh');
+    expect(buildResumePayload(checkpoint).budgetMode).toBe('fresh');
+  });
+
   it('decideResume threads the same budgetMode into the compatible payload and the start narrative, for both lifecycles', () => {
     const stored = testSnapshot();
     for (const [lifecycle, expectedMode] of [['interrupted', 'carryForward'], ['failed', 'fresh']] as const) {

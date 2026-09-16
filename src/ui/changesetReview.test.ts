@@ -12,7 +12,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
 import { changesetDraftKeyFor, changesetPartialDraftKeyFor, retainedFromRun, runKeyForChangeset, type ChangesetDraft } from '../app/retainedReview';
-import type { ReviewRunManager, RunRecord } from '../app/reviewRunManager';
+import { deriveRunControls, type ReviewRunManager, type RunControls, type RunRecord } from '../app/reviewRunManager';
 import type { PodStore } from '../app/pods';
 import type { KeyValueStore } from '../app/storage';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
@@ -224,7 +224,13 @@ function fakeRuns(): ReviewRunManager {
     get: () => undefined,
     acknowledge: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
     trigger: vi.fn(),
+    // The changeset-panel-no-live-controls fix's own read on every render — `deriveRunControls`
+    // itself (`reviewRunManager.ts`), never reimplemented here, mirroring `reviewFlow.test.ts`'s own
+    // `fakeRuns`.
+    controlsFor: vi.fn((): RunControls => deriveRunControls(undefined, undefined)),
   } as unknown as ReviewRunManager;
 }
 
@@ -236,6 +242,9 @@ function fakeRuns(): ReviewRunManager {
  */
 function controllableRuns() {
   const listeners = new Set<(record: RunRecord) => void>();
+  // The one record `controlsFor` derives from below — kept in step with whatever the test last
+  // `settle()`d, the same stand-in `reviewFlow.test.ts`'s own `fakeRuns` uses for its live manager.
+  let current: RunRecord | undefined;
   return {
     subscribe(listener: (record: RunRecord) => void) {
       listeners.add(listener);
@@ -244,8 +253,12 @@ function controllableRuns() {
     get: () => undefined,
     acknowledge: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
     trigger: vi.fn(),
+    controlsFor: vi.fn((): RunControls => deriveRunControls(current, undefined)),
     settle(record: Partial<RunRecord>): void {
+      current = record as RunRecord;
       for (const listener of [...listeners]) listener(record as RunRecord);
     },
   };
@@ -702,5 +715,63 @@ describe('budget-exhausted resume (feature) mirrored for changesets: the failure
     await flush();
 
     expect(panel.webview.html).toContain('The true partial finding from the failed run');
+  });
+});
+
+describe('changeset-panel-no-live-controls / changeset-missing-live-counts-line: the running changeset screen gets the same live surfaces the single-CR flow has', () => {
+  it('shows pause/cancel controls for a running changeset review, not only while it is still queued', async () => {
+    const runs = controllableRuns();
+    await openPanel(undefined as unknown as ChangesetDraft, runs as unknown as ReviewRunManager);
+
+    panel.state.messageHandler?.({ type: 'run' });
+    await flush();
+
+    runs.settle({
+      key: runKeyForChangeset(CHANGESET_ID),
+      status: 'running',
+      lifecycle: 'investigating',
+      projection: {
+        runId: 'r1', lineageId: 'l1', attempt: 1, lifecycle: 'investigating', completeness: 'none',
+        phase: 'investigating', elapsedMs: 1_000, progressMode: 'indeterminate', attention: 'none', limitations: [],
+      },
+    } as unknown as Partial<RunRecord>);
+    await flush();
+
+    // `id="pause-run"` only ever comes from `runControlsRow` (the queued screen's own cancel button
+    // has no pause counterpart) — its presence here proves `FlowViewState.runControls` reached the
+    // renderer.
+    expect(panel.webview.html).toContain('id="pause-run"');
+    expect(panel.webview.html).toContain('id="cancel-run"');
+  });
+
+  it('shows the live findings/model-turns line once a checkpoint has landed, mirroring ReviewFlowPanel\'s own fix for the identical incident', async () => {
+    const runs = controllableRuns();
+    await openPanel(undefined as unknown as ChangesetDraft, runs as unknown as ReviewRunManager);
+
+    panel.state.messageHandler?.({ type: 'run' });
+    await flush();
+
+    runs.settle({
+      key: runKeyForChangeset(CHANGESET_ID),
+      status: 'running',
+      lifecycle: 'verifying',
+      projection: {
+        runId: 'r1', lineageId: 'l1', attempt: 1, lifecycle: 'verifying', completeness: 'none',
+        phase: 'verifying', elapsedMs: 1_000, progressMode: 'indeterminate', attention: 'none', limitations: [],
+      },
+      checkpoint: {
+        candidates: [
+          { candidateId: 'c1', state: 'accepted', repairs: 0, reasons: [] },
+          { candidateId: 'c2', state: 'unresolved', repairs: 0, reasons: [] },
+        ],
+        budget: { modelTurnsUsed: 5, toolCallsUsed: 0, evidenceBytesUsed: 0, elapsedMs: 0, highRiskReserveUsed: 0, verificationReserveUsed: 0 },
+        activityLog: { runId: 'r1', lineageId: 'l1', attempt: 1, events: [] },
+      },
+    } as unknown as Partial<RunRecord>);
+    await flush();
+
+    // Only the one accepted candidate counts — the unresolved one does not.
+    expect(panel.webview.html).toContain('1 finding so far');
+    expect(panel.webview.html).toContain('5 model turns used');
   });
 });

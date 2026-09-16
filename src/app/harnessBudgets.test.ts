@@ -278,17 +278,25 @@ describe('reserve partitions and lane access (task 8.5)', () => {
 describe('changeset per-member minimums (task 8.6)', () => {
   const MEMBERS = ['m1', 'm2', 'm3'];
 
-  it('carves each member a private minimum out of ordinary and a private share of the high-risk reserve', () => {
+  it('carves each member a private minimum out of ordinary and a private share of the high-risk reserve — for toolCalls/evidenceBytes only, the two pools a reservation can actually attribute to a member', () => {
     const tracker = createBudgetTracker(POLICY, { members: MEMBERS });
     const state = tracker.state();
     expect(state.setupWarnings).toEqual([]);
     for (const memberId of MEMBERS) {
-      expect(state.members[memberId]?.privateOrdinary).toMatchObject({ modelTurns: { capacity: 1 }, toolCalls: { capacity: 4 }, evidenceBytes: { capacity: 1_000 } });
-      expect(state.members[memberId]?.privateHighRiskReserve).toMatchObject({ modelTurns: { capacity: 1 }, toolCalls: { capacity: 6 }, evidenceBytes: { capacity: 666 } });
+      expect(state.members[memberId]?.privateOrdinary).toMatchObject({ toolCalls: { capacity: 4 }, evidenceBytes: { capacity: 1_000 } });
+      expect(state.members[memberId]?.privateHighRiskReserve).toMatchObject({ toolCalls: { capacity: 6 }, evidenceBytes: { capacity: 666 } });
+      // budget-arithmetic fix (finding "1"): `modelTurns` gets no private carve-out at all — the
+      // harness's only reservation call site for it (`beginTurn`) never supplies a `memberId`, so a
+      // private slice here would be dead capacity nothing could ever charge against. See the
+      // dedicated test below for the full consequence (the full ordinary lane stays reachable).
+      expect(state.members[memberId]?.privateOrdinary.modelTurns).toMatchObject({ capacity: 0, used: 0 });
+      expect(state.members[memberId]?.privateHighRiskReserve.modelTurns).toMatchObject({ capacity: 0, used: 0 });
     }
     // Lane totals are unchanged by the carve-out: private + shared still equals the partition.
     expect(state.pools.toolCalls.lanes.ordinary.capacity).toBe(65);
     expect(state.pools.toolCalls.lanes.highRiskReserve.capacity).toBe(20);
+    // modelTurns' ordinary lane, by contrast, is the FULL partition — nothing walled off per member.
+    expect(state.pools.modelTurns.lanes.ordinary.capacity).toBe(13);
   });
 
   it('drains a member\'s private minimum before the shared pool and never touches another member\'s', () => {
@@ -348,6 +356,35 @@ describe('changeset per-member minimums (task 8.6)', () => {
     for (const memberId of MEMBERS) expect(state.members[memberId]?.privateOrdinary.evidenceBytes.capacity).toBe(2_166);
     expect(state.pools.evidenceBytes.lanes.ordinary.capacity).toBe(6_500);
     expect(tracker.warnings().map((warning) => warning.code)).toContain('insufficientMemberMinimum');
+  });
+
+  // budget-arithmetic (finding "1"): `modelTurns` is never member-attributed — the harness's only
+  // reservation call site for it (`runPhaseLoop`'s `budget.beginTurn(...)`, `harnessAttempt.ts`) is
+  // one shared model conversation across the whole changeset and never supplies a `memberId`. A
+  // private per-member `modelTurns` slice carved out of the ordinary/high-risk lanes anyway would be
+  // dead capacity nothing can ever charge against — shrinking the attempt's real turn budget and
+  // masking its own exhaustion (`state().ordinaryExhausted`/`.hardExhausted` would sum `remaining`
+  // across those unreachable buckets too, staying falsely non-exhausted).
+  it('modelTurns is never partitioned per member — a memberless reservation (what beginTurn actually sends) can draw the FULL ordinary lane, and exhaustion is reported truthfully once it is spent', () => {
+    const tracker = createBudgetTracker(POLICY, { members: MEMBERS });
+    const state = tracker.state();
+    // No real per-member modelTurns capacity exists at all, unlike toolCalls/evidenceBytes (which
+    // genuinely are member-attributed and keep their carve-out unchanged).
+    for (const memberId of MEMBERS) {
+      expect(state.members[memberId]?.privateOrdinary.modelTurns).toMatchObject({ capacity: 0, used: 0 });
+      expect(state.members[memberId]?.privateHighRiskReserve.modelTurns).toMatchObject({ capacity: 0, used: 0 });
+      expect(state.members[memberId]?.privateOrdinary.toolCalls.capacity).toBe(4);
+    }
+    // The FULL ordinary lane (13, per this file's own POLICY comment) is reachable by a memberless
+    // reservation — never reduced by an unreachable per-member carve-out (3 members * 1 turn each
+    // would otherwise wall off 3 of the 13 for nothing to ever draw from).
+    expect(state.pools.modelTurns.lanes.ordinary.capacity).toBe(13);
+    for (let i = 0; i < 13; i += 1) {
+      expect(tracker.reserve(request({ purpose: 'exploration', modelTurns: 1, hostInitiated: true })).ok).toBe(true);
+    }
+    // The ordinary lane is genuinely exhausted now — not masked by phantom "remaining" capacity in
+    // buckets nothing can reach.
+    expect(tracker.state().ordinaryExhausted.modelTurns).toBe(true);
   });
 
   it('treats a single member as an individual review: no private slices, member id accepted', () => {

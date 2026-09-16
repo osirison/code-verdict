@@ -349,7 +349,21 @@ export function createBudgetTracker(policy: HarnessPolicy, options: BudgetTracke
     partitions[pool] = partition;
     let sharedOrdinary = partition.ordinary;
     let sharedHighRisk = partition.highRiskReserve;
-    if (changeset) {
+    // budget-arithmetic fix (finding "1", out-of-whitelist deviation — see the fix commit's own
+    // disclosure): `modelTurns` is never member-attributed. The harness's only reservation call site
+    // for it, `runPhaseLoop`'s `budget.beginTurn(...)` (`harnessAttempt.ts`), is one shared model
+    // conversation across the whole changeset and never supplies a `memberId` — `candidateBuckets`
+    // below only ever adds a member's own private bucket `if (memberId !== undefined)`, so a private
+    // per-member `modelTurns` slice carved out here can never be charged by any real code path.
+    // Carving one anyway would wall off real capacity nothing can reach — dead capacity that
+    // silently shrinks the attempt's actual turn budget (a 20-member changeset loses ~46% of its
+    // ordinary lane to buckets nothing can ever touch) and masks its own exhaustion (`state()`'s
+    // `hardExhausted` sums `remaining` across every owner including these unreachable buckets, so it
+    // stays falsely `false` long after the only reachable lane is spent). `toolCalls`/`evidenceBytes`
+    // ARE genuinely member-attributed (`harnessToolDispatcher.ts` passes `memberId: request.memberId`
+    // on every reservation) and keep their per-member partition unchanged — this exclusion is
+    // `modelTurns`-specific, not a blanket "changesets get no per-member minimums" regression.
+    if (changeset && pool !== 'modelTurns') {
       const wanted = memberMinimum(frozenPolicy, pool);
       const perMember = Math.min(wanted, Math.floor(partition.ordinary / members.length));
       if (perMember < wanted) {
@@ -657,10 +671,14 @@ export function createBudgetTracker(policy: HarnessPolicy, options: BudgetTracke
           const privateOrdinary = {} as Record<BudgetPool, LaneBalance>;
           const privateHighRiskReserve = {} as Record<BudgetPool, LaneBalance>;
           for (const pool of BUDGET_POOLS) {
-            const ordinary = bucket(pool, 'ordinary', memberId) as Bucket;
-            const highRisk = bucket(pool, 'highRiskReserve', memberId) as Bucket;
-            privateOrdinary[pool] = balance(ordinary.capacity, ordinary.used);
-            privateHighRiskReserve[pool] = balance(highRisk.capacity, highRisk.used);
+            // budget-arithmetic fix (finding "1"): `modelTurns` no longer gets a per-member bucket at
+            // all (see the exclusion at creation, above) — `bucket(...)` genuinely returns `undefined`
+            // for it here now, truthfully reported as zero capacity/used rather than crashing on a
+            // non-null assertion that predates this fix.
+            const ordinary = bucket(pool, 'ordinary', memberId);
+            const highRisk = bucket(pool, 'highRiskReserve', memberId);
+            privateOrdinary[pool] = ordinary ? balance(ordinary.capacity, ordinary.used) : balance(0, 0);
+            privateHighRiskReserve[pool] = highRisk ? balance(highRisk.capacity, highRisk.used) : balance(0, 0);
           }
           memberBalances[memberId] = Object.freeze({ privateOrdinary: Object.freeze(privateOrdinary), privateHighRiskReserve: Object.freeze(privateHighRiskReserve) });
         }
