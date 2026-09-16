@@ -198,6 +198,23 @@ describe('validateCandidate (task 7.6)', () => {
     expect(parsed).toMatchObject({ candidate: { line: 12, endLine: undefined } });
   });
 
+  it('treats a literal null the same as omitted for every other optional field the protocol governs, not just endLine', () => {
+    const fixture = setup();
+    expect(parseCandidateFinding(candidate(fixture, { code: null }))).toMatchObject({ candidate: { code: undefined } });
+    expect(parseCandidateFinding(candidate(fixture, { rule: null }))).toMatchObject({ candidate: { rule: undefined } });
+    expect(parseCandidateFinding(candidate(fixture, { reference: null }))).toMatchObject({ candidate: { reference: undefined } });
+    expect(parseCandidateFinding(candidate(fixture, { suggestion: null }))).toMatchObject({ candidate: { suggestion: undefined } });
+    expect(parseCandidateFinding(candidate(fixture, { citations: { primary: cite(fixture.diff, 'src/auth/token.ts', 12), supporting: null } })))
+      .toMatchObject({ candidate: { citations: { supporting: undefined } } });
+    expect(parseCandidateFinding(candidate(fixture, { body: null }))).toMatchObject({ candidate: { body: '' } });
+    // A genuinely malformed value in each of those fields is still rejected — null is the only
+    // value treated as absent, not a general loosening of the schema.
+    expect(parseCandidateFinding(candidate(fixture, { code: 42 }))).toMatchObject({ reasons: [{ code: 'schema' }] });
+    expect(parseCandidateFinding(candidate(fixture, { suggestion: 'not-an-object' }))).toMatchObject({ reasons: [{ code: 'schema' }] });
+    expect(parseCandidateFinding(candidate(fixture, { citations: { primary: cite(fixture.diff, 'src/auth/token.ts', 12), supporting: 'not-an-array' } })))
+      .toMatchObject({ reasons: [{ code: 'schema' }] });
+  });
+
   it('rejects an unknown member before touching citations', () => {
     const fixture = setup();
     expect(validateCandidate(candidate(fixture, { memberId: 'm9' }), fixture.context)).toMatchObject({ state: 'rejected', reasons: [{ code: 'unknownMember' }] });

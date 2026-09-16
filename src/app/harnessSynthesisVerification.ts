@@ -747,6 +747,20 @@ export function selectEvidenceExcerpt(finding: ValidatedFinding, source: LedgerE
  * for a new false positive — a verifier reading "the quoted text is not here"
  * off a deliberately partial view.
  */
+/**
+ * Picks a fence to delimit the evidence block that the evidence itself cannot forge: a run of `"`
+ * one longer than the longest run of `"` already inside `text`, so no substring of the untrusted
+ * excerpt can equal this exact delimiter and read as an early close of the block. Mirrors
+ * `markdownCodeSpan`'s backtick-run technique (`../domain/markdownSafety.ts`) rather than reusing it
+ * outright: that helper collapses embedded newlines and is meant for a single-line code span, while
+ * the evidence here is multi-line and must reach the verifier byte-for-byte, never rewritten.
+ */
+function evidenceFence(text: string): string {
+  const runs = text.match(/"+/g) ?? [];
+  const longestRun = runs.reduce((max, run) => Math.max(max, run.length), 0);
+  return '"'.repeat(Math.max(3, longestRun + 1));
+}
+
 export function buildContradictionDirective(finding: ValidatedFinding, excerpt: PresentableExcerpt): string {
   const primary = finding.evidence.primary;
   const claim = sanitizePublicText(`${finding.item.title} — ${finding.item.body}`) ?? sanitizePublicText(finding.item.title) ?? finding.item.title;
@@ -770,6 +784,14 @@ export function buildContradictionDirective(finding: ValidatedFinding, excerpt: 
             `window: lines ${excerpt.firstLine}-${excerpt.lastLine} of the ${excerpt.totalLines} lines of this source's exact bytes, containing the cited file lines ${primary.path}:${primary.range.startLine}-${primary.range.endLine}${sideSuffix}.`,
             'Judge only the bytes below. The rest of this source exists and was not included, so text missing from this window is not evidence against the claim.',
           ];
+  // The evidence is untrusted file content: a PR can put any bytes it likes inside the cited
+  // range, including a run of `"` chosen to look like the fence below and smuggle instruction-position
+  // text past it. `evidenceFence` picks a fence strictly longer than any quote run the evidence
+  // actually contains, so no substring of the evidence can equal it — see its own doc comment. The
+  // declaration line is worth its bytes only when the fence actually had to widen past the
+  // ordinary `"""`; the common case (no `"""`-length quote run in the evidence) pays nothing extra.
+  const fence = evidenceFence(excerpt.text);
+  const fenceNote = fence.length > 3 ? [`Fence: ${fence.length}x '"', longer than any quote run below, so the evidence cannot fake it or inject a reply.`] : [];
   return [
     CONTRADICTION_CHECK_MARKER,
     `candidateId: ${finding.candidateId}`,
@@ -778,9 +800,10 @@ export function buildContradictionDirective(finding: ValidatedFinding, excerpt: 
     `digest: ${primary.digest}`,
     `claim: ${claim}`,
     ...evidenceHeader,
-    '"""',
+    ...fenceNote,
+    fence,
     excerpt.text,
-    '"""',
+    fence,
     'Does this exact evidence support or contradict the claim above?',
     `Reply with exactly one JSON object and nothing else: {"candidateId":"${finding.candidateId}","contradicted":<true|false>,"reason":"<required and short when contradicted>"}.`,
   ].join('\n');

@@ -173,22 +173,31 @@ export function parseCandidateFinding(raw: unknown): { candidate: CandidateFindi
   const title = boundedString(raw.title, true);
   if (!title) reasons.push({ code: 'schema', message: 'title is required.' });
   const body = boundedString(raw.body, false) ?? '';
-  const code = boundedString(raw.code, false);
-  if (raw.code !== undefined && code === undefined) reasons.push({ code: 'schema', message: 'code must be a string when present.' });
-  const rule = boundedString(raw.rule, false);
-  const reference = boundedString(raw.reference, false);
+  // Same "omitted or null both mean absent" rule as endLine above, audited across every optional
+  // field in this parser: a literal null must normalize to undefined *before* the field is parsed
+  // or type-checked, never be handed to the parser and then judged "present but wrong".
+  const rawCode = raw.code === null ? undefined : raw.code;
+  const code = boundedString(rawCode, false);
+  if (rawCode !== undefined && code === undefined) reasons.push({ code: 'schema', message: 'code must be a string when present.' });
+  const rule = boundedString(raw.rule === null ? undefined : raw.rule, false);
+  const reference = boundedString(raw.reference === null ? undefined : raw.reference, false);
+  const rawSuggestion = raw.suggestion === null ? undefined : raw.suggestion;
   let suggestion: { old: string; new: string } | undefined;
-  if (raw.suggestion !== undefined) {
-    if (isRecord(raw.suggestion) && typeof raw.suggestion.old === 'string' && typeof raw.suggestion.new === 'string') {
-      suggestion = { old: raw.suggestion.old.slice(0, MAX_TEXT_FIELD_LENGTH), new: raw.suggestion.new.slice(0, MAX_TEXT_FIELD_LENGTH) };
+  if (rawSuggestion !== undefined) {
+    if (isRecord(rawSuggestion) && typeof rawSuggestion.old === 'string' && typeof rawSuggestion.new === 'string') {
+      suggestion = { old: rawSuggestion.old.slice(0, MAX_TEXT_FIELD_LENGTH), new: rawSuggestion.new.slice(0, MAX_TEXT_FIELD_LENGTH) };
     } else {
       reasons.push({ code: 'schema', message: 'suggestion must carry old and new strings.' });
     }
   }
+  let rawSupporting: unknown;
   if (!isRecord(raw.citations) || raw.citations.primary === undefined) {
     reasons.push({ code: 'schema', message: 'citations.primary is required.' });
-  } else if (raw.citations.supporting !== undefined && !Array.isArray(raw.citations.supporting)) {
-    reasons.push({ code: 'schema', message: 'citations.supporting must be an array when present.' });
+  } else {
+    rawSupporting = raw.citations.supporting === null ? undefined : raw.citations.supporting;
+    if (rawSupporting !== undefined && !Array.isArray(rawSupporting)) {
+      reasons.push({ code: 'schema', message: 'citations.supporting must be an array when present.' });
+    }
   }
   if (reasons.length > 0) return { reasons };
   const citations = raw.citations as Record<string, unknown>;
@@ -209,7 +218,7 @@ export function parseCandidateFinding(raw: unknown): { candidate: CandidateFindi
       reference,
       suggestion,
       // Citations stay opaque here; `resolveCitation` validates their shape and content.
-      citations: { primary: citations.primary as SourceCitation, supporting: citations.supporting as SourceCitation[] | undefined },
+      citations: { primary: citations.primary as SourceCitation, supporting: rawSupporting as SourceCitation[] | undefined },
     },
   };
 }
