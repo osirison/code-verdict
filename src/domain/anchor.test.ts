@@ -77,15 +77,45 @@ describe('resolveAnchor — sides (mandate A: widen past added-only)', () => {
   it('anchors a finding about a deletion onto the old side, side LEFT', () => {
     const result = resolveAnchor(CANDIDATES, { line: 41, code: '  return store.get(id);' });
     // The new side has no match for this exact text (the rewrite dropped the
-    // token argument), so the old-side deletion — the removed line's own
-    // number — is what the finding is about.
-    expect(result).toEqual({ state: 'exact', line: 41, side: 'old' });
+    // token argument), so the old-side deletion is matched. Even if the line
+    // numbers coincidentally equal, line numbers on the old side (old-file
+    // numbering) and the anchor (always new-file numbering) are in different
+    // spaces, so this can only be 'moved', never 'exact'.
+    expect(result).toEqual({ state: 'moved', line: 41, side: 'old' });
   });
 
   it('drift-matches a deletion that moved on the old side, once the new side has no match', () => {
     const shiftedOld = CANDIDATES.map((c) => (c.side === 'old' ? { ...c, line: c.line + 3 } : c));
     const result = resolveAnchor(shiftedOld, { line: 41, code: '  return store.get(id);' });
     expect(result).toEqual({ state: 'moved', line: 44, side: 'old' });
+  });
+
+  it('never treats an old-side candidate as exact even when its line number coincidentally matches anchor.line — the candidate is in old-file numbering, anchor.line is always new-file', () => {
+    // A deleted line whose old-file number happens to equal the anchor's
+    // new-file number. Before the fix, line-number equality alone triggered
+    // the 'exact' shortcut even on the old side, incorrectly marking a deleted
+    // line's ghost match as 'exact'. Now the shortcut is gated to the new side
+    // only, so this yields 'moved', not 'exact'.
+    const result = resolveAnchor([{ line: 145, text: 'return null;', side: 'old' }], {
+      line: 145,
+      code: 'return null;',
+    });
+    expect(result).toEqual({ state: 'moved', line: 145, side: 'old' });
+  });
+
+  it('still matches exactly on new-side candidates at the same line', () => {
+    // Verify that the fix to gate the 'exact' shortcut to the new side only
+    // does not break genuine new-side exact matches. A context line or added
+    // line on the new side that matches both line number and text must still
+    // resolve as 'exact'.
+    const result = resolveAnchor(
+      [
+        { line: 145, text: 'return null;', side: 'new' },
+        { line: 145, text: 'return null;', side: 'old' },
+      ],
+      { line: 145, code: 'return null;' },
+    );
+    expect(result).toEqual({ state: 'exact', line: 145, side: 'new' });
   });
 
   it('never lets an old-side line win over a real new-side match, however close its number', () => {

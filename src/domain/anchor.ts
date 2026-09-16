@@ -77,6 +77,12 @@ function same(a: string, b: string): boolean {
  * candidate in `candidates`' own order (document order, for every producer
  * of this shape) instead: deterministic, and never a distance the two
  * numbers were never comparable by in the first place.
+ *
+ * The 'exact' shortcut also requires `rankByDistance` — a line number match
+ * is only exact when the two numbers share a numbering space. On the new side,
+ * both are new-file numbers. On the old side, `candidate.line` is old-file
+ * numbering while `anchor.line` is always new-file, so coincidental numeric
+ * equality means nothing — the candidate at best moved, never exact.
  */
 function resolveOnSide(
   candidates: readonly AnchorCandidate[],
@@ -84,7 +90,7 @@ function resolveOnSide(
   rankByDistance: boolean,
 ): AnchorResolution | undefined {
   const code = anchor.code;
-  const exact = candidates.find((c) => c.line === anchor.line && same(c.text, code));
+  const exact = rankByDistance && candidates.find((c) => c.line === anchor.line && same(c.text, code));
   if (exact) return { state: 'exact', line: anchor.line, side: exact.side, oldLine: exact.oldLine };
   let best: AnchorCandidate | undefined;
   for (const candidate of candidates) {
