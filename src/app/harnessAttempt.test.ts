@@ -2221,6 +2221,71 @@ describe('HarnessAttempt.run (9.6: a long retry delay moves through waiting to r
     expect(last.coverage.classified).toBe(1);
     expect(last.coverage.total).toBe(1);
   });
+
+  /**
+   * `onCheckpointDue` is a synchronous callback contract (`HostToolRetryOptions`, called unawaited
+   * from `runWithRetry`'s long-delay branch), never `await`ed inside `run()`'s own top-level
+   * try/catch the way every other `fireCheckpoint` call is. Before the fix, a checkpoint-store
+   * write failure at exactly this moment — the long-backoff wait this whole describe block drives —
+   * became an unhandled promise rejection instead of a recorded failure: no `toolFailed` activity
+   * fact, no limitation, and the attempt otherwise ran to completion as though the checkpoint had
+   * succeeded.
+   */
+  it('a checkpoint-store failure during the long-wait checkpoint is caught and recorded as a toolFailed activity fact, never escaping as an unhandled rejection', async () => {
+    const path = 'file1.ts';
+    let readDiffCalls = 0;
+    const connection = reviewConnection({
+      files: [path],
+      readDiff: async (request) => {
+        readDiffCalls += 1;
+        if (readDiffCalls === 1) throw new ScmError('network', 'a transient network blip');
+        return diffPageResult(request.path);
+      },
+    });
+
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(path)), messages(readDiffMessage(path)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      const attempt = createHarnessAttempt({
+        ...baseOptions(),
+        snapshot: testSnapshot(),
+        members: [member(connection)],
+        modelSeam: seam,
+        policy: testPolicy(),
+        onCheckpoint: (info) => {
+          if (info.reason === 'toolCadence') throw new Error('simulated checkpoint-store write failure');
+        },
+        retry: { longDelayThresholdMs: 0, sleep: async () => {} },
+      });
+
+      const result = await attempt.run();
+      // Let the rejection's own microtask (the `.catch` handler) actually run before asserting
+      // nothing escaped — the failure happens inside a fire-and-forget call `run()` never awaits.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(readDiffCalls).toBe(2);
+      // The regression this guards: the attempt used to resolve as if the checkpoint had
+      // succeeded, with no trace of the failure anywhere in the log.
+      const failures = result.activityLog.events.filter((event) => event.kind === 'toolFailed' && event.tool === 'checkpointWrite');
+      expect(failures).toHaveLength(1);
+      if (failures[0]?.kind === 'toolFailed') {
+        expect(failures[0].reason).toContain('simulated checkpoint-store write failure');
+      }
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+    expect(unhandled).toEqual([]);
+  });
 });
 
 // ---- add-local-git-investigation, tasks 3.5/3.6: declined content is never terminal --------

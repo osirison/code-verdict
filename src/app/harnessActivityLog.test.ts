@@ -325,6 +325,75 @@ describe('mergeActivityEvents (tasks 5.1/5.2 — out-of-order and duplicate deli
     expect(merged.events.map((e) => e.kind)).toEqual(['planCreated', 'planItemStateChanged']);
   });
 
+  /**
+   * `mergeActivityEvents` used to cross-validate `incoming` in raw array (arrival) order —
+   * `knownIds` only grew as a `planCreated`/`planRevised` event was iterated — so a batch delivered
+   * out of order (exactly the "transport that can redeliver or reorder" case this function exists
+   * for) validated a `planItemStateChanged` event against `knownIds` before the plan it depends on,
+   * arriving later in the array despite its lower sequence, had been processed — failing
+   * `sanitizeFact`'s known-item check and dropping the event for good (its sequence is never
+   * claimed, so nothing resurfaces it on a later merge). The trailing `.sort()` only reorders what
+   * already survived; it can never resurrect an event dropped during validation. Same fixture as
+   * the "arrives earlier in the same batch" test above, with the array order reversed relative to
+   * sequence order — this is the one case that test's own array order could not catch.
+   */
+  it('cross-validates by protocol sequence, not array arrival order: a plan-dependent event delivered before its plan in the array must still be accepted', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const planEvent: ActivityEvent = {
+      ...base,
+      sequence: 1,
+      occurredAt: '2026-09-01T00:00:01.000Z',
+      elapsedMs: 1000,
+      kind: 'planCreated',
+      plan: { revision: 1, items: [{ id: 'p1', description: 'Inspect auth', state: 'pending' }] },
+    };
+    const stateEvent: ActivityEvent = {
+      ...base,
+      sequence: 2,
+      occurredAt: '2026-09-01T00:00:02.000Z',
+      elapsedMs: 2000,
+      kind: 'planItemStateChanged',
+      itemId: 'p1',
+      state: 'completed',
+    };
+    // The state-change event (sequence 2) arrives FIRST in the array, its plan (sequence 1) second.
+    const merged = mergeActivityEvents(log, [stateEvent, planEvent]);
+    expect(merged.events.map((e) => e.kind)).toEqual(['planCreated', 'planItemStateChanged']);
+  });
+
+  /**
+   * `mergeActivityEvents`' own doc comment claims "every incoming event is put through the same
+   * fail-closed sanitization `appendActivityEvent` applies to a caller-supplied fact" — but only the
+   * per-kind fact fields ever reached `sanitizeFact`; the common/base fields (`phase`, `elapsedMs`,
+   * `occurredAt`, `sequence`) were copied verbatim from the incoming event with no equivalent of
+   * `appendActivityEvent`'s own `validContext`. A garbage `phase`, a negative `elapsedMs`, and an
+   * unparsable `occurredAt` all used to be accepted into the log unchanged.
+   */
+  it('drops an incoming event whose base fields are invalid, exactly as appendActivityEvent\'s validContext would', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const garbagePhase: ActivityEvent = { ...base, phase: 'not-a-real-phase' as unknown as typeof base.phase, sequence: 1, occurredAt: '2026-09-01T00:00:01.000Z', elapsedMs: 1000, kind: 'resuming' };
+    const negativeElapsed: ActivityEvent = { ...base, sequence: 2, occurredAt: '2026-09-01T00:00:02.000Z', elapsedMs: -999999, kind: 'resuming' };
+    const unparsableTime: ActivityEvent = { ...base, sequence: 3, occurredAt: 'not-a-date', elapsedMs: 3000, kind: 'resuming' };
+    const merged = mergeActivityEvents(log, [garbagePhase, negativeElapsed, unparsableTime]);
+    expect(merged.events).toHaveLength(0);
+    expect(merged).toBe(log);
+  });
+
+  /**
+   * A `NaN` sequence used to be accepted verbatim (`JSON.stringify` renders it as `sequence: null`),
+   * poisoning every later `appendActivityEvent` on that log: `nextSequence` computes `last.sequence +
+   * 1`, and `NaN + 1` is `NaN` forever. `nextSequence` never produces anything but a positive
+   * integer starting at 1, so an incoming event claiming otherwise cannot be a real member of this
+   * log's own ordering.
+   */
+  it('drops an incoming event with a NaN or non-positive-integer sequence rather than admitting it and poisoning every later append', () => {
+    const log = createActivityLog('run-1', 'lineage-1', 1);
+    const nanSequence: ActivityEvent = { ...base, sequence: NaN, occurredAt: '2026-09-01T00:00:01.000Z', elapsedMs: 1000, kind: 'resuming' };
+    const merged = mergeActivityEvents(log, [nanSequence]);
+    expect(merged.events).toHaveLength(0);
+    expect(merged).toBe(log);
+  });
+
   it('drops an event from another attempt so attempt boundaries are never crossed', () => {
     const log = createActivityLog('run-1', 'lineage-1', 2);
     const foreign: ActivityEvent = {

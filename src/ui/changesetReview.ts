@@ -43,6 +43,7 @@ import { sha256Hex } from '../app/contentDigest';
 import {
   carryRetainedResult,
   changesetDraftKeyFor,
+  changesetPartialDraftKeyFor,
   clearChangesetSubmitLedger,
   readRetained,
   runKeyForChangeset,
@@ -777,12 +778,21 @@ export class ChangesetReviewPanel {
    * The clean branch used to persist nothing at all, so a reload after a clean
    * re-run walked back into the *previous* run's findings; a clean record is
    * what stops that as well as making the clean screen re-openable.
+   *
+   * `source` defaults to the complete-review key every ordinary caller wants;
+   * `usePartial`'s own call site is the one exception (budget-exhausted resume
+   * feature) — it reads the *separate* durable partial key instead
+   * (`retainedReview.ts`'s `changesetPartialDraftKeyFor`/`readRetained`'s own
+   * `{partial: true}` option), mirroring `ReviewFlowPanel.enterRetained`'s own
+   * `source` parameter, so "Use N partial findings" actually opens the partial
+   * review it names rather than whatever complete review this changeset
+   * happened to retain before.
    */
-  private enterRetained(): boolean {
+  private enterRetained(source: { key: string; partial?: boolean } = { key: this.draftKey() }): boolean {
     // A pending coalesced write may hold newer triage than the store; land it
     // first so this read cannot revert the screen (see `ReviewFlowPanel`).
     this.draftWriter.flushQuietly();
-    const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(this.draftKey()));
+    const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(source.key), { partial: source.partial });
     if (!retained) {
       this.retained = undefined;
       this.review = undefined;
@@ -916,7 +926,10 @@ export class ChangesetReviewPanel {
       case 'usePartial':
         this.deps.runs.acknowledge(this.runKey());
         this.runRecord = undefined;
-        if (!this.enterRetained()) this.screen = 'agent';
+        // The separate durable partial key (`enterRetained`'s own doc comment on why `usePartial` is
+        // its one caller that overrides `source`) — never this changeset's complete-review key,
+        // which a failed run never wrote.
+        if (!this.enterRetained({ key: changesetPartialDraftKeyFor(this.changesetId), partial: true })) this.screen = 'agent';
         break;
       case 'newRun':
         // The pickers, over a result that stays exactly where it is, started
@@ -1398,8 +1411,13 @@ export class ChangesetReviewPanel {
       runProjection: this.runRecord?.projection,
       runActivity: this.runRecord?.checkpoint?.activityLog.events,
       runStartedAt: this.runRecord?.startedAt,
+      // `partialCount` reads `RunRecord.partialResult` — `settle`'s own field for exactly this
+      // (`reviewRunManager.ts`, generic across target kinds) — never a hardcoded 0: a failed
+      // changeset run's validated findings are real and durably saved (`changesetPartialDraftKeyFor`),
+      // and the failure card must name them accurately, mirroring `ReviewFlowPanel`'s own fix for the
+      // single-CR case.
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
-        ? { ...this.runRecord.failure, partialCount: 0 }
+        ? { ...this.runRecord.failure, partialCount: this.runRecord.partialResult?.items.length ?? 0 }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),

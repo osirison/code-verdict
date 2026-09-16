@@ -22,6 +22,7 @@ import type { CompletionBlockerDetail } from './harnessCompletion';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
+import { resumeBudgetModeFor } from './harnessResume';
 import type { CitedEvidenceRef, TrackedCandidate, ValidatedFinding } from './harnessCandidateValidation';
 import type { LedgerEvidenceSource } from './harnessEvidenceLedger';
 import { sha256Hex } from './contentDigest';
@@ -1374,7 +1375,15 @@ describe('the in-flight record and the interrupted sweep', () => {
       // RESULT's own truthful outcome — never a fabricated `'interrupted'`.
       const reread = harnessRunStore.readLineage(record.lineageId);
       expect(reread?.terminalAttempts).toEqual([expect.objectContaining({ attempt: 1, lifecycle: 'failed', completeness: 'partial' })]);
-      expect(harnessRunStore.latestCheckpoint(record.lineageId)?.projection.lifecycle).toBe('failed');
+      const recovered = harnessRunStore.latestCheckpoint(record.lineageId)!;
+      expect(recovered.projection.lifecycle).toBe('failed');
+      // The recovered checkpoint keeps the orderly-completion reason `runPersisting` itself would
+      // have used — never `'attemptFailed'` (reserved for a crash escaping every phase runner,
+      // which this attempt never did: `run()` resolved normally). Mislabeling this would make
+      // `resumeBudgetModeFor` treat a genuine budget-exhaustion resume as a crash-resume and
+      // silently downgrade its fresh budget to `carryForward`.
+      expect(recovered.reason).toBe('phaseBoundary');
+      expect(resumeBudgetModeFor(recovered)).toBe('fresh');
       // And the marker cleared normally — no persistence-gap limitation was needed.
       expect(new InFlightRunStore(globalState).list()).toEqual([]);
       expect(runs.get(record.key)?.limitations).not.toContainEqual(expect.objectContaining({ code: 'terminalPersistenceGap' }));
@@ -2614,6 +2623,51 @@ describe('task 12.7: the activation sweep consults stored checkpoints for a rich
     // The lineage's own checkpoint is closed as interrupted too, not only the coarse history row.
     const closed = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
     expect(closed?.projection.lifecycle).toBe('interrupted');
+    expect(new InFlightRunStore(globalState).list()).toEqual([]);
+  });
+
+  /**
+   * The production incident `IntendedTerminal` exists to close, reached through
+   * `closeLeftoverInFlightEntry`'s own truthful branch: a writer's own `intendedTerminal` declares
+   * `succeeded`, but `projection.lifecycle` was misclassified non-terminal (the documented
+   * late/out-of-order activity-event bug). `isCheckpointTerminal` correctly routes this checkpoint
+   * into the "already terminal, record it truthfully" branch rather than closing it as
+   * `interrupted` — but that branch must then also read the truthful `succeeded` lifecycle, not the
+   * misclassified `projection.lifecycle`, when deciding the row's outcome.
+   */
+  it('a checkpoint whose intendedTerminal says succeeded but whose projection was misclassified non-terminal is recorded as the truthful succeeded outcome, not fought as interrupted nor misreported by its own stale projection', async () => {
+    const globalState = memoryStore();
+    const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+    const snapshot = sweepSnapshot();
+    await harnessRunStore.writeSnapshot(snapshot);
+    const primary = fakeSource('ev_a00000000000000000000000000000', 'exact diff bytes');
+    const candidate = acceptedCandidate('cand-1', primary);
+    const built = buildCheckpoint(
+      sweepCheckpointInput(snapshot, {
+        evidenceSources: [primary],
+        candidates: [candidate],
+        intendedTerminal: { lifecycle: 'succeeded', completeness: 'complete' },
+      }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    // Sanity: the projection itself really is misclassified non-terminal — the exact disagreement
+    // `isCheckpointTerminal` exists to see past.
+    expect(built.projection.lifecycle).toBe('investigating');
+    await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+    await addInFlightEntry(globalState);
+
+    const swept = await sweepInterruptedRuns(globalState, { harnessRunStore });
+
+    expect(swept).toBe(1);
+    // Never `interrupted`: `isCheckpointTerminal` correctly refuses to re-close an
+    // `intendedTerminal`-declared-terminal checkpoint. And never a `succeeded` outcome silently
+    // relabeled by the stale `investigating` projection either — the row reflects the truthful
+    // `succeeded` lifecycle the writer actually declared.
+    expect(new ReviewRunStore(globalState).list()[0]).toMatchObject({ repoId: 'repo-1', crNumber: '42', outcome: 'findings', findingCount: 1 });
+    // The persisted checkpoint itself is untouched — never overwritten as interrupted.
+    const stillThere = harnessRunStore.latestCheckpoint(SWEEP_LINEAGE_ID);
+    expect(stillThere?.projection.lifecycle).toBe('investigating');
+    expect(stillThere?.intendedTerminal).toEqual({ lifecycle: 'succeeded', completeness: 'complete' });
     expect(new InFlightRunStore(globalState).list()).toEqual([]);
   });
 

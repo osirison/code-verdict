@@ -105,6 +105,46 @@ describe('resolveAnchor — sides (mandate A: widen past added-only)', () => {
     const result = resolveAnchor(CANDIDATES, { line: 41, code: 'somethingElseEntirely();' });
     expect(result).toEqual({ state: 'lost', line: 41 });
   });
+
+  /**
+   * Among two or more trim-identical old-side candidates, ranking by
+   * `Math.abs(candidate.line - anchor.line)` used to pick whichever one's
+   * OLD-file line number happened to be numerically closest to `anchor.line`
+   * — which is always NEW-file numbering (`resolveAnchor`'s own doc comment,
+   * and every real caller: `submit.ts` passes `item.line`). This file's own
+   * header calls exactly that comparison "meaningless" ("old-side line 60
+   * and new-side line 60 do not describe the same place in the file") and
+   * names it as the reason the two sides are searched in separate passes —
+   * yet the old-side pass's own tie-break performed it anyway. The fix
+   * removes the ranking for the old side rather than replacing it with
+   * another distance the two numbers were never comparable by: the first
+   * matching candidate in document order wins, deterministically, and
+   * changing only the OTHER candidate's numeric position must never flip
+   * the pick.
+   */
+  it('never ranks two same-text old-side candidates by numeric closeness to the new-side anchor line — the first in document order wins regardless of which one a stale new-side number happens to sit nearer to', () => {
+    const duplicateOldText = [
+      { line: 40, text: 'function handle(req) {', side: 'new' as const },
+      { line: 15, text: 'return null;', side: 'old' as const },
+      { line: 460, text: 'return null;', side: 'old' as const },
+    ];
+    const anchor = { line: 145, code: 'return null;' };
+    const first = resolveAnchor(duplicateOldText, anchor);
+    expect(first).toEqual({ state: 'moved', line: 15, side: 'old' });
+
+    // Retargeting the second candidate to a line number far closer to
+    // `anchor.line` (145) than the first candidate's (15) must not flip the
+    // pick — before the fix, this exact retargeting did flip it (distance 5
+    // vs 130), proving the choice was driven by the invalid cross-space
+    // comparison rather than document order.
+    const retargeted = [
+      duplicateOldText[0]!,
+      duplicateOldText[1]!,
+      { ...duplicateOldText[2]!, line: 140 },
+    ];
+    const second = resolveAnchor(retargeted, anchor);
+    expect(second).toEqual({ state: 'moved', line: 15, side: 'old' });
+  });
 });
 
 describe('movedAnchors', () => {

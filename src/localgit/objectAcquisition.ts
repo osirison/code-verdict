@@ -318,7 +318,11 @@ export function createObjectCache(options: ObjectCacheOptions): ObjectCache {
   });
 
   const invoke = async (operation: GitOperation, context: GitProcessContext): Promise<GitInvocationOutcome | { readonly state: 'refused'; readonly reason: string }> => {
-    const planned = planGitInvocation(operation);
+    // The second lock `isFetchableObjectSourceUrl`'s own doc comment describes: `context` is the
+    // one place this module knows whether a credential is about to be attached
+    // (`gitProcessEnvironment` injects it as `Authorization` from `context.credentialHeaderValue`
+    // alone), so that fact travels into the plan here rather than being invisible to it.
+    const planned = planGitInvocation(operation, context.credentialHeaderValue !== undefined);
     if (!planned.ok) return { state: 'refused', reason: planned.refusal.reason };
     return run(planned.plan, context);
   };

@@ -584,6 +584,84 @@ describe('caller cancellation (spec: cancelling a run stops the work it is doing
     expect(fragmentsYielded).toBe(0);
   });
 
+  /**
+   * Before the fix, `vscode.lm.selectChatModels` and `model.countTokens` ran before any of the
+   * three timeout windows were armed and before the caller's own cancellation token was even
+   * subscribed — a stall in either hung the whole turn with no way out, not even the reviewer's
+   * own stop button. This reproduces exactly that stall (a `selectChatModels` promise that never
+   * settles) and proves the caller's own cancellation now reaches it.
+   */
+  it('bounds a stalled selectChatModels call: caller cancellation reaches it, never leaving the turn hanging with no way to stop it', async () => {
+    const { runHarnessModelTurn } = await import('./lmAgent.js');
+    selectChatModels.mockImplementation(() => new Promise(() => {})); // never settles
+    const caller = callerToken();
+    const outcome = await (async () => {
+      const p = settle(runHarnessModelTurn('lm:acme/turbo', 'the prompt', { trace: fakeSink(), cancellation: caller }));
+      await vi.advanceTimersByTimeAsync(5_000);
+      caller.cancel();
+      await vi.advanceTimersByTimeAsync(1_000);
+      return p;
+    })();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect((outcome.error as { cancelled?: boolean }).cancelled).toBe(true);
+    expect((outcome.error as { timeoutReason?: string }).timeoutReason).toBe('caller');
+  });
+
+  /**
+   * The other half of the same gap: with no caller involved at all, a stalled `selectChatModels`
+   * used to hang forever because no timeout window was armed yet either. The `firstOutputMs`
+   * window — "agent never started answering" — is exactly as true of a stalled model-selection
+   * call as of a stalled stream, and now covers it too.
+   */
+  it('bounds a stalled selectChatModels call with the firstOutput window when no caller cancellation is involved either', async () => {
+    const { runHarnessModelTurn, AgentRunError } = await import('./lmAgent.js');
+    selectChatModels.mockImplementation(() => new Promise(() => {})); // never settles
+    const outcome = await (async () => {
+      const p = settle(runHarnessModelTurn('lm:acme/turbo', 'the prompt', {
+        trace: fakeSink(),
+        timeouts: { firstOutputMs: 4_000, inactivityMs: 0, ceilingMs: 0 },
+      }));
+      await vi.advanceTimersByTimeAsync(5_000);
+      return p;
+    })();
+    // Without the fix, this promise never settles at all — the assertion below only reaches this
+    // point because the firstOutput window now actually bounds the stalled selectChatModels call.
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error).toBeInstanceOf(AgentRunError);
+    const err = outcome.error as InstanceType<typeof AgentRunError>;
+    expect(err.timedOut).toBe(true);
+    expect(err.timeoutReason).toBe('firstOutput');
+  });
+
+  /**
+   * The finding's other named call: `model.countTokens` accepts an optional `CancellationToken`
+   * (`@types/vscode`) but was never passed one, and ran in the same unbounded pre-timeout window
+   * as `selectChatModels`. A provider whose `countTokens` stalls must be bounded exactly the same
+   * way — by the caller's own cancellation reaching it, not only by a provider that happens to
+   * honour the token itself.
+   */
+  it('bounds a stalled countTokens call the same way: caller cancellation reaches it too', async () => {
+    const { runHarnessModelTurn } = await import('./lmAgent.js');
+    selectChatModels.mockImplementation(async () => [{ sendRequest, maxInputTokens: 100_000, countTokens: () => new Promise<number>(() => {}) }]);
+    const caller = callerToken();
+    const outcome = await (async () => {
+      const p = settle(runHarnessModelTurn('lm:acme/turbo', 'the prompt', { trace: fakeSink(), cancellation: caller }));
+      await vi.advanceTimersByTimeAsync(5_000);
+      caller.cancel();
+      await vi.advanceTimersByTimeAsync(1_000);
+      return p;
+    })();
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect((outcome.error as { cancelled?: boolean }).cancelled).toBe(true);
+    expect((outcome.error as { timeoutReason?: string }).timeoutReason).toBe('caller');
+    expect(sendRequest).not.toHaveBeenCalled();
+  });
+
   it('changes nothing for a token that is never cancelled', async () => {
     const { runHarnessModelTurn } = await import('./lmAgent.js');
     sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>

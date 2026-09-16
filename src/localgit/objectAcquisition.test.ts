@@ -676,6 +676,32 @@ describe.skipIf(gitVersion === undefined || backend === undefined)('obtaining th
       expect(outcome.code).toBe('fetchFailed');
       expect(outcome.commit).toBe(unreachableSha);
     });
+
+    /**
+     * The "second lock" `isFetchableObjectSourceUrl`'s own doc comment names: a descriptor whose
+     * `fetchUrl` is plain `http` to a real (non-loopback) host, carrying a credential, must be
+     * refused before any fetch is attempted — never accepted just because `planGitInvocation` was
+     * never told a credential was coming. No real server is needed: the refusal happens before any
+     * network I/O, from the URL and the presence of `authorizationHeaderValue` alone.
+     */
+    it('refuses to fetch at all from a non-loopback http source that carries a credential, before any network request', async () => {
+      const cache = createObjectCache({ root });
+
+      const outcome = await cache.acquire({
+        identity: IDENTITY,
+        descriptor: {
+          fetchUrl: 'http://internal-forge.example.invalid/acme/core.git',
+          authorizationHeaderValue: 'Bearer would-otherwise-travel-in-cleartext',
+          mergeTargetRef: 'refs/heads/main',
+        },
+        attemptId: 'attempt-1',
+        headCommit: repo.headSha,
+      });
+
+      expect(outcome.state).toBe('unavailable');
+      if (outcome.state !== 'unavailable') return;
+      expect(outcome.code).toBe('requestRefused');
+    });
   });
 
   describe('a cache location that cannot be written (task 7.12)', () => {

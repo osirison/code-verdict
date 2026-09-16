@@ -65,10 +65,23 @@ function same(a: string, b: string): boolean {
  * meaningless — old-side line 60 and new-side line 60 do not describe the
  * same place in the file — and a coincidental old-side hit closer in number
  * than the true new-side one would win the wrong match.
+ *
+ * `rankByDistance` names whether `candidate.line` and `anchor.line` actually
+ * share a numbering space for THIS pass — true only for the new-side pass,
+ * where both are new-file line numbers and "nearest" is a real position
+ * comparison. The old-side pass's `anchor.line` is new-side numbering (every
+ * `ReviewItem.line` always is), so ranking two same-text old-side candidates
+ * by `Math.abs(candidate.line - anchor.line)` would be exactly the
+ * meaningless cross-space comparison this file's own two-pass split exists
+ * to avoid — false here disables it and falls back to the first matching
+ * candidate in `candidates`' own order (document order, for every producer
+ * of this shape) instead: deterministic, and never a distance the two
+ * numbers were never comparable by in the first place.
  */
 function resolveOnSide(
   candidates: readonly AnchorCandidate[],
   anchor: { line: number; code: string },
+  rankByDistance: boolean,
 ): AnchorResolution | undefined {
   const code = anchor.code;
   const exact = candidates.find((c) => c.line === anchor.line && same(c.text, code));
@@ -76,10 +89,11 @@ function resolveOnSide(
   let best: AnchorCandidate | undefined;
   for (const candidate of candidates) {
     if (!same(candidate.text, code)) continue;
-    if (
-      !best ||
-      Math.abs(candidate.line - anchor.line) < Math.abs(best.line - anchor.line)
-    ) {
+    if (!best) {
+      best = candidate;
+      continue;
+    }
+    if (rankByDistance && Math.abs(candidate.line - anchor.line) < Math.abs(best.line - anchor.line)) {
       best = candidate;
     }
   }
@@ -109,8 +123,8 @@ export function resolveAnchor(
   const newSide = candidates.filter((c) => (c.side ?? 'new') === 'new');
   const oldSide = candidates.filter((c) => c.side === 'old');
   return (
-    resolveOnSide(newSide, anchor) ??
-    resolveOnSide(oldSide, anchor) ?? { state: 'lost', line: anchor.line }
+    resolveOnSide(newSide, anchor, true) ??
+    resolveOnSide(oldSide, anchor, false) ?? { state: 'lost', line: anchor.line }
   );
 }
 

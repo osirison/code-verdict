@@ -531,6 +531,43 @@ function partDescriptor(part: unknown): string {
  * is never silently dropped even when the turn overall succeeds on other parts' text:
  * `trace.nonTextPart` logs it immediately, every time, metadata only.
  */
+/**
+ * Bounds an awaited call this file cannot otherwise cancel, by racing it against a
+ * `CancellationToken` instead of trusting the call itself to honour one. `vscode.lm.selectChatModels`
+ * takes no token at all, and a provider's own `countTokens` may ignore the one it is given — both
+ * are real, awaited round trips to the extension host or a remote model, and neither had any of
+ * `streamText`'s three timeout windows or the caller's own cancellation covering them before this
+ * fix, so a stall in either hung the whole turn with no way out (not even the reviewer's own stop
+ * button, since `callerCancel.onCancellationRequested` was not even subscribed yet).
+ *
+ * The abandoned native `promise` is never left to reject unobserved: whether this race settles via
+ * `token` or via `promise` itself, the other one is still live underneath, and a `promise` that
+ * later rejects on its own would otherwise become exactly the unhandled-rejection class this
+ * codebase already fixed once for a fire-and-forget checkpoint write (`harnessAttempt.ts`'s
+ * `onCheckpointDue`). The `.catch` below is that same guard, applied here.
+ */
+function withCancellation<T>(promise: Thenable<T>, token: vscode.CancellationToken): Promise<T> {
+  // `Thenable`, not `Promise`: `vscode.lm.selectChatModels`/`countTokens` return the VS Code API's
+  // own Promise-like interface, which guarantees only `.then` — never `.catch`.
+  Promise.resolve(promise).catch(() => {
+    // Deliberately empty: see this function's own doc comment above.
+  });
+  if (token.isCancellationRequested) return Promise.reject(new Error('cancelled before dispatch'));
+  return new Promise<T>((resolve, reject) => {
+    const subscription = token.onCancellationRequested(() => reject(new Error('cancelled')));
+    promise.then(
+      (value) => {
+        subscription.dispose();
+        resolve(value);
+      },
+      (error: unknown) => {
+        subscription.dispose();
+        reject(error);
+      },
+    );
+  });
+}
+
 async function streamText<T>(
   modelId: string,
   prompt: string,
@@ -586,40 +623,6 @@ async function streamText<T>(
     });
   };
 
-  const models = await vscode.lm.selectChatModels({ vendor, family });
-  const model = models[0];
-  if (!model) {
-    const message = `Model ${modelId} is no longer available`;
-    trace.failure(message);
-    reportTiming('failed');
-    throw new AgentRunError(message, requestId, false);
-  }
-
-  // Every turn, not just the first. `fitBootstrapToModel` sizes the *bootstrap envelope* once, at
-  // the start of an attempt; a turn's prompt is that envelope plus the previous turn's tool
-  // results, which grow. While a single tool result was capped at 64 KB that gap was theoretical.
-  // It is not any more: a read now returns a whole file, so one turn can carry hundreds of
-  // kilobytes the bootstrap check never saw. An oversized request is not reliably an error — the
-  // failure this whole harness spent days chasing was a model returning zero bytes, no exception,
-  // in 3ms — so this refuses the send with a named reason rather than letting it come back empty
-  // and be misdiagnosed as anything else. Not retryable: the same prompt will not fit next time.
-  if (model.maxInputTokens > 0) {
-    let promptTokens: number | undefined;
-    try {
-      promptTokens = await model.countTokens(prompt);
-    } catch {
-      // A tokenizer that cannot answer must not fail the turn on its own — the send below is
-      // still the more informative outcome, whatever it returns.
-      promptTokens = undefined;
-    }
-    if (promptTokens !== undefined && promptTokens > model.maxInputTokens) {
-      const message = `This turn's prompt is about ${promptTokens} tokens, over ${modelId}'s ${model.maxInputTokens}-token input limit`;
-      trace.failure(message);
-      reportTiming('failed');
-      throw new AgentRunError(message, requestId, false);
-    }
-  }
-
   const timeouts = options?.timeouts ?? DEFAULT_AGENT_RUN_TIMEOUTS;
   const tokenSource = new vscode.CancellationTokenSource();
   let timeoutReason: AgentTimeoutReason | undefined;
@@ -633,7 +636,11 @@ async function streamText<T>(
 
   // The ceiling re-arms itself for as long as output keeps arriving, so its
   // handle is reassigned rather than fixed; `finally` clears whichever one is
-  // pending at the end.
+  // pending at the end. Armed here, before model selection and the per-turn token count, not only
+  // before the send: those two are awaited round trips this file cannot otherwise bound (neither
+  // had any of these three windows, nor the caller's own cancellation, covering them before this
+  // fix — see `withCancellation`'s own doc comment for the incident this closes), so a stall in
+  // either must be bounded exactly like a stall mid-stream already was.
   let producedThisCeiling = false;
   let ceiling: ReturnType<typeof setTimeout> | undefined;
   const armCeiling = () => {
@@ -648,20 +655,23 @@ async function streamText<T>(
   };
   armCeiling();
 
-  // Armed once, before the send, and cleared for good by the first part of any kind. The
+  // Armed once, before model selection, and cleared for good by the first part of any kind. The
   // inactivity window starts unarmed on purpose: it measures the gap between fragments, and
   // before the first fragment there is no gap to measure — there is a request still ingesting its
   // prompt, whose legitimate silence grows with prompt size (the 207KB-prompt failure this
   // separation comes from is described at `FIRST_OUTPUT_TIMEOUT_MS`). Arming inactivity here
   // instead, as this code used to, made 90s the bound on time-to-first-token and killed a healthy
-  // large-prompt request that had produced zero fragments.
+  // large-prompt request that had produced zero fragments. Its "agent never started answering"
+  // sentence is equally true of a stalled model-selection or token-count call below, so this same
+  // window (never a second, parallel one) covers both.
   let firstOutput = schedule(timeouts.firstOutputMs, () => cancelWith('firstOutput'));
   let inactivity: ReturnType<typeof setTimeout> | undefined;
   // The caller's signal joins the same source the three windows use, so there is
   // one way to stop a request and one place that classifies why it stopped.
   // Checked first as well as subscribed: a token that was already cancelled
-  // before the run started fires no event, and would otherwise stream to
-  // completion for a caller that had already given up.
+  // before the run started fires no event, and would otherwise select a model
+  // and count tokens — then stream to completion — for a caller that had
+  // already given up.
   const callerCancel = options?.cancellation;
   const callerSubscription = callerCancel?.onCancellationRequested(() => cancelWith('caller'));
   if (callerCancel?.isCancellationRequested) cancelWith('caller');
@@ -674,7 +684,85 @@ async function streamText<T>(
     inactivity = schedule(timeouts.inactivityMs, () => cancelWith('inactivity'));
   };
 
+  /**
+   * The one place every one of the three windows and the caller's own cancellation become the
+   * reviewer-facing failure — shared by the pre-send wait below (model selection, the per-turn
+   * token count) and the streaming `catch` further down, so both report the identical sentence for
+   * the identical reason rather than risking the two drifting apart. Reads `timeoutReason` fresh:
+   * whichever of the three windows or the caller fired first is what `cancelWith` already recorded
+   * there.
+   */
+  const throwForCancellation = (): never => {
+    if (timeoutReason === 'caller') {
+      // Not a failure: the reviewer asked for this. Reported as its own
+      // outcome so the caller does not offer to lengthen a window that had
+      // nothing to do with it.
+      const message = 'run cancelled';
+      trace.failure(message, 'caller');
+      reportTiming('failed');
+      throw new AgentRunError(message, requestId, false, 'caller', true);
+    }
+    // Three limits, three sentences: which window ran out tells the reviewer
+    // which condition actually happened — a request that never began
+    // answering is not a stall, and saying "stalled" for it (as this code
+    // did when the inactivity window bounded both) sends the reviewer at
+    // the wrong knob. `timeoutReason` is always one of the three here (never
+    // `undefined`): this is only ever called once `tokenSource.token.isCancellationRequested`
+    // is true, and `cancelWith` is the only thing that sets either.
+    const reason = timeoutReason ?? 'firstOutput';
+    const message =
+      reason === 'ceiling'
+        ? `agent produced nothing for a full ${timeouts.ceilingMs / 1000}s run window`
+        : reason === 'firstOutput'
+          ? `agent never started answering: no output at all within ${timeouts.firstOutputMs / 1000}s of the request`
+          : `agent stalled: no output for ${timeouts.inactivityMs / 1000}s`;
+    trace.failure(message, reason);
+    reportTiming('failed');
+    throw new AgentRunError(message, requestId, true, reason);
+  };
+
   try {
+    let models: Awaited<ReturnType<typeof vscode.lm.selectChatModels>>;
+    try {
+      models = await withCancellation(vscode.lm.selectChatModels({ vendor, family }), tokenSource.token);
+    } catch (error) {
+      if (tokenSource.token.isCancellationRequested) throwForCancellation();
+      throw error;
+    }
+    const model = models[0];
+    if (!model) {
+      const message = `Model ${modelId} is no longer available`;
+      trace.failure(message);
+      reportTiming('failed');
+      throw new AgentRunError(message, requestId, false);
+    }
+
+    // Every turn, not just the first. `fitBootstrapToModel` sizes the *bootstrap envelope* once, at
+    // the start of an attempt; a turn's prompt is that envelope plus the previous turn's tool
+    // results, which grow. While a single tool result was capped at 64 KB that gap was theoretical.
+    // It is not any more: a read now returns a whole file, so one turn can carry hundreds of
+    // kilobytes the bootstrap check never saw. An oversized request is not reliably an error — the
+    // failure this whole harness spent days chasing was a model returning zero bytes, no exception,
+    // in 3ms — so this refuses the send with a named reason rather than letting it come back empty
+    // and be misdiagnosed as anything else. Not retryable: the same prompt will not fit next time.
+    if (model.maxInputTokens > 0) {
+      let promptTokens: number | undefined;
+      try {
+        promptTokens = await withCancellation(model.countTokens(prompt, tokenSource.token), tokenSource.token);
+      } catch {
+        if (tokenSource.token.isCancellationRequested) throwForCancellation();
+        // A tokenizer that cannot answer must not fail the turn on its own — the send below is
+        // still the more informative outcome, whatever it returns.
+        promptTokens = undefined;
+      }
+      if (promptTokens !== undefined && promptTokens > model.maxInputTokens) {
+        const message = `This turn's prompt is about ${promptTokens} tokens, over ${modelId}'s ${model.maxInputTokens}-token input limit`;
+        trace.failure(message);
+        reportTiming('failed');
+        throw new AgentRunError(message, requestId, false);
+      }
+    }
+
     const response = await model.sendRequest(
       [vscode.LanguageModelChatMessage.User(prompt)],
       {},
@@ -735,31 +823,12 @@ async function streamText<T>(
     reportTiming('completed');
     return finish(text);
   } catch (e) {
-    if (tokenSource.token.isCancellationRequested) {
-      if (timeoutReason === 'caller') {
-        // Not a failure: the reviewer asked for this. Reported as its own
-        // outcome so the caller does not offer to lengthen a window that had
-        // nothing to do with it.
-        const message = 'run cancelled';
-        trace.failure(message, 'caller');
-        reportTiming('failed');
-        throw new AgentRunError(message, requestId, false, 'caller', true);
-      }
-      // Three limits, three sentences: which window ran out tells the reviewer
-      // which condition actually happened — a request that never began
-      // answering is not a stall, and saying "stalled" for it (as this code
-      // did when the inactivity window bounded both) sends the reviewer at
-      // the wrong knob.
-      const message =
-        timeoutReason === 'ceiling'
-          ? `agent produced nothing for a full ${timeouts.ceilingMs / 1000}s run window`
-          : timeoutReason === 'firstOutput'
-            ? `agent never started answering: no output at all within ${timeouts.firstOutputMs / 1000}s of the request`
-            : `agent stalled: no output for ${timeouts.inactivityMs / 1000}s`;
-      trace.failure(message, timeoutReason);
-      reportTiming('failed');
-      throw new AgentRunError(message, requestId, true, timeoutReason);
-    }
+    // Already a fully-formed, already-traced `AgentRunError` — either `throwForCancellation`
+    // above, or the missing-model/oversized-prompt refusals a few lines up, both inside this same
+    // `try` now so `finally` below always runs for them too. Rethrown verbatim: re-classifying it
+    // here would call `trace.failure` a second time for the identical failure.
+    if (e instanceof AgentRunError) throw e;
+    if (tokenSource.token.isCancellationRequested) throwForCancellation();
     if (e instanceof AgentResponseError || e instanceof SyntaxError) {
       const message = `agent response did not match the contract: ${e.message}`;
       // The thrown `AgentRunError` keeps `e.message` verbatim (existing, tested behaviour: the

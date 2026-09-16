@@ -411,6 +411,21 @@ describe('closeAttemptAsInterrupted / computeInterruptedCompleteness (11.6, rest
     expect(closeAttemptAsInterrupted(terminalCheckpoint, { checkpointId: 'ckpt-x', occurredAt: '2026-01-01T00:20:00.000Z' }, DEFAULT_HARNESS_POLICY)).toBeUndefined();
   });
 
+  it('trusts a writer-declared intendedTerminal over a misclassified nonterminal projection: a genuinely succeeded checkpoint is never overwritten as interrupted (the production incident IntendedTerminal exists to close)', () => {
+    const snapshot = testSnapshot();
+    // `projection.lifecycle` says non-terminal — exactly the misclassification this file's own
+    // `IntendedTerminal` doc comment names ("a single late/out-of-order-sequence activity event
+    // ... could silently misclassify a genuinely terminal checkpoint as non-terminal") — while the
+    // writer's own `intendedTerminal` correctly declares the attempt succeeded.
+    const misclassified = testCheckpoint(snapshot, {
+      intendedTerminal: { lifecycle: 'succeeded', completeness: 'complete' },
+    });
+    expect(misclassified.projection.lifecycle).not.toBe('succeeded');
+    expect(
+      closeAttemptAsInterrupted(misclassified, { checkpointId: 'ckpt-should-not-exist', occurredAt: '2026-01-01T00:20:00.000Z' }, DEFAULT_HARNESS_POLICY),
+    ).toBeUndefined();
+  });
+
   it('clamps a backwards-moving clock up to the checkpoint\'s own last event time rather than dropping the interruption event', () => {
     const snapshot = testSnapshot();
     let log = createActivityLog(RUN_ID, LINEAGE_ID, 1);

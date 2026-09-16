@@ -243,10 +243,28 @@ function sanitizeFact(fact: ActivityFact, knownItemIds: () => Set<string>): Acti
   }
 }
 
+/**
+ * The base-field checks `validContext` and `mergeActivityEvents` both need: a real `RunPhase`, a
+ * finite non-negative `elapsedMs`, and an `occurredAt` `Date.parse` can actually read. Split out of
+ * `validContext` so `mergeActivityEvents` can run the identical per-event field validation
+ * `appendActivityEvent` always has, without also asserting monotonicity against `log`'s own last
+ * event — a batch is sorted and merged as a whole below, not appended one event at a time, so that
+ * comparison belongs to the merge's own ordering, not to whether one event's fields are well-formed.
+ */
+function validEventFields(phase: unknown, elapsedMs: unknown, occurredAt: unknown): boolean {
+  if (!isRunPhase(phase)) return false;
+  if (typeof elapsedMs !== 'number' || !Number.isFinite(elapsedMs) || elapsedMs < 0) return false;
+  if (typeof occurredAt !== 'string' || Number.isNaN(Date.parse(occurredAt))) return false;
+  return true;
+}
+
+/** A log's own `sequence` is always a positive integer (`nextSequence` starts at 1 and increments by 1); an incoming event claiming anything else — `NaN` included — cannot be a real member of this log's ordering. */
+function validSequence(sequence: unknown): sequence is number {
+  return typeof sequence === 'number' && Number.isInteger(sequence) && sequence >= 1;
+}
+
 function validContext(log: ActivityLog, context: ActivityContext): boolean {
-  if (!isRunPhase(context.phase)) return false;
-  if (!Number.isFinite(context.elapsedMs) || context.elapsedMs < 0) return false;
-  if (typeof context.occurredAt !== 'string' || Number.isNaN(Date.parse(context.occurredAt))) return false;
+  if (!validEventFields(context.phase, context.elapsedMs, context.occurredAt)) return false;
   const last = log.events[log.events.length - 1];
   if (!last) return true;
   // Elapsed time and wall-clock time must not run backwards within one attempt.
@@ -330,17 +348,32 @@ export function mergeActivityEvents(log: ActivityLog, incoming: readonly Activit
   // change on it together validates the state change against the plan it
   // arrived with, not only against what was already on disk.
   const knownIds = knownPlanItemIds(log.events);
-  for (const event of incoming) {
+  // Processed in sequence order, never raw arrival order: this function exists precisely for "a
+  // transport that can redeliver or reorder" (this function's own doc comment above), and
+  // `knownIds` is grown incrementally as a `planCreated`/`planRevised` event is accepted below — so
+  // a `planItemStateChanged` event that arrives earlier in the array than the `planCreated` it
+  // depends on must still be validated *after* that plan is known, not before. Sorting once here
+  // (stable, so same-sequence duplicates keep their relative arrival order for the "first wins,
+  // second must be identical" rule below) is the only change needed; nothing downstream assumes
+  // `incoming`'s own array order.
+  const orderedIncoming = [...incoming].sort((a, b) => a.sequence - b.sequence);
+  for (const event of orderedIncoming) {
     if (event.runId !== log.runId || event.lineageId !== log.lineageId || event.attempt !== log.attempt) continue;
+    // The same fail-closed field validation `appendActivityEvent`'s own `validContext` applies to a
+    // caller-supplied context — a garbage `phase`, a negative/non-finite `elapsedMs`, an unparsable
+    // `occurredAt`, or a non-positive-integer `sequence` (`nextSequence` never produces anything
+    // else) is exactly as untrustworthy arriving through a redelivering/reordering transport as it
+    // would be from a caller, and this module's own header promises nothing unsanitized reaches the
+    // log either way. Checked before `sequence` is used as a `Set`/`Map` key below, so a `NaN` or
+    // fractional sequence can never be claimed or compared against `stored`.
+    if (!validEventFields(event.phase, event.elapsedMs, event.occurredAt) || !validSequence(event.sequence)) continue;
     if (stored.has(event.sequence)) continue;
-    // Every incoming event is put through the same fail-closed sanitization
-    // `appendActivityEvent` applies to a caller-supplied fact — this module's
-    // own header promises nothing unsanitized reaches the log, and a
-    // transport that can redeliver or reorder is not a more trustworthy
-    // source than a caller. An event that does not sanitize cleanly is
-    // dropped rather than accepted verbatim; it is not the same failure as
-    // two different facts sharing a sequence, so it does not refuse the rest
-    // of the batch.
+    // Every incoming event's own fact fields are put through the same fail-closed sanitization
+    // `appendActivityEvent` applies to a caller-supplied fact — this module's own header promises
+    // nothing unsanitized reaches the log, and a transport that can redeliver or reorder is not a
+    // more trustworthy source than a caller. An event that does not sanitize cleanly is dropped
+    // rather than accepted verbatim; it is not the same failure as two different facts sharing a
+    // sequence, so it does not refuse the rest of the batch.
     const { runId, lineageId, attempt, sequence, occurredAt, phase, elapsedMs, ...rawFact } = event;
     const sanitized = sanitizeFact(rawFact as ActivityFact, () => knownIds);
     if (!sanitized) continue;

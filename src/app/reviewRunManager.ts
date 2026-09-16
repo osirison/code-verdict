@@ -94,7 +94,7 @@ import type { KeyValueStore } from './storage';
 import type { CheckpointInfo, HarnessAttempt, HarnessAttemptResult } from './harnessAttempt';
 import type { CompletionBlockerDetail, CompletionEvaluation } from './harnessCompletion';
 import { reduceActivity } from './harnessActivityProjection';
-import { closeCheckpointAsTerminal } from './harnessCheckpoint';
+import { closeCheckpointAsTerminal, isCheckpointTerminal } from './harnessCheckpoint';
 import type { ActivityFact } from './harnessActivityLog';
 import { createHarnessRunStore, type HarnessRunStore } from './harnessRunStore';
 import { checkCheckpointIntegrity, closeAttemptAsInterrupted, nextAttemptNumber, ResumeIncompatibleError } from './harnessResume';
@@ -1556,7 +1556,18 @@ export class ReviewRunManager {
         };
         const closed = closeCheckpointAsTerminal(
           latest,
-          { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(this.now()).toISOString(), reason: 'attemptFailed', terminalFact },
+          // `'phaseBoundary'`, never `'attemptFailed'`: `completeAttempt` only ever reaches here with
+          // a genuine `HarnessAttemptResult` — the attempt already resolved through the normal
+          // `runCompleting` -> `runPersisting` funnel, exactly the shape `runPersisting`'s own
+          // terminal write always reasons `'phaseBoundary'` for, whether `result.lifecycle` is
+          // `'succeeded'` or `'failed'` (budget exhaustion included). `'attemptFailed'` is reserved
+          // for `finalizeEscapedError`'s crash catch-all (`harnessAttempt.ts`'s own `CHECKPOINT_REASONS`
+          // doc comment: "never produced anywhere `runPersisting`/`finalizeBootstrapFailure` already
+          // ran to completion for this attempt") — a case this recovery path, by construction, is
+          // never in. Mislabeling this `'attemptFailed'` would make `resumeBudgetModeFor` treat a
+          // recovered budget-exhaustion resume as a crash-resume and silently downgrade its fresh
+          // budget to `carryForward`.
+          { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(this.now()).toISOString(), reason: 'phaseBoundary', terminalFact },
           DEFAULT_HARNESS_POLICY,
         );
         if (closed) {
@@ -2354,16 +2365,22 @@ async function closeLeftoverInFlightEntry(entry: InFlightRun, runs: ReviewRunSto
     // rather than skip) — then straight to clearing the leftover marker with every other entry
     // once the loop ends, never through `closeAttemptAsInterrupted` or the generic `interrupted`
     // row built below, both of which are for a genuinely nonterminal checkpoint only.
-    if (latest && isTerminalLifecycle(latest.projection.lifecycle)) {
+    if (latest && isCheckpointTerminal(latest)) {
       const findingCount = acceptedFindingCount(latest.candidates);
-      const { outcome, limitations } = truthfulTerminalRow(latest.projection.lifecycle, findingCount, latest.projection.limitations);
+      // `isCheckpointTerminal` above already trusts a declared `intendedTerminal` over
+      // `projection.lifecycle` when the two disagree (`harnessCheckpoint.ts`'s own doc comment on
+      // why) — this row must trust the same source, or the exact disagreement that gate exists to
+      // catch (a genuinely `succeeded` attempt whose projection was misclassified non-terminal)
+      // would still hand `truthfulTerminalRow` the misclassified, non-`succeeded` lifecycle.
+      const truthfulLifecycle = latest.intendedTerminal?.lifecycle ?? latest.projection.lifecycle;
+      const { outcome, limitations } = truthfulTerminalRow(truthfulLifecycle, findingCount, latest.projection.limitations);
       // `'failed'` is the one live-terminal lifecycle this row offers a fresh-budget new attempt
       // for (`truthfulTerminalRow`'s own doc comment) — the same `checkCheckpointIntegrity` check
       // `ReviewRunManager.completeAttempt`'s own `failed` branch runs, here because the extension
       // host stopped before that branch's own write could land.
       let terminalResumable: boolean | undefined;
       let terminalResumeReasons: readonly Limitation[] | undefined;
-      if (latest.projection.lifecycle === 'failed') {
+      if (truthfulLifecycle === 'failed') {
         const storedSnapshot = harnessRunStore.readSnapshot(lineageId, latest.attempt);
         const integrityReasons = storedSnapshot ? checkCheckpointIntegrity(storedSnapshot, latest) : undefined;
         // Mirrors `completeAttempt`'s own `headMovedNotes` fold above: this branch exists for
@@ -2455,7 +2472,7 @@ export async function sweepInterruptedRuns(globalState: KeyValueStore, options: 
     for (const record of harnessRunStore.listLineages()) {
       if (markedLineageIds.has(record.lineageId)) continue;
       const latest = harnessRunStore.latestCheckpoint(record.lineageId);
-      if (!latest || isTerminalLifecycle(latest.projection.lifecycle)) continue;
+      if (!latest || isCheckpointTerminal(latest)) continue;
       const closed = closeAttemptAsInterrupted(latest, { checkpointId: mintHarnessId('ckpt'), occurredAt: new Date(now()).toISOString() }, policy);
       if (closed) {
         await harnessRunStore.writeCheckpoint(closed, policy);

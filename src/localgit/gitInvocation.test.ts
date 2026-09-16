@@ -361,6 +361,42 @@ describe('the fetch transport is validated before any fetch (task 6.19)', () => 
   });
 });
 
+/**
+ * The "second lock" `isFetchableObjectSourceUrl`'s own doc comment describes: whether a credential
+ * is about to be attached is invisible to `planGitInvocation` unless the caller says so, and
+ * `objectAcquisition.ts`'s `invoke()` is the only real caller that can — `GitOperation` itself
+ * carries no such field. Before this fix, `planGitInvocation` never took a second argument at all,
+ * so `hasAuthorizationHeader` defaulted `false` unconditionally and an `http://` fetch to a real,
+ * non-loopback forge was accepted even though a credential was genuinely about to be attached to it.
+ */
+describe('planGitInvocation learns whether a credential is about to be attached (the "second lock" against sending it over plain http)', () => {
+  it('refuses a non-loopback http fetch when a credential is attached, for both fetchCommit and fetchMergeTarget', () => {
+    const commitResult = planGitInvocation({ kind: 'fetchCommit', fetchUrl: 'http://internal-forge.example.invalid/acme/core.git', commit: HEAD, depth: 1 }, true);
+    expect(commitResult.ok).toBe(false);
+    if (commitResult.ok) return;
+    expect(commitResult.refusal.code).toBe('fetchUrlTransport');
+
+    const mergeTargetResult = planGitInvocation({ kind: 'fetchMergeTarget', fetchUrl: 'http://internal-forge.example.invalid/acme/core.git', targetRef: 'refs/heads/main', depth: 1 }, true);
+    expect(mergeTargetResult.ok).toBe(false);
+  });
+
+  it('still accepts the identical non-loopback http fetch when no credential is attached — this is the ordinary, credential-blind case every other test in this file exercises', () => {
+    const result = planGitInvocation({ kind: 'fetchCommit', fetchUrl: 'http://internal-forge.example.invalid/acme/core.git', commit: HEAD, depth: 1 }, false);
+    expect(result.ok).toBe(true);
+  });
+
+  it('still accepts a loopback http fetch even with a credential attached — the one exemption objectAcquisition.test.ts\'s own real local HTTP server fixtures rely on', () => {
+    for (const fetchUrl of ['http://127.0.0.1:8080/r.git', 'http://localhost:8080/r.git', 'http://[::1]:8080/r.git']) {
+      expect(planGitInvocation({ kind: 'fetchCommit', fetchUrl, commit: HEAD, depth: 1 }, true).ok).toBe(true);
+    }
+  });
+
+  it('never lets the loopback exemption rescue a URL that was already refused with no credential at all', () => {
+    const result = planGitInvocation({ kind: 'fetchCommit', fetchUrl: 'ssh://git@127.0.0.1/acme/core.git', commit: HEAD, depth: 1 }, true);
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe('the child environment is constructed, not inherited (tasks 6.5, 6.6, 6.7)', () => {
   it('names an empty configuration, literal pathspecs, no prompt and a fixed locale', () => {
     const env = gitProcessEnvironment({ gitDir: '/cache/abc.git' });

@@ -481,6 +481,23 @@ describe('revalidation and unresolved tracking (task 7.8)', () => {
     expect(tracker.get('cand-1')).toMatchObject({ state: 'contradicted' });
     expect(tracker.triageFindings()).toEqual([]);
   });
+
+  it('an accepted candidate stays closed too (Fix 3): resubmitting the same id with a citation that now fails must not demote it out of triage', () => {
+    const fixture = setup();
+    const tracker = createCandidateTracker();
+    tracker.record(validateCandidate(candidate(fixture), fixture.context));
+    expect(tracker.get('cand-1')).toMatchObject({ state: 'accepted' });
+    expect(tracker.triageFindings().map((finding) => finding.candidateId)).toEqual(['cand-1']);
+
+    // A resubmission of the same id whose citation now fails (here: a digest mismatch, an outright
+    // rejection rather than a repairable gap) must not overwrite the already-accepted, ledger-backed
+    // finding — mirroring the guard already in place for `rejected`/`contradicted` above.
+    const failing = candidate(fixture, { citations: { primary: { ...cite(fixture.diff, 'src/auth/token.ts', 12), digest: sha256Hex('tampered bytes') } } });
+    const resubmission = tracker.record(validateCandidate(failing, fixture.context));
+    expect(resubmission.state).toBe('accepted');
+    expect(tracker.get('cand-1')).toMatchObject({ state: 'accepted' });
+    expect(tracker.triageFindings().map((finding) => finding.candidateId)).toEqual(['cand-1']);
+  });
 });
 
 describe('seeding from a resumed checkpoint (task 14.6)', () => {

@@ -526,12 +526,18 @@ export function createCandidateTracker(options: CandidateTrackerOptions = {}): C
     record(outcome) {
       const previous = tracked.get(outcome.candidateId);
       const repairs = previous ? previous.repairs : 0;
-      // A rejected or contradicted candidate is closed; resubmit under a new id. `contradicted`
-      // predates neither `rejected` nor this guard, but was still missing here (Fix 2): resubmitting
-      // a contradicted candidate's id used to fall through to the switch below and resurrect it as
-      // `accepted`, undoing the contradiction pass's own conclusion with a stale re-validation the
-      // pass never saw.
-      if (previous?.state === 'rejected' || previous?.state === 'contradicted') return previous;
+      // A rejected, contradicted, or accepted candidate is closed; resubmit under a new id.
+      // `contradicted` predates neither `rejected` nor this guard, but was still missing here
+      // (Fix 2): resubmitting a contradicted candidate's id used to fall through to the switch
+      // below and resurrect it as `accepted`, undoing the contradiction pass's own conclusion with
+      // a stale re-validation the pass never saw. `accepted` has the same gap in the other
+      // direction (Fix 3): without this clause, resubmitting an already-accepted id with a citation
+      // that now fails falls through to `case 'rejected'`/the `repairable` branch and silently
+      // demotes a real, ledger-backed finding out of `triageFindings()` with no trace. A caller that
+      // genuinely needs to change an accepted candidate's own verdict uses `invalidate()`/`contradict()`
+      // below, both of which require the caller to already hold `previous.state === 'accepted'` —
+      // never a bare resubmission through `record()`.
+      if (previous?.state === 'rejected' || previous?.state === 'contradicted' || previous?.state === 'accepted') return previous;
       switch (outcome.state) {
         case 'accepted':
           return set({ candidateId: outcome.candidateId, state: 'accepted', repairs, reasons: [], finding: outcome.finding });

@@ -351,16 +351,37 @@ export function computeSnapshotDigest(snapshot: ReviewRunSnapshot): string {
 // ---- Closing a lost attempt as interrupted (task 11.6, D13) -------------------------
 
 /**
+ * Whether a checkpoint is terminal for the purpose of "may this be closed as
+ * `interrupted`" — the same declaration-over-projection precedence
+ * `HarnessRunStore.writeCheckpoint`'s marker gate already applies (its own
+ * "the marker gate" comment). A writer's own `intendedTerminal` (`IntendedTerminal`'s
+ * doc comment above) is trusted first when present, exactly because
+ * `projection.lifecycle` is recomputed one layer away by `reduceActivity` and
+ * can misclassify a genuinely terminal checkpoint as non-terminal on a
+ * late/out-of-order activity event — the production incident `intendedTerminal`
+ * exists to close. Every caller deciding whether a checkpoint may still be
+ * closed as `interrupted` (this file's own `closeCheckpointAsTerminal`, and
+ * `reviewRunManager.ts`'s two activation-sweep call sites) must use this
+ * rather than re-deriving `isTerminalLifecycle(checkpoint.projection.lifecycle)`
+ * alone, or a checkpoint the writer already knows is terminal — durably
+ * recorded as such in `terminalAttempts` — can still be reached and
+ * overwritten as `interrupted`.
+ */
+export function isCheckpointTerminal(checkpoint: PersistedCheckpoint): boolean {
+  return checkpoint.intendedTerminal ? isTerminalLifecycle(checkpoint.intendedTerminal.lifecycle) : isTerminalLifecycle(checkpoint.projection.lifecycle);
+}
+
+/**
  * Transforms a lineage's *latest* checkpoint for one attempt into a closed,
  * terminal one by appending exactly one more activity fact to its own
  * already-persisted activity — never re-snapshotting from live collaborators
  * (there are none: this runs after the process that held them is gone).
  *
- * `undefined` when `latest`'s own projection is already terminal ("A
- * completed run leaves no interrupted marker", spec `background-review-runs`)
- * or when `context.occurredAt`/the fact itself fails
- * `appendActivityEvent`'s own validation (fail closed: the checkpoint the
- * caller already has is returned as-is by that caller, not silently
+ * `undefined` when `latest` is already terminal per `isCheckpointTerminal`
+ * ("A completed run leaves no interrupted marker", spec
+ * `background-review-runs`) or when `context.occurredAt`/the fact itself
+ * fails `appendActivityEvent`'s own validation (fail closed: the checkpoint
+ * the caller already has is returned as-is by that caller, not silently
  * fabricated here as "closed").
  *
  * `context.occurredAt` is clamped up to `latest`'s own last event time (never
@@ -376,7 +397,7 @@ export function closeCheckpointAsTerminal(
   context: { checkpointId: string; occurredAt: string; reason: CheckpointReason; terminalFact: Extract<ActivityFact, { kind: 'terminalResult' }> },
   policy: Pick<HarnessPolicy, 'maxActivityEventsPerAttempt' | 'maxActivityBytesPerAttempt'>,
 ): PersistedCheckpoint | undefined {
-  if (isTerminalLifecycle(latest.projection.lifecycle)) return undefined;
+  if (isCheckpointTerminal(latest)) return undefined;
 
   const priorLog: ActivityLog = { runId: latest.runId, lineageId: latest.lineageId, attempt: latest.attempt, events: latest.activity };
   const lastEvent = latest.activity[latest.activity.length - 1];

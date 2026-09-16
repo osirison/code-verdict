@@ -826,14 +826,64 @@ function planDiff(base: string, head: string, paths: readonly string[]): readonl
   return ['diff', ...DIFF_ARGUMENTS, `${base}..${head}`, '--', ...paths];
 }
 
+/** A loopback host never leaves this machine to reach a network eavesdropper — see `isFetchableFetchUrl`'s own doc comment for why that is the one thing that makes an exemption safe here. `URL.hostname` renders an IPv6 literal bracketed (`'[::1]'`), so that form is listed alongside the bare one. */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+
+/**
+ * This module's own consumer-side "second lock" (task 6.19), one exemption narrower than what it
+ * delegates to: `isFetchableObjectSourceUrl` itself has, and must keep, no localhost carve-out — a
+ * self-hosted forge reachable over a real network on plain `http` is exactly the case its own doc
+ * comment names, and a provider's descriptor-construction check (the *other* caller of that
+ * function) still refuses that combination unconditionally, with nothing routed through here.
+ *
+ * The exemption below exists only for a fetch this process is about to run against a host that
+ * cannot be anyone but itself: loopback traffic never crosses a network boundary, so there is no
+ * eavesdropper for an `Authorization` header to leak to, which is the entire reason
+ * `isFetchableObjectSourceUrl` refuses `http` plus a credential in the first place. That is exactly
+ * what a same-machine test double stands in for a real remote to exercise (`objectAcquisition.test.ts`'s
+ * own fixtures run a real local HTTP server so the actual git subprocess is driven against real HTTP
+ * responses — 401s included — rather than a mock; a throwaway TLS certificate would need git told to
+ * trust it, adding a weakened trust store to remove no real risk). A URL that would already be
+ * refused with no credential attached at all (bad scheme, userinfo, an empty host, `ext::`, …) is
+ * never rescued by this: the loopback check only ever *widens* what a credential alone would have
+ * narrowed, never what was already refused on its own terms.
+ */
+function isFetchableFetchUrl(fetchUrl: string, hasAuthorizationHeader: boolean): boolean {
+  if (isFetchableObjectSourceUrl(fetchUrl, hasAuthorizationHeader)) return true;
+  if (!hasAuthorizationHeader || !isFetchableObjectSourceUrl(fetchUrl, false)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(fetchUrl);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === 'http:' && LOOPBACK_HOSTS.has(parsed.hostname);
+}
+
 /**
  * Validate one operation and lay out its arguments (tasks 6.1, 6.2, 6.3, 6.4).
  *
  * Every pathspec is emitted after `--` and every search pattern after `-e`,
  * here, once, for all callers. A caller that wanted to place a path itself has
  * no way to express that: it hands over typed fields and receives a plan.
+ *
+ * `hasAuthorizationHeader` is the "second lock" `isFetchableObjectSourceUrl`'s
+ * own doc comment describes: whether the caller is about to attach a
+ * credential is a fact only *it* holds (a `GitOperation` carries no such
+ * field, and never should — see `GitOperation`'s own doc comment on staying a
+ * plain data description), so it must be threaded in here rather than
+ * defaulted. `objectAcquisition.ts`'s `invoke()` is this seam's one real
+ * caller and passes `context.credentialHeaderValue !== undefined` — the exact
+ * fact `gitProcessEnvironment` acts on when it injects the `Authorization`
+ * header. Defaulting to `false` (never attaching a credential) keeps every
+ * caller that does not pass this — including every existing test that plans a
+ * `fetchCommit`/`fetchMergeTarget` bare, with no context — refusing exactly
+ * what it refused before: an `http://` fetch is still accepted when nothing
+ * is ever going to attach a header to it (`isFetchableObjectSourceUrl`'s own
+ * `hasAuthorizationHeader = false` default), so this closes the credential
+ * combination without narrowing plain-HTTP fetches that carry nothing.
  */
-export function planGitInvocation(operation: GitOperation): GitInvocationPlanResult {
+export function planGitInvocation(operation: GitOperation, hasAuthorizationHeader = false): GitInvocationPlanResult {
   const refuse = (refusal: GitRefusal): GitInvocationPlanResult => ({ ok: false, refusal });
   const plan = (
     args: readonly string[],
@@ -928,7 +978,7 @@ export function planGitInvocation(operation: GitOperation): GitInvocationPlanRes
       // same predicate the providers apply when they compose a descriptor. A
       // descriptor is only as trustworthy as whatever produced it, and `ext::`
       // runs a command of the remote's choosing.
-      if (!isFetchableObjectSourceUrl(operation.fetchUrl)) {
+      if (!isFetchableFetchUrl(operation.fetchUrl, hasAuthorizationHeader)) {
         return refuse({
           code: 'fetchUrlTransport',
           reason: 'Objects can only be fetched from an http or https location that carries no credentials of its own.',
@@ -978,7 +1028,7 @@ export function planGitInvocation(operation: GitOperation): GitInvocationPlanRes
       if (!Number.isInteger(operation.depth) || operation.depth < 1 || operation.depth > MAX_FETCH_DEPTH) {
         return refuse({ code: 'depthOutOfRange', reason: `A fetch depth must be a whole number between 1 and ${String(MAX_FETCH_DEPTH)}.` });
       }
-      if (!isFetchableObjectSourceUrl(operation.fetchUrl)) {
+      if (!isFetchableFetchUrl(operation.fetchUrl, hasAuthorizationHeader)) {
         return refuse({
           code: 'fetchUrlTransport',
           reason: 'Objects can only be fetched from an http or https location that carries no credentials of its own.',

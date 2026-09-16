@@ -1475,7 +1475,19 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   const retryOptions: HostToolRetryOptions = {
     ...options.retry,
     onCheckpointDue: (info) => {
-      void fireCheckpoint(currentPhase, 'toolCadence');
+      // `onCheckpointDue` is a synchronous callback contract (`HostToolRetryOptions`'s own type,
+      // called unawaited from `runWithRetry`'s long-delay branch) — this call is structurally
+      // exempt from both of this file's usual safety nets for a checkpoint-write failure: it is
+      // never inside `run()`'s own top-level try/catch the way every `await`ed `fireCheckpoint` call
+      // is, and it is not `finalizeEscapedError`'s own terminal write, which wraps itself. Left
+      // fire-and-forget, a checkpoint-store failure during a long provider backoff would become an
+      // unhandled promise rejection instead of a recorded failure. `.catch` here records it the same
+      // way `finalizeEscapedError` records its own write failure — a `checkpointWrite` `toolFailed`
+      // activity fact — rather than losing the "this checkpoint failed" signal silently.
+      fireCheckpoint(currentPhase, 'toolCadence').catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        appendActivity({ kind: 'toolFailed', tool: 'checkpointWrite', reason: `Writing this attempt's checkpoint failed: ${message}` }, currentPhase);
+      });
       options.retry?.onCheckpointDue?.(info);
     },
     onEnterWaiting: (info) => {

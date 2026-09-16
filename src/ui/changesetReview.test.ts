@@ -11,8 +11,8 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
-import { changesetDraftKeyFor, retainedFromRun, type ChangesetDraft } from '../app/retainedReview';
-import type { ReviewRunManager } from '../app/reviewRunManager';
+import { changesetDraftKeyFor, changesetPartialDraftKeyFor, retainedFromRun, runKeyForChangeset, type ChangesetDraft } from '../app/retainedReview';
+import type { ReviewRunManager, RunRecord } from '../app/reviewRunManager';
 import type { PodStore } from '../app/pods';
 import type { KeyValueStore } from '../app/storage';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
@@ -228,9 +228,32 @@ function fakeRuns(): ReviewRunManager {
   } as unknown as ReviewRunManager;
 }
 
-async function openPanel(seed: ChangesetDraft = retainedChangesetRecord()) {
+/**
+ * A stand-in for `ReviewRunManager` with the surface the panel touches for a live run — the same
+ * shape `reviewFlow.test.ts`'s own `fakeRuns` uses, so `settle()` can drive a run through to a
+ * `failed` status with a real `partialResult` and notify the panel's subscription, in the
+ * one-writer order the real manager keeps (write the retained record, then notify).
+ */
+function controllableRuns() {
+  const listeners = new Set<(record: RunRecord) => void>();
+  return {
+    subscribe(listener: (record: RunRecord) => void) {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
+    },
+    get: () => undefined,
+    acknowledge: vi.fn(),
+    cancel: vi.fn(),
+    trigger: vi.fn(),
+    settle(record: Partial<RunRecord>): void {
+      for (const listener of [...listeners]) listener(record as RunRecord);
+    },
+  };
+}
+
+async function openPanel(seed: ChangesetDraft = retainedChangesetRecord(), runs: ReviewRunManager = fakeRuns()) {
   const activePod = pod();
-  const podStore = { activePod, list: () => [activePod] } as unknown as PodStore;
+  const podStore = { activePod, list: () => [activePod], upsert: vi.fn(() => Promise.resolve()) } as unknown as PodStore;
   const { AppStore } = await import('../app/appStore.js');
   const appStore = new AppStore({
     podStore,
@@ -252,7 +275,7 @@ async function openPanel(seed: ChangesetDraft = retainedChangesetRecord()) {
       secrets: {} as never,
       workspaceState,
       globalState,
-      runs: fakeRuns(),
+      runs,
       openSingle: () => undefined,
       openDashboard: () => undefined,
     },
@@ -599,5 +622,85 @@ describe('submit posts each member\'s shared prose once, never its own findings 
     // And never the OTHER member's finding at all.
     expect(summary7).not.toContain('Member 8 unanchored finding');
     expect(summary8).not.toContain('Member 7 unanchored finding');
+  });
+});
+
+describe('budget-exhausted resume (feature) mirrored for changesets: the failure card shows the true finding count, and "Use N partial findings" opens the durable partial record', () => {
+  it('runError.partialCount reflects RunRecord.partialResult\'s real item count, never a hardcoded 0 (mirrors ReviewFlowPanel\'s own fix)', async () => {
+    const runs = controllableRuns();
+    await openPanel(undefined as unknown as ChangesetDraft, runs as unknown as ReviewRunManager);
+
+    // `renderRunning`'s failure card only renders on the `'running'` screen (`reviewFlowHtml.ts`) —
+    // the same `run()` transition `reviewFlow.test.ts`'s own equivalent test drives through `'run'`.
+    panel.state.messageHandler?.({ type: 'run' });
+    await flush();
+
+    runs.settle({
+      key: runKeyForChangeset(CHANGESET_ID),
+      status: 'failed',
+      lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+      partialResult: {
+        schemaVersion: '1',
+        agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+        agentLabel: 'Default review',
+        headSha: 'head-1',
+        items: [
+          { id: 'i0', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'Finding 0', body: 'Body', code: '', repoId: 'acme/repo', crNumber: '7' },
+          { id: 'i1', file: 'src/a.ts', anchored: true, line: 2, severity: 'minor', category: 'style', confidence: 80, title: 'Finding 1', body: 'Body', code: '', repoId: 'acme/repo', crNumber: '7' },
+        ],
+        candidates: [],
+      },
+    });
+    await flush();
+
+    expect(panel.webview.html).toContain('2 findings arrived before it stopped.');
+    expect(panel.webview.html).toContain('Use 2 partial findings');
+  });
+
+  it('usePartial reads the durable changeset partial record under changesetPartialDraftKeyFor, never the changeset\'s complete-review key — mirrors the same enterRetained(source) fix ReviewFlowPanel got', async () => {
+    const runs = controllableRuns();
+    const { workspaceState } = await openPanel(undefined as unknown as ChangesetDraft, runs as unknown as ReviewRunManager);
+
+    const partialReview: Review = {
+      repoId: 'changeset',
+      crNumber: CHANGESET_ID,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      modelId: 'lm:acme/turbo',
+      criteria: structuredClone(DEFAULT_CRITERIA),
+      headSha: 'acme/repo!7:head|acme/repo!8:head',
+      items: [
+        { id: 'partial-1', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'The true partial finding from the failed run', body: 'Body', code: '', repoId: 'acme/repo', crNumber: '7' },
+      ],
+      verdicts: {},
+      summary: '',
+    };
+    const partialSeed = retainedFromRun({
+      review: partialReview,
+      ranAt: '2026-09-01T10:14:00.000Z',
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      agentLabel: 'Default review',
+      modelId: 'lm:acme/turbo',
+      completeness: 'partial',
+      limitations: [{ code: 'harness.budgetExhausted', message: 'Budget exhausted.' }],
+    });
+    await workspaceState.update(changesetPartialDraftKeyFor(CHANGESET_ID), partialSeed);
+
+    panel.state.messageHandler?.({ type: 'run' });
+    await flush();
+
+    runs.settle({
+      key: runKeyForChangeset(CHANGESET_ID),
+      status: 'failed',
+      lifecycle: 'failed',
+      failure: { message: 'Budget exhausted.', requestId: 'r1', code: 'harness.budgetExhausted' },
+      partialResult: { schemaVersion: '1', agentId: BUILTIN_AGENT_DESCRIPTOR.id, agentLabel: 'Default review', headSha: 'head-1', items: partialReview.items, candidates: [] },
+    });
+    await flush();
+
+    panel.state.messageHandler?.({ type: 'usePartial' });
+    await flush();
+
+    expect(panel.webview.html).toContain('The true partial finding from the failed run');
   });
 });
