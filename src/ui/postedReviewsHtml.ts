@@ -470,19 +470,39 @@ const SCRIPT = `
   // held draft for this thread (task 7.4b) before it patches #pr-detail, so
   // the value this re-render emits is genuinely empty rather than a DOM node
   // being blanked out from under the reviewer mid-keystroke. A failed send
-  // leaves the held draft alone and patches nothing at all, so the typed text
-  // stays exactly as it was, for a retry.
+  // clears nothing, so the held draft committed below is still the text — the
+  // DOM keeps it, and any later repaint of this region puts it back for a
+  // retry. (It is NOT true that a failure "patches nothing at all", so the
+  // text is safe: this region is patched by every OTHER thread's activity too,
+  // which is why the draft, not the DOM, has to be the copy that survives.)
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
-    // Cancel this thread's pending debounce commit before sending: without
-    // this, a commit still in flight when the reply round-trip finishes can
-    // land AFTER the host clears the draft on success, writing the
-    // already-sent text back in — the next unrelated patch of this region
-    // would then replay it as though it were never sent.
+    // Commit what is about to be sent as this thread's held draft, THEN cancel
+    // the pending debounce so no later timer can re-commit it. Both halves are
+    // needed and the order is the fix:
+    //
+    // Cancelling alone (the previous shape) left the host holding nothing
+    // while the round trip was in flight. Enter fires no click and no blur, so
+    // the release below hands this field back to the host's value — and any
+    // patch of #pr-detail arriving before the send resolves repaints from that
+    // empty state. A resolve or concede on a DIFFERENT thread lands exactly
+    // that patch, wiping text that had not been sent yet. Committing first
+    // makes the draft the copy that outlives the tick: a success deletes it
+    // (task 7.4b) so the box still ends empty, and a failure leaves it as the
+    // retry. Committing the trimmed text — what is actually being sent —
+    // rather than the raw value costs only trailing whitespace on a repaint.
+    //
+    // Cancelling still matters after committing: a timer left armed would
+    // re-commit the same text AFTER the host cleared the draft on success, and
+    // the next unrelated patch would replay it as though it were never sent.
+    post({ type: 'replyDraft', threadId: input.dataset.reply, text });
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
     replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
+    // Enter fires no click or blur (theme.ts), so forget this field's watch
+    // or the sent text outlasts the cleared draft and a second Enter resends it.
+    window.verdictForgetTypedId(input.id);
   }
   document.addEventListener('keydown', (ev) => {
     const el = ev.target.closest('[data-reply]');

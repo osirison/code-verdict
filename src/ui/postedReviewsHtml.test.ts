@@ -178,7 +178,12 @@ describe('the reply field survives a patch (issue #46 tasks 7.4a, 9.3)', () => {
     expect(html).toContain('id="reply-input" data-reply="thread-1" value=""');
   });
 
-  it('posts a debounced replyDraft message on input, never on every keystroke synchronously and never from the send path', () => {
+  // Renamed in round 3: this test used to claim "and never from the send
+  // path", which was the round-2 design. The send path now commits a draft
+  // deliberately (the sibling test below) because that draft is the only copy
+  // of the text while the round trip is unresolved. What this test asserts —
+  // the INPUT path is debounced and per-thread — is unchanged.
+  it('posts a debounced replyDraft message on input, never synchronously on every keystroke', () => {
     const html = renderPostedReviewsHtml(
       state([row([thread()])], { expandedThreadId: 'thread-1' }),
       'nonce123',
@@ -193,15 +198,24 @@ describe('the reply field survives a patch (issue #46 tasks 7.4a, 9.3)', () => {
     expect(html).toContain('replyDraftTimers.set(threadId,');
   });
 
-  it('cancels this thread\'s pending debounce commit before sending, so a slow timer cannot resurrect already-sent text', () => {
+  it('commits the text being sent as this thread\'s draft and only then cancels the pending debounce, both before the reply goes out — the host must hold a copy for as long as the send is unresolved', () => {
     const html = renderPostedReviewsHtml(
       state([row([thread()])], { expandedThreadId: 'thread-1' }),
       'nonce123',
     );
     const submitReply = html.slice(html.indexOf('function submitReply'), html.indexOf('function submitReply') + html.slice(html.indexOf('function submitReply')).indexOf('}\n'));
+    expect(submitReply).toContain("post({ type: 'replyDraft', threadId: input.dataset.reply, text })");
     expect(submitReply).toContain('clearTimeout(replyDraftTimers.get(input.dataset.reply))');
-    // Ordered before the post — cancelling after would already be too late
-    // if the round trip resolves before this tick ends.
+    // Committed before the send: Enter releases REGIONS_SCRIPT's typed hold on
+    // the field, so from here the field is painted from host state alone, and
+    // a patch of #pr-detail from any OTHER thread's activity arriving before
+    // the round trip resolves would otherwise blank an unsent reply.
+    // ("post({ type: 'reply'" does not match the replyDraft line — the closing
+    // quote after `reply` is what separates them.)
+    expect(submitReply.indexOf("post({ type: 'replyDraft'")).toBeLessThan(submitReply.indexOf("post({ type: 'reply'"));
+    // And cancelled before the send too — cancelling after would already be
+    // too late if the round trip resolves before this tick ends, and a timer
+    // left armed would re-commit the text after a success cleared the draft.
     expect(submitReply.indexOf('clearTimeout')).toBeLessThan(submitReply.indexOf("post({ type: 'reply'"));
   });
 });

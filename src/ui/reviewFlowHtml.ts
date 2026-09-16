@@ -2277,9 +2277,14 @@ const on = (id, type, extra) => document.addEventListener('click', (ev) => {
 // ---- in-progress text commits (task 9.3 / design D8) -----------------------
 // Every editable's text is committed to the host on debounced input, never on
 // 'change': 'change' fires on blur, so mid-typing text existed only in the
-// DOM, and a flow-body patch re-rendered the last blurred value over it. The
-// host handlers for these messages store the text and never re-render, so a
-// commit cannot fight the caret in the field it came from.
+// DOM, and a flow-body patch re-rendered the last blurred value over it.
+// 'editSummary', 'setNote' and 'askDraft' store the text and return without
+// rendering, so a commit cannot fight the caret in the field it came from.
+// 'setInstructions' is the one that must render — the context-usage estimate
+// and the resolved '@file' chips answer for the instruction text — and the
+// render it causes carries the DEBOUNCED value, already behind the field it
+// came from. REGIONS_SCRIPT holds the live value against that patch (theme.ts);
+// the flush signals below are what tells it a host-authored value may now land.
 const pendingCommits = new Map();
 const queueCommit = (key, fire) => {
   clearTimeout(pendingCommits.get(key)?.t);

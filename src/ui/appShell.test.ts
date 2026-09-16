@@ -273,8 +273,40 @@ describe('the first-paint size bound (task 8.7)', () => {
    * worth of new rendering, which is precisely the case this bound is written
    * to make someone state out loud rather than absorb. The ~5% margin is
    * restored so the next addition trips it too.
+   *
+   * NOT raised for the lagging-value fix, which grew REGIONS_SCRIPT again (the
+   * 'typed' map that holds a control's live value against a patch carrying the
+   * debounced one): 118,370 → 122,710 as first written, over the bound, then
+   * trimmed to 121,578 by cutting comment prose that said the same thing at
+   * two sites. The bound did its job — the cost was paid down rather than
+   * absorbed — but the headroom is now ~420 characters, not the usual ~5%, so
+   * the next addition of any size trips this and must raise the number with
+   * its own cost stated.
+   *
+   * Tripped exactly as warned by the very next addition: releasing the typed
+   * hold for a page-initiated send (Enter in the reply box, postedReviewsHtml.ts
+   * + the exported `verdictForgetTypedId` in REGIONS_SCRIPT) measured 122,401
+   * as first written, over the bound by 401. Trimmed comment prose at both
+   * call sites down to 121,980 rather than raise the number. Headroom is now
+   * ~20 characters — effectively none — so the next addition of any size
+   * WILL trip this and must raise the number with its own cost stated;
+   * trimming further is no longer realistic.
+   *
+   * Raised to 129,000 by that next addition: 121,980 → 123,182, i.e. 1,182
+   * over. The growth is `submitReply` (postedReviewsHtml.ts) committing the
+   * text it is about to send as this thread's held draft before posting the
+   * reply, plus the rationale for why both that commit and the cancel that
+   * follows it are needed. Releasing the typed hold on Enter (the entry above)
+   * handed the field back to host state while the send was still unresolved,
+   * so any patch of #pr-detail from another thread's activity in that window
+   * blanked an unsent reply — the held draft is now the copy that survives
+   * the round trip. The two trims above were the honest end of trimming: this
+   * is explanatory prose for a defect that shipped twice, and cutting it to
+   * fit an arbitrary line is how the next round loses the reasoning. Headroom
+   * is restored to 5,818 characters (4.5%), the usual ~5% margin, so the
+   * next addition trips this test and states its own cost the same way.
    */
-  const BUDGET_CHARS = 122_000;
+  const BUDGET_CHARS = 129_000;
 
   it(`the shell document stays under ${BUDGET_CHARS} characters`, () => {
     const doc = renderShellDocument({
