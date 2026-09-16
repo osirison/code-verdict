@@ -68,6 +68,23 @@ describe('sanitizePublicText (task 5.5)', () => {
     expect(result).toBe('line one line two bell');
   });
 
+  // gap-2 (U+0085): NEL is a line-break control character that JavaScript's
+  // backslash-s character class does not recognize, unlike CR/LF/LS/PS, which
+  // the whitespace collapse already folds into one space -- it used to survive
+  // this function byte for byte.
+  it('neutralizes a NEL (codepoint 133) the same way as an ordinary line break', () => {
+    const nel = String.fromCharCode(0x85);
+    const result = sanitizePublicText(`off-manifest${nel}path/etc/passwd`);
+    expect(result).not.toContain(nel);
+    expect(result).toBe('off-manifest path/etc/passwd');
+  });
+
+  it('leaves ordinary text with no NEL unchanged', () => {
+    expect(sanitizePublicText('src/app/harnessActivitySanitizer.ts')).toBe(
+      'src/app/harnessActivitySanitizer.ts',
+    );
+  });
+
   it('truncates text longer than the concise-text bound', () => {
     const long = 'x'.repeat(MAX_PUBLIC_TEXT_LENGTH + 100);
     const result = sanitizePublicText(long)!;

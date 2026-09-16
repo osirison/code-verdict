@@ -10,6 +10,14 @@ export interface ChangesetSubmitMember {
   candidatesFor: (file: string) => readonly AnchorCandidate[] | undefined;
   projectLabel?: string;
   workspaceRootLabel?: string;
+  /**
+   * gitlab-anchor-oldpath-never-set: the finding's pre-rename path in this
+   * member's own diff, in provider spelling — threaded to `composeCommentDrafts`
+   * so `DiffAnchor.oldPath` is set and GitLab's `buildPosition` can position a
+   * comment on a renamed file. `undefined` (or omitted) for an unrenamed file,
+   * or a caller that has not wired this in.
+   */
+  oldPathFor?: (file: string) => string | undefined;
 }
 
 export interface ChangesetMemberPlan {
@@ -60,6 +68,7 @@ export function buildChangesetSubmitPlans(
       member.anchorRefs,
       member.candidatesFor,
       member.workspaceRootLabel,
+      member.oldPathFor,
     );
     const comments = composition.drafts.map((comment) => {
       const item = memberItems.find((candidate) => candidate.id === comment.key);

@@ -1149,6 +1149,16 @@ export class ChangesetReviewPanel {
         ));
         return changed ? diffAnchorCandidates(changed.diff) : undefined;
       },
+      // gitlab-anchor-oldpath-never-set: this member's own pre-rename path,
+      // so a renamed file's comment lands with GitLab's required
+      // old_path/new_path pair rather than old_path silently defaulting to
+      // new_path.
+      oldPathFor: (file: string) => {
+        const changed = member.diff.files.find((candidate) => (
+          modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
+        ));
+        return changed?.isRenamed ? changed.oldPath : undefined;
+      },
       projectLabel: member.projectPath,
       workspaceRootLabel: member.workspaceRootLabel,
     }));

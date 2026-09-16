@@ -684,6 +684,23 @@ function redactAtDepth(text: string, depth: number): string {
 const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 /**
+ * NEL (codepoint 133, hex 85) is a line-break control character that JavaScript's
+ * backslash-s character class does not recognize, unlike CR, LF and the other
+ * separators the whitespace collapse below already folds into one space. Left
+ * out of both CONTROL_CHARS (a non-whitespace control code, deleted outright
+ * above) and that collapse, a NEL used to survive this function byte for byte:
+ * a model-authored string carrying one, such as an off-manifest path echoed
+ * into the investigation map that reaches every prompt, could fake a line
+ * break undetected. Split out and joined back with a plain space below,
+ * rather than deleted like an ordinary control code, so it becomes a
+ * separator rather than silently fusing the text on either side of it -
+ * the same treatment neutralizeLineBreaks (./harnessModelSeam.ts) gives it
+ * on the model-facing side. Built from its numeric code point rather than
+ * written as an escape literal, so the byte is unambiguous in source.
+ */
+const NEL_CHAR = String.fromCharCode(0x85);
+
+/**
  * Fails closed: anything that is not a non-empty string after cleaning
  * returns `undefined`, so a caller (the builder) can refuse to append the
  * event rather than store something guessed.
@@ -706,7 +723,7 @@ const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
  */
 export function sanitizePublicText(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined;
-  const redacted = redactSecrets(raw).replace(CONTROL_CHARS, '');
+  const redacted = redactSecrets(raw).replace(CONTROL_CHARS, '').split(NEL_CHAR).join(' ');
   const collapsed = redacted.replace(/\s+/g, ' ').trim();
   if (collapsed.length === 0) return undefined;
   return collapsed.length > MAX_PUBLIC_TEXT_LENGTH ? `${collapsed.slice(0, MAX_PUBLIC_TEXT_LENGTH - 1)}…` : collapsed;

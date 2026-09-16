@@ -25,7 +25,7 @@ import { DEFAULT_CRITERIA } from '../domain/criteria';
 import type { Review } from '../domain/types';
 import type { ScmProvider } from '../platform/provider';
 import { clearProviders, registerProvider } from '../platform/registry';
-import type { ChangeRequestDiff, ChangeRequestRef, SubmitResult } from '../platform/types';
+import type { ChangeRequestDiff, ChangeRequestRef, ReviewCommentDraft, ReviewSubmission, SubmitResult } from '../platform/types';
 import { GITHUB_VOCABULARY } from '../testing/specFixtures';
 import type { ReviewFlowDeps } from './reviewFlow';
 import { VerdictSidebarProvider, VerdictStatusBar } from './sidebar';
@@ -216,6 +216,9 @@ const DIFF: ChangeRequestDiff = {
   files: [
     { oldPath: 'src/a.ts', newPath: 'src/a.ts', diff: '@@ -1 +1 @@\n+const a = 1;' },
     { oldPath: 'src/b.ts', newPath: 'src/b.ts', diff: '@@ -1 +1 @@\n+const b = 2;' },
+    // gitlab-anchor-oldpath-never-set: a renamed-and-edited file, so a draft on it must carry the
+    // pre-rename path through to `DiffAnchor.oldPath`.
+    { oldPath: 'src/old-name.ts', newPath: 'src/new-name.ts', diff: '@@ -1 +1 @@\n+const c = 3;', isRenamed: true },
   ],
   anchorRefs: {},
 };
@@ -601,6 +604,51 @@ describe('the done screen reports actual posted outcomes, never the verdict tall
     );
     expect(entries?.[0]?.postedComments).toBe(1);
     expect(entries?.[0]?.counts.accepted).toBe(2);
+  });
+});
+
+describe('gitlab-anchor-oldpath-never-set: a renamed file carries its old path onto the drafted anchor', () => {
+  it('sets oldPath from the diff for a renamed file, and leaves it unset for one that was not renamed', async () => {
+    const renameReview: Review = {
+      repoId: REF.repoId,
+      crNumber: REF.number,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      modelId: 'lm:acme/turbo',
+      criteria: DEFAULT_CRITERIA,
+      headSha: 'aaaa',
+      items: [
+        { id: 'renamed', file: 'src/new-name.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'Finding on the renamed file', body: 'Body', code: 'const c = 3;' },
+        { id: 'plain', file: 'src/a.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 90, title: 'Finding on the unrenamed file', body: 'Body', code: 'const a = 1;' },
+      ],
+      verdicts: {},
+      summary: '',
+    };
+    const seed = retainedFromRun({
+      review: renameReview,
+      ranAt: RAN_AT,
+      agentId: BUILTIN_AGENT_DESCRIPTOR.id,
+      agentLabel: 'Security Reviewer',
+      modelId: 'lm:acme/turbo',
+    });
+    const h = await harness(seed);
+    await h.open();
+
+    let captured: ReviewCommentDraft[] = [];
+    world.submitReview = (submission) => {
+      captured = (submission as unknown as ReviewSubmission).comments;
+      return defaultSubmitReview(submission);
+    };
+
+    await h.post({ type: 'verdict', itemId: 'renamed', verdict: 'accepted' });
+    await h.post({ type: 'verdict', itemId: 'plain', verdict: 'accepted' });
+    await h.post({ type: 'generateSummary' });
+    await h.post({ type: 'submit' });
+
+    const renamed = captured.find((comment) => comment.key === 'renamed');
+    const plain = captured.find((comment) => comment.key === 'plain');
+    expect(renamed?.anchor.oldPath).toBe('src/old-name.ts');
+    expect(renamed?.anchor.filePath).toBe('src/new-name.ts');
+    expect(plain?.anchor.oldPath).toBeUndefined();
   });
 });
 

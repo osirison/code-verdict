@@ -85,6 +85,29 @@ describe('outbound payloads reproduce the postDiscussionRequest fixture', () => 
     });
   });
 
+  // gitlab-anchor-oldpath-never-set: GitLab needs BOTH old_path and new_path to position a
+  // comment on a renamed-and-edited file — old_path silently defaulting to new_path (the bug)
+  // mis-positions the comment against the wrong file identity.
+  describe('buildPosition — old_path on a renamed file', () => {
+    const mr = fixtures.gitlabMergeRequest as { diff_refs: Record<string, string> };
+    const refs = mr.diff_refs;
+
+    it('sends the anchor oldPath as old_path, alongside filePath as new_path', () => {
+      const position = buildPosition({
+        filePath: 'src/auth/token-new.ts',
+        oldPath: 'src/auth/token-old.ts',
+        line: 63,
+        refs,
+      });
+      expect(position).toMatchObject({ old_path: 'src/auth/token-old.ts', new_path: 'src/auth/token-new.ts' });
+    });
+
+    it('defaults old_path to filePath when the anchor carries no oldPath (an unrenamed file)', () => {
+      const position = buildPosition({ filePath: 'src/auth/token.ts', line: 63, refs });
+      expect(position).toMatchObject({ old_path: 'src/auth/token.ts', new_path: 'src/auth/token.ts' });
+    });
+  });
+
   it('extends the suggestion span for multi-line anchors', () => {
     const body = buildCommentBody({
       key: 'itm_01H9Z5',

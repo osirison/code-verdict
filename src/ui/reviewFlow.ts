@@ -736,6 +736,20 @@ export class ReviewFlowPanel {
     return diffAnchorCandidates(changed.diff);
   }
 
+  /**
+   * gitlab-anchor-oldpath-never-set: the finding's pre-rename path, in
+   * provider spelling, so `composeCommentDrafts` can carry it onto
+   * `DiffAnchor.oldPath` — GitLab's `buildPosition` needs BOTH `old_path` and
+   * `new_path` to position a comment on a renamed file, and without this it
+   * silently defaulted `old_path` to `new_path`, mis-positioning the comment.
+   * `undefined` for an unrenamed file, exactly like `composeCommentDrafts`'s
+   * own contract documents.
+   */
+  private oldPathFor(diff: ChangeRequestDiff, file: string): string | undefined {
+    const changed = diff.files.find((f) => f.newPath === this.providerFilePath(file));
+    return changed?.isRenamed ? changed.oldPath : undefined;
+  }
+
   private markMoved(diff: ChangeRequestDiff): Set<string> {
     if (!this.review) return new Set();
     return movedAnchors(this.review.items, (file) => this.anchorCandidates(diff, file));
@@ -1644,6 +1658,7 @@ export class ReviewFlowPanel {
       diff.anchorRefs,
       (file) => this.anchorCandidates(diff, file),
       this.workspaceRootLabel(),
+      (file) => this.oldPathFor(diff, file),
     );
   }
 

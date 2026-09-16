@@ -131,6 +131,36 @@ describe('changeset submission', () => {
     expect(plans.flatMap((plan) => plan.withheld)).toEqual([]);
   });
 
+  // gitlab-anchor-oldpath-never-set: `oldPathFor` is threaded from `ChangesetSubmitMember` through
+  // to `composeCommentDrafts`, so a renamed file's drafted anchor carries the pre-rename path a
+  // member supplies. A member that omits `oldPathFor` (or returns undefined) keeps today's
+  // behavior — `oldPath` stays unset.
+  it('carries a member-supplied oldPathFor onto a renamed file drafted anchor', () => {
+    const renameReview: Review = {
+      ...review,
+      items: [
+        { ...review.items[0]!, id: 'renamed', repoId: 'repo-a', crNumber: '1', file: 'src/new-name.ts', line: 5, code: 'renamed();' },
+        { ...review.items[0]!, id: 'plain', repoId: 'repo-a', crNumber: '1', file: 'src/other.ts', line: 5, code: 'plain();' },
+      ],
+      verdicts: {
+        renamed: { verdict: 'accepted', applyFix: false },
+        plain: { verdict: 'accepted', applyFix: false },
+      },
+    };
+    const plans = buildChangesetSubmitPlans(renameReview, [
+      {
+        ref: { repoId: 'repo-a', number: '1' },
+        anchorRefs: { head: 'a' },
+        candidatesFor: (file) => (file === 'src/new-name.ts' || file === 'src/other.ts' ? [{ line: 5, text: 'renamed();' }, { line: 5, text: 'plain();' }] : undefined),
+        oldPathFor: (file) => (file === 'src/new-name.ts' ? 'src/old-name.ts' : undefined),
+      },
+    ], 'Agent', 'you', 'Summary.', false, false);
+
+    const comments = plans[0]?.submission.comments ?? [];
+    expect(comments.find((comment) => comment.key === 'renamed')?.anchor.oldPath).toBe('src/old-name.ts');
+    expect(comments.find((comment) => comment.key === 'plain')?.anchor.oldPath).toBeUndefined();
+  });
+
   it('includes only each member accepted unanchored and withheld findings in its summary', () => {
     const memberSummaryReview: Review = {
       ...review,
