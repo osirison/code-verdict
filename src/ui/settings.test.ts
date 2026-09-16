@@ -219,6 +219,63 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     expect(posted.regions['set-json']).toContain('&quot;codeVerdict.context.sectionBudget&quot;: 6000');
   });
 
+  it('a harness numeric setting patches only harness and JSON, and funnels through the harness config namespace', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+    world.testConnection.mockClear();
+    world.discoverAgents.mockClear();
+
+    handlers.message?.({ type: 'setHarnessNumber', key: 'maxModelTurnsPerAttempt', value: 128 });
+    await flush();
+
+    expect(world.testConnection).not.toHaveBeenCalled();
+    expect(world.discoverAgents).not.toHaveBeenCalled();
+    expect(configBacking.get('harness.maxModelTurnsPerAttempt')).toBe(128);
+    const posted = lastPosted();
+    expect(Object.keys(posted.regions).sort()).toEqual(['set-harness', 'set-json']);
+    expect(posted.regions['set-harness']).toContain('data-harness-number="maxModelTurnsPerAttempt" type="number" min="1" step="1" value="128"');
+    expect(posted.regions['set-json']).toContain('&quot;codeVerdict.harness.maxModelTurnsPerAttempt&quot;: 128');
+  });
+
+  it('a setHarnessNumber message for a key this change does not expose is ignored', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+
+    // Not one of `HARNESS_POLICY_SETTINGS`' keys — a provider page size, deliberately never exposed.
+    handlers.message?.({ type: 'setHarnessNumber', key: 'manifestPageSize', value: 500 });
+    await flush();
+
+    expect(configBacking.has('harness.manifestPageSize')).toBe(false);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('the risk-coverage control writes the enum setting and rejects a non-risk-level value', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+
+    handlers.message?.({ type: 'setHarnessMinRisk', value: 'medium' });
+    await flush();
+    expect(configBacking.get('harness.requireInspectionMinRisk')).toBe('medium');
+    const posted = lastPosted();
+    expect(Object.keys(posted.regions).sort()).toEqual(['set-harness', 'set-json']);
+    expect(posted.regions['set-harness']).toMatch(/class="active" data-min-risk="medium"/);
+
+    panel.webview.postMessage.mockClear();
+    handlers.message?.({ type: 'setHarnessMinRisk', value: 'not-a-risk-level' });
+    await flush();
+    expect(configBacking.get('harness.requireInspectionMinRisk')).toBe('medium');
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
   it('the explicit re-test control does call testConnection, and only then does the status change', async () => {
     const { deps } = makeDeps();
     const { SettingsPanel } = await import('./settings.js');
@@ -238,7 +295,7 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     // remaining path that picks up a config edit made outside this page
     // while it was already open (see `testLiveState`'s comment).
     expect(Object.keys(posted.regions).sort()).toEqual(
-      ['set-agents', 'set-connection', 'set-context', 'set-json', 'set-notifications', 'set-privacy'].sort(),
+      ['set-agents', 'set-connection', 'set-context', 'set-harness', 'set-json', 'set-notifications', 'set-privacy'].sort(),
     );
     expect(posted.regions['set-connection']).toContain('connection failed');
   });

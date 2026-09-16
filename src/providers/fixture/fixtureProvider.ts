@@ -13,10 +13,16 @@ import type {
 } from '../../platform/provider';
 import type {
   ChangeRequest,
+  ChangeRequestDetailRequest,
+  ChangeRequestDetailResult,
   ChangeRequestDiff,
   ChangeRequestRef,
   CiRun,
   ConnectionStatus,
+  CurrentHeadResult,
+  IssueDetailRequest,
+  IssueDetailResult,
+  ObjectSourceResult,
   Repository,
   ReviewSubmission,
   ReviewThread,
@@ -29,6 +35,9 @@ import { ScmError } from '../../platform/errors';
 // shares that grammar. A pure parser, not the GitLab provider itself.
 import { parseSourceInput } from '../gitlab/sourceInput';
 import * as data from './data';
+// Task 1.3 deterministic harness fixtures — the investigation registry below
+// reuses these verbatim instead of inventing new adversarial content.
+import * as harnessFixtures from './harnessFixtures';
 
 const CAPABILITIES: ProviderCapabilities = {
   suggestions: true,
@@ -37,6 +46,14 @@ const CAPABILITIES: ProviderCapabilities = {
   threadResolution: true,
   groupHierarchy: true,
   batchedReview: false,
+  // D7: the two detail reads. The five revision-pinned operations this used to
+  // declare moved to `./demoInvestigationSource.ts` with their dataset, when
+  // the provider stopped being an investigation source at all.
+  detailRetrieval: {
+    changeRequestDetails: { supported: true },
+    issueDetails: { supported: true },
+    pagination: { maxPageSize: harnessFixtures.HUGE_REVIEW_PAGE_SIZE },
+  },
 };
 
 const VOCABULARY: Vocabulary = {
@@ -69,6 +86,18 @@ export interface FixtureSimulation {
   staleAnchorKeys?: ReadonlySet<string>;
   /** Every write fails with this error. */
   failAll?: ScmError;
+  /**
+   * Every *detail* read fails with the neutral rate-limited error — the two
+   * structured detail retrievals and the head check, which is all this
+   * connection is asked for now. The manifest, diff, file and search reads it
+   * used to cover moved to `./demoInvestigationSource.ts` with the rest of
+   * investigation, and carry their own flag there.
+   */
+  investigationRateLimited?: boolean;
+}
+
+function investigationRateLimitedError(): ScmError {
+  return new ScmError('rateLimited', 'Detail read is rate limited', { retryAfterSeconds: 30 });
 }
 
 function crKey(ref: ChangeRequestRef): string {
@@ -238,6 +267,90 @@ export class FixtureConnection implements Connection {
 
   async approve(_ref: ChangeRequestRef): Promise<void> {
     // No-op in the fixture.
+  }
+
+  async getChangeRequestDetails(request: ChangeRequestDetailRequest): Promise<ChangeRequestDetailResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const cr = data.CHANGE_REQUESTS.find((c) => c.ref.repoId === request.snapshot.repoId && c.ref.number === request.number);
+    if (!cr) return { snapshot: request.snapshot, state: 'notFound', reason: `No such change request: ${request.number}` };
+    const discussion = data.THREADS.filter((t) => t.crRef.repoId === cr.ref.repoId && t.crRef.number === cr.ref.number).flatMap((t) => t.notes);
+    const partOf = /Part-of: #(\d+)/.exec(cr.description ?? '');
+    return {
+      snapshot: request.snapshot,
+      state: 'complete',
+      value: {
+        title: cr.title,
+        body: cr.description,
+        labels: [],
+        commits: [],
+        discussion,
+        checkSummaries: cr.ci ? [{ name: 'pipeline', status: cr.ci.status, summary: `Pipeline ${cr.ci.runId}` }] : [],
+        relationships: partOf ? [{ kind: 'partOf', ref: partOf[1]! }] : [],
+        unavailableSections: ['labels', 'commits'],
+      },
+    };
+  }
+
+  async getIssueDetails(request: IssueDetailRequest): Promise<IssueDetailResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    const isLongIssue =
+      request.issueRepoId === harnessFixtures.LONG_ISSUE.repoId && request.issueNumber === harnessFixtures.LONG_ISSUE.number;
+    const workItem = isLongIssue
+      ? harnessFixtures.LONG_ISSUE
+      : data.WORK_ITEMS.find((w) => w.repoId === request.issueRepoId && w.number === request.issueNumber);
+    if (!workItem) {
+      return { snapshot: request.snapshot, state: 'notFound', reason: `No such issue: ${request.issueRepoId}#${request.issueNumber}` };
+    }
+    return {
+      snapshot: request.snapshot,
+      state: 'complete',
+      value: {
+        title: workItem.title,
+        body: workItem.description,
+        labels: [],
+        commits: [],
+        discussion: isLongIssue ? harnessFixtures.LONG_DISCUSSION.notes : [],
+        checkSummaries: [],
+        relationships: [],
+        unavailableSections: isLongIssue
+          ? ['labels', 'commits', 'checkSummaries', 'relationships']
+          : ['labels', 'commits', 'discussion', 'checkSummaries', 'relationships'],
+      },
+    };
+  }
+
+  async getCurrentHead(ref: ChangeRequestRef): Promise<CurrentHeadResult> {
+    if (this.simulate.investigationRateLimited) throw investigationRateLimitedError();
+    // The one deliberately drifted fixture: a push landed after the snapshot.
+    if (ref.repoId === harnessFixtures.CHANGED_HEAD_REF.repoId && ref.number === harnessFixtures.CHANGED_HEAD_REF.number) {
+      return { repoId: ref.repoId, state: 'resolved', headSha: harnessFixtures.CHANGED_HEAD_LATER_SHA };
+    }
+    const cr = data.CHANGE_REQUESTS.find((c) => c.ref.repoId === ref.repoId && c.ref.number === ref.number);
+    if (!cr) return { repoId: ref.repoId, state: 'notFound' };
+    return { repoId: ref.repoId, state: 'resolved', headSha: cr.headSha };
+  }
+
+  /**
+   * There is no object source, stated rather than left unimplemented
+   * (`add-local-git-investigation` task 2.4).
+   *
+   * This provider's content is built in memory from `./data.ts` and
+   * `./harnessFixtures.ts`; `demo.invalid` is a reserved name that resolves
+   * nowhere, and no commit here exists in any repository. Returning a
+   * descriptor pointing at it would be a lie that a demo pod pays for with a
+   * network fetch at source-selection time — the one moment nothing should be
+   * waiting on a remote.
+   *
+   * Implementing it as an explicit refusal is also what keeps the contract
+   * suite's unavailable branch exercised: GitHub and GitLab both answer with a
+   * descriptor, so without this the "or reports it unavailable with a reason"
+   * half of task 2.5's conformance case would never run against anything.
+   */
+  async getObjectSource(_ref: ChangeRequestRef): Promise<ObjectSourceResult> {
+    return {
+      state: 'unavailable',
+      reason: 'This provider serves built-in sample data from memory; its revisions exist in no repository to fetch from.',
+    };
   }
 }
 

@@ -8,6 +8,7 @@ import { clearProviders, registerProvider } from '../platform/registry';
 import { registerBuiltInProviders } from '../registry';
 import { legacyTokenSecretKey, tokenSecretKey, type SecretStore } from './storage';
 import type { Pod } from '../domain/types';
+import { clearRegisteredSecretValues, redactSecrets } from './harnessActivitySanitizer';
 
 function secretsWith(entries: Record<string, string> = {}): SecretStore & { seen: Map<string, string> } {
   const seen = new Map(Object.entries(entries));
@@ -170,5 +171,46 @@ describe('a pod that recorded its auth mode is not re-authenticated as someone e
     });
     await expect(connectionForPod(pod('github', 'https://ghe.example.test', 'session'), secrets))
       .resolves.toBeDefined();
+  });
+});
+
+/**
+ * The one place the redactor's strongest layer gets its facts. `harnessActivitySanitizer.ts` had
+ * three separate holes in a day, each a credential that was plainly present and simply did not
+ * have the syntax the pattern expected. A value the host is holding does not need a shape to be
+ * recognised — but only if something tells the redactor about it, and this is the only point where
+ * a credential of either kind becomes a value the rest of the extension can hold.
+ *
+ * The secrets below are deliberately opaque: no `ghp_`/`glpat-` prefix, nothing any pattern in the
+ * sanitizer recognises, so a passing assertion can only mean registration happened.
+ */
+describe('a credential the host materialises is registered with the redactor', () => {
+  afterEach(clearRegisteredSecretValues);
+
+  it('registers a pasted token, so it is redacted wherever it later appears', async () => {
+    registerBuiltInProviders();
+    const opaque = 'Qp7xTv2rLw8sNb4cZk3m';
+    expect(redactSecrets(`plain ${opaque} text`)).toContain(opaque); // nothing knows it yet
+
+    const secrets = secretsWith({ [tokenSecretKey('gitlab', 'https://gitlab.com')]: opaque });
+    await expect(connectionForPod(pod('gitlab', 'https://gitlab.com'), secrets)).resolves.toBeDefined();
+
+    expect(redactSecrets(`plain ${opaque} text`)).toBe('plain [REDACTED] text');
+  });
+
+  it('registers a host-supplied session token too, which stores no secret to find later', async () => {
+    registerBuiltInProviders();
+    const opaque = 'Nb4cZk3mQp7xTv2rLw8s';
+    setSessionProvider(() => Promise.resolve(opaque));
+
+    await expect(connectionForPod(pod('github', 'https://github.com'), secretsWith())).resolves.toBeDefined();
+
+    expect(redactSecrets(`{"note":"used ${opaque}"}`)).not.toContain(opaque);
+  });
+
+  it('registers nothing for a provider that needs no credential', async () => {
+    registerBuiltInProviders();
+    await expect(connectionForPod(pod('fixture', 'https://demo.invalid'), secretsWith())).resolves.toBeDefined();
+    expect(redactSecrets('an ordinary sentence about a demo pod')).toBe('an ordinary sentence about a demo pod');
   });
 });

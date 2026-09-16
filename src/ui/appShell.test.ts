@@ -45,6 +45,22 @@ const settingsState: SettingsViewState = {
     includeLinkedItems: true,
     usageEnabled: true,
   },
+  harness: {
+    maxElapsedSecondsPerAttempt: 1_800,
+    maxModelTurnsPerAttempt: 64,
+    maxToolRequestsPerAttempt: 256,
+    maxPromptKilobytesPerTurn: 192,
+  maxEvidenceMegabytesPerAttempt: 8,
+    highRiskReservePercent: 20,
+    verificationReservePercent: 15,
+    transientRetriesPerOperation: 3,
+    checkpointCadenceToolCalls: 10,
+    retainedCheckpointsPerLineage: 3,
+    maxActivityEventsPerAttempt: 1_000,
+    terminalAttemptHistoryCount: 5,
+    terminalAttemptHistoryMaxAgeDays: 30,
+    requireInspectionMinRisk: 'low',
+  },
   connected: true,
   hasToken: true,
   quietMode: false,
@@ -246,8 +262,19 @@ describe('the first-paint size bound (task 8.7)', () => {
    * screen joining the union (5–15k of CSS and script) must trip this test
    * and raise the number consciously, with the cost stated. The shell is
    * paid once per panel lifetime; before D7 every navigation paid ~40k.
+   *
+   * Raised again to 122,000 when the agentic review harness merged with main:
+   * measured 116,754, i.e. 754 over, and neither side alone crossed it. The
+   * union carries main's screen-scoped triage keys (the hidden per-screen
+   * marker and the widened typing-surface guard) plus the harness's own run
+   * screen — lifecycle and action lines, progress bar, coverage, plan block,
+   * limitations, activity feed and the retained-details/conclusion blocks —
+   * where before there was a percentage and a step list. That is a screen's
+   * worth of new rendering, which is precisely the case this bound is written
+   * to make someone state out loud rather than absorb. The ~5% margin is
+   * restored so the next addition trips it too.
    */
-  const BUDGET_CHARS = 116_000;
+  const BUDGET_CHARS = 122_000;
 
   it(`the shell document stays under ${BUDGET_CHARS} characters`, () => {
     const doc = renderShellDocument({

@@ -146,6 +146,7 @@ const TOKEN_TS_DIFF = `@@ -60,6 +60,6 @@ export class TokenStore {
 export const DIFFS: ChangeRequestDiff[] = [
   {
     ref: { repoId: '9101', number: '2841' },
+    baseSha: DIFF_REFS.base_sha,
     headSha: DIFF_REFS.head_sha,
     files: [
       { oldPath: 'src/auth/token.ts', newPath: 'src/auth/token.ts', diff: TOKEN_TS_DIFF },
@@ -159,6 +160,7 @@ export const DIFFS: ChangeRequestDiff[] = [
   },
   {
     ref: { repoId: '9102', number: '812' },
+    baseSha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a2',
     headSha: 'b2c3d4e5f60718293a4b5c6d7e8f9012345678a1',
     files: [
       {
@@ -177,6 +179,7 @@ export const DIFFS: ChangeRequestDiff[] = [
     // The producer half of the seeded cross-repo mismatch: the gateway
     // renames the response field to `expires_at`.
     ref: { repoId: '9103', number: '381' },
+    baseSha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a3',
     headSha: 'c3d4e5f60718293a4b5c6d7e8f9012345678a1b2',
     files: [
       {
@@ -194,6 +197,7 @@ export const DIFFS: ChangeRequestDiff[] = [
   {
     // …and the consumer half: the console still reads `.expiry`.
     ref: { repoId: '9210', number: '1509' },
+    baseSha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a4',
     headSha: 'd4e5f60718293a4b5c6d7e8f9012345678a1b2c3',
     files: [
       {
@@ -210,6 +214,7 @@ export const DIFFS: ChangeRequestDiff[] = [
   },
   {
     ref: { repoId: '9102', number: '804' },
+    baseSha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a5',
     headSha: 'e5f60718293a4b5c6d7e8f9012345678a1b2c3d4',
     files: [
       {
@@ -226,6 +231,7 @@ export const DIFFS: ChangeRequestDiff[] = [
   },
   {
     ref: { repoId: '9103', number: '385' },
+    baseSha: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456a6',
     headSha: 'f60718293a4b5c6d7e8f9012345678a1b2c3d4e5',
     files: [
       {

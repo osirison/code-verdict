@@ -204,13 +204,43 @@ describe('changeset submission', () => {
     expect(plans[1]?.withheld.map((item) => item.id)).toEqual(['lost-b']);
     const repoASummary = plans[0]?.submission.summary ?? '';
     const repoBSummary = plans[1]?.submission.summary ?? '';
-    expect(repoASummary).toContain('projectId=repo-a mrIid=1 file=src/shared.ts:999');
-    expect(repoBSummary).toContain('projectId=repo-b mrIid=2 file=src/other.ts:888');
-    expect(repoASummary.match(/Attachment-only A/g)).toHaveLength(1);
+    // Each member's own summary carries only its own change request's
+    // findings, and — since a per-member submission never mixes more than
+    // one change request — never names that identity at all: the summary
+    // already sits on it.
+    expect(repoASummary).toContain('`src/shared.ts`, line 999');
+    expect(repoBSummary).toContain('`src/other.ts`, line 888');
+    expect(repoASummary).not.toContain('change request');
+    expect(repoBSummary).not.toContain('change request');
+    expect(repoASummary).not.toContain('projectId=');
+    expect(repoBSummary).not.toContain('mrIid=');
+    // A title's hyphen comes back backslash-escaped (`escapeMarkdownText`) —
+    // still "Attachment-only A" to a reader, never literal markdown syntax.
+    expect(repoASummary.match(/Attachment\\-only A/g)).toHaveLength(1);
     expect(repoASummary.match(/Lost anchored A/g)).toHaveLength(1);
-    expect(repoBSummary.match(/Attachment-only B/g)).toHaveLength(1);
+    expect(repoBSummary.match(/Attachment\\-only B/g)).toHaveLength(1);
     expect(repoBSummary.match(/Lost anchored B/g)).toHaveLength(1);
-    expect(repoASummary).not.toMatch(/Attachment-only B|Lost anchored B/);
-    expect(repoBSummary).not.toMatch(/Attachment-only A|Lost anchored A/);
+    expect(repoASummary).not.toMatch(/Attachment\\-only B|Lost anchored B/);
+    expect(repoBSummary).not.toMatch(/Attachment\\-only A|Lost anchored A/);
+  });
+
+  it('reports withheldCount so completion is never blind to what anchor resolution dropped (mandate C)', async () => {
+    // Every comment for this member's one item is withheld by
+    // `candidatesFor` returning nothing that matches — `complete` still
+    // becomes true (nothing was attempted, nothing is pending), but a caller
+    // reading only `complete` must not conclude the finding was posted.
+    const plans = buildChangesetSubmitPlans(review, [
+      { ref: { repoId: '9103', number: '381' }, anchorRefs: { head: 'gateway' }, candidatesFor: () => [] },
+    ], 'Agent', 'you', 'Summary.', false, false);
+    expect(plans[0]?.withheld.map((item) => item.id)).toEqual(['gateway']);
+
+    const submitReview = vi.fn(async (_ref, submission: ReviewSubmission): Promise<SubmitResult> => ({
+      comments: submission.comments.map((c) => ({ key: c.key, ok: true })),
+      summaryPosted: true,
+    }));
+    const connection = { submitReview } as unknown as Connection;
+    const result = await performChangesetSubmit(connection, plans);
+    expect(result.complete).toBe(true);
+    expect(result.withheldCount).toBe(1);
   });
 });

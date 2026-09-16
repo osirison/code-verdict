@@ -6,7 +6,7 @@ import {
   type AttachmentKind,
   type AttachmentRange,
 } from './reviewContext';
-import { modelVisiblePathForUri, type ModelVisibleWorkspaceRoot } from './modelVisiblePath';
+import { modelVisiblePathForUri, normalizePathSlashes, type ModelVisibleWorkspaceRoot } from './modelVisiblePath';
 
 export interface AttachmentUri {
   readonly path: string;
@@ -139,7 +139,7 @@ function basename(path: string): string {
 }
 
 function normalizePath(path: string): string {
-  return path.replace(/\\/g, '/').replace(/^\.\//, '');
+  return normalizePathSlashes(path);
 }
 
 function sourceUri(target: FileAttachmentTarget): string {

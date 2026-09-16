@@ -28,7 +28,7 @@ Every initial review and rerun SHALL execute through the same agentic review har
 
 ### Requirement: A run starts from an immutable snapshot and isolated bootstrap
 
-Before model work begins, the host SHALL snapshot immutable repository identity, base and head revisions, target identity, selected agent instructions and persona, criteria, model, thinking effort, context controls, and host-owned tool contracts. The bootstrap SHALL include normalized full linked-issue details; normalized full change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships; root `AGENTS.md` policy from the base revision; and references that let large sections be reopened. Full CI logs and the patch SHALL NOT be included in bootstrap.
+Before model work begins, the host SHALL snapshot immutable repository identity, base and head revisions, target identity, selected agent instructions and persona, criteria, model, thinking effort, context controls, and host-owned tool contracts. The bootstrap SHALL include normalized full linked-issue details; normalized full change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships; root `AGENTS.md`/`CLAUDE.md` policy identity and its composed text from the base revision (`CLAUDE.md` serves as a fallback when `AGENTS.md` is absent and as a companion when both exist); and references that let large sections be reopened. Full CI logs and the patch SHALL NOT be included in bootstrap. When the composed policy text cannot fit the model's input limit alongside the rest of the envelope, the host SHALL degrade to identity plus a stated reason rather than send a silently truncated policy body.
 
 #### Scenario: Bootstrap is assembled
 
@@ -52,12 +52,13 @@ Before model work begins, the host SHALL snapshot immutable repository identity,
 #### Scenario: Target head changes after snapshot
 
 - **WHEN** the provider reports a different head revision before final completion
-- **THEN** the attempt cannot complete successfully
+- **THEN** the attempt still completes successfully against the pinned snapshot — a review of the pinned revision is valid regardless of what the branch did afterward
+- **AND** the result states that the head moved, naming the pinned and current revisions
 - **AND** evidence from the old head is not relabelled or reused as evidence for the new head
 
 ### Requirement: The model plans and investigates through bounded host tools
 
-The harness SHALL let the model create and revise a public plan, classify risk, and choose investigation steps. All investigation SHALL use host-authorized, revision-pinned, paginated or otherwise bounded tools. The available tools SHALL include changed-file manifest retrieval, diff reads, base and head file-range reads, repository search, diff search, applicable nested base-revision `AGENTS.md` policy resolution, issue and change-request detail retrieval, incremental candidate-finding submission, and completion requests.
+The harness SHALL let the model create and revise a public plan, classify risk, and choose investigation steps. All investigation SHALL use host-authorized, revision-pinned, paginated or otherwise bounded tools. The available tools SHALL include changed-file manifest retrieval, diff reads, base and head file-range reads, repository search, diff search, applicable nested base-revision `AGENTS.md`/`CLAUDE.md` policy resolution, issue and change-request detail retrieval, incremental candidate-finding submission, and completion requests.
 
 #### Scenario: Model investigates a subsystem
 
@@ -73,9 +74,15 @@ The harness SHALL let the model create and revise a public plan, classify risk, 
 
 #### Scenario: Nested policy applies to a file
 
-- **WHEN** the model investigates a changed file beneath one or more nested `AGENTS.md` files
-- **THEN** the policy tool resolves the applicable policy chain from the base revision
+- **WHEN** the model investigates a changed file beneath one or more nested `AGENTS.md`/`CLAUDE.md` files
+- **THEN** the policy tool resolves the applicable policy chain from the base revision, checking both file names at every level
 - **AND** the host applies that policy to the investigation without making it citable evidence
+
+#### Scenario: Repository policy is absent versus unavailable
+
+- **WHEN** the host resolves a repository's root policy
+- **THEN** a level where both `AGENTS.md` and `CLAUDE.md` were checked and neither exists is reported as absent
+- **AND** a level the host could not fully check — no readable source, a withheld capability, or a failed read — is reported distinguishably as unavailable, with the reviewer told the principles were not read
 
 #### Scenario: Agent instructions request another tool
 
@@ -129,7 +136,7 @@ The host SHALL maintain a complete changed-file inventory and SHALL track classi
 
 ### Requirement: The host decides whether completion is valid
 
-A model completion request SHALL be advisory. The host SHALL grant complete status only after inventory exhaustion or explicit classification, configured risk coverage, resolution of all required fetches and candidate findings, citation validation, a verification and contradiction pass, deduplication, and confirmation that the target head is unchanged.
+A model completion request SHALL be advisory. The host SHALL grant complete status only after inventory exhaustion or explicit classification, configured risk coverage, resolution of all required fetches and candidate findings, citation validation, a verification and contradiction pass, deduplication, and confirmation that the target head was actually checked before completion. A target head that was checked and found to have moved past the pinned snapshot SHALL NOT withhold complete status on that basis alone — a review of the pinned revision is valid regardless of what the branch did afterward — but the result SHALL disclose the move.
 
 #### Scenario: Complete review with findings
 

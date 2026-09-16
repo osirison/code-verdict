@@ -9,6 +9,22 @@ export interface HunkLine {
   text: string;
   oldLine?: number;
   newLine?: number;
+  /**
+   * 1-based index of this line inside the patch text itself, counting every
+   * physical line including the `@@` headers and the metadata lines the parse
+   * skips. `oldLine`/`newLine` say where a line sits in the *file*; this says
+   * where it sits in the *patch*, which is the only coordinate a caller
+   * holding the patch string can slice by.
+   *
+   * Added for `../app/harnessSynthesisVerification.ts`'s evidence excerpt: it
+   * must cut a window of the exact patch bytes around a citation's file lines,
+   * and a citation's range is in file lines. Without this, that module would
+   * have to re-walk the patch with its own copy of the header regex and the
+   * skip rules below — two parsers that could disagree about which line is
+   * which. Optional so every existing `HunkLine` literal (the UI's fixtures)
+   * stays valid unchanged; it is always set by `parseHunks` itself.
+   */
+  patchLine?: number;
 }
 
 export interface Hunk {
@@ -39,7 +55,21 @@ function parseHunksUncached(diff: string): Hunk[] {
   let oldLine = 0;
   let newLine = 0;
 
-  for (const raw of diff.split('\n')) {
+  // Split on either ending. `HEADER` is anchored at both ends, so a diff whose
+  // lines end `\r\n` left a trailing `\r` on the header line, the match failed,
+  // and every hunk in the file was silently dropped — no anchors, no line
+  // numbers, an empty result indistinguishable from a diff with no hunks. The
+  // same trailing `\r` would otherwise be baked into `HunkLine.text`, which
+  // matters here because citation validation compares exact content.
+  // `patchLine` counts every physical line of this split, including the ones
+  // the body of the loop skips (metadata, `\ No newline`, blanks), because it
+  // is a position in the patch string, not a position in `hunk.lines`. A
+  // caller slicing the patch by these numbers must see the same line count
+  // this split produces — it does: `\r\n` and `\n` are both one separator
+  // here and one `\n` there, so the two agree line for line.
+  let patchLine = 0;
+  for (const raw of diff.split(/\r?\n/)) {
+    patchLine += 1;
     const header = raw.match(HEADER);
     if (header) {
       current = {
@@ -60,13 +90,13 @@ function parseHunksUncached(diff: string): Hunk[] {
     // counting it would shift every anchor after it by one.
     if (raw.startsWith('\\')) continue;
     if (raw.startsWith('+')) {
-      current.lines.push({ kind: 'add', text: raw.slice(1), newLine });
+      current.lines.push({ kind: 'add', text: raw.slice(1), newLine, patchLine });
       newLine += 1;
     } else if (raw.startsWith('-')) {
-      current.lines.push({ kind: 'del', text: raw.slice(1), oldLine });
+      current.lines.push({ kind: 'del', text: raw.slice(1), oldLine, patchLine });
       oldLine += 1;
     } else {
-      current.lines.push({ kind: 'context', text: raw.slice(1), oldLine, newLine });
+      current.lines.push({ kind: 'context', text: raw.slice(1), oldLine, newLine, patchLine });
       oldLine += 1;
       newLine += 1;
     }
@@ -81,6 +111,44 @@ export function addedLines(diff: string): Array<{ line: number; text: string }> 
       .filter((l) => l.kind === 'add' && l.newLine !== undefined)
       .map((l) => ({ line: l.newLine as number, text: l.text })),
   );
+}
+
+/**
+ * Every line a finding can legitimately anchor to in this diff: additions and
+ * unchanged context, numbered on the new (resulting) file — the space every
+ * `ReviewItem.line` is recorded in — plus removed lines, numbered on the old
+ * file, for a finding that is about a deletion rather than a line that still
+ * exists. Supersedes `addedLines` as the anchor candidate universe: an
+ * addition is not the only line a comment can land on, GitHub accepts a
+ * comment on any line inside a diff hunk on either side, and a finding whose
+ * flagged statement sits on a context line (very common in a hunk that
+ * rewrites only part of a function) was previously unable to anchor at all,
+ * however exactly its recorded line and code matched the file.
+ *
+ * A context candidate also carries `oldLine`, its paired old-file line
+ * number — GitLab's position API rejects an unchanged line's position
+ * unless it names both coordinates (`gitlab/mappers.ts#buildPosition`), and
+ * this is the one place that pairing is known: `parseHunks` already tracks
+ * both counters for a context line, it was just never threaded past this
+ * function. An added line has no old-side counterpart to pair with, and a
+ * removed line's `line` already IS the old-side number, so neither sets it.
+ */
+export function diffAnchorCandidates(
+  diff: string,
+): Array<{ line: number; text: string; side: 'old' | 'new'; oldLine?: number }> {
+  const candidates: Array<{ line: number; text: string; side: 'old' | 'new'; oldLine?: number }> = [];
+  for (const hunk of parseHunks(diff)) {
+    for (const l of hunk.lines) {
+      if (l.kind === 'context' && l.newLine !== undefined && l.oldLine !== undefined) {
+        candidates.push({ line: l.newLine, text: l.text, side: 'new', oldLine: l.oldLine });
+      } else if (l.kind === 'add' && l.newLine !== undefined) {
+        candidates.push({ line: l.newLine, text: l.text, side: 'new' });
+      } else if (l.kind === 'del' && l.oldLine !== undefined) {
+        candidates.push({ line: l.oldLine, text: l.text, side: 'old' });
+      }
+    }
+  }
+  return candidates;
 }
 
 /**

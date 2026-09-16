@@ -52,6 +52,61 @@ describe('resolveAnchor', () => {
   });
 });
 
+describe('resolveAnchor — sides (mandate A: widen past added-only)', () => {
+  // A hunk that rewrote the middle of a function: one context line either
+  // side of the change, one removed statement, one added statement.
+  const CANDIDATES = [
+    { line: 40, text: 'function handle(req) {', side: 'new' as const },
+    { line: 41, text: '  const id = req.params.id;', side: 'new' as const },
+    { line: 42, text: '  return store.get(id, token);', side: 'new' as const },
+    { line: 43, text: '}', side: 'new' as const },
+    { line: 41, text: '  return store.get(id);', side: 'old' as const },
+  ];
+
+  it('anchors exactly on a context line — never reachable through added lines alone', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 40, code: 'function handle(req) {' });
+    expect(result).toEqual({ state: 'exact', line: 40, side: 'new' });
+  });
+
+  it('drift-matches a context line that shifted, still on the new side', () => {
+    const shifted = CANDIDATES.map((c) => (c.side === 'new' ? { ...c, line: c.line + 2 } : c));
+    const result = resolveAnchor(shifted, { line: 43, code: '}' });
+    expect(result).toEqual({ state: 'moved', line: 45, side: 'new' });
+  });
+
+  it('anchors a finding about a deletion onto the old side, side LEFT', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 41, code: '  return store.get(id);' });
+    // The new side has no match for this exact text (the rewrite dropped the
+    // token argument), so the old-side deletion — the removed line's own
+    // number — is what the finding is about.
+    expect(result).toEqual({ state: 'exact', line: 41, side: 'old' });
+  });
+
+  it('drift-matches a deletion that moved on the old side, once the new side has no match', () => {
+    const shiftedOld = CANDIDATES.map((c) => (c.side === 'old' ? { ...c, line: c.line + 3 } : c));
+    const result = resolveAnchor(shiftedOld, { line: 41, code: '  return store.get(id);' });
+    expect(result).toEqual({ state: 'moved', line: 44, side: 'old' });
+  });
+
+  it('never lets an old-side line win over a real new-side match, however close its number', () => {
+    // A deleted line numbered exactly where the finding's new-side code also
+    // matches, nearer in number than the true new-side line would ever be
+    // negative distance from — the new-side pass must still win outright,
+    // the old side never even consulted.
+    const withCloserGhost = [
+      ...CANDIDATES,
+      { line: 42, text: '  return store.get(id, token);', side: 'old' as const },
+    ];
+    const result = resolveAnchor(withCloserGhost, { line: 42, code: '  return store.get(id, token);' });
+    expect(result).toEqual({ state: 'exact', line: 42, side: 'new' });
+  });
+
+  it('reports lost, not old-side, when neither side has the code at all', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 41, code: 'somethingElseEntirely();' });
+    expect(result).toEqual({ state: 'lost', line: 41 });
+  });
+});
+
 describe('movedAnchors', () => {
   const items = [
     { id: 'f1', file: 'src/a.ts', line: 4, code: '  return cache.get(key);' },

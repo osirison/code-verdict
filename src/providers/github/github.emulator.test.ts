@@ -371,6 +371,47 @@ describe('listing', () => {
   });
 });
 
+/**
+ * What one change-request diff costs after task 5.1 added the merge-base
+ * lookup, measured rather than asserted in prose. Both halves matter: three
+ * requests, and what the third one costs the second time it is made.
+ */
+describe('the cost of one change-request diff', () => {
+  const MERGE_BASE_SHA = '7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091';
+  const HEAD_SHA = '9f2c1ab4e5d6708192a3b4c5d6e7f8091a2b3c4d';
+
+  it('costs three requests: the pull, its files, and the comparison the merge base comes from', async () => {
+    const log: RequestLog = { paths: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.getChangeRequestDiff(CR);
+
+    expect(log.paths).toEqual([
+      '/repos/acme/core/pulls/2841',
+      '/repos/acme/core/pulls/2841/files',
+      `/repos/acme/core/compare/${MERGE_BASE_SHA}...${HEAD_SHA}`,
+    ]);
+  });
+
+  it('answers the second call entirely from 304s, so the added request is issued but not charged', async () => {
+    // GitHub does not charge a 304 against the rate limit, and `GitHubHttp`
+    // sends every GET conditionally. The compare response is a new URL the
+    // first time and a validator hit after that — which is what makes the
+    // added call cost a round trip rather than a request from the budget.
+    const log: RequestLog = { paths: [], statuses: [] };
+    const conn = createGitHubProvider(makeFakeGitHubFetch({ log })).connect(CONFIG);
+
+    await conn.getChangeRequestDiff(CR);
+    expect(log.statuses).toEqual([200, 200, 200]);
+
+    log.paths.length = 0;
+    log.statuses!.length = 0;
+    await conn.getChangeRequestDiff(CR);
+    expect(log.paths).toHaveLength(3);
+    expect(log.statuses).toEqual([304, 304, 304]);
+  });
+});
+
 describe('source resolution', () => {
   it('reports a well-formed but invisible repository as notVisible, adding nothing', async () => {
     await expect(connect().resolveSource('acme/nope')).resolves.toEqual({
@@ -419,6 +460,13 @@ describe('auth modes are declared per host', () => {
       threadResolution: true,
       groupHierarchy: true,
       batchedReview: true,
+      // The two forge-only detail reads, and nothing else. The five pinned
+      // investigation operations this used to declare are gone from every
+      // provider: a change is read from a local object store, never computed by
+      // a forge. GitHub's `repositorySearch` was already honestly `false` here,
+      // because its code search indexes only a repository's default branch and
+      // cannot be pinned to a revision — the same gap from the other end.
+      detailRetrieval: { changeRequestDetails: { supported: true }, issueDetails: { supported: true }, pagination: { maxPageSize: 100 } },
     });
   });
 });
@@ -892,6 +940,37 @@ describe('threadId is a thread id, in both submit paths', () => {
   });
 });
 
+describe('a batched review that silently drops part of the batch (defect #4)', () => {
+  it('never reports ok:true for a comment GitHub did not confirm creating', async () => {
+    const { conn, anchor } = await draft({ reviewCommentsReturned: 2 });
+    const result = await conn.submitReview(CR, {
+      comments: [
+        { key: 'a', body: 'x', anchor },
+        { key: 'b', body: 'y', anchor },
+        { key: 'c', body: 'z', anchor },
+      ],
+      summary: 's',
+    });
+    // The POST itself succeeded (no throw, no fallback triggered) — only the
+    // confirmed-count check catches the drop.
+    expect(result.comments.map((c) => [c.key, c.ok])).toEqual([
+      ['a', true],
+      ['b', true],
+      ['c', false],
+    ]);
+    expect(result.comments[2]?.error?.message).toMatch(/did not confirm/);
+  });
+
+  it('reports every comment ok when GitHub confirms the full batch', async () => {
+    const { conn, anchor } = await draft();
+    const result = await conn.submitReview(CR, {
+      comments: [{ key: 'a', body: 'x', anchor }, { key: 'b', body: 'y', anchor }],
+      summary: 's',
+    });
+    expect(result.comments.every((c) => c.ok)).toBe(true);
+  });
+});
+
 
 describe('conditional requests — the poll that costs nothing', () => {
   /** A response with header lookup as case-insensitive as a real one. */
@@ -1332,5 +1411,61 @@ describe('stopping before the wall', () => {
     expect(budget.secondsUntilReset('acct', 'core', 50, NOW_MS)).toBeUndefined();
     budget.observe('acct', 'core', { get: (n) => (n === 'x-ratelimit-reset' ? String(RESET_AT) : null) });
     expect(budget.secondsUntilReset('acct', 'core', 50, NOW_MS)).toBe(600);
+  });
+});
+
+describe('anchorPayload — LEFT/RIGHT, start_line/start_side, and the head commit_id', () => {
+  // `anchorPayload` is private to the provider, so it is exercised the same
+  // way every other GitHub request shape in this file is: through a real
+  // `submitReview` call, capturing the POST body the fake would otherwise
+  // just validate and discard.
+  function connectCapturing(options: FakeGitHubOptions = {}) {
+    const inner = makeFakeGitHubFetch(options);
+    const requests: Array<{ body: Record<string, unknown> }> = [];
+    const capturing: FetchLike = async (url, init) => {
+      if (init?.method === 'POST' && init.body) {
+        requests.push({ body: JSON.parse(init.body) as Record<string, unknown> });
+      }
+      return inner(url, init);
+    };
+    return { conn: createGitHubProvider(capturing).connect(CONFIG), requests };
+  }
+
+  it('maps an added line, a context line, a deleted line, and a range, and sends the head commit_id', async () => {
+    const { conn, requests } = connectCapturing();
+    const diff = await conn.getChangeRequestDiff(CR);
+    const refs = diff.anchorRefs as { commitId: string };
+    requests.length = 0;
+
+    await conn.submitReview(CR, {
+      comments: [
+        // An added or context line both take RIGHT + the new-file number —
+        // `oldLine` (only ever set for context) plays no part in what
+        // GitHub receives; anchorPayload does not read it at all.
+        { key: 'added', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 12, side: 'new', refs } },
+        { key: 'context', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 13, side: 'new', oldLine: 13, refs } },
+        // A deleted line takes LEFT + the old-file number.
+        { key: 'deleted', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 8, side: 'old', refs } },
+        // A range takes the end line as `line`, and the start of the range
+        // as `start_line`/`start_side` (same side as the whole range).
+        { key: 'range', body: 'x', anchor: { filePath: 'src/limiter.ts', line: 10, endLine: 12, side: 'new', refs } },
+      ],
+      summary: 's',
+    });
+
+    const reviewRequest = requests.find((r) => Array.isArray(r.body.comments));
+    const comments = reviewRequest?.body.comments as Array<Record<string, unknown>> | undefined;
+    expect(comments?.[0]).toMatchObject({ path: 'src/limiter.ts', line: 12, side: 'RIGHT' });
+    expect(comments?.[0]?.start_line).toBeUndefined();
+    expect(comments?.[1]).toMatchObject({ path: 'src/limiter.ts', line: 13, side: 'RIGHT' });
+    expect(comments?.[1]?.start_line).toBeUndefined();
+    expect(comments?.[2]).toMatchObject({ path: 'src/limiter.ts', line: 8, side: 'LEFT' });
+    expect(comments?.[2]?.start_line).toBeUndefined();
+    expect(comments?.[3]).toMatchObject({
+      path: 'src/limiter.ts', line: 12, side: 'RIGHT', start_line: 10, start_side: 'RIGHT',
+    });
+    // `commit_id` is the single head commit for the whole review, sent
+    // top-level rather than per comment (enforced separately above).
+    expect(reviewRequest?.body.commit_id).toBe(refs.commitId);
   });
 });

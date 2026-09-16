@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseAgentReviewResponse } from '../domain/agentResponse';
-import { resolveAnchor } from '../domain/anchor';
+import { documentCandidates, resolveAnchor } from '../domain/anchor';
 import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { diffAnchorCandidates } from '../domain/diffHunks';
 import { createReview, setVerdict } from '../domain/reviewState';
-import type { Review } from '../domain/types';
+import type { Review, ReviewItem } from '../domain/types';
 import { loadSpecFixtures } from '../testing/specFixtures';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from './submit';
 
@@ -37,7 +38,7 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(drafts.map((d) => d.key)).toEqual(['itm_01H9Z4', 'itm_01H9Z6']);
 
     const blocker = drafts[0];
-    expect(blocker?.body).toContain('**Refresh token logged in error path** · blocker · security · CWE-532');
+    expect(blocker?.body).toContain('**Refresh token logged in error path** · blocker · security · CWE\\-532');
     expect(blocker?.footer).toBe(
       '<sub>Flagged by HVE Core · PR Review (96% confidence), accepted by @you via Code Verdict.</sub>',
     );
@@ -79,9 +80,14 @@ describe('composeCommentDrafts (spec §7)', () => {
     ).drafts.map((draft) => draft.key)).toEqual(['inline']);
     const summary = composeSummaryBody('Review summary.', '', review);
     expect(summary).toContain('## Accepted findings outside the diff');
-    expect(summary).toContain('### docs/evidence.md:12 - Summary only');
+    expect(summary).toContain('### Summary only');
+    expect(summary).toContain('minor · docs · 85% confidence');
+    expect(summary).toContain('`docs/evidence.md`, line 12');
     expect(summary).toContain('Summary body');
-    expect(summary).not.toContain('### src/diff.ts:4');
+    expect(summary).not.toContain('### Inline');
+    // Single change request: its identity is never named, inline or in the
+    // summary — the summary already sits on it.
+    expect(summary).not.toContain('change request');
   });
 
   it('qualifies duplicate changeset attachment paths with member identity', () => {
@@ -103,8 +109,54 @@ describe('composeCommentDrafts (spec §7)', () => {
     review = setVerdict(review, 'second', 'accepted', false);
 
     const summary = composeSummaryBody('Review summary.', '', review);
-    expect(summary).toContain('### projectId=repo-a mrIid=11 file=docs/evidence.md:12 - First member');
-    expect(summary).toContain('### projectId=repo-b mrIid=22 file=docs/evidence.md:12 - Second member');
+    // Two change requests share this summary (the changeset-wide preview),
+    // so each member's identity is named once, grouping its findings —
+    // never repeated into every finding's own heading.
+    const groupA = summary.indexOf('**repo\\-a · change request 11**');
+    const groupB = summary.indexOf('**repo\\-b · change request 22**');
+    expect(groupA).toBeGreaterThanOrEqual(0);
+    expect(groupB).toBeGreaterThanOrEqual(0);
+    const titleFirst = summary.indexOf('### First member');
+    const titleSecond = summary.indexOf('### Second member');
+    expect(titleFirst).toBeGreaterThan(groupA);
+    expect(titleSecond).toBeGreaterThan(groupB);
+    expect(summary).not.toContain('projectId=');
+    expect(summary).not.toContain('mrIid=');
+  });
+
+  it('labels a section by the whole summary\'s span, not that section\'s own slice', () => {
+    const { response: routed } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'combined',
+      items: [
+        { id: 'first', projectId: 'repo-a', mrIid: '11', file: 'docs/evidence.md', line: 12, severity: 'minor', category: 'docs', confidence: 85, title: 'First member', body: 'First body', code: 'stale' },
+        { id: 'second', projectId: 'repo-b', mrIid: '22', file: 'src/diff.ts', line: 999, severity: 'major', category: 'tests', confidence: 90, title: 'Second member', body: 'Second body', code: 'notInTheDiff();' },
+      ],
+    }, {
+      diffPaths: ['src/diff.ts'],
+      attachmentManifest: [{ path: 'docs/evidence.md', ranges: [{ startLine: 12, endLine: 12 }] }],
+    });
+    let review = createReview({
+      repoId: 'changeset', crNumber: 'set-1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response: routed,
+    });
+    review = setVerdict(review, 'first', 'accepted', false);
+    review = setVerdict(review, 'second', 'accepted', false);
+
+    // 'first' is unanchored (repo-a only, routed to "outside the diff");
+    // 'second' is anchored but unresolvable (repo-b, routed to "without a
+    // current inline anchor"). Each section is single-repo on its own —
+    // only the summary as a whole spans two members.
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => []);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((item) => item.id)).toEqual(['second']);
+
+    const summary = composeSummaryBody('Review summary.', '', review, composed.withheld);
+    expect(summary).toContain('## Accepted findings outside the diff');
+    expect(summary).toContain('## Accepted findings without a current inline anchor');
+    // Both single-repo sections still label their group, because the
+    // summary they share spans two members.
+    expect(summary).toContain('**repo\\-a · change request 11**');
+    expect(summary).toContain('**repo\\-b · change request 22**');
   });
 
   it('keeps a drifted diff-file finding anchored, repairs its line, and posts it inline', () => {
@@ -153,7 +205,7 @@ describe('composeCommentDrafts (spec §7)', () => {
     expect(composed.drafts).toEqual([]);
     expect(composed.withheld.map((item) => item.id)).toEqual(['hallucinated']);
     expect(composeSummaryBody('Review summary.', '', review, composed.withheld)).toContain(
-      'Withheld from inline submission because its code does not match a current added line.',
+      '**Withheld:** neither its code nor its reported line matches anything currently in the diff.',
     );
   });
 
@@ -180,9 +232,10 @@ describe('composeCommentDrafts (spec §7)', () => {
       () => [{ line: 9, text: 'realAddedLine();' }],
     );
     expect(composed.drafts).toEqual([]);
-    expect(composeSummaryBody('Review summary.', '', review, composed.withheld)).toContain(
-      '### src/diff.ts:40 - Unchanged context',
-    );
+    const summary = composeSummaryBody('Review summary.', '', review, composed.withheld);
+    expect(summary).toContain('### Unchanged context');
+    expect(summary).toContain('`src/diff.ts`, line 40');
+    expect(summary).toContain('**Withheld:** neither its code nor its reported line matches anything currently in the diff.');
   });
 
   it('never sends a hallucinated line to the provider comment list', async () => {
@@ -239,6 +292,380 @@ describe('composeCommentDrafts (spec §7)', () => {
       storedLineCandidates(review),
       'api',
     ).drafts[0]?.anchor.filePath).toBe('src/diff.ts');
+  });
+
+  it('neutralizes a fence or leading hash marks in a title so the inline comment cannot break markdown structure', () => {
+    const { response: hostile } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'abc123',
+      items: [
+        {
+          id: 'fenced', file: 'src/diff.ts', line: 4, severity: 'major', category: 'tests', confidence: 90,
+          title: 'Closes early\n```\nrm -rf /\n```', body: 'Body one.', code: 'bad();',
+        },
+        {
+          id: 'hashed', file: 'src/diff.ts', line: 5, severity: 'minor', category: 'tests', confidence: 80,
+          title: '### Fake heading', body: 'Body two.', code: 'next();',
+        },
+      ],
+    }, { diffPaths: ['src/diff.ts'] });
+    let review = createReview({
+      repoId: 'repo', crNumber: '1', agentId: 'agent', criteria: DEFAULT_CRITERIA, response: hostile,
+    });
+    review = setVerdict(review, 'fenced', 'accepted', false);
+    review = setVerdict(review, 'hashed', 'accepted', false);
+
+    const { drafts } = composeCommentDrafts(
+      review,
+      'Agent',
+      'you',
+      refs,
+      () => [{ line: 4, text: 'bad();' }, { line: 5, text: 'next();' }],
+    );
+    // The whole headline stays on one line — no bare fence or heading marker
+    // survives to be read as document structure by the renderer.
+    expect(drafts[0]?.body.split('\n')[0]).toBe('**Closes early \\`\\`\\` rm \\-rf / \\`\\`\\`** · major · tests');
+    expect(drafts[1]?.body.split('\n')[0]).toBe('**\\#\\#\\# Fake heading** · minor · tests');
+  });
+});
+
+describe('composeSummaryBody renders a summary-carried finding like something a human wrote', () => {
+  const baseReview: Review = {
+    repoId: 'repo', crNumber: '1', agentId: 'agent', headSha: 'h', summary: '',
+    criteria: DEFAULT_CRITERIA, items: [], verdicts: {},
+  };
+
+  it('renders an outside-the-diff finding as a title heading, an inline-vocabulary meta line, and a full path', () => {
+    const review: Review = {
+      ...baseReview,
+      items: [{
+        id: 'outside', file: 'docs/notes.md', anchored: false, line: 7, severity: 'minor', category: 'docs',
+        confidence: 72, title: 'Stale changelog entry', body: 'The entry still names the old flag.', code: 'flag: old',
+      }],
+      verdicts: { outside: { verdict: 'accepted', applyFix: false } },
+    };
+    expect(composeSummaryBody('Summary.', '', review)).toBe([
+      'Summary.',
+      [
+        '## Accepted findings outside the diff',
+        [
+          '### Stale changelog entry',
+          'minor · docs · 72% confidence',
+          '`docs/notes.md`, line 7',
+          'The entry still names the old flag.',
+        ].join('\n\n'),
+      ].join('\n\n'),
+    ].join('\n\n'));
+  });
+
+  it('renders a withheld finding with its full path, its line, and a labeled withholding reason — never a bare blockquote or a projectId=/mrIid=/file= header', () => {
+    const item: ReviewItem = {
+      id: 'withheld', file: 'gui/src-tauri/src/panel.rs', anchored: true, line: 638, severity: 'major',
+      category: 'craftsmanship', confidence: 88, title: 'click_is_below documentation and name are inverted',
+      body: 'The name and the doc comment disagree about the direction.', code: 'fn click_is_below',
+    };
+    const summary = composeSummaryBody('Summary.', '', baseReview, [item]);
+    expect(summary).toBe([
+      'Summary.',
+      [
+        '## Accepted findings without a current inline anchor',
+        [
+          '### click\\_is\\_below documentation and name are inverted',
+          'major · craftsmanship · 88% confidence',
+          '`gui/src-tauri/src/panel.rs`, line 638',
+          '**Withheld:** neither its code nor its reported line matches anything currently in the diff.',
+          'The name and the doc comment disagree about the direction.',
+        ].join('\n\n'),
+      ].join('\n\n'),
+    ].join('\n\n'));
+    expect(summary).not.toContain('>');
+    expect(summary).not.toContain('projectId=');
+    expect(summary).not.toContain('mrIid=');
+    expect(summary).not.toContain('file=');
+  });
+
+  it('neutralizes a fenced/hash-leading title and a backtick inside the path, so the summary structure survives', () => {
+    const item: ReviewItem = {
+      id: 'hostile', file: 'src/weird`quote.ts', anchored: false, line: 3, severity: 'minor', category: 'docs',
+      confidence: 60, title: '# Fence attack\n```\nrm -rf /\n```', body: 'Body.', code: 'x',
+    };
+    const review: Review = { ...baseReview, items: [item], verdicts: { hostile: { verdict: 'accepted', applyFix: false } } };
+    const summary = composeSummaryBody('Summary.', '', review);
+    // The heading collapses to one line — no bare fence or leading hash
+    // reaches the start of its own line, where it would be read as
+    // document structure instead of the title's own text.
+    expect(summary).toContain('### \\# Fence attack \\`\\`\\` rm \\-rf / \\`\\`\\`');
+    expect(summary.split('\n')).not.toContainEqual(expect.stringMatching(/^```/));
+    // A raw backtick in the path can no longer close the code span early —
+    // the span's own delimiter is a wider run than any inside the path.
+    expect(summary).toContain('``src/weird`quote.ts``, line 3');
+  });
+});
+
+describe('composeSummaryBody names the reviewed revision when the live head has moved (task: submission disclosure)', () => {
+  const baseReview: Review = {
+    repoId: 'repo', crNumber: '1', agentId: 'agent', headSha: 'abcdef1234567', summary: '',
+    criteria: DEFAULT_CRITERIA, items: [], verdicts: {},
+  };
+
+  it('states the reviewed revision as the first line, with both shas short, when the live head differs', () => {
+    const summary = composeSummaryBody('Summary.', '', baseReview, [], 'zzzzzzz9999999');
+    expect(summary).toBe('Reviewed at `abcdef1`; the branch has since moved to `zzzzzzz`.\n\nSummary.');
+  });
+
+  it('omits the line entirely when the live head matches the reviewed head exactly', () => {
+    const summary = composeSummaryBody('Summary.', '', baseReview, [], 'abcdef1234567');
+    expect(summary).toBe('Summary.');
+  });
+
+  it('omits the line when the live head is unknown (the caller never passed one)', () => {
+    expect(composeSummaryBody('Summary.', '', baseReview)).toBe('Summary.');
+  });
+
+  it('omits the line when there is no review at all — nothing was "reviewed" to name a revision for', () => {
+    expect(composeSummaryBody('Summary.', '', undefined, [], 'zzzzzzz9999999')).toBe('Summary.');
+  });
+});
+
+// A hunk that rewrites part of a function, leaving several statements as
+// unchanged context around two real additions. Widening the candidate
+// universe past added-only lines is what makes a finding on any of these
+// context lines anchorable at all — a categorical bug confirmed by reading
+// `anchorCandidates`, independent of whether it is what withheld any one
+// real finding.
+const REWRITE_DIFF = [
+  '@@ -10,7 +10,9 @@ impl Panel {',
+  ' fn shared() {}',
+  '+fn resolve_click_space() -> bool {',
+  '     let a = 1;',
+  '     if a == 1 {',
+  '         return true;',
+  '     }',
+  '+    false',
+  ' }',
+].join('\n');
+
+function itemAt(id: string, line: number, code: string): Record<string, unknown> {
+  return { id, file: 'src/panel.rs', line, severity: 'major', category: 'craftsmanship', confidence: 90, title: id, body: 'Body', code };
+}
+
+describe('mandate A: a finding on a context or removed line anchors inline', () => {
+  const candidatesFor = () => diffAnchorCandidates(REWRITE_DIFF);
+
+  it('anchors five findings that all sit on context lines around a rewritten hunk — none withheld', () => {
+    // New-file line numbers of the five context lines in REWRITE_DIFF: the
+    // function above the rewrite (10), the three untouched statements inside
+    // it (12, 13, 14), and the closing brace (17).
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [
+        itemAt('above', 10, 'fn shared() {}'),
+        itemAt('assign', 12, '    let a = 1;'),
+        itemAt('condition', 13, '    if a == 1 {'),
+        itemAt('return', 14, '        return true;'),
+        itemAt('brace', 17, '}'),
+      ],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    for (const item of response.items) review = setVerdict(review, item.id, 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts.map((d) => [d.key, d.anchor.line, d.anchor.side])).toEqual([
+      ['above', 10, 'new'],
+      ['assign', 12, 'new'],
+      ['condition', 13, 'new'],
+      ['return', 14, 'new'],
+      ['brace', 17, 'new'],
+    ]);
+  });
+
+  it('carries a context anchor\'s paired old-file line, and leaves it off a plain addition', () => {
+    // GitLab's position API needs BOTH coordinates for an unchanged line
+    // (`gitlab/mappers.ts#buildPosition`); this is where that pairing must
+    // survive the anchoring pipeline into the drafted comment. Line 12
+    // ('let a = 1;') is context — new 12 pairs with old 11 in REWRITE_DIFF.
+    // Line 11 ('fn resolve_click_space...') is a pure addition and must
+    // carry no old-side number at all.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [
+        itemAt('context-line', 12, '    let a = 1;'),
+        itemAt('added-line', 11, 'fn resolve_click_space() -> bool {'),
+      ],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    for (const item of response.items) review = setVerdict(review, item.id, 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts.find((d) => d.key === 'context-line')?.anchor).toMatchObject({ line: 12, oldLine: 11 });
+    expect(composed.drafts.find((d) => d.key === 'added-line')?.anchor.oldLine).toBeUndefined();
+  });
+
+  it('anchors a finding about a removed statement on the old side, side LEFT', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'removed', file: 'src/legacy.rs', line: 61, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Removed without replacement', body: 'Body', code: "logger.error('refresh failed')",
+        suggestion: { old: 'x', new: 'y' },
+      }],
+    }, { diffPaths: ['src/legacy.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'removed', 'accepted', true);
+
+    const diff = [
+      '@@ -60,4 +60,3 @@ export class TokenStore {',
+      '   async refresh() {',
+      "-    logger.error('refresh failed')",
+      '     throw new RefreshError()',
+      '   }',
+    ].join('\n');
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => diffAnchorCandidates(diff));
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 61, side: 'old' });
+    // A suggestion fence replaces a line's content — meaningless on a
+    // deletion, since there is no live line left to replace.
+    expect(composed.drafts[0]?.suggestion).toBeUndefined();
+  });
+
+  it('withholds a multi-line range that reaches past what the diff shows', () => {
+    // The hunk's new side ends at line 17; a range that claims to run to 20
+    // has three lines the diff carries no text for at all, so the whole
+    // comment is withheld rather than posted against a guessed range.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'overreach', file: 'src/panel.rs', line: 14, endLine: 20, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Overreaching range', body: 'Body', code: '        return true;',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'overreach', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['overreach']);
+  });
+
+  it('anchors on the recorded line when its code matches nowhere at all — the recorded line is the PRIMARY anchor', () => {
+    // Reproduces the confirmed shape of the 2026-09-12 incident: the finding's
+    // recorded line (11) is genuinely an added line in the diff — trim-match
+    // would find it instantly for a one-line quote — but `code` here is the
+    // multi-line hunk the field is documented to carry, which can never
+    // trim-equal any single candidate line. Withholding this finding would be
+    // wrong: its location was never in question, only the text comparison.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'multiline-code', file: 'src/panel.rs', line: 11, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Multi-line quote', body: 'Body',
+        code: 'fn resolve_click_space() -> bool {\n    false\n}',
+        suggestion: { old: 'x', new: 'y' },
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'multiline-code', 'accepted', true);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 11, side: 'new' });
+    // Unverified — the fix's target text was never confirmed — so no
+    // suggestion fence is offered even though the finding carried one.
+    expect(composed.drafts[0]?.suggestion).toBeUndefined();
+  });
+
+  it('carries the recorded line\'s paired old-file number through the fallback too, when it lands on context', () => {
+    // Same shape as the incident reproduction above, but the recorded line
+    // (12) is a context line rather than a plain addition — its `oldLine`
+    // pairing must survive the unverified fallback exactly as it does the
+    // verified path, or a GitLab comment built from this draft would be
+    // missing the coordinate its position API requires.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'multiline-context', file: 'src/panel.rs', line: 12, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Multi-line quote on context', body: 'Body',
+        code: 'fn resolve_click_space() -> bool {\n    false\n}',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'multiline-context', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor).toMatchObject({ line: 12, side: 'new', oldLine: 11 });
+  });
+
+  it('still withholds when the code matches nothing AND the recorded line is not addressable either', () => {
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'nowhere', file: 'src/panel.rs', line: 500, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'Nowhere near the hunk', body: 'Body', code: 'fn resolve_click_space() -> bool {\n    false\n}',
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'nowhere', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['nowhere']);
+  });
+
+  it.each([
+    ['an empty-string code field', { code: '' }],
+    ['an omitted code field', {}],
+  ] as const)('withholds a finding with %s even when its recorded line is addressable', (_label, codeField) => {
+    // Line 11 is genuinely an added line in REWRITE_DIFF — exactly the shape
+    // the recorded-line fallback exists to rescue — but the fallback's
+    // justification is "evidence existed but could not be text-matched", not
+    // "there was no evidence at all". `resolveAnchor` already reports empty
+    // code as unconditionally `lost`; this finding must not then fall
+    // through to trusting the bare line number anyway.
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [{
+        id: 'no-evidence', file: 'src/panel.rs', line: 11, severity: 'major', category: 'craftsmanship',
+        confidence: 90, title: 'No supporting code', body: 'Body', ...codeField,
+      }],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'no-evidence', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, candidatesFor);
+    expect(composed.drafts).toEqual([]);
+    expect(composed.withheld.map((i) => i.id)).toEqual(['no-evidence']);
+  });
+
+  it('normalizes a verified text match\'s undefined side to \'new\' on the drafted anchor, not only on the internal side variable', () => {
+    // `documentCandidates` never sets `side` at all — the haystack a plain
+    // open editor gives, as opposed to a diff's old/new-tagged hunks — so a
+    // verified match against it is exactly the case where `textMatch.side`
+    // is `undefined` and the raw `verified ? textMatch.side : 'new'`
+    // expression diverges from the normalized `side` variable used
+    // everywhere else in this function.
+    const file = ['fn shared() {}', '', 'fn resolve_click_space() -> bool {', '    false', '}'].join('\n');
+    const { response } = parseAgentReviewResponse({
+      schemaVersion: '1',
+      headSha: 'h',
+      items: [itemAt('doc-match', 3, 'fn resolve_click_space() -> bool {')],
+    }, { diffPaths: ['src/panel.rs'] });
+    let review = createReview({ repoId: 'r', crNumber: '1', agentId: 'a', criteria: DEFAULT_CRITERIA, response });
+    review = setVerdict(review, 'doc-match', 'accepted', false);
+
+    const composed = composeCommentDrafts(review, 'Agent', 'you', refs, () => documentCandidates(file));
+    expect(composed.withheld).toEqual([]);
+    expect(composed.drafts[0]?.anchor.side).toBe('new');
   });
 });
 

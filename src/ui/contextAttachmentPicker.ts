@@ -8,6 +8,7 @@ import {
 import {
   labelledWorkspaceRoots,
   modelVisiblePathForUri,
+  normalizePathSlashes,
   type ModelVisibleWorkspaceRoot,
 } from '../app/modelVisiblePath';
 import type { Attachment, AttachmentRange } from '../app/reviewContext';
@@ -38,7 +39,7 @@ export function attachmentFileTarget(uri: vscode.Uri): FileAttachmentTarget {
 
 /** Resolve a canonical root-qualified path within that root; otherwise require one global match. */
 export async function findReferenceFile(name: string): Promise<FileAttachmentTarget | undefined> {
-  const normalized = name.replace(/\\/g, '/').replace(/^\.\//, '');
+  const normalized = normalizePathSlashes(name);
   if (normalized.startsWith('/') || normalized.split('/').includes('..')) return undefined;
   const folders = vscode.workspace.workspaceFolders ?? [];
   const labelledRoots = labelledWorkspaceRoots(modelVisibleWorkspaceRoots());

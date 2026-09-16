@@ -77,3 +77,18 @@ export class ReviewHistory {
     return new Set(this.list().map((r) => `${r.repoId}!${r.crNumber}`));
   }
 }
+
+/**
+ * An agent's historical accept rate for one pod, 0-100 — `undefined` until
+ * the pod has a first triaged item. One formula shared by the single-file
+ * and changeset review screens: two independent roundings of the same ratio
+ * is exactly how they could report different rates for the identical
+ * history.
+ */
+export function acceptRateForPod(history: readonly SubmittedReview[], podId: string): number | undefined {
+  const records = history.filter((record) => record.podId === podId);
+  const produced = records.reduce((count, record) => count + record.counts.accepted + record.counts.rejected + record.counts.skipped, 0);
+  return produced > 0
+    ? Math.round((records.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100)
+    : undefined;
+}

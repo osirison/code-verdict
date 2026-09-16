@@ -222,4 +222,28 @@ describe('InDiffEditor', () => {
     expect(editor.setDecorations.mock.calls.at(-1)?.[1]).toEqual([]);
     inDiff.dispose();
   });
+
+  it('escapes markdown metacharacters in title to prevent corruption of rendering', async () => {
+    const itemWithFence = {
+      ...ITEM,
+      id: 'f-fence',
+      title: 'Issue with ``` code fence in title',
+    };
+    const { InDiffEditor } = await import('./inDiffEditor.js');
+    const inDiff = new InDiffEditor();
+
+    await inDiff.show({ item: itemWithFence, agentLabel: 'agent' });
+
+    // Extract the MarkdownString body that was passed to createCommentThread
+    const call = createCommentThread.mock.calls[0];
+    const comments = call?.[2] as unknown[];
+    const markdownBody = comments?.[0] as { body: { value: string } };
+    const renderedText = markdownBody?.body?.value ?? '';
+
+    // The escaped fence should be present (backslash before backticks)
+    expect(renderedText).toContain('\\`\\`\\`');
+    // The unescaped fence should not be present
+    expect(renderedText).not.toMatch(/(?<!\\)\`\`\`/);
+    inDiff.dispose();
+  });
 });
