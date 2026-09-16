@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { GITLAB_VOCABULARY } from '../testing/specFixtures';
-import { formatConnectionStatus, renderSettingsHtml, type SettingsViewState } from './settingsHtml';
+import { formatConnectionStatus, renderSettingsHtml, renderSettingsRegions, type SettingsViewState } from './settingsHtml';
 
 const state: SettingsViewState = {
   vocabulary: GITLAB_VOCABULARY,
@@ -145,6 +145,45 @@ describe('settings fidelity (spec §11)', () => {
 
   it('never writes an inline style attribute anywhere on the page', () => {
     expect(renderSettingsHtml(state, 'nonce123')).not.toContain('style="');
+  });
+});
+
+/**
+ * D13's no-reconnect wording ban (task 14.6: "The literal word 'resume' never appears in anything a
+ * reviewer reads about reviving an interrupted lineage"), pinned here the way it already is for
+ * every string `harnessResume.ts` produces (`harnessResume.test.ts`) and for the picker banner,
+ * button, and failure-card notice (`reviewFlowHtml.test.ts`). This screen is the third surface
+ * whose premise matches the rule and that neither of those tests reaches: the retained checkpoints
+ * it configures are exactly what a new attempt is started from, so its hints are prose about
+ * reviving a lineage, not about the live pause/resume row task 14.6 exempts — that path only
+ * transitions in-memory lifecycle and reads no checkpoint at all. Leaving this unpinned is what let
+ * "resume history" stand two screens from the button that deliberately reads "Start new attempt
+ * from checkpoint".
+ */
+describe('no-reconnect wording on the settings screen (D13, task 14.6)', () => {
+  const FORBIDDEN = [/reconnect/i, /reattach/i, /\bresum(e|ed|ing)\b/i, /\bcontinu(e|ed|ing|ation)\b/i, /still connected/i, /same (session|stream|attempt)/i, /picks?\s.*back up/i];
+
+  /**
+   * Every region, and regions rather than the whole page: `SETTINGS_REGION_IDS` is the complete set
+   * of reviewer-facing markup this screen has (`renderSettingsHtml` composes exactly these), while
+   * the page also carries `SCRIPT`, which is machine-facing wiring — a `continue` statement in it
+   * would fail this scan for nothing anyone reads. Tags are stripped for the reason
+   * `reviewFlowHtml.test.ts` strips them: ids and classes are wiring too.
+   */
+  function visibleText(html: string): string {
+    return html.replace(/<[^>]*>/g, ' ');
+  }
+
+  it('no region of the rendered settings screen carries a phrase that implies a stopped review is picked back up', () => {
+    for (const [regionId, html] of Object.entries(renderSettingsRegions(state))) {
+      for (const pattern of FORBIDDEN) expect(visibleText(html), `${regionId} matched ${pattern}`).not.toMatch(pattern);
+    }
+  });
+
+  it('the retained-checkpoints hint still says what those checkpoints are for, in the words the control that spends them uses', () => {
+    const harness = renderSettingsRegions(state)['set-harness'];
+    expect(harness).toContain('Retained checkpoints');
+    expect(harness).toContain('a new attempt can be started from one an earlier attempt left');
   });
 });
 

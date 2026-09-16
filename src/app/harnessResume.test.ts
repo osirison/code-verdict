@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { canonicalStringify, sha256Hex } from './contentDigest';
-import { computeSnapshotDigest, INITIAL_RETRY_STATE, type PersistedCheckpoint } from './harnessCheckpoint';
+import { buildCheckpoint, computeSnapshotDigest, INITIAL_RETRY_STATE, type PersistedCheckpoint } from './harnessCheckpoint';
+import { blockerLimitation } from './harnessCompletion';
 import { createEvidenceLedger, toRetainedEvidenceRecord, type LedgerEvidenceSource, type EvidenceLedgerMember } from './harnessEvidenceLedger';
 import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
 import { createHarnessRunStore } from './harnessRunStore';
@@ -17,6 +18,7 @@ import {
   importRetainedEvidence,
   interruptedLimitation,
   nextAttemptNumber,
+  priorAttemptEndingFor,
   resumeBudgetModeFor,
   ResumeIncompatibleError,
   type ResumeIncompatibilityCode,
@@ -25,7 +27,9 @@ import { PRE_LOCAL_GIT_LINEAGE_KEY, preLocalGitLineageRecord } from './migration
 import { DEFAULT_CRITERIA } from '../domain/criteria';
 import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION } from '../domain/harnessPolicy';
 import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
+import type { Limitation } from '../domain/harnessActivity';
 import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
+import type { ResultCompleteness, RunLifecycle } from '../domain/harnessLifecycle';
 import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 
 // ---- Fixtures -------------------------------------------------------------------------
@@ -155,6 +159,48 @@ function testCheckpoint(snapshot: ReviewRunSnapshot, overrides: Partial<Persiste
   };
   const merged = { ...base, ...overrides };
   return { ...merged, bytes: 10 };
+}
+
+/**
+ * A terminal checkpoint built the way `runPersisting`/`finalizeBootstrapFailure`/
+ * `finalizeEscapedError` actually build one: a real `terminalResult` fact through
+ * `appendActivityEvent`, then the real `buildCheckpoint` funnel that derives the projection from
+ * it. `priorAttemptEndingFor` reads that derived projection, so hand-writing a `projection.result`
+ * no writer would have produced would prove nothing about whether the cause is reachable at all —
+ * which is the whole question the fresh-budget narrative got wrong.
+ */
+function terminalCheckpoint(
+  snapshot: ReviewRunSnapshot,
+  reason: PersistedCheckpoint['reason'],
+  terminal: { lifecycle: RunLifecycle; completeness: ResultCompleteness; limitations: readonly Limitation[] },
+  trailing?: { limitations: readonly Limitation[] },
+): PersistedCheckpoint {
+  let log = createActivityLog(snapshot.runId, snapshot.lineageId, snapshot.attempt);
+  const context = { occurredAt: '2026-01-01T00:10:00.000Z', phase: 'persisting' as const, elapsedMs: 1000 };
+  log = appendActivityEvent(log, { kind: 'terminalResult', ...terminal }, context);
+  if (trailing) log = appendActivityEvent(log, { kind: 'partialResult', limitations: trailing.limitations }, context);
+  return buildCheckpoint(
+    {
+      checkpointId: 'ckpt-terminal',
+      runId: snapshot.runId,
+      lineageId: snapshot.lineageId,
+      attempt: snapshot.attempt,
+      phase: 'persisting',
+      reason,
+      occurredAt: '2026-01-01T00:10:00.000Z',
+      elapsedMs: 1000,
+      snapshotDigest: computeSnapshotDigest(snapshot),
+      activityEvents: log.events,
+      evidenceSources: [],
+      candidates: [],
+      contradicted: [],
+      budget: ZERO_BUDGET,
+      coverage: ZERO_COVERAGE,
+      unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+      intendedTerminal: { lifecycle: terminal.lifecycle, completeness: terminal.completeness },
+    },
+    DEFAULT_HARNESS_POLICY,
+  );
 }
 
 // ---- checkCheckpointIntegrity -----------------------------------------------------------
@@ -486,7 +532,7 @@ describe('no-reconnect wording (11.8, D13 "the rule that matters most")', () => 
   }
 
   it('describeResumeStart names a new attempt from a checkpoint, never a reconnection', () => {
-    const text = describeResumeStart(1, 2, 'investigating');
+    const text = describeResumeStart(1, 2, 'investigating', 'carryForward', 'interrupted');
     assertClean(text);
     expect(text).toMatch(/attempt 2/i);
     expect(text).toMatch(/checkpoint/i);
@@ -495,17 +541,57 @@ describe('no-reconnect wording (11.8, D13 "the rule that matters most")', () => 
 
   // Budget-exhausted resume feature: the 'fresh' branch narrates a live `failed` terminal
   // attempt honestly — never "interrupted" (it did not crash), never "resume"/"continue" either.
-  it('describeResumeStart(..., \'fresh\') names the budget running out, never calls it interrupted, and stays clean of every forbidden phrase', () => {
-    const text = describeResumeStart(1, 2, 'completing', 'fresh');
+  //
+  // fresh-resume-narrates-budget-exhaustion-for-non-budget-failure: the cause clause is now the
+  // `ending`'s job and the mode decides only the fresh-pool clause, because `resumeBudgetModeFor`
+  // reads the `failed`/`phaseBoundary` pair `runPersisting` stamps for EVERY completion-ineligible
+  // attempt — which is evidence about the new attempt's pool, never about why the last one stopped.
+  // The four cases below are the four sentences that pair can reach; each asserts the clause the
+  // record actually supports AND the clause it must not contain, since a single positive match
+  // (the old `/budget/i`, which the trailing "and a fresh budget" satisfies on its own) cannot tell
+  // a named cause from a neutral one.
+  it('a fresh-budget start whose terminal record names the budget blocker says the budget ran out, never calls it interrupted, and stays clean of every forbidden phrase', () => {
+    const text = describeResumeStart(1, 2, 'completing', 'fresh', 'budgetExhausted');
     assertClean(text);
     expect(text).toMatch(/attempt 2/i);
     expect(text).toMatch(/checkpoint/i);
-    expect(text).toMatch(/budget/i);
+    expect(text).toMatch(/Attempt 1 ended when its budget ran out/);
+    expect(text).toMatch(/a fresh budget\.$/);
     expect(text).not.toMatch(/interrupted/i);
   });
 
-  it('describeResumeStart defaults to the original carryForward/interrupted sentence — the pinned three-argument call is byte-identical to before this parameter existed', () => {
-    expect(describeResumeStart(1, 2, 'investigating')).toBe(describeResumeStart(1, 2, 'investigating', 'carryForward'));
+  it('a fresh-budget start whose terminal record names the elapsed-time blocker says the time limit, not a spent budget — `timeout` and `budgetExhausted` are two separate blockers and only one of them means a pool ran dry', () => {
+    const text = describeResumeStart(1, 2, 'completing', 'fresh', 'timedOut');
+    assertClean(text);
+    expect(text).toMatch(/Attempt 1 ended when it reached its time limit/);
+    expect(text).not.toMatch(/ran out/);
+    expect(text).toMatch(/a fresh budget\.$/);
+  });
+
+  it('a fresh-budget start over a record that names no budget-shaped cause says only that the attempt ended without completing — the fresh pool is a fact about the new attempt and is never restated as a cause of the old one', () => {
+    const text = describeResumeStart(1, 2, 'verifying', 'fresh', 'unstated');
+    assertClean(text);
+    expect(text).toMatch(/Attempt 1 ended without completing/);
+    expect(text).not.toMatch(/ran out/);
+    expect(text).not.toMatch(/interrupted/i);
+    expect(text).toMatch(/a fresh budget\.$/);
+  });
+
+  // Invariant E, the sibling branch: `carryForward` covers the sweep's own `interrupted` closure
+  // AND `finalizeEscapedError`'s crash record (`resumeBudgetModeFor`'s own doc comment says so),
+  // and only the first of those was ever closed as interrupted.
+  it('a carryForward start over a record that does not say interrupted says the attempt ended without completing — only the activation sweep\'s own closure earns that word', () => {
+    const text = describeResumeStart(1, 2, 'investigating', 'carryForward', 'unstated');
+    assertClean(text);
+    expect(text).toMatch(/Attempt 1 ended without completing/);
+    expect(text).not.toMatch(/interrupted/i);
+    expect(text).not.toMatch(/fresh budget/);
+  });
+
+  it('describeResumeStart\'s omitted arguments default to carryForward and an unstated cause — an argument a caller never derived can only under-report, never assert a cause the record does not carry', () => {
+    expect(describeResumeStart(1, 2, 'investigating')).toBe(describeResumeStart(1, 2, 'investigating', 'carryForward', 'unstated'));
+    expect(describeResumeStart(1, 2, 'investigating')).toMatch(/Attempt 1 ended without completing/);
+    expect(describeResumeStart(1, 2, 'investigating')).not.toMatch(/interrupted/i);
   });
 
   it('interruptedLimitation states the attempt is closed, never that it can be reconnected to', () => {
@@ -745,8 +831,129 @@ describe('resumeBudgetModeFor: which resume shape a checkpoint\'s own terminal l
       expect(decision.kind).toBe('compatible');
       if (decision.kind !== 'compatible') continue;
       expect(decision.payload.budgetMode).toBe(expectedMode);
-      expect(decision.startAction).toBe(describeResumeStart(checkpoint.attempt, nextAttemptNumber(checkpoint.attempt), checkpoint.phase, expectedMode));
+      expect(decision.startAction).toBe(
+        describeResumeStart(checkpoint.attempt, nextAttemptNumber(checkpoint.attempt), checkpoint.phase, expectedMode, priorAttemptEndingFor(checkpoint)),
+      );
     }
+  });
+});
+
+// ---- priorAttemptEndingFor / the cause clause (fresh-resume-narrates-budget-exhaustion-for-non-budget-failure) ----
+
+/**
+ * The derivation that keeps the start narrative's cause clause true. Every checkpoint below is
+ * built through the real `buildCheckpoint` funnel over a real `terminalResult` fact, because the
+ * claim under test is precisely that the cause IS reachable from what a writer persists — a
+ * hand-written `projection` would assert that by construction.
+ *
+ * The pair `resumeBudgetModeFor` reads (`failed` + `phaseBoundary`) is stamped by `runPersisting`
+ * for ANY completion-ineligible attempt, so it spans all of `COMPLETION_BLOCKERS` plus
+ * `finalizeBootstrapFailure`'s "cannot even start". That is why the mode cannot double as the
+ * cause, and why these two derivations are separate functions over the same checkpoint.
+ */
+describe('priorAttemptEndingFor: the cause the prior attempt\'s own terminal record actually supports', () => {
+  it('a runPersisting failure whose terminal record lists the budget blocker is budgetExhausted, and the narrative names it', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(snapshot, 'phaseBoundary', { lifecycle: 'failed', completeness: 'partial', limitations: [blockerLimitation('budgetExhausted')] });
+    expect(priorAttemptEndingFor(checkpoint)).toBe('budgetExhausted');
+    expect(decideResume({ storedSnapshot: snapshot, checkpoint, candidateSnapshot: snapshot })).toMatchObject({
+      startAction: expect.stringContaining('Attempt 1 ended when its budget ran out'),
+    });
+  });
+
+  it('a runPersisting failure whose terminal record lists the elapsed-time blocker is timedOut — `timeout` is its own blocker and does not mean a pool was spent', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(snapshot, 'phaseBoundary', { lifecycle: 'failed', completeness: 'none', limitations: [blockerLimitation('timeout')] });
+    expect(priorAttemptEndingFor(checkpoint)).toBe('timedOut');
+    expect(decideResume({ storedSnapshot: snapshot, checkpoint, candidateSnapshot: snapshot })).toMatchObject({
+      startAction: expect.stringContaining('Attempt 1 ended when it reached its time limit'),
+    });
+  });
+
+  it('a record listing both budget-shaped blockers names the spent pool, the more specific of the two — a fixed precedence, never whichever `evaluateCompletion` happened to add first', () => {
+    const snapshot = testSnapshot();
+    const both = terminalCheckpoint(snapshot, 'phaseBoundary', { lifecycle: 'failed', completeness: 'none', limitations: [blockerLimitation('timeout'), blockerLimitation('budgetExhausted')] });
+    expect(priorAttemptEndingFor(both)).toBe('budgetExhausted');
+  });
+
+  /**
+   * The finding itself. `insufficientRiskCoverage` standing alone is an ordinary, budget-untouched
+   * outcome — the completion gate refusing over file state — and it reaches the identical
+   * `failed`/`phaseBoundary` checkpoint that `resumeBudgetModeFor` calls `'fresh'`, which is how
+   * the reviewer used to be told a budget ran out that never did.
+   */
+  it('a runPersisting failure over a non-budget blocker is unstated, and the narrative says only that the attempt ended without completing — never that a budget it never spent ran out', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(snapshot, 'phaseBoundary', { lifecycle: 'failed', completeness: 'partial', limitations: [blockerLimitation('insufficientRiskCoverage')] });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('fresh'); // the mode this checkpoint genuinely calls for, unchanged
+    expect(priorAttemptEndingFor(checkpoint)).toBe('unstated');
+    const decision = decideResume({ storedSnapshot: snapshot, checkpoint, candidateSnapshot: snapshot });
+    expect(decision.kind).toBe('compatible');
+    if (decision.kind !== 'compatible') return;
+    expect(decision.startAction).toContain('Attempt 1 ended without completing');
+    expect(decision.startAction).not.toContain('budget ran out');
+    expect(decision.startAction).toContain('a fresh budget'); // the pool clause stays: it is true of the new attempt
+  });
+
+  it('finalizeBootstrapFailure\'s "this attempt cannot even start" record is unstated — it carries no blocker at all, and the same phaseBoundary reason still routes it to a fresh pool', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(snapshot, 'phaseBoundary', {
+      lifecycle: 'failed',
+      completeness: 'none',
+      limitations: [{ code: 'promptBudgetNoRoom', message: 'The review envelope does not fit this model.' }],
+    });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('fresh');
+    expect(priorAttemptEndingFor(checkpoint)).toBe('unstated');
+  });
+
+  it('finalizeEscapedError\'s crash record is unstated, and its carryForward narrative no longer calls the attempt interrupted — the sweep never closed it, an unhandled error ended it', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(snapshot, 'attemptFailed', {
+      lifecycle: 'failed',
+      completeness: 'partial',
+      limitations: [{ code: 'attemptFailed', message: 'An unhandled error ended this attempt: boom' }],
+    });
+    expect(resumeBudgetModeFor(checkpoint)).toBe('carryForward');
+    expect(priorAttemptEndingFor(checkpoint)).toBe('unstated');
+    const decision = decideResume({ storedSnapshot: snapshot, checkpoint, candidateSnapshot: snapshot });
+    expect(decision.kind).toBe('compatible');
+    if (decision.kind !== 'compatible') return;
+    expect(decision.startAction).toContain('Attempt 1 ended without completing');
+    expect(decision.startAction).not.toMatch(/interrupted/i);
+  });
+
+  it('the activation sweep\'s own closure is the one shape called interrupted — read from the lifecycle only `closeAttemptAsInterrupted` ever writes', () => {
+    const snapshot = testSnapshot();
+    const live = testCheckpoint(snapshot, { phase: 'investigating' });
+    const closed = closeAttemptAsInterrupted(live, { checkpointId: 'ckpt-swept', occurredAt: '2026-01-01T00:20:00.000Z' }, DEFAULT_HARNESS_POLICY)!;
+    expect(priorAttemptEndingFor(closed)).toBe('interrupted');
+    const decision = decideResume({ storedSnapshot: snapshot, checkpoint: closed, candidateSnapshot: snapshot });
+    expect(decision.kind).toBe('compatible');
+    if (decision.kind !== 'compatible') return;
+    expect(decision.startAction).toContain('Attempt 1 is interrupted');
+  });
+
+  it('a checkpoint with no terminal fact to read — an ordinary mid-run phase boundary, or one persisted before this cause existed — is unstated rather than guessed', () => {
+    expect(priorAttemptEndingFor(testCheckpoint(testSnapshot()))).toBe('unstated');
+  });
+
+  /**
+   * Why the cause is read from `projection.result` and not `projection.limitations`: both are
+   * re-derived from the same activity, but `limitations` is the last `partialResult` OR
+   * `terminalResult`, so one late event of the kind `mergeActivityEvents` exists to reconcile
+   * (`IntendedTerminal`'s own documented drift class) would otherwise hand a mid-run limitation
+   * set to a sentence about how the attempt ended.
+   */
+  it('reads the terminal record itself, so a partialResult landing after it cannot rename the cause', () => {
+    const snapshot = testSnapshot();
+    const checkpoint = terminalCheckpoint(
+      snapshot,
+      'phaseBoundary',
+      { lifecycle: 'failed', completeness: 'partial', limitations: [blockerLimitation('budgetExhausted')] },
+      { limitations: [blockerLimitation('insufficientRiskCoverage')] },
+    );
+    expect(checkpoint.projection.limitations.map((limitation) => limitation.code)).toEqual(['insufficientRiskCoverage']); // sanity: the drift is genuinely present
+    expect(priorAttemptEndingFor(checkpoint)).toBe('budgetExhausted');
   });
 });
 

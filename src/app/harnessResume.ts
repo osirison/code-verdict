@@ -64,7 +64,7 @@ import { closeCheckpointAsTerminal, computeSnapshotDigest, requiredSourceIds, ty
 import { sanitizePublicText } from './harnessActivitySanitizer';
 import type { ActivityFact } from './harnessActivityLog';
 import type { TrackedCandidate } from './harnessCandidateValidation';
-import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
+import type { BudgetConsumption, CompletionBlocker, MemberCoverage } from '../domain/harnessCoverage';
 import type { EvidenceLedger, RegistrationRefusal, RetainedEvidenceRecord } from './harnessEvidenceLedger';
 import type { Limitation, Plan, RunPhase } from '../domain/harnessActivity';
 import type { AttemptNumber } from '../domain/harnessLifecycle';
@@ -428,28 +428,120 @@ export function nextAttemptNumber(prior: AttemptNumber): AttemptNumber {
 }
 
 /**
+ * Which cause, if any, the prior attempt's own terminal record supports being
+ * named out loud. Deliberately not `ResumeBudgetMode`: the two answer different
+ * questions, and conflating them is what made the `'fresh'` sentence false.
+ * `resumeBudgetModeFor` answers "does the new attempt's pool start empty",
+ * which `runPersisting`'s `'failed'`/`'phaseBoundary'` pair settles on its own;
+ * this answers "why did the prior attempt stop", which that same pair does not
+ * settle at all — `runPersisting` stamps it for ANY completion-ineligible
+ * attempt, so it covers every one of `COMPLETION_BLOCKERS`, of which exactly
+ * the two below are budget-shaped, and `finalizeBootstrapFailure` (an orderly
+ * "this attempt cannot even start", no blocker at all) stamps it too.
+ *
+ * `'unstated'` is not "nothing went wrong" — it is "this record names no cause
+ * a sentence may repeat", the honest answer for the other thirteen blockers,
+ * for a bootstrap failure, for `finalizeEscapedError`'s crash record, and for
+ * any checkpoint written before a terminal fact existed to read.
+ */
+export type PriorAttemptEnding = 'interrupted' | 'budgetExhausted' | 'timedOut' | 'unstated';
+
+/**
+ * The only two `COMPLETION_BLOCKERS` whose own meaning is a cause a reviewer
+ * can be told in one clause, in the order they are read: a spent pool is the
+ * more specific fact when an attempt both ran out of budget and ran long, and
+ * `evaluateCompletion` can genuinely report both at once. Typed as
+ * `CompletionBlocker` so renaming a blocker code breaks the build here rather
+ * than silently demoting a named cause to `'unstated'`.
+ */
+const BUDGET_SHAPED_ENDINGS: readonly (readonly [CompletionBlocker, PriorAttemptEnding])[] = [
+  ['budgetExhausted', 'budgetExhausted'],
+  ['timeout', 'timedOut'],
+];
+
+/**
+ * What the checkpoint actually records about its own attempt's ending — the
+ * one input `describeResumeStart`'s cause clause is allowed to have, so the
+ * sentence cannot assert a cause the data does not carry (`fresh-resume-
+ * narrates-budget-exhaustion-for-non-budget-failure`).
+ *
+ * Two fields, read for the same reasons their existing readers give:
+ *
+ * - Lifecycle comes from `intendedTerminal` before `projection.lifecycle`, the
+ *   same order `resumeBudgetModeFor` and `isCheckpointTerminal` already use
+ *   (`IntendedTerminal`'s own doc comment: a late/out-of-order activity event
+ *   can misclassify a genuinely terminal checkpoint's re-derived projection).
+ *   Only `closeAttemptAsInterrupted` ever writes `'interrupted'`, so that
+ *   lifecycle alone is the whole evidence for the interrupted clause.
+ * - The cause comes from `projection.result`, NOT `projection.limitations`.
+ *   Both are re-derived from the same activity, but `result` is the last
+ *   `terminalResult`'s own limitation set while `limitations` is the last
+ *   `partialResult` OR `terminalResult`'s — so one trailing `partialResult`
+ *   would hand this function a mid-run limitation set to name a terminal
+ *   cause from. The blocker codes here are written by `blockerLimitation`
+ *   into exactly that terminal fact.
+ */
+export function priorAttemptEndingFor(checkpoint: PersistedCheckpoint): PriorAttemptEnding {
+  const lifecycle = checkpoint.intendedTerminal?.lifecycle ?? checkpoint.projection.lifecycle;
+  if (lifecycle === 'interrupted') return 'interrupted';
+  const codes = new Set((checkpoint.projection.result?.limitations ?? []).map((limitation) => limitation.code));
+  for (const [blocker, ending] of BUDGET_SHAPED_ENDINGS) {
+    if (codes.has(blocker)) return ending;
+  }
+  return 'unstated';
+}
+
+/** One clause, and never more than the `ending` it was handed actually establishes. */
+function priorEndingClause(priorAttempt: AttemptNumber, ending: PriorAttemptEnding): string {
+  switch (ending) {
+    case 'interrupted':
+      return `Attempt ${priorAttempt} is interrupted`;
+    case 'budgetExhausted':
+      return `Attempt ${priorAttempt} ended when its budget ran out`;
+    case 'timedOut':
+      return `Attempt ${priorAttempt} ended when it reached its time limit`;
+    case 'unstated':
+      return `Attempt ${priorAttempt} ended without completing`;
+  }
+}
+
+/**
  * The public narrative for the new attempt's activity (task 11.8's
  * "no-reconnect wording", spec: "activity and evidence identify the attempt
  * boundary"). The string itself is final: it is asserted, post-sanitizer, in
  * `harnessResume.test.ts`.
  *
- * `budgetMode` defaults to `'carryForward'` — the original, still-pinned
- * interrupted-crash sentence, byte-identical to what this function always
- * said — so every existing caller (and the pinned test that calls this with
- * three arguments) is untouched. `decideResume` below is the one production
- * caller that ever passes `'fresh'`, chosen the same way `ResumePayload.
- * budgetMode` is (`resumeBudgetModeFor`): a checkpoint the sweep closed as
- * `interrupted` never says its budget "ran out" (it was never given the
- * chance to exhaust one), and a checkpoint from a live `failed` settle is
- * never called "interrupted" — each sentence names only what actually
- * happened to its own prior attempt. Neither branch says "resume" or
- * "continue" (D13's own rule, this file's own FORBIDDEN-wording test).
+ * Two independent facts, from two separate derivations over the same
+ * checkpoint, because one cannot be read off the other:
+ *
+ * - `budgetMode` (`resumeBudgetModeFor`) decides only the closing "and a fresh
+ *   budget" clause, which is true of every `'fresh'` resume whatever ended the
+ *   prior attempt.
+ * - `ending` (`priorAttemptEndingFor`) decides the cause clause, and defaults
+ *   to `'unstated'` precisely so a caller that derives nothing says nothing:
+ *   the neutral sentence is true of every terminal checkpoint, so the worst a
+ *   future caller can do by omission is under-report. It was the previous
+ *   hardcoded pairing — `'fresh'` asserting an exhausted budget — that told
+ *   reviewers a cause their run's record did not carry, since `runPersisting`
+ *   stamps that same `'failed'`/`'phaseBoundary'` pair for every
+ *   completion-ineligible attempt.
+ *
+ * Each sentence names only what actually happened to its own prior attempt: a
+ * checkpoint the sweep closed as `interrupted` is the one shape called
+ * interrupted, an exhausted pool is named only when the terminal record lists
+ * that blocker, and anything else ended "without completing". No branch says
+ * "resume" or "continue" (D13's own rule, this file's own FORBIDDEN-wording
+ * test).
  */
-export function describeResumeStart(priorAttempt: AttemptNumber, newAttempt: AttemptNumber, priorPhase: RunPhase, budgetMode: ResumeBudgetMode = 'carryForward'): string {
-  if (budgetMode === 'fresh') {
-    return `Starting attempt ${newAttempt} in this lineage from the checkpoint attempt ${priorAttempt} left during the ${priorPhase} phase. Attempt ${priorAttempt} ended when its budget ran out; this is a new attempt with its own model and tool session and a fresh budget.`;
-  }
-  return `Starting attempt ${newAttempt} in this lineage from the checkpoint attempt ${priorAttempt} left during the ${priorPhase} phase. Attempt ${priorAttempt} is interrupted; this is a new attempt with its own model and tool session.`;
+export function describeResumeStart(
+  priorAttempt: AttemptNumber,
+  newAttempt: AttemptNumber,
+  priorPhase: RunPhase,
+  budgetMode: ResumeBudgetMode = 'carryForward',
+  ending: PriorAttemptEnding = 'unstated',
+): string {
+  const freshBudget = budgetMode === 'fresh' ? ' and a fresh budget' : '';
+  return `Starting attempt ${newAttempt} in this lineage from the checkpoint attempt ${priorAttempt} left during the ${priorPhase} phase. ${priorEndingClause(priorAttempt, ending)}; this is a new attempt with its own model and tool session${freshBudget}.`;
 }
 
 // ---- What section 12 carries forward into the new attempt (task 11.6) ---------------
@@ -487,9 +579,11 @@ export function describeResumeStart(priorAttempt: AttemptNumber, newAttempt: Att
  * checkpoint `reason: 'phaseBoundary'`, so it falls in this bucket too; that is correct rather than
  * an oversight, since a bootstrap failure has consumed effectively no budget for a fresh pool to
  * discard. "Start another attempt with a fresh budget" is the whole point here, so consumption
- * starting over is not a gap, it is the feature. See `BudgetTrackerOptions.carryForward`'s own doc
- * comment (`harnessBudgets.ts`) for what a `'fresh'` mode omits (every pool's consumption *and* both
- * reserve counters, not elapsed time alone) and why.
+ * starting over is not a gap, it is the feature. What this bucket's width does mean is that
+ * `'fresh'` is evidence about the new attempt's pool and never about why the prior one stopped —
+ * the narrative reads `priorAttemptEndingFor` for that, off the terminal record itself. See
+ * `BudgetTrackerOptions.carryForward`'s own doc comment (`harnessBudgets.ts`) for what a `'fresh'`
+ * mode omits (every pool's consumption *and* both reserve counters, not elapsed time alone) and why.
  */
 export type ResumeBudgetMode = 'carryForward' | 'fresh';
 
@@ -569,7 +663,7 @@ export function decideResume(input: ResumeCompatibilityInput): ResumeDecision {
   return {
     kind: 'compatible',
     payload: buildResumePayload(input.checkpoint),
-    startAction: describeResumeStart(input.checkpoint.attempt, newAttempt, input.checkpoint.phase, resumeBudgetModeFor(input.checkpoint)),
+    startAction: describeResumeStart(input.checkpoint.attempt, newAttempt, input.checkpoint.phase, resumeBudgetModeFor(input.checkpoint), priorAttemptEndingFor(input.checkpoint)),
   };
 }
 

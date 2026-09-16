@@ -26,6 +26,7 @@
  */
 import type { Review, ReviewItem } from './types';
 import { isReviewItemAnchored } from './types';
+import { escapeMarkdownText } from './markdownSafety';
 
 export type AgentVoice = 'terse' | 'explanatory' | 'blunt';
 
@@ -65,8 +66,15 @@ export function composeSummary(
 
   const parts: string[] = [`Reviewed with ${agentLabel}.`];
   if (blockers.length > 0) {
+    // `title`/`file` are model-authored (validated only for type and length —
+    // `boundedString`/`normalizeEvidencePath` in harnessCandidateValidation.ts
+    // — never for content), and this list sits in plain prose, the same
+    // position `escapeMarkdownText` repairs at submit.ts's headline/heading
+    // renderers for the identical `title` field: unescaped, a title carrying
+    // a fence or a heading marker forges structure in a summary posted under
+    // the reviewer's own account.
     const list = blockers
-      .map((b) => `${lowerFirst(b.title)} (${shortFile(b.file)}:${b.line})`)
+      .map((b) => `${escapeMarkdownText(lowerFirst(b.title))} (${escapeMarkdownText(shortFile(b.file))}:${b.line})`)
       .join('; ');
     parts.push(`${blockers.length} ${plural(blockers.length, 'blocker')}: ${list}. Needs a fix before merge.`);
   }

@@ -316,7 +316,11 @@ export const HARNESS_NUMBER_FIELDS: ReadonlyArray<{
   {
     key: 'retainedCheckpointsPerLineage',
     label: 'Retained checkpoints',
-    hint: 'How many checkpoints are kept for one review\'s resume history.',
+    // D13's reviewer-facing wording ban reaches this screen too (`settingsHtml.test.ts`'s own
+    // scan): these checkpoints are what a new attempt is started from, which is the exact feature
+    // the ban exists for — two screens away the button for it reads "Start new attempt from
+    // checkpoint" rather than naming a stopped review as something with a history to pick up.
+    hint: 'How many checkpoints are kept for one review, so a new attempt can be started from one an earlier attempt left.',
     min: 1,
   },
   {

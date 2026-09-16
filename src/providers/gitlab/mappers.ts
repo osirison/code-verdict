@@ -20,6 +20,7 @@ import type {
   WorkItem,
 } from '../../platform/types';
 import { ScmError } from '../../platform/errors';
+import { markdownCodeFence } from '../../domain/markdownSafety';
 
 // ---- raw GitLab shapes (the fields we read) --------------------------------
 
@@ -344,7 +345,22 @@ export function buildCommentBody(draft: ReviewCommentDraft): string {
     // line; single-line anchors keep the spec's `-0+0` form.
     const { line, endLine } = draft.anchor;
     const span = endLine !== undefined && endLine > line ? endLine - line : 0;
-    parts.push(`\`\`\`suggestion:-0+${span}\n${draft.suggestion.new}\n\`\`\``);
+    // The fence is picked from the suggestion's own bytes, never fixed at three
+    // backticks — `markdownCodeFence` (`../../domain/markdownSafety.ts`) explains
+    // what a suggestion that closes its own fence early forges. The twin site
+    // (`../github/githubProvider.ts`) has widened its fence since that was
+    // found; this one kept the fixed fence for a whole batch afterwards, which
+    // is why the arithmetic now lives in one shared helper instead of two.
+    //
+    // Unverified from here, and shipped anyway: GitLab documents the fixed
+    // ```suggestion form and its rendering of a WIDENED (4+ backtick) fence
+    // could not be confirmed. The trade is one-sided — worst case a benign
+    // suggestion that happens to contain a ``` run loses its Apply button,
+    // which is rare and degrades safely, against the current behavior of
+    // posting a forged, independently applyable block carrying code no part of
+    // the review pipeline validated.
+    const fence = markdownCodeFence(draft.suggestion.new);
+    parts.push(`${fence}suggestion:-0+${span}\n${draft.suggestion.new}\n${fence}`);
   }
   if (draft.footer) parts.push(draft.footer);
   return parts.join('\n\n');

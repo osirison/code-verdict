@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { escapeMarkdownText, markdownCodeSpan } from './markdownSafety';
+import { escapeMarkdownText, markdownCodeFence, markdownCodeSpan, neutralizeCodeFences } from './markdownSafety';
 
 describe('escapeMarkdownText', () => {
   it('leaves plain prose untouched', () => {
@@ -48,5 +48,60 @@ describe('markdownCodeSpan', () => {
 
   it('collapses an embedded newline, since the span is documented as single-line', () => {
     expect(markdownCodeSpan('a\nb')).toBe('`a b`');
+  });
+});
+
+/**
+ * The block-fence half of the same widening idea, shared by all three sites that wrap a
+ * model-authored suggestion in a fence — both provider `buildCommentBody`s and the in-editor peek
+ * widget. The first two assertions are the ones that let it be shared at all: a suggestion with no
+ * fence run in it must keep the ordinary three backticks, byte-identically to the fixed fence each
+ * site used to write, or adopting the helper would silently change every benign suggestion a
+ * reviewer posts.
+ */
+describe('markdownCodeFence', () => {
+  it('stays at three backticks for code containing none, so benign suggestions post byte-identically to a fixed fence', () => {
+    expect(markdownCodeFence('const limit = 10;')).toBe('```');
+  });
+
+  it('stays at three backticks for a run too short to close a three-backtick fence', () => {
+    expect(markdownCodeFence('use `limit` here, not ``limit``')).toBe('```');
+  });
+
+  it('widens past a three-backtick run so the suggestion cannot close its own fence and forge a second block', () => {
+    expect(markdownCodeFence('legit fix\n```suggestion\nconst evil = true;\n```')).toBe('````');
+  });
+
+  it('widens past the longest run present, not merely past three', () => {
+    expect(markdownCodeFence('a\n`````\nb')).toBe('``````');
+  });
+
+  it('keeps multi-line code intact — the fence is chosen from the bytes, never applied to them', () => {
+    const code = 'line one\r\nline two\n```';
+    expect(markdownCodeFence(code)).toBe('````');
+    // Nothing here rewrites `code`; contrast `markdownCodeSpan`, which would collapse both breaks.
+    expect(code).toBe('line one\r\nline two\n```');
+  });
+});
+
+/**
+ * The prose half: text that must never open a block at all. Shared by the posting path
+ * (`../app/submit.ts`) and the in-editor peek widget, which render the same `item.body`.
+ */
+describe('neutralizeCodeFences', () => {
+  it('leaves an inline code span alone, so an ordinary finding body reads exactly as written', () => {
+    expect(neutralizeCodeFences('the `limit` field is off by one')).toBe('the `limit` field is off by one');
+  });
+
+  it('escapes every character of a backtick fence run, so no tail is left to pair into a stray span', () => {
+    expect(neutralizeCodeFences('before\n```suggestion\nevil\n```')).toBe('before\n\\`\\`\\`suggestion\nevil\n\\`\\`\\`');
+  });
+
+  it('escapes a tilde fence run too — GFM reads ~~~ as a fence exactly as it reads ```', () => {
+    expect(neutralizeCodeFences('~~~\nevil\n~~~')).toBe('\\~\\~\\~\nevil\n\\~\\~\\~');
+  });
+
+  it('leaves a mixed backtick/tilde run untouched, since CommonMark reads it as no fence at all', () => {
+    expect(neutralizeCodeFences('`~`~`~')).toBe('`~`~`~');
   });
 });

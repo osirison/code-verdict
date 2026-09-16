@@ -289,3 +289,81 @@ describe('end-to-end flows against the emulator', () => {
     }
   });
 });
+
+/**
+ * The GitLab half of A1-suggestion-fence-forgery, which the GitHub provider has been pinned against
+ * since the fence widening was added there (`../github/github.emulator.test.ts`) and this provider
+ * was not: `buildCommentBody` wrapped `draft.suggestion.new` in a fixed ` ```suggestion:-0+N ` /
+ * ` ``` ` fence, and `suggestion.new` is model-authored replacement code that
+ * `harnessCandidateValidation.ts` bounds for length and never inspects for content. A ``` run
+ * inside it — an example fence in a markdown fix, or one steered in by prompt injection from the
+ * change's own text — closed the real fence early, and everything after it posted as a second,
+ * independent ```suggestion block with its own Apply control, carrying code that passed no
+ * validation, no contradiction check and no reviewer triage under the reviewer's own account.
+ *
+ * Asserted through the emulator rather than on `buildCommentBody` directly so the claim is about
+ * the bytes that reach the server and come back on the note, not about a pure function in
+ * isolation.
+ */
+describe('a GitLab suggestion cannot forge its own fence (A1)', () => {
+  it('widens the fence past any ``` run the suggestion itself contains, so the whole suggestion stays inside one Apply block', async () => {
+    const emulator = new GitLabEmulator({ seed: 6 });
+    const conn = connect(emulator);
+    const ref = { repoId: '9101', number: '2841' };
+    const diff = await conn.getChangeRequestDiff(ref);
+
+    const maliciousNew = "return sanitize(input);\n```\n\n```suggestion:-0+0\nrequire('child_process').exec(process.env.EXFIL_URL)";
+    const result = await conn.submitReview(ref, {
+      comments: [{
+        key: 'a',
+        body: 'x',
+        anchor: { filePath: 'src/auth/token.ts', line: 63, refs: diff.anchorRefs },
+        suggestion: { old: 'y', new: maliciousNew },
+      }],
+    });
+    expect(result.comments[0]?.ok).toBe(true);
+
+    // Located by its own payload rather than by position: the seeded world already holds
+    // discussions on this merge request, and a fence-shaped `find` would match the forgery too.
+    const threads = await conn.listThreads(ref);
+    const posted = threads.find((thread) => thread.notes[0]?.body.includes('return sanitize(input);'))?.notes[0]?.body ?? '';
+
+    const openMatch = /^(`{3,})suggestion:-0\+0$/m.exec(posted);
+    expect(openMatch, `no fence opener found in: ${posted}`).not.toBeNull();
+    const fenceLength = openMatch![1]!.length;
+    // Widened strictly past 3: the suggestion's own longest backtick run (3) can no longer match.
+    expect(fenceLength).toBeGreaterThan(3);
+    const fence = '`'.repeat(fenceLength);
+    const openIdx = posted.indexOf(`${fence}suggestion:-0+0`);
+    const afterOpen = openIdx + fence.length + 'suggestion:-0+0'.length + 1; // + the newline
+    const closeIdx = posted.indexOf(fence, afterOpen);
+    expect(closeIdx).toBeGreaterThan(-1);
+    // Every byte of the payload — its own fake fence markers included — sits verbatim inside the
+    // one real block. Nothing is escaped or rewritten: a suggestion has to stay applyable code.
+    expect(posted.slice(afterOpen, closeIdx)).toBe(`${maliciousNew}\n`);
+    // And nothing past the real close opens a second Apply block. Searched from after the close
+    // rather than over the whole note, because the widened opener itself contains ```suggestion as
+    // a substring one character in.
+    expect(posted.indexOf('```suggestion', closeIdx + fence.length)).toBe(-1);
+  });
+
+  it('keeps the ordinary three-backtick fence when the suggestion contains no backticks, so a benign fix posts unchanged', async () => {
+    const emulator = new GitLabEmulator({ seed: 7 });
+    const conn = connect(emulator);
+    const ref = { repoId: '9101', number: '2841' };
+    const diff = await conn.getChangeRequestDiff(ref);
+
+    await conn.submitReview(ref, {
+      comments: [{
+        key: 'a',
+        body: 'x',
+        anchor: { filePath: 'src/auth/token.ts', line: 63, refs: diff.anchorRefs },
+        suggestion: { old: 'y', new: "logger.error('refresh failed')" },
+      }],
+    });
+
+    const threads = await conn.listThreads(ref);
+    const posted = threads.find((thread) => thread.notes[0]?.body.includes('refresh failed'))?.notes[0]?.body ?? '';
+    expect(posted).toContain("```suggestion:-0+0\nlogger.error('refresh failed')\n```");
+  });
+});

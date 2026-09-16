@@ -354,8 +354,15 @@ function describePresentPolicyFiles(source: BootstrapPolicySource): string {
 function renderRootPolicy(entry: BootstrapMemberRootPolicy): string {
   const { memberId, source } = entry;
   if (!source.present) {
+    // The reason is not host prose in every case: `readPolicyFile`
+    // (`harnessAgentsPolicy.ts`) folds a failed read's `error.message` in
+    // verbatim, so a source or transport can put its own bytes — line breaks
+    // included — on this bare `- ` line inside the authoritative section.
+    // Same treatment as every other untrusted single-line value rendered
+    // unframed here; `textOmittedReason` below needs none, being host literals
+    // (`harnessRunStore.ts`, `harnessBootstrap.ts`) with no external input.
     return source.unavailableReason !== undefined
-      ? `- ${memberId}: root policy could not be checked: ${source.unavailableReason}`
+      ? `- ${memberId}: root policy could not be checked: ${neutralizeLineBreaks(source.unavailableReason)}`
       : `- ${memberId}: no root AGENTS.md or CLAUDE.md`;
   }
   const agreementNote = (source.files?.length ?? 0) === 2 ? `${source.identical ? 'identical' : 'differ'}, ` : '';
@@ -883,12 +890,19 @@ const INVESTIGATION_MAP_REASON_MAX = 300;
 function renderSubmission(submission: InvestigationSubmission): string {
   const where = submission.path === undefined ? '' : ` — ${neutralizeLineBreaks(submission.path)}`;
   const note = submission.state === 'unresolved' ? ' (repair and resubmit)' : submission.state === 'rejected' ? ' (do not resubmit)' : '';
+  // Every untrusted value on this line is neutralized, not just the path: `candidateId` is chosen
+  // by the model and reaches here through `boundedString` (`harnessCandidateValidation.ts`), which
+  // is a type check and a length slice and nothing else, and `reason` is assembled from validation
+  // messages that interpolate model-authored fields of their own (`Candidate names ${candidate.file}
+  // but …`). Collapsing the break before the cap, not after, so the cap measures what is actually
+  // rendered rather than bytes a `\r\n` pair later gives back.
+  const reasonText = submission.reason === undefined ? undefined : neutralizeLineBreaks(submission.reason);
   // Accepted candidates carry none, so a clean review's map is byte-identical to what it was
   // before the reason existed (`harnessSmallReviewCost.assurance.test.ts` is that budget).
-  const reason = submission.reason === undefined || submission.reason.trim() === ''
+  const reason = reasonText === undefined || reasonText.trim() === ''
     ? ''
-    : `\n    because: ${submission.reason.length > INVESTIGATION_MAP_REASON_MAX ? `${submission.reason.slice(0, INVESTIGATION_MAP_REASON_MAX)}…` : submission.reason}`;
-  return `  ${submission.state} ${submission.candidateId}${where}${note}${reason}`;
+    : `\n    because: ${reasonText.length > INVESTIGATION_MAP_REASON_MAX ? `${reasonText.slice(0, INVESTIGATION_MAP_REASON_MAX)}…` : reasonText}`;
+  return `  ${submission.state} ${neutralizeLineBreaks(submission.candidateId)}${where}${note}${reason}`;
 }
 
 /** Every file is in a state that will never change by reading more: inspected, or terminally not-readable. */

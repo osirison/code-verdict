@@ -24,33 +24,10 @@
 import type { Connection } from '../platform/provider';
 import type { AnchorRefs, ChangeRequestRef, ReviewCommentDraft, SubmitProgressFn, SubmitResult } from '../platform/types';
 import { resolveAnchor, type AnchorCandidate } from '../domain/anchor';
-import { escapeMarkdownText, markdownCodeSpan } from '../domain/markdownSafety';
+import { escapeMarkdownText, markdownCodeSpan, neutralizeCodeFences } from '../domain/markdownSafety';
 import type { Review, ReviewItem } from '../domain/types';
 import { isReviewItemAnchored } from '../domain/types';
 import { providerRelativePath } from './modelVisiblePath';
-
-/**
- * Neutralizes `item.body` against forging its own markdown code fence, without touching anything
- * else about it: the body is model-authored prose that is posted close to verbatim (inline `code`
- * spans, bold, links all meant to survive), so the blunt fix — `escapeMarkdownText`, which
- * backslash-escapes every single backtick and would flatten every legitimate inline code
- * reference — is too broad. Only a run of three or more fence characters is dangerous: backtick
- * runs (```) and tilde runs (~~~) are the two sequences CommonMark/GFM read as a fence delimiter
- * (block-level fences and long-delimiter inline code spans alike — a mixed run of both characters
- * is neither and stays untouched), so a bare ```suggestion...``` (or plain ``` or ~~~) sequence
- * sitting in a finding's own free text becomes a second, independently applyable "Commit
- * suggestion" the instant the comment posts — reachable through nothing more than an ordinary
- * accept-and-submit, no `suggestion` field or `applyFix` toggle involved. Backslash-escaping every
- * character of the run (mirroring `escapeMarkdownText`'s own per-character technique, one directory
- * up in `../domain/markdownSafety.ts`) keeps every fence-character byte the reader sees — nothing
- * is stripped or rewritten — while CommonMark fence recognition requires the line's fence
- * characters to be literal and unescaped, and a code span's delimiter run must be unescaped
- * backticks too: escaping every character in the run, not just its first, also stops the
- * remaining (n-1)-length tail from pairing into a stray inline span elsewhere in the same body.
- */
-function neutralizeCodeFences(text: string): string {
-  return text.replace(/`{3,}|~{3,}/g, (run) => run.replace(/[`~]/g, '\\$&'));
-}
 
 export interface CommentDraftComposition {
   drafts: ReviewCommentDraft[];

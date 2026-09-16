@@ -834,6 +834,19 @@ function activePhaseFor(lifecycle: RunLifecycle): RunProjection['phase'] {
   }
 }
 
+/**
+ * What `recoverEscapedCrash` salvaged from a rejected attempt's own best-effort terminal checkpoint.
+ * Named once because three places now read this exact shape — the recovery itself, the persistence
+ * `recoverAndRecordEscapedAttempt` performs from it, and both settle call sites that carry it into
+ * the settled record — and a fourth copy of the literal is how they would drift apart.
+ */
+interface RecoveredEscapedAttempt {
+  readonly checkpoint: PersistedCheckpoint;
+  readonly completeness: ResultCompleteness;
+  readonly partial?: AgentReviewResponse;
+  readonly limitations: readonly Limitation[];
+}
+
 export class ReviewRunManager {
   private readonly records = new Map<string, RunRecord>();
   private readonly cancellations = new Map<string, RunCancellation>();
@@ -1350,12 +1363,19 @@ export class ReviewRunManager {
    * (model-backed or the demo participant), awaits it, and hands a resolved
    * `HarnessAttemptResult` to `completeAttempt`.
    *
-   * `HarnessAttempt.run()` only ever *rejects* for a genuine crash — a
-   * normal failed or cancelled review outcome comes back as a *resolved*
-   * result with `lifecycle: 'failed' | 'cancelled'` (`runPersisting`'s own
-   * guarantee in `harnessAttempt.ts`; `completeAttempt` branches on it). The
-   * `catch` below classifies that crash through `asRunFailure`/the
-   * cancellation-token convention.
+   * `HarnessAttempt.run()` *resolves* for every outcome it reaches
+   * cooperatively, including a failed or cancelled one (`runPersisting`'s own
+   * guarantee in `harnessAttempt.ts`; `completeAttempt` branches on it). It
+   * *rejects* for a genuine crash — and, the case the
+   * cancel-mid-model-turn-discards-validated-findings fix corrects below, for a
+   * cancel that lands while a model turn is in flight: nothing between
+   * `lmAgent`'s cancellation-token rejection and `run()`'s own catch is
+   * cooperative, so that cancel arrives here as a rejection rather than as a
+   * resolved `cancelled` result. Either way the attempt's own
+   * `finalizeEscapedError` writes a terminal checkpoint first, which is what
+   * the `catch` below recovers from before it settles; `asRunFailure`/the
+   * cancellation-token convention decides only which of the two lifecycles it
+   * settles as.
    */
   private async executeAttempt(key: string): Promise<void> {
     const record = this.records.get(key);
@@ -1401,20 +1421,38 @@ export class ReviewRunManager {
         return;
       }
       const failure = asRunFailure(error, record.input.timeouts);
-      // A genuine crash (not the cancellation-token rejection convention
-      // itself) arriving after the reviewer already asked this run to stop:
-      // `cancelling`'s only legal edge is to `cancelled`
-      // (`buildLegalRunTransitions`), so settling this as `failed` would
-      // silently no-op and strand the record. A rejection carries no
-      // findings either way, so this settles exactly like a cooperative
-      // cancellation with none. Left ungated (no
-      // `verifyStoreTerminalBeforeClearingMarker`): this is the *expected*, designed way a
-      // cooperative cancellation resolves (`armCancelGrace`'s own doc comment — "settles the record
-      // itself, through `executeAttempt`'s ordinary... catch handling, well before" the grace timer
-      // ever fires), not an unexpected escape, so it keeps the same unconditional clear every other
-      // ordinary settle uses.
+      // Either the cancellation-token rejection convention itself (`asRunFailure` reads
+      // `err.cancelled`), or a genuine crash arriving after the reviewer already asked this run to
+      // stop: `cancelling`'s only legal edge is to `cancelled` (`buildLegalRunTransitions`), so
+      // settling that second shape as `failed` would silently no-op and strand the record.
+      //
+      // cancel-mid-model-turn-discards-validated-findings fix: this branch used to settle with
+      // nothing recovered, on the stated premise that "a rejection carries no findings either way".
+      // That premise was false for the commonest cancel there is — one landing while a model turn is
+      // in flight, where the token rejection (`lmAgent`'s own `AgentRunError(..., cancelled: true)`)
+      // escapes every cooperative between-turns check, `finalizeEscapedError` writes a terminal
+      // checkpoint carrying every already-accepted finding before rethrowing, and this settle then
+      // reported `completeness: 'none'` with no findings and no durable row over it. It is the same
+      // rejection shape, and the same already-written checkpoint, the `failed` branch below already
+      // recovers from, so both go through the one `recoverAndRecordEscapedAttempt` (its own doc
+      // comment for what the lifecycle changes) rather than this branch carrying a second copy of it.
+      //
+      // Left ungated (no `verifyStoreTerminalBeforeClearingMarker`): this is the *expected*, designed
+      // way a cooperative cancellation resolves (`armCancelGrace`'s own doc comment — "settles the
+      // record itself, through `executeAttempt`'s ordinary... catch handling, well before" the grace
+      // timer ever fires), not an unexpected escape, so it keeps the same unconditional clear every
+      // other ordinary settle uses. A recovery here does not change that: the terminal checkpoint it
+      // read and the terminal marker that gate inspects are written by the same
+      // `harnessRunStore.writeCheckpoint` update, so the gate could only ever agree with it.
       if (failure === 'cancelled' || current.lifecycle === 'cancelling') {
-        this.settle(current, { lifecycle: 'cancelled' });
+        const { aborted, recovered } = await this.recoverAndRecordEscapedAttempt(key, current, 'cancelled');
+        if (aborted) return;
+        this.settle(current, {
+          lifecycle: 'cancelled',
+          completeness: recovered?.completeness,
+          limitations: recovered?.limitations,
+          partialResult: recovered?.partial,
+        });
         return;
       }
       // The one settle this file's own incident review actually traced (this method's doc comment,
@@ -1428,44 +1466,11 @@ export class ReviewRunManager {
       // designed-for case, not the rarer double-failure one — so this crash records exactly like a
       // live `completeAttempt` failure would have (`recoverEscapedCrash`'s own doc comment), instead
       // of silently discarding every already-accepted finding and never reaching `ReviewRunStore` at
-      // all.
-      const recovered = this.recoverEscapedCrash(current);
-      if (recovered) {
-        const identity = reviewIdentityFor(current.input.target);
-        const ranAt = new Date(this.now()).toISOString();
-        if (recovered.partial) {
-          const review = createReview({
-            repoId: identity.repoId,
-            crNumber: identity.crNumber,
-            agentId: current.input.agent.id,
-            modelId: current.input.modelId,
-            effort: current.input.effort,
-            criteria: current.input.criteria,
-            response: recovered.partial,
-          });
-          const partialRecord = retainedFromRun({
-            review,
-            ranAt,
-            agentId: current.input.agent.id,
-            agentLabel: current.input.agentLabel,
-            modelId: current.input.modelId,
-            candidates: recovered.partial.candidates,
-            filesRead: undefined,
-            attachmentWarnings: current.attachmentWarnings,
-            completeness: recovered.completeness,
-            limitations: recovered.limitations,
-            protocolProvenance: recovered.checkpoint.plan ? 'harness' : undefined,
-            lineageId: current.lineageId,
-            attempt: current.attempt,
-            activity: recovered.checkpoint.activity,
-          });
-          await this.deps.workspaceState.update(partialRecordKeyFor(current.input.target), partialRecord);
-          if (!this.isSettleable(key)) return;
-        }
-        const checkpointOffer = this.computeCheckpointOffer(current, recovered.limitations);
-        await this.recordPartialHistory(identity, current.input.agentLabel, recovered.partial?.items.length ?? 0, ranAt, recovered.limitations, checkpointOffer);
-        if (!this.isSettleable(key)) return;
-      }
+      // all. Shared verbatim with the cancelled branch above since the
+      // cancel-mid-model-turn-discards-validated-findings fix; nothing about what this branch does
+      // changed when it moved.
+      const { aborted, recovered } = await this.recoverAndRecordEscapedAttempt(key, current, 'failed');
+      if (aborted) return;
       this.settle(
         current,
         { lifecycle: 'failed', failure, completeness: recovered?.completeness ?? 'none', limitations: recovered?.limitations ?? [], partialResult: recovered?.partial },
@@ -1703,7 +1708,7 @@ export class ReviewRunManager {
    * terminal state (the store write itself also failed — the rarer double-failure case
    * `sweepInterruptedRuns`'s own markerless backstop still exists to catch, unchanged by this fix).
    */
-  private recoverEscapedCrash(record: RunRecord): { checkpoint: PersistedCheckpoint; completeness: ResultCompleteness; partial?: AgentReviewResponse; limitations: readonly Limitation[] } | undefined {
+  private recoverEscapedCrash(record: RunRecord): RecoveredEscapedAttempt | undefined {
     const checkpoint = this.harnessRunStore.latestCheckpoint(record.lineageId, record.attempt);
     if (!checkpoint || !isCheckpointTerminal(checkpoint)) return undefined;
     const items = checkpoint.candidates.filter((candidate) => candidate.state === 'accepted' && candidate.finding !== undefined).map((candidate) => candidate.finding!.item);
@@ -1712,6 +1717,84 @@ export class ReviewRunManager {
     const partial: AgentReviewResponse | undefined =
       items.length > 0 ? { schemaVersion: '1', agentId: record.input.agent.id, agentLabel: record.input.agentLabel, headSha: headShaFor(record.input.target), items, candidates: [] } : undefined;
     return { checkpoint, completeness, partial, limitations };
+  }
+
+  /**
+   * The whole of what `executeAttempt`'s catch does with a rejected attempt before it settles, for
+   * BOTH terminal lifecycles a rejection can reach — `recoverEscapedCrash`, then the durable partial
+   * record, then the run-history row. One definition, called twice: the `cancelled` branch used to
+   * have none of this (`cancel-mid-model-turn-discards-validated-findings`), and copying the
+   * `failed` branch's block up into it would only have re-created, one branch apart, exactly the
+   * two-sites-one-rule asymmetry that produced that finding.
+   *
+   * `lifecycle` is the only input the two call sites differ by, and it decides exactly two things,
+   * both of them matching what `completeAttempt` already does for the same lifecycle when the
+   * attempt resolves cooperatively instead of rejecting:
+   *
+   * - The checkpoint offer is `failed`-only. A failed attempt is the terminal state this feature
+   *   offers a fresh-budget new attempt from; a run the reviewer stopped on purpose is not, and
+   *   `recordPartialHistory`'s own doc comment states that a row with no `lineageId`/`resumable` is
+   *   what keeps `deriveRunControls` from offering one.
+   * - A `cancelled` recovery writes no history row at all without a partial, mirroring
+   *   `completeAttempt`'s cancelled branch (`if (settled && partial)`); the `failed` branch records
+   *   even at zero findings, because the offer it carries is worth a row on its own.
+   *
+   * Both call sites record BEFORE their settle — the one place this deliberately diverges from
+   * `completeAttempt`'s cancelled branch, which records after `settle()`'s notify. Here there is no
+   * `settled` flag to gate on yet, and nothing needs one: `isSettleable` is re-checked after every
+   * await below and there is no await between the last check and either settle, while every
+   * non-terminal lifecycle has a legal edge to `cancelling` and `cancelling`'s only edge is to
+   * `cancelled` (`buildLegalRunTransitions`) — so a settle reached from here cannot be refused.
+   * Recording first also keeps the crash catch's own write-before-notify ordering, the same reason
+   * the `failed` branch already had for it.
+   *
+   * `aborted: true` means the record stopped being settleable across one of those awaits (a cancel
+   * grace timeout, say, settling it first) and the caller must return without settling — never that
+   * there was nothing to recover, which is the ordinary `recovered: undefined` answer.
+   */
+  private async recoverAndRecordEscapedAttempt(
+    key: string,
+    record: RunRecord,
+    lifecycle: 'failed' | 'cancelled',
+  ): Promise<{ readonly aborted: boolean; readonly recovered?: RecoveredEscapedAttempt }> {
+    const recovered = this.recoverEscapedCrash(record);
+    if (!recovered) return { aborted: false };
+    const identity = reviewIdentityFor(record.input.target);
+    const ranAt = new Date(this.now()).toISOString();
+    if (recovered.partial) {
+      const review = createReview({
+        repoId: identity.repoId,
+        crNumber: identity.crNumber,
+        agentId: record.input.agent.id,
+        modelId: record.input.modelId,
+        effort: record.input.effort,
+        criteria: record.input.criteria,
+        response: recovered.partial,
+      });
+      const partialRecord = retainedFromRun({
+        review,
+        ranAt,
+        agentId: record.input.agent.id,
+        agentLabel: record.input.agentLabel,
+        modelId: record.input.modelId,
+        candidates: recovered.partial.candidates,
+        filesRead: undefined,
+        attachmentWarnings: record.attachmentWarnings,
+        completeness: recovered.completeness,
+        limitations: recovered.limitations,
+        protocolProvenance: recovered.checkpoint.plan ? 'harness' : undefined,
+        lineageId: record.lineageId,
+        attempt: record.attempt,
+        activity: recovered.checkpoint.activity,
+      });
+      await this.deps.workspaceState.update(partialRecordKeyFor(record.input.target), partialRecord);
+      if (!this.isSettleable(key)) return { aborted: true, recovered };
+    }
+    if (lifecycle === 'cancelled' && !recovered.partial) return { aborted: false, recovered };
+    const checkpointOffer = lifecycle === 'failed' ? this.computeCheckpointOffer(record, recovered.limitations) : undefined;
+    await this.recordPartialHistory(identity, record.input.agentLabel, recovered.partial?.items.length ?? 0, ranAt, recovered.limitations, checkpointOffer);
+    if (!this.isSettleable(key)) return { aborted: true, recovered };
+    return { aborted: false, recovered };
   }
 
   private async completeAttempt(key: string, rawResult: HarnessAttemptResult): Promise<void> {

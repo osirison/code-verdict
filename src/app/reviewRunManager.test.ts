@@ -271,6 +271,92 @@ function fixtureHarnessSnapshot(runId: string, lineageId: string): ReviewRunSnap
   };
 }
 
+/**
+ * `finalizeEscapedError`'s own store-level shape (`harnessAttempt.ts`): the best-effort terminal
+ * checkpoint it writes from `run()`'s catch *before* rethrowing — `reason: 'attemptFailed'`, the
+ * lifecycle and completeness it just appended as this attempt's `terminalResult` fact *declared*
+ * through `intendedTerminal` rather than left for a projection to re-derive, and every candidate the
+ * tracker had already accepted. Seeded at the store level because this suite drives the manager, not
+ * a real `HarnessAttempt`.
+ *
+ * Parameterized by `intendedTerminal` rather than copied per test because `executeAttempt`'s catch
+ * recovers from this one shape for BOTH terminal lifecycles a rejection can reach:
+ * `finalizeEscapedError` declares `'cancelled'` when the token had already tripped (a cancel landing
+ * inside a model turn) and `'failed'` otherwise, and the only thing that differs downstream is which
+ * branch of that catch reads it — which is exactly where
+ * `cancel-mid-model-turn-discards-validated-findings` lived.
+ */
+async function seedEscapedTerminalCheckpoint(
+  globalState: ReturnType<typeof memoryStore>,
+  identity: { runId: string; lineageId: string },
+  intendedTerminal: NonNullable<CheckpointBuildInput['intendedTerminal']>,
+  findingCount = 1,
+): Promise<void> {
+  const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
+  const snapshot = fixtureHarnessSnapshot(identity.runId, identity.lineageId);
+  await harnessRunStore.writeSnapshot(snapshot);
+  const candidates: readonly TrackedCandidate[] = Array.from({ length: findingCount }, (_, index) => {
+    const candidateId = `cand-${index + 1}`;
+    const finding: ValidatedFinding = {
+      candidateId,
+      memberId: 'm1',
+      routing: 'inline',
+      item: { id: candidateId, file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A validated finding', body: 'Body.', code: '' },
+      provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
+      evidence: { repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, primary: { sourceId: 'ev_a', digest: 'x', origin: 'diffPage', memberId: 'm1', repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, path: 'file1.ts', range: { startLine: 1, endLine: 1 } }, supporting: [] },
+    };
+    return { candidateId, state: 'accepted', repairs: 0, reasons: [], finding };
+  });
+  let log = createActivityLog(identity.runId, identity.lineageId, 1);
+  log = appendActivityEvent(
+    log,
+    { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+    { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'verifying', elapsedMs: 1000 },
+  );
+  // The `terminalResult` fact `finalizeEscapedError` appends immediately before it reports this
+  // checkpoint, carrying the exact limitation it writes for each lifecycle. Included so
+  // `checkpoint.projection.limitations` — what the recovery carries into the settled record, the
+  // durable partial, and the dashboard row's own "why partial" tooltip — is the real set rather than
+  // the empty one a fixture without this fact would leave behind.
+  log = appendActivityEvent(
+    log,
+    {
+      kind: 'terminalResult',
+      lifecycle: intendedTerminal.lifecycle,
+      completeness: intendedTerminal.completeness,
+      limitations:
+        intendedTerminal.lifecycle === 'cancelled'
+          ? [{ code: 'cancelled', message: 'The reviewer cancelled the run before completion.' }]
+          : [{ code: 'attemptFailed', message: 'An unhandled error ended this attempt: unhandled escape' }],
+    },
+    { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'verifying', elapsedMs: 1000 },
+  );
+  const built = buildCheckpoint(
+    {
+      checkpointId: 'ckpt-1',
+      runId: identity.runId,
+      lineageId: identity.lineageId,
+      attempt: 1,
+      phase: 'verifying',
+      reason: 'attemptFailed',
+      occurredAt: '2026-01-01T00:05:00.000Z',
+      elapsedMs: 1000,
+      snapshotDigest: computeSnapshotDigest(snapshot),
+      activityEvents: log.events,
+      evidenceSources: [],
+      candidates,
+      contradicted: [],
+      budget: ZERO_BUDGET,
+      coverage: [],
+      unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+      retry: INITIAL_RETRY_STATE,
+      intendedTerminal,
+    },
+    DEFAULT_HARNESS_POLICY,
+  );
+  await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+}
+
 /** Shared by `controllableRunners`/`unresponsiveRunner`: the same items-in, `HarnessAttemptResult`-out conversion the deleted pre-harness `{lm, demo}` adapter (`reviewRunManager.ts`, removed task 15.8) used, kept here purely as a test fixture — never a shipped bypass. */
 function resultFromResponse(refLabel: string, response: AgentReviewResponse): HarnessAttemptResult {
   return { ...succeededResult(response.items.length, refLabel), findings: response.items.map((item) => ({ item }) as unknown as ValidatedFinding) };
@@ -845,8 +931,121 @@ describe('reviewer-initiated cancellation keeps validated findings (D11\'s cance
     await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
 
     expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+    // Nothing was seeded into `harnessRunStore` here, so this run genuinely has no terminal
+    // checkpoint to recover anything from — "no partial" is the truthful answer, not the discarded
+    // one the two tests below pin (`cancel-mid-model-turn-discards-validated-findings`).
     expect(workspaceState.get(PARTIAL_KEY)).toBeUndefined();
   });
+
+  // cancel-mid-model-turn-discards-validated-findings. Every cancellation test above ends
+  // cooperatively: the attempt notices the token BETWEEN two turns and *reports* a `cancelled`
+  // result, which `completeAttempt` then keeps as a partial. The click a reviewer actually makes
+  // usually lands INSIDE a model turn, and nothing between `lmAgent`'s cancellation-token rejection
+  // and `HarnessAttempt.run()`'s own catch is cooperative — so that cancel arrives at
+  // `executeAttempt`'s catch as a REJECTION, after `finalizeEscapedError` has already written a
+  // terminal checkpoint carrying every accepted finding. That arm used to settle
+  // `completeness: 'none'` with no partial and no row, discarding exactly what the `failed` arm one
+  // branch below had already been taught to recover.
+  it(
+    'a cancel landing inside a model turn — a rejection, not a reported result — keeps the findings ' +
+      'its terminal checkpoint already carried, settling with the same partial, completeness and ' +
+      'dashboard row the identical click landing between two turns produces',
+    async () => {
+      const { started, runners } = controllableRunners();
+      const seenAtNotify: Array<{ record: RunRecord; durablePartial: unknown }> = [];
+      const outcomes: unknown[] = [];
+      const { runs, globalState, workspaceState } = manager({
+        runners,
+        onChange: (record) => {
+          if (record.status !== 'cancelled') return;
+          seenAtNotify.push({ record, durablePartial: workspaceState.get(PARTIAL_KEY) });
+        },
+        onRunOutcome: (info) => outcomes.push(info),
+      });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      // Both conditions, not only the marker: the token listener that makes the cancel below
+      // deterministic is registered inside `run()` itself.
+      await vi.waitFor(() => {
+        expect(started).toContain('!2841');
+        expect(new InFlightRunStore(globalState).list()).toHaveLength(1);
+      });
+      // What `finalizeEscapedError` has already written by the time the rejection reaches the
+      // manager: three accepted findings under a checkpoint that declares itself terminal
+      // `cancelled`/`partial`.
+      await seedEscapedTerminalCheckpoint(globalState, record, { lifecycle: 'cancelled', completeness: 'partial' }, 3);
+
+      // The reviewer's click, with no timing anywhere in it: `cancel()` trips this run's own
+      // cancellation token synchronously, and `controllableRunners`'s listener rejects the in-flight
+      // `run()` promise right there with the exact shape a real transport throws (`lmAgent`'s
+      // `AgentRunError(..., cancelled: true)`). One promise, one rejection — never two racing.
+      runs.cancel(record.key);
+      await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+      // The settled record the reviewer's screen and the toast are notified with — never
+      // `completeness: 'none'` over a run that produced three findings.
+      expect(seenAtNotify).toHaveLength(1);
+      expect(seenAtNotify[0]!.record.completeness).toBe('partial');
+      expect(seenAtNotify[0]!.record.partialResult?.items).toHaveLength(3);
+      // Write-before-notify, the same discipline the cooperative cancellation path keeps: the
+      // durable partial was already on disk the moment a listener reacted.
+      expect(seenAtNotify[0]!.durablePartial).toBeDefined();
+      expect(outcomes[0]).toMatchObject({ lifecycle: 'cancelled', completeness: 'partial', findingCount: 3 });
+
+      // The durable partial itself — explicitly incomplete, on its own key, and never merged into
+      // this target's retained complete review.
+      const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+      expect(partial?.completeness).toBe('partial');
+      expect(partial?.draft.review.items).toHaveLength(3);
+      expect(workspaceState.get('codeVerdict.draft.repo-1!2841')).toBeUndefined();
+
+      // The dashboard row: `3 partial` with a truthful "why" tooltip (`dashboardState.ts`'s `aiPill`
+      // reads exactly these two fields), where before this run left no row at all and the pill fell
+      // through to 'not run'.
+      const row = new ReviewRunStore(globalState).list().find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+      expect(row).toMatchObject({ outcome: 'partial', findingCount: 3 });
+      expect(row?.limitations).toContainEqual(expect.objectContaining({ code: 'cancelled' }));
+      // ...and no new-attempt offer on it: the checkpoint offer stays `failed`-only, so a run the
+      // reviewer deliberately stopped never grows a "Start new attempt from checkpoint" button it
+      // did not have when it settled cooperatively.
+      expect(row).not.toHaveProperty('lineageId');
+      expect(row).not.toHaveProperty('resumable');
+      expect(deriveRunControls(undefined, row).canStartFreshAttempt).toBe(false);
+
+      // The marker still clears exactly as this arm always has — the recovered checkpoint and the
+      // terminal marker are written by the same `writeCheckpoint` update, so recovering one can
+      // never leave the other behind for a sweep.
+      expect(new InFlightRunStore(globalState).list()).toEqual([]);
+    },
+  );
+
+  // The same recovery on the other arm of that guard's own `||`: a plain crash (nothing
+  // cancellation-shaped about the rejection at all) arriving after the reviewer already cancelled,
+  // which `cancelling`'s single legal edge forces down the cancelled branch too. Pins that the
+  // recovery belongs to the BRANCH, not to the error shape that happened to reach it — the split
+  // that let this gap exist in the first place.
+  it(
+    'a plain crash arriving after the reviewer cancelled recovers its terminal checkpoint too, ' +
+      'rather than the recovery depending on the rejection having been cancellation-shaped',
+    async () => {
+      const { pending, runners } = controllableAttempts();
+      const { runs, globalState, workspaceState } = manager({ runners });
+
+      const record = runs.trigger(crInput('2841'), 3);
+      await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
+      await seedEscapedTerminalCheckpoint(globalState, record, { lifecycle: 'cancelled', completeness: 'partial' }, 2);
+
+      runs.cancel(record.key);
+      expect(runs.get(record.key)?.lifecycle).toBe('cancelling');
+      pending.get('!2841')!.reject(new Error('boom'));
+      await vi.waitFor(() => expect(runs.get(record.key)).toBeUndefined());
+
+      const partial = readRetained(workspaceState.get<SessionDraft>(PARTIAL_KEY), { partial: true });
+      expect(partial?.draft.review.items).toHaveLength(2);
+      const row = new ReviewRunStore(globalState).list().find((r) => r.repoId === 'repo-1' && r.crNumber === '2841');
+      expect(row).toMatchObject({ outcome: 'partial', findingCount: 2 });
+    },
+  );
 
   it('a failed result with validated findings, arriving after the reviewer cancelled, still keeps them as a partial rather than stranding the record', async () => {
     const { pending, runners } = controllableAttempts();
@@ -1676,52 +1875,9 @@ describe('the in-flight record and the interrupted sweep', () => {
       const record = runs.trigger(crInput('2841'), 3);
       await vi.waitFor(() => expect(new InFlightRunStore(globalState).list()).toHaveLength(1));
 
-      const harnessRunStore = createHarnessRunStore(globalState, { now: () => Date.parse('2026-01-01T00:10:00.000Z') });
-      const snapshot = fixtureHarnessSnapshot(record.runId, record.lineageId);
-      await harnessRunStore.writeSnapshot(snapshot);
-      const finding: ValidatedFinding = {
-        candidateId: 'cand-1',
-        memberId: 'm1',
-        routing: 'inline',
-        item: { id: 'cand-1', file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A validated finding', body: 'Body.', code: '' },
-        provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
-        evidence: { repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, primary: { sourceId: 'ev_a', digest: 'x', origin: 'diffPage', memberId: 'm1', repositoryId: 'repo-1', baseSha: BASE_SHA, headSha: HEAD_SHA, path: 'file1.ts', range: { startLine: 1, endLine: 1 } }, supporting: [] },
-      };
-      const candidate: TrackedCandidate = { candidateId: 'cand-1', state: 'accepted', repairs: 0, reasons: [], finding };
-      let log = createActivityLog(record.runId, record.lineageId, 1);
-      log = appendActivityEvent(
-        log,
-        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
-        { occurredAt: '2026-01-01T00:05:00.000Z', phase: 'verifying', elapsedMs: 1000 },
-      );
-      // `finalizeEscapedError`'s own shape: a genuine terminal write, `intendedTerminal` declared,
-      // never `'attemptFailed'`'s crash-catch-all reason for a checkpoint like this one — this is
-      // `harnessAttempt.ts`'s own doc comment's exact case, simulated at the store level here since
-      // this suite drives the manager, not a real `HarnessAttempt`.
-      const built = buildCheckpoint(
-        {
-          checkpointId: 'ckpt-1',
-          runId: record.runId,
-          lineageId: record.lineageId,
-          attempt: 1,
-          phase: 'verifying',
-          reason: 'attemptFailed',
-          occurredAt: '2026-01-01T00:05:00.000Z',
-          elapsedMs: 1000,
-          snapshotDigest: computeSnapshotDigest(snapshot),
-          activityEvents: log.events,
-          evidenceSources: [],
-          candidates: [candidate],
-          contradicted: [],
-          budget: ZERO_BUDGET,
-          coverage: [],
-          unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
-          retry: INITIAL_RETRY_STATE,
-          intendedTerminal: { lifecycle: 'failed', completeness: 'partial' },
-        },
-        DEFAULT_HARNESS_POLICY,
-      );
-      await harnessRunStore.writeCheckpoint(built, DEFAULT_HARNESS_POLICY);
+      // `finalizeEscapedError`'s own shape: a genuine terminal write with `intendedTerminal`
+      // declared, carrying the one candidate the tracker had already accepted.
+      await seedEscapedTerminalCheckpoint(globalState, record, { lifecycle: 'failed', completeness: 'partial' });
 
       // The genuine crash: `HarnessAttempt.run()` rejects outright, reaching `executeAttempt`'s
       // generic catch — never a resolved `HarnessAttemptResult`.

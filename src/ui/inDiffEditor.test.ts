@@ -246,4 +246,81 @@ describe('InDiffEditor', () => {
     expect(renderedText).not.toMatch(/(?<!\\)\`\`\`/);
     inDiff.dispose();
   });
+
+  /**
+   * The peek widget is the third site of the "untrusted text must not be able to close its own
+   * fence" rule, after the posting path (`../app/submit.ts`) and the provider `buildCommentBody`s,
+   * and it was the one the rule reached last. It renders `item.body` and `item.suggestion.new` as
+   * markdown, and neither is inspected for content anywhere upstream — `harnessCandidateValidation.ts`
+   * bounds the body's length and truncates the suggestion, which must stay byte-verbatim code.
+   *
+   * Display-only, and it stays that way: the `vscode.MarkdownString` built here never sets
+   * `isTrusted`, so command links inside model text cannot execute. What a fence run costs is
+   * structure — the reviewer reading this widget sees a different suggestion than the one the
+   * webview beside it will post.
+   */
+  it('widens the suggestion fence past a ``` run inside the suggested code, so the whole suggestion stays in one block', async () => {
+    const withFence = {
+      ...ITEM,
+      id: 'f-suggestion-fence',
+      suggestion: { old: '  return cache.get(key);', new: 'Run it with:\n```\nnpm test\n```' },
+    };
+    const { InDiffEditor } = await import('./inDiffEditor.js');
+    const inDiff = new InDiffEditor();
+
+    await inDiff.show({ item: withFence, agentLabel: 'agent' });
+    const comments = createCommentThread.mock.calls[0]?.[2] as unknown[];
+    const rendered = (comments?.[0] as { body: { value: string } })?.body?.value ?? '';
+
+    const openMatch = /^(`{3,})suggestion$/m.exec(rendered);
+    expect(openMatch, `no fence opener found in: ${rendered}`).not.toBeNull();
+    const fence = openMatch![1]!;
+    expect(fence.length).toBeGreaterThan(3);
+    const afterOpen = rendered.indexOf(`${fence}suggestion`) + fence.length + 'suggestion'.length + 1;
+    const closeIdx = rendered.indexOf(fence, afterOpen);
+    // Every byte of the suggested code is inside the one block, its own fence run included —
+    // nothing is escaped here, unlike the body: a suggestion has to stay applyable code.
+    expect(rendered.slice(afterOpen, closeIdx)).toBe('Run it with:\n```\nnpm test\n```\n');
+    inDiff.dispose();
+  });
+
+  it('keeps the ordinary three-backtick fence for a suggestion containing no backticks', async () => {
+    const plain = {
+      ...ITEM,
+      id: 'f-suggestion-plain',
+      suggestion: { old: '  return cache.get(key);', new: '  return await cache.get(key);' },
+    };
+    const { InDiffEditor } = await import('./inDiffEditor.js');
+    const inDiff = new InDiffEditor();
+
+    await inDiff.show({ item: plain, agentLabel: 'agent' });
+    const comments = createCommentThread.mock.calls[0]?.[2] as unknown[];
+    const rendered = (comments?.[0] as { body: { value: string } })?.body?.value ?? '';
+
+    expect(rendered).toContain('```suggestion\n  return await cache.get(key);\n```');
+    inDiff.dispose();
+  });
+
+  it('escapes a fence run in the body, so an unterminated one cannot swallow the suggestion block below it', async () => {
+    const withBodyFence = {
+      ...ITEM,
+      id: 'f-body-fence',
+      body: 'The call site opens\n```\nand never closes it.',
+      suggestion: { old: '  return cache.get(key);', new: '  return await cache.get(key);' },
+    };
+    const { InDiffEditor } = await import('./inDiffEditor.js');
+    const inDiff = new InDiffEditor();
+
+    await inDiff.show({ item: withBodyFence, agentLabel: 'agent' });
+    const comments = createCommentThread.mock.calls[0]?.[2] as unknown[];
+    const rendered = (comments?.[0] as { body: { value: string } })?.body?.value ?? '';
+
+    // The body's run is neutralized character by character, so it renders as text and opens nothing.
+    expect(rendered).toContain('The call site opens\n\\`\\`\\`\nand never closes it.');
+    // The suggestion below it still opens its own block on its own line, and the label above it is
+    // still a label rather than code swallowed by the body's block.
+    expect(rendered).toMatch(/^_Suggested change_$/m);
+    expect(rendered).toMatch(/^```suggestion$/m);
+    inDiff.dispose();
+  });
 });
