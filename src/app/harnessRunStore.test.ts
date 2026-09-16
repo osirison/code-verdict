@@ -891,6 +891,87 @@ describe('HarnessRunStore (11.4): each HarnessPolicy bound triggers eviction at 
   });
 });
 
+// Two checkpoints written in the same millisecond share an `occurredAt` exactly — ISO strings carry
+// no finer granularity, and one attempt can cross two phase boundaries inside one millisecond. The
+// ordering comparator used to break that tie on `checkpointId`, which is `ckpt_` plus 16 random
+// bytes (`mintId`, `harnessAttempt.ts`): reproducible for one pair of ids, but unrelated to which
+// checkpoint was actually written first, so the tie was decided by whatever the random ids happened
+// to be. Both tests here construct the tie directly with hand-chosen ids rather than racing a clock
+// — a timing-based repro would inherit the same intermittency it is meant to close — and give the
+// LATER-written checkpoint the lexicographically SMALLER id, the arrangement under which the old
+// comparator is wrong every single run.
+describe('HarnessRunStore: two checkpoints sharing one millisecond are ordered by write order, never by their random checkpointIds', () => {
+  const MIDPHASE_ID = 'ckpt_ffffffffffffffffffffffffffffffff'; // written first, sorts LAST lexicographically
+  const TERMINAL_ID = 'ckpt_00000000000000000000000000000000'; // written second, sorts FIRST lexicographically
+  const TIED_AT = '2026-01-01T00:00:05.000Z';
+
+  it('latestCheckpoint returns the terminal checkpoint written second, not the mid-phase one it shares a timestamp with, even though the terminal id sorts first', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    // Both checkpoints are built through `buildCheckpoint` over real activity, not hand-set
+    // projections: `parsePersistedCheckpoint` recomputes `projection` from the persisted activity on
+    // every read (`reduceActivityForRead`), so a hand-set projection would never be what a reader
+    // actually sees. The lifecycles asserted below are therefore the ones a real caller reads back.
+    let midPhaseLog = createActivityLog(RUN_ID, 'lineage-1', 1);
+    midPhaseLog = appendActivityEvent(
+      midPhaseLog,
+      { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+      { occurredAt: TIED_AT, phase: 'investigating', elapsedMs: 5000 },
+    );
+    const midPhase = buildCheckpoint(
+      checkpointInput({ checkpointId: MIDPHASE_ID, occurredAt: TIED_AT, phase: 'investigating', activityEvents: midPhaseLog.events }),
+      DEFAULT_HARNESS_POLICY,
+    );
+
+    let terminalLog = createActivityLog(RUN_ID, 'lineage-1', 1);
+    terminalLog = appendActivityEvent(
+      terminalLog,
+      { kind: 'terminalResult', lifecycle: 'failed', completeness: 'partial', limitations: [] },
+      { occurredAt: TIED_AT, phase: 'persisting', elapsedMs: 5000 },
+    );
+    const terminal = buildCheckpoint(
+      checkpointInput({ checkpointId: TERMINAL_ID, occurredAt: TIED_AT, phase: 'persisting', activityEvents: terminalLog.events }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    // Sanity: the two really are distinguishable by lifecycle, and really do share a timestamp.
+    expect(midPhase.projection.lifecycle).toBe('investigating');
+    expect(terminal.projection.lifecycle).toBe('failed');
+    expect(midPhase.occurredAt).toBe(terminal.occurredAt);
+
+    await runStore.writeCheckpoint(midPhase, GENEROUS_RETENTION);
+    await runStore.writeCheckpoint(terminal, GENEROUS_RETENTION);
+
+    // The live symptom: a caller reading back an attempt that has already ended was told it was
+    // still mid-phase, because the mid-phase checkpoint sorted last on the strength of its id alone.
+    const latest = runStore.latestCheckpoint('lineage-1');
+    expect(latest?.checkpointId).toBe(TERMINAL_ID);
+    expect(latest?.projection.lifecycle).toBe('failed');
+
+    // `checkpointsFor`'s own documented contract — "oldest to newest" — over the same tied pair.
+    // Persisted order is this comparator's sorted output, so this is what a restart reads back too,
+    // not an in-memory-only ordering.
+    expect(runStore.checkpointsFor('lineage-1').map((c) => c.checkpointId)).toEqual([MIDPHASE_ID, TERMINAL_ID]);
+  });
+
+  it('retainedCheckpointsPerLineage evicts the older member of a same-timestamp pair, never the newer one whose random id happens to sort first', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, retainedCheckpointsPerLineage: 2 };
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: MIDPHASE_ID, occurredAt: TIED_AT }), policy);
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: TERMINAL_ID, occurredAt: TIED_AT }), policy);
+    // A third checkpoint one second later pushes the lineage one past the count bound, so the
+    // eviction boundary falls exactly between the two tied checkpoints — the only arrangement in
+    // which a tie decides which checkpoint is lost rather than merely which is listed first.
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: 'ckpt-later', occurredAt: '2026-01-01T00:00:06.000Z' }), policy);
+
+    // Silent data loss if the tie goes the wrong way: the newer checkpoint is evicted and the older
+    // one it superseded is kept, with nothing recorded anywhere to say it happened.
+    const remaining = runStore.checkpointsFor('lineage-1').map((c) => c.checkpointId);
+    expect(remaining).toEqual([TERMINAL_ID, 'ckpt-later']);
+    expect(remaining).not.toContain(MIDPHASE_ID);
+  });
+});
+
 describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and unknown-enum persisted blobs all fail closed on read', () => {
   const validLineage = () => ({
     schemaVersion: '1',

@@ -939,10 +939,28 @@ async function removeLineageFromRunIndex(store: KeyValueStore, runId: RunId, lin
   await store.update(runIndexKey(runId), { ...existing, lineageIds: remaining });
 }
 
-/** Orders by `occurredAt`, then `checkpointId` as a deterministic tiebreaker (two checkpoints can share a timestamp). */
+/**
+ * Orders by `occurredAt` alone, returning 0 on a tie — two checkpoints can share a timestamp,
+ * because `occurredAt` is an ISO string with millisecond granularity and one attempt can cross two
+ * phase boundaries inside the same millisecond. A tie is left to `Array.prototype.sort`'s
+ * stability, which keeps the two in the array order they already had, and that order is write
+ * order: `writeCheckpoint` appends, and every path the array passes through afterwards preserves
+ * position (`parseArray` in `parsePersistedLineageRecord` on read-back,
+ * `enforceTerminalAttemptHistory`'s filter, `checkpointsFor`'s filter), so it survives a restart
+ * rather than living only in one process's memory.
+ *
+ * There is deliberately no `checkpointId` tiebreaker. `checkpointId` is `ckpt_` plus 16 random
+ * bytes (`mintId`, `harnessAttempt.ts`), so comparing it ranks tied checkpoints arbitrarily rather
+ * than chronologically — reproducible for one pair of ids, but unrelated to which was written
+ * first. That is what made `latestCheckpoint` (the last element of this sort) return a mid-phase
+ * checkpoint instead of the terminal one written after it in the same millisecond, and what let
+ * `enforceLineageRetention` below evict the newer of a tied pair and keep the older. Returning 0
+ * matches what `enforceTerminalAttemptHistory`'s own marker sort and `harnessDiagnosticsSource.ts`
+ * already do with equal `occurredAt` values.
+ */
 function byOccurredAt(a: PersistedCheckpoint, b: PersistedCheckpoint): number {
-  if (a.occurredAt !== b.occurredAt) return a.occurredAt < b.occurredAt ? -1 : 1;
-  return a.checkpointId < b.checkpointId ? -1 : a.checkpointId > b.checkpointId ? 1 : 0;
+  if (a.occurredAt === b.occurredAt) return 0;
+  return a.occurredAt < b.occurredAt ? -1 : 1;
 }
 
 /** Task 11.4's per-lineage bounds: count first, then aggregate bytes — both by evicting whole older checkpoints; only the single newest may end up marked incompatible, never stripped. */

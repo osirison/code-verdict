@@ -257,6 +257,29 @@ describe('findRecentDiagnosticsCandidates', () => {
     expect(candidates[0]?.lineageId).toBe('lineage-new');
   });
 
+  it('breaks a same-`occurredAt` tie between two lineages for one target by write order, keeping the later-written (newer) lineage rather than whichever store.keys() walks to first', async () => {
+    const store = jsonMemoryStore();
+    // `writeFailedLineage(store, 'lineage-old', ...)` runs to completion — its `store.update` included
+    // — before the `lineage-new` call starts, so `lineage-old`'s key claims the earlier position in
+    // the underlying `Map` and `lineage-new`'s claims the later one; `keys()` never moves an existing
+    // key on a later write, only a brand-new one gets appended. Both checkpoints share TIED_AT exactly,
+    // so `findRecentDiagnosticsCandidates`'s dedup cannot break the tie by comparing timestamps — only
+    // write order can, and the older lineage is what a strict `<` used to keep.
+    const TIED_AT = '2026-01-05T00:00:00.000Z';
+    await writeFailedLineage(store, 'lineage-old', TIED_AT);
+    const runStore = await writeFailedLineage(store, 'lineage-new', TIED_AT);
+
+    const candidates = findRecentDiagnosticsCandidates(runStore.listLineages(), identifyAll);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.lineageId).toBe('lineage-new');
+
+    // The user-visible half: `showRunDiagnostics` auto-reports `selectDiagnosticsCandidate`'s `chosen`
+    // without asking first, so a tie resolved the wrong way here means the reviewer is shown the wrong
+    // run's diagnostics with no indication anything was chosen at all.
+    const selection = selectDiagnosticsCandidate(candidates, new Set());
+    expect(selection?.chosen.lineageId).toBe('lineage-new');
+  });
+
   it('sorts distinct targets newest first, and only prompts a picker (a caller\'s job) when more than one exists', async () => {
     const store = jsonMemoryStore();
     await writeFailedLineage(store, 'lineage-1', '2026-01-01T00:00:00.000Z');

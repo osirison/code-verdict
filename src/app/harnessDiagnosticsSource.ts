@@ -206,7 +206,17 @@ export function findRecentDiagnosticsCandidates(
     const candidate = candidateFromLineage(lineage, identify);
     if (!candidate) continue;
     const existing = byTarget.get(candidate.targetKey);
-    if (!existing || existing.occurredAt < candidate.occurredAt) byTarget.set(candidate.targetKey, candidate);
+    // `<=`, not `<`: `lineages` is `listLineages()`'s walk of `store.keys()` (`KeyValueStore`'s own
+    // contract — `vscode.Memento` in production, a `Map` in tests — neither ever re-inserts a key it
+    // already holds), so a lineage's key sits at whatever position its *first* write claimed — two
+    // lineages for one target are always encountered oldest first. A strict `<`
+    // lets a tied `occurredAt` fall through unreplaced, keeping whichever candidate got here first —
+    // the older lineage, every time — which is the opposite of what this function promises ("newest
+    // ... one entry per target") and what `selectDiagnosticsCandidate` relies on to auto-report the
+    // right run. Same rule as `byOccurredAt` in `harnessRunStore.ts`: order among same-timestamp
+    // records follows write order, so the later-encountered (newer) candidate must win a tie, not
+    // lose it.
+    if (!existing || existing.occurredAt <= candidate.occurredAt) byTarget.set(candidate.targetKey, candidate);
   }
   return [...byTarget.values()].sort((a, b) => (a.occurredAt < b.occurredAt ? 1 : a.occurredAt > b.occurredAt ? -1 : 0));
 }
