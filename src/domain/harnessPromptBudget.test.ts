@@ -178,6 +178,18 @@ describe('admitting one more result', () => {
     expect(reason).toContain('No turn of this attempt can carry it');
     expect(describeFramingOverrun(resolvePromptBudget(196_608, 210_000))).toContain('codeVerdict.harness.maxPromptKilobytesPerTurn');
   });
+
+  it('advises a shorter description on an unshrunk overrun, but not once the untrusted content was already capped and summarized (the incident fix)', () => {
+    const untouched = describeFramingOverrun(resolvePromptBudget(126_976, 148_417));
+    expect(untouched).toContain('review a change request with a shorter description');
+    expect(untouched).not.toContain('capping');
+
+    const shrunk = describeFramingOverrun(resolvePromptBudget(126_976, 148_417), { alreadyShrunk: true });
+    expect(shrunk).toContain('codeVerdict.harness.maxPromptKilobytesPerTurn');
+    expect(shrunk).toContain('capping its commit list and description');
+    // The lever this used to (wrongly) suggest was already pulled — advising it again would blame the reviewer for a shape the run already reduced.
+    expect(shrunk).not.toContain('review a change request with a shorter description');
+  });
 });
 
 describe('the figures as the model reads them', () => {

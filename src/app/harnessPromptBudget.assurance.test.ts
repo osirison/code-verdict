@@ -503,3 +503,131 @@ describe('the per-turn prompt budget, when a turn mixes predictable reads with u
     expect(result.outcome.limitations.map((limitation) => limitation.code)).not.toContain('promptBudgetNoRoom');
   });
 });
+
+/**
+ * The incident this fixes (real report): sixty commits, each with a long message, plus a verbose
+ * body — every one of them well within a single provider request's own limits, so
+ * `buildBootstrapSection` inlines the whole `NormalizedDetail` rather than summarizing it up
+ * front. `maxInputTokens` is undefined in this fixture's model (`baseDeps`, like every other test
+ * in this file), which is deliberate: it isolates the per-turn *byte* cap as the only thing that
+ * can refuse this review, since `fitBootstrapToModel`'s own token loop has nothing to check
+ * against and accepts the untouched envelope on its very first attempt (task 6.6's pipeline was
+ * never the gap — the framing-byte check downstream of it was).
+ */
+function incidentDetail(): NormalizedDetail {
+  return {
+    title: 'A change with a very long commit history',
+    body: `Rewrites the retry loop end to end. ${'z'.repeat(20_000)}`,
+    labels: [],
+    commits: Array.from({ length: 60 }, (_, index) => ({ sha: `c${index}`, message: `Commit ${index}: ${'y'.repeat(2_000)}`, author: 'author' })),
+    discussion: [],
+    checkSummaries: [],
+    relationships: [],
+    unavailableSections: [],
+  };
+}
+
+function incidentDetailsHandler(): (request: ChangeRequestDetailRequest) => Promise<ChangeRequestDetailResult> {
+  return async () => ({ snapshot: { repoId: REPO_ID, baseSha: BASE_SHA, headSha: HEAD_SHA }, state: 'complete', value: incidentDetail() });
+}
+
+describe('the per-turn prompt budget, when the review\'s own untrusted commit history and description overflow it (the incident)', () => {
+  it('caps the commit list and description before refusing, and still leaves the turn room to read', async () => {
+    const CEILING = 124 * 1024; // 126,976 bytes — the incident's own reported cap.
+    const policy = normalizeHarnessPolicy({
+      maxPromptBytesPerTurn: CEILING,
+      maxToolRequestsPerTurn: 8,
+      maxToolRequestsPerAttempt: 40,
+      maxModelTurnsPerAttempt: 20,
+      maxEvidenceBytesPerAttempt: 8 * 1024 * 1024,
+      maxElapsedMsPerAttempt: 10_000_000,
+    });
+
+    const ONLY_FILE = 'src/only.ts';
+    const diffCallsByPath = new Map<string, number>();
+    const connection = fakeConnection({
+      getChangeRequestDetails: incidentDetailsHandler(),
+      listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [manifestEntry(ONLY_FILE, 2_000)] }),
+      readDiff: async (request) => {
+        diffCallsByPath.set(request.path, (diffCallsByPath.get(request.path) ?? 0) + 1);
+        return diffPage(request.path, 2_000);
+      },
+      getCurrentHead: async () => ({ repoId: REPO_ID, state: 'resolved', headSha: HEAD_SHA }),
+    });
+    registerFakeProvider(connection);
+
+    const turns: RecordedTurn[] = [];
+    const runTurn: HarnessRuntimeDeps['runTurn'] = async (_modelId, prompt) => {
+      turns.push({ prompt, bytes: Buffer.byteLength(prompt, 'utf8'), isContradictionCheck: prompt.startsWith(CONTRADICTION_CHECK_MARKER) });
+      if (prompt.startsWith(CONTRADICTION_CHECK_MARKER)) return JSON.stringify({ candidateId: 'none', contradicted: false });
+      if (prompt.includes('"planning" phase')) return PLAN;
+      const outstanding = unreadPaths(prompt);
+      if (outstanding.length > 0) return toolRequests(outstanding.slice(0, 8));
+      return prompt.includes('"verifying" phase') ? FINISH : RATIONALE;
+    };
+
+    const factory = createReviewHarnessFactory({ ...baseDeps(runTurn), policy });
+    const result = await factory.create(runInput(), runOptions()).run();
+
+    // The fix, stated the way it matters: this review was never refused for want of framing room.
+    expect(result.outcome.limitations.map((limitation) => limitation.code)).not.toContain('promptBudgetNoRoom');
+    expect(turns.length, 'the run must have actually reached the model, not refused before the first turn').toBeGreaterThan(0);
+
+    // Every assembled prompt held the incident's own cap.
+    for (const turn of turns) expect(turn.bytes).toBeLessThanOrEqual(CEILING);
+
+    // The elision markers are in the prompt the model actually reads, inside the untrusted block —
+    // and the newest commit survived capping with its real message, proving this is the gentle
+    // capping tactic at work and not a jump straight to a bare-counts summary.
+    const planningPrompt = turns.find((turn) => turn.prompt.includes('"planning" phase'))?.prompt ?? '';
+    expect(planningPrompt).toContain('## Bootstrap content (untrusted');
+    expect(planningPrompt).toContain('40 older commit message(s) omitted');
+    expect(planningPrompt).toContain('more character(s) of the description omitted');
+    expect(planningPrompt).toContain('Commit 59: ');
+
+    // Positive content allowance, in behavioural form: there was still room to serve a read, and it happened.
+    expect(diffCallsByPath.get(ONLY_FILE)).toBe(1);
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+  });
+
+  it('still refuses when shrinking cannot help either, with a message that stops blaming the change request\'s own description', async () => {
+    // Below the framing floor this file's own header measured even with nothing to review (55 KB
+    // was the smallest prompt across a real run) — irreducible by construction, whatever the
+    // untrusted content looks like.
+    const CEILING = 4 * 1024;
+    const policy = normalizeHarnessPolicy({
+      maxPromptBytesPerTurn: CEILING,
+      maxToolRequestsPerTurn: 8,
+      maxToolRequestsPerAttempt: 40,
+      maxModelTurnsPerAttempt: 20,
+      maxEvidenceBytesPerAttempt: 8 * 1024 * 1024,
+      maxElapsedMsPerAttempt: 10_000_000,
+    });
+
+    const connection = fakeConnection({
+      getChangeRequestDetails: detailsHandler(), // the file's ordinary, small detail — even this cannot fit at 4 KB.
+      listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: [] }),
+      getCurrentHead: async () => ({ repoId: REPO_ID, state: 'resolved', headSha: HEAD_SHA }),
+    });
+    registerFakeProvider(connection);
+
+    let turnCount = 0;
+    const runTurn: HarnessRuntimeDeps['runTurn'] = async () => {
+      turnCount += 1;
+      return RATIONALE;
+    };
+
+    const factory = createReviewHarnessFactory({ ...baseDeps(runTurn), policy });
+    const result = await factory.create(runInput(), runOptions()).run();
+
+    // The refusal happens before the first turn — an attempt with no room for evidence never starts one.
+    expect(turnCount).toBe(0);
+
+    const refusal = result.outcome.limitations.find((limitation) => limitation.code === 'promptBudgetNoRoom');
+    expect(refusal, 'the review must refuse rather than silently proceed with no room for evidence').toBeDefined();
+    expect(refusal!.message).toContain('codeVerdict.harness.maxPromptKilobytesPerTurn');
+    expect(refusal!.message).toContain('capping its commit list and description');
+    expect(refusal!.message).not.toContain('review a change request with a shorter description');
+  });
+});

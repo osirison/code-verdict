@@ -19,7 +19,9 @@ import {
   withMinimalToolDescriptions,
   withPolicyTextOmitted,
   withSectionsSummarized,
+  withUntrustedContentCapped,
   type BootstrapEnvelope,
+  type UntrustedContentCaps,
 } from '../domain/harnessBootstrap';
 import type { Limitation } from '../domain/harnessActivity';
 
@@ -42,20 +44,42 @@ function renderForCounting(envelope: BootstrapEnvelope): string {
 }
 
 /** Stated once here so both the shrink call and the render-time reason (`harnessModelSeam.ts`) agree on the same wording. */
-export const POLICY_TEXT_OMITTED_REASON = "Root policy text omitted: the bootstrap envelope did not fit the model's input limit even after summarizing sections and shortening tool descriptions.";
+export const POLICY_TEXT_OMITTED_REASON = "Root policy text omitted: the bootstrap envelope did not fit the model's input limit even after capping untrusted content, summarizing sections, and shortening tool descriptions.";
 
 /**
- * Tries the full envelope, then three shrink tactics in order — replace
- * reopenable sections with their summaries, shorten non-normative tool
- * descriptions, then (new) drop the composed root-policy text down to
- * identity only — and fails closed with a `bootstrapOverflow` limitation
- * (D4's own term) when even the minimal authoritative envelope does not fit.
+ * The canonical shrink ladder, most-disposable-first, shared by every caller that must fit this
+ * envelope against *some* limit: the token-based loop directly below, and the per-turn byte-cap
+ * retry in `../app/harnessAttempt.ts`'s `runBootstrap` (the incident fix — the framing byte
+ * ceiling is a separate, often tighter budget than a model's own input-token limit, and it used to
+ * have no shrink step of its own at all). One list means the two budgets can never disagree about
+ * what gets dropped first.
  *
- * Policy text is tried last, after both existing tactics: it is authoritative
- * instruction the repository owner wrote, worth more bootstrap space than
- * reopenable-section detail or tool-description prose, so it is the last
- * thing dropped rather than the first — but it is dropped, truthfully
- * (`withPolicyTextOmitted` marks exactly why), rather than let a large
+ * Order, cheapest-to-precious: cap the untrusted PR/MR content (commits, body) while leaving it
+ * structured; collapse every reopenable section to its bare-counts summary; drop non-normative
+ * tool-description prose; and only last, drop the repository owner's own authoritative policy
+ * text. See `../domain/harnessBootstrap.ts`'s doc comments on each tactic for why each is ordered
+ * where it is (in particular: capping must run before summarizing, because summarizing already
+ * destroys the commit list and body this tactic would otherwise cap).
+ */
+export function bootstrapShrinkAttempts(envelope: BootstrapEnvelope, caps?: UntrustedContentCaps): readonly BootstrapEnvelope[] {
+  const capped = withUntrustedContentCapped(envelope, caps);
+  const summarized = withSectionsSummarized(capped);
+  const minimal = withMinimalToolDescriptions(summarized);
+  const policyTrimmed = withPolicyTextOmitted(minimal, POLICY_TEXT_OMITTED_REASON);
+  return [envelope, capped, summarized, minimal, policyTrimmed];
+}
+
+/**
+ * Tries the full envelope, then the four shrink tactics of `bootstrapShrinkAttempts` in order —
+ * cap untrusted content, replace reopenable sections with their summaries, shorten non-normative
+ * tool descriptions, then drop the composed root-policy text down to identity only — and fails
+ * closed with a `bootstrapOverflow` limitation (D4's own term) when even the minimal authoritative
+ * envelope does not fit.
+ *
+ * Policy text is tried last, after every other tactic: it is authoritative instruction the
+ * repository owner wrote, worth more bootstrap space than untrusted-section detail or
+ * tool-description prose, so it is the last thing dropped rather than the first — but it is
+ * dropped, truthfully (`withPolicyTextOmitted` marks exactly why), rather than let a large
  * `AGENTS.md`/`CLAUDE.md` sink an otherwise-fitting bootstrap outright.
  */
 export async function fitBootstrapToModel(input: BootstrapBudgetInput): Promise<BootstrapFitResult> {
@@ -64,10 +88,7 @@ export async function fitBootstrapToModel(input: BootstrapBudgetInput): Promise<
   }
   const maxInputTokens = input.maxInputTokens;
 
-  const summarized = withSectionsSummarized(input.envelope);
-  const minimal = withMinimalToolDescriptions(summarized);
-  const policyTrimmed = withPolicyTextOmitted(minimal, POLICY_TEXT_OMITTED_REASON);
-  const attempts: readonly BootstrapEnvelope[] = [input.envelope, summarized, minimal, policyTrimmed];
+  const attempts = bootstrapShrinkAttempts(input.envelope);
 
   let lastUsedTokens: number | undefined;
   for (const attempt of attempts) {

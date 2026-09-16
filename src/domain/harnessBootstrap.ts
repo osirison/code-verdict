@@ -32,7 +32,7 @@
  * linked-issue and change-request metadata, title, body, commits,
  * discussion, labels, check summaries, and relationships.
  */
-import type { InvestigationCursor, NormalizedDetail } from '../platform/types';
+import type { InvestigationCursor, NormalizedCommit, NormalizedDetail } from '../platform/types';
 import type { Criteria } from './criteria';
 import type { EffortLevel } from './effort';
 import { HOST_TOOL_DEFINITIONS } from './harnessTools';
@@ -284,12 +284,131 @@ export function buildBootstrapEnvelope(input: BuildBootstrapEnvelopeInput): Boot
   };
 }
 
+/**
+ * Caps for the newest shrink tactic (below): how many of a change request's commits survive
+ * inline, how long any one surviving commit message may be, and how much of the PR/MR body is
+ * kept. Fixed numbers, not a fraction of whatever budget happens to be asking: the caller (the
+ * fit loop in `../app/harnessBootstrapBudget.ts`, and the per-turn byte retry in
+ * `../app/harnessAttempt.ts`) already has three further, more aggressive tactics behind this one
+ * if a fixed cap is not enough, so this tactic does not need to know the caller's actual budget to
+ * be useful — it only needs to turn "40 commits and a long description" into "a bounded amount of
+ * real content" before falling back to the bare-counts summary that erases it entirely.
+ */
+export interface UntrustedContentCaps {
+  /** Commits kept inline; older ones collapse into one elision entry. */
+  readonly maxCommits: number;
+  /** Characters kept per surviving commit message. */
+  readonly maxCommitMessageChars: number;
+  /** Characters kept from the head of the PR/MR body. */
+  readonly maxBodyChars: number;
+}
+
+export const DEFAULT_UNTRUSTED_CONTENT_CAPS: UntrustedContentCaps = {
+  maxCommits: 20,
+  maxCommitMessageChars: 500,
+  maxBodyChars: 4_000,
+};
+
+const FRAMING_CAP_REASON = 'framing exceeded the per-turn prompt cap';
+
+/** The `sha` this tactic mints for its own elision entry — recognized on a re-application (see `capCommitList`) so capping twice is a fixed point rather than eliding the previous elision. */
+const ELIDED_COMMIT_SHA = '(elided)';
+
+/**
+ * Keeps the newest `caps.maxCommits` commits (each message capped at `caps.maxCommitMessageChars`)
+ * and replaces everything older with one truthful elision entry — never a silent drop, and never a
+ * change to `sha`/`author`/`message` for a commit that survives uncapped.
+ *
+ * "Newest" assumes `commits` arrives oldest-first, the order GitHub's PR-commits API returns
+ * (`../providers/github/mappers.ts` passes it through unchanged). A provider that hands over
+ * newest-first instead would have this keep the oldest commits rather than the newest — the
+ * safety property (bounded count, bounded message length, an honest count of what is missing)
+ * holds either way; only which specific commits survive would differ.
+ *
+ * Idempotent: a list already starting with this tactic's own elision entry is recognized as such,
+ * so re-running it (never done by `withUntrustedContentCapped` itself, which runs once per fit
+ * attempt, but kept true because nothing here should assume its own caller) caps only the commits
+ * after that entry rather than eliding the elision.
+ */
+function capCommitList(commits: readonly NormalizedCommit[], caps: UntrustedContentCaps): readonly NormalizedCommit[] {
+  const alreadyElided = commits.length > 0 && commits[0]!.sha === ELIDED_COMMIT_SHA;
+  const real = alreadyElided ? commits.slice(1) : commits;
+  let changed = false;
+  const shortened = real.map((commit) => {
+    if (commit.message.length <= caps.maxCommitMessageChars) return commit;
+    changed = true;
+    return { ...commit, message: `${commit.message.slice(0, caps.maxCommitMessageChars)}… (message truncated: ${FRAMING_CAP_REASON})` };
+  });
+  const overflow = shortened.length - caps.maxCommits;
+  if (overflow <= 0) {
+    if (!changed) return commits; // fixed point, with or without a marker already present
+    return alreadyElided ? [commits[0]!, ...shortened] : shortened;
+  }
+  const elided: NormalizedCommit = {
+    sha: ELIDED_COMMIT_SHA,
+    author: '(host)',
+    message: `… ${overflow} older commit message(s) omitted: ${FRAMING_CAP_REASON}.`,
+  };
+  return [elided, ...shortened.slice(overflow)];
+}
+
+/** Keeps the head of `body` within `caps.maxBodyChars`, with a truthful count of what was cut. */
+function capBodyText(body: string | undefined, caps: UntrustedContentCaps): string | undefined {
+  if (body === undefined || body.length <= caps.maxBodyChars) return body;
+  const omitted = body.length - caps.maxBodyChars;
+  return `${body.slice(0, caps.maxBodyChars)}\n… ${omitted} more character(s) of the description omitted: ${FRAMING_CAP_REASON}.`;
+}
+
+/** `undefined` when neither the commit list nor the body needed capping — the caller's no-op check. */
+function capNormalizedDetail(detail: NormalizedDetail, caps: UntrustedContentCaps): NormalizedDetail | undefined {
+  const commits = capCommitList(detail.commits, caps);
+  const body = capBodyText(detail.body, caps);
+  if (commits === detail.commits && body === detail.body) return undefined;
+  return { ...detail, commits, body };
+}
+
+/**
+ * Caps one section's commit list and body when it is still a full `NormalizedDetail` (`state:
+ * 'complete'`) — a section `withSectionsSummarized` already collapsed to a bare-counts string has
+ * nothing left for this tactic to cap, so it passes through unchanged, same as `forceSummary`'s own
+ * is-string check. Capping is itself a truncation the model was not shown before, so it moves
+ * `state` to `'truncated'` — honest about what changed, even though (unlike a provider-side
+ * truncation) there is no cursor to reopen it with; the section stays reopenable in full through
+ * the detail tool via its unchanged `digest`.
+ */
+function capSection(section: BootstrapSection, caps: UntrustedContentCaps): BootstrapSection {
+  if (typeof section.content === 'string') return section;
+  const capped = capNormalizedDetail(section.content, caps);
+  if (capped === undefined) return section;
+  return { ...section, state: 'truncated', content: capped };
+}
+
+/**
+ * Task 6.6's first shrink tactic (inserted ahead of section summarization by the incident fix
+ * below): cap each untrusted section's commit list and body rather than jumping straight to a
+ * bare-counts summary. `withSectionsSummarized` already destroys commit messages and the body
+ * entirely, so this has to run *before* it — capping a section that summarization already reduced
+ * to a string would have nothing left to cap. Tried first because it is the gentlest of the four
+ * tactics: real commit and description content survives, just bounded, so a model that only needed
+ * a little more headroom keeps the detail the later tactics would erase outright.
+ */
+export function withUntrustedContentCapped(envelope: BootstrapEnvelope, caps: UntrustedContentCaps = DEFAULT_UNTRUSTED_CONTENT_CAPS): BootstrapEnvelope {
+  return {
+    ...envelope,
+    untrusted: envelope.untrusted.map((memberSections) => ({
+      ...memberSections,
+      changeRequestDetails: capSection(memberSections.changeRequestDetails, caps),
+      issueDetails: memberSections.issueDetails.map((section) => capSection(section, caps)),
+    })),
+  };
+}
+
 function forceSummary(section: BootstrapSection): BootstrapSection {
   if (typeof section.content === 'string') return section; // already a summary — nothing left to shrink this way
   return { ...section, state: 'truncated', content: summarizeNormalizedDetail(section.content) };
 }
 
-/** Task 6.6's first shrink tactic: replace every reopenable section with its bounded summary. Pure — the caller's token-count loop decides when to call this. */
+/** Task 6.6's second shrink tactic: replace every reopenable section with its bounded summary. Pure — the caller's token-count loop decides when to call this. */
 export function withSectionsSummarized(envelope: BootstrapEnvelope): BootstrapEnvelope {
   return {
     ...envelope,
@@ -301,7 +420,7 @@ export function withSectionsSummarized(envelope: BootstrapEnvelope): BootstrapEn
   };
 }
 
-/** Task 6.6's second shrink tactic: drop the tool catalog's non-normative prose, keeping the normative name and required scope. */
+/** Task 6.6's third shrink tactic: drop the tool catalog's non-normative prose, keeping the normative name and required scope. */
 export function withMinimalToolDescriptions(envelope: BootstrapEnvelope): BootstrapEnvelope {
   return {
     ...envelope,
@@ -313,14 +432,14 @@ export function withMinimalToolDescriptions(envelope: BootstrapEnvelope): Bootst
 }
 
 /**
- * A third, last-resort shrink tactic added alongside the root-policy content fix: drop the
+ * A fourth, last-resort shrink tactic added alongside the root-policy content fix: drop the
  * composed policy `text` for every member that carries one, keeping identity (`sourceId`/`digest`/
- * `files`/`identical`) and recording why the text is missing. Tried only after both existing
- * tactics above, on the theory that a repository's own authoritative conventions are worth more
- * bootstrap space than untrusted-section detail or tool-description prose — but an envelope that
- * still does not fit must degrade this too rather than fail outright while ordinary bootstrap
- * content survives untouched. Never a silent truncation: a member whose text is dropped keeps its
- * exact identity line, and `harnessModelSeam.ts`'s `renderAuthoritative` states the omission inline
+ * `files`/`identical`) and recording why the text is missing. Tried only after all three tactics
+ * above, on the theory that a repository's own authoritative conventions are worth more bootstrap
+ * space than untrusted-section detail or tool-description prose — but an envelope that still does
+ * not fit must degrade this too rather than fail outright while ordinary bootstrap content
+ * survives untouched. Never a silent truncation: a member whose text is dropped keeps its exact
+ * identity line, and `harnessModelSeam.ts`'s `renderAuthoritative` states the omission inline
  * rather than mid-sentence-cutting the policy prose itself.
  */
 export function withPolicyTextOmitted(envelope: BootstrapEnvelope, reason: string): BootstrapEnvelope {

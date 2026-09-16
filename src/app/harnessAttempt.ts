@@ -212,7 +212,7 @@ import {
   type BootstrapPolicySource,
   type BootstrapToolSchema,
 } from '../domain/harnessBootstrap';
-import { fitBootstrapToModel } from './harnessBootstrapBudget';
+import { bootstrapShrinkAttempts, fitBootstrapToModel } from './harnessBootstrapBudget';
 import type { Limitation, Plan, RunPhase } from '../domain/harnessActivity';
 import type { BudgetConsumption, FileInspectionState, MemberCoverage, RiskLevel, UnresolvedWork } from '../domain/harnessCoverage';
 import { effortPrompt } from '../domain/effort';
@@ -1102,7 +1102,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   let activityLog: ActivityLog = createActivityLog(runId, lineageId, attemptNumber);
   let currentPhase: RunPhase = 'bootstrap';
-  /** The fitted bootstrap envelope (`runBootstrap`'s own `fit.envelope`) — set once, after `fitBootstrapToModel` confirms it fits, and handed to `options.modelSeam.askModel` on every `planning`/`investigating`/`verifying` call `runPhaseLoop` makes. See `HarnessModelSeam.envelope`'s own doc comment. */
+  /** The fitted bootstrap envelope (`runBootstrap`'s own `fit.envelope`) — assigned once `fitBootstrapToModel` confirms it fits the model's token limit, and reassigned once more if `runBootstrap`'s own per-turn byte-cap retry has to shrink it further (see that function's doc comment) — always before the first turn, and handed to `options.modelSeam.askModel` on every `planning`/`investigating`/`verifying` call `runPhaseLoop` makes. See `HarnessModelSeam.envelope`'s own doc comment. */
   let fittedEnvelope: BootstrapEnvelope | undefined;
   /** Seeded from the prior attempt's checkpoint on a resume — a fresh attempt still creates its own on the first planning turn, same as always. */
   let plan: Plan | undefined = resumeSeed?.payload.plan;
@@ -2518,12 +2518,21 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     deferrals: number;
   }
 
-  /** The prompt these results would produce, measured by the seam that renders it; `undefined` when this seam cannot render one (the demo participant, a hand-built test seam) — in which case no prompt budget applies and every request is served exactly as before. */
-  function measureNextPrompt(phase: RunPhase, results: readonly HostToolResult[]): number | undefined {
+  /**
+   * The prompt these results would produce, measured by the seam that renders it; `undefined` when
+   * this seam cannot render one (the demo participant, a hand-built test seam) — in which case no
+   * prompt budget applies and every request is served exactly as before.
+   *
+   * `envelopeOverride` measures a *candidate* envelope without committing to it — `runBootstrap`'s
+   * byte-cap retry (see its own doc comment) uses this to ask "would this shrunk envelope's framing
+   * fit?" for each rung of `bootstrapShrinkAttempts` before ever assigning `fittedEnvelope`. Every
+   * other call site omits it and measures against the envelope already committed to.
+   */
+  function measureNextPrompt(phase: RunPhase, results: readonly HostToolResult[], envelopeOverride?: BootstrapEnvelope): number | undefined {
     return options.modelSeam.measurePromptBytes?.({
       phase,
       toolResults: results,
-      envelope: fittedEnvelope,
+      envelope: envelopeOverride ?? fittedEnvelope,
       investigation: investigationMap(),
       submissions: submissionsSummary(),
     });
@@ -3514,13 +3523,36 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // is the real one. The precedent is `fitBootstrapToModel`'s own `bootstrapOverflow`, which
     // refuses the same way for the model's token limit: reporting "this cannot work, and here is
     // the number" before the first turn beats forty turns that each read nothing.
-    const framingBytes = measureNextPrompt('planning', []);
+    //
+    // `fitBootstrapToModel` above only guarded `snapshot.modelCapability?.maxInputTokens` — the
+    // model's own context window. `maxPromptBytesPerTurn` is a separate, independently configured
+    // ceiling (often far tighter: it exists to bound latency and cost, not just fit a context
+    // window), so an envelope the token fit accepted on its very first attempt — untouched, because
+    // it already fit comfortably in tokens — can still be too many *bytes* once actually rendered.
+    // That was the incident: forty long commit messages and a verbose description fit any
+    // reasonable token window but blew the byte cap, and this check used to have no shrink step of
+    // its own at all — it just measured the untouched envelope once and refused. It now retries the
+    // same `bootstrapShrinkAttempts` ladder `fitBootstrapToModel` already uses (skipping index 0,
+    // the full envelope just measured), this time checking real rendered bytes instead of tokens,
+    // and commits to the first rung that fits before ever falling through to the refusal below.
+    let framingBytes = measureNextPrompt('planning', []);
+    if (framingBytes !== undefined && framingBytes >= policy.maxPromptBytesPerTurn) {
+      for (const attempt of bootstrapShrinkAttempts(fittedEnvelope).slice(1)) {
+        const attemptBytes = measureNextPrompt('planning', [], attempt);
+        if (attemptBytes === undefined) continue; // cannot claim a fit that was never actually measured
+        framingBytes = attemptBytes;
+        if (attemptBytes < policy.maxPromptBytesPerTurn) {
+          fittedEnvelope = attempt;
+          break;
+        }
+      }
+    }
     if (framingBytes !== undefined && framingBytes >= policy.maxPromptBytesPerTurn) {
       return {
         ok: false,
         limitation: {
           code: 'promptBudgetNoRoom',
-          message: describeFramingOverrun(resolvePromptBudget(policy.maxPromptBytesPerTurn, framingBytes)),
+          message: describeFramingOverrun(resolvePromptBudget(policy.maxPromptBytesPerTurn, framingBytes), { alreadyShrunk: true }),
         },
       };
     }

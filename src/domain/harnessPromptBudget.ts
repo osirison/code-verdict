@@ -242,7 +242,24 @@ export function describeDroppedResults(droppedCount: number, ceilingBytes: numbe
   return `(${droppedCount} result(s) from your previous turn are not shown: including them would have pushed this prompt past its ${formatExactBytes(ceilingBytes)}-byte cap. Nothing was read from them — the files they cover still count as unread and their evidence is not citable. Those requests remain available: ask for them again, fewer at a time.)`;
 }
 
-/** Reported when even an empty-result prompt is over the ceiling: nothing can be dropped, so the run says so. */
-export function describeFramingOverrun(budget: PromptBudget): string {
-  return `This review's own framing needs ${formatExactBytes(budget.framingBytes)} bytes per turn, ${formatExactBytes(budget.framingOverrunBytes)} over the ${formatExactBytes(budget.ceilingBytes)}-byte prompt cap, so no turn has room for any tool result at all. Raise codeVerdict.harness.maxPromptKilobytesPerTurn above ${Math.ceil(budget.framingBytes / 1024)} KB, or review a change request with a shorter description.`;
+/**
+ * Reported when even an empty-result prompt is over the ceiling: nothing can be dropped, so the
+ * run says so.
+ *
+ * `alreadyShrunk` names the incident this message used to hide: before the fit retried
+ * `bootstrapShrinkAttempts` (`../app/harnessBootstrapBudget.ts`) against this same ceiling, the
+ * advice below was wrong on any change request with a verbose commit history or description — the
+ * "shorter description" a reviewer might have picked was already the shape the run had capped and
+ * summarized down to, so the sentence blamed a lever that had already been pulled. When shrinking
+ * was tried and still did not fit, the message says so and drops that clause: the only remaining
+ * lever is the setting.
+ */
+export function describeFramingOverrun(budget: PromptBudget, options?: { readonly alreadyShrunk?: boolean }): string {
+  const shrunkClause = options?.alreadyShrunk
+    ? ' even after capping its commit list and description and summarizing its untrusted content,'
+    : '';
+  const advice = options?.alreadyShrunk
+    ? `Raise codeVerdict.harness.maxPromptKilobytesPerTurn above ${Math.ceil(budget.framingBytes / 1024)} KB — this change request's own content is already at its floor.`
+    : `Raise codeVerdict.harness.maxPromptKilobytesPerTurn above ${Math.ceil(budget.framingBytes / 1024)} KB, or review a change request with a shorter description.`;
+  return `This review's own framing needs ${formatExactBytes(budget.framingBytes)} bytes per turn${shrunkClause}, ${formatExactBytes(budget.framingOverrunBytes)} over the ${formatExactBytes(budget.ceilingBytes)}-byte prompt cap, so no turn has room for any tool result at all. ${advice}`;
 }

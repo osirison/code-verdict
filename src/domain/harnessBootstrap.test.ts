@@ -4,11 +4,13 @@ import type { NormalizedDetail } from '../platform/types';
 import {
   buildBootstrapEnvelope,
   buildBootstrapSection,
+  DEFAULT_UNTRUSTED_CONTENT_CAPS,
   estimateEnvelopeLength,
   HOST_TOOL_CATALOG,
   summarizeNormalizedDetail,
   withMinimalToolDescriptions,
   withSectionsSummarized,
+  withUntrustedContentCapped,
   type BootstrapAuthoritative,
   type BootstrapEnvelope,
   type BootstrapMemberSections,
@@ -224,6 +226,117 @@ describe('shrink tactics (task 6.6 support)', () => {
     expect(shrunk.authoritative.toolCatalog.map((t) => t.name)).toEqual(HOST_TOOL_CATALOG.map((t) => t.name));
     expect(shrunk.authoritative.toolCatalog.map((t) => t.requiredScope)).toEqual(HOST_TOOL_CATALOG.map((t) => t.requiredScope));
     expect(shrunk.authoritative.toolCatalog.every((t) => t.description === '')).toBe(true);
+  });
+
+  describe('withUntrustedContentCapped (incident fix: 40 long commit messages and a verbose description blowing the per-turn byte cap)', () => {
+    it('leaves a section untouched, by reference, when nothing needs capping', () => {
+      const envelope = buildBootstrapEnvelope(envelopeInput());
+      const capped = withUntrustedContentCapped(envelope);
+      expect(capped.untrusted[0]!.changeRequestDetails).toBe(envelope.untrusted[0]!.changeRequestDetails);
+      expect(estimateEnvelopeLength(capped)).toBe(estimateEnvelopeLength(envelope));
+    });
+
+    it('keeps only the newest commits, capped per-message, with a truthful elision entry for the rest', () => {
+      const many = Array.from({ length: 25 }, (_, index) => ({ sha: `c${index}`, message: index === 24 ? 'y'.repeat(600) : `commit ${index}`, author: 'a' }));
+      const envelope = buildBootstrapEnvelope(envelopeInput({
+        memberSections: [{
+          memberId: 'm1',
+          changeRequestDetails: buildBootstrapSection({
+            kind: 'changeRequestDetails',
+            sectionId: 'changeRequestDetails:m1',
+            detail: detail({ commits: many }),
+            digest: 'digest-cr-1',
+            providerState: 'complete',
+            maxInlineChars: 1_000_000,
+          }),
+          issueDetails: [],
+        }],
+      }));
+      const capped = withUntrustedContentCapped(envelope, { maxCommits: 20, maxCommitMessageChars: 500, maxBodyChars: 4_000 });
+      const section = capped.untrusted[0]!.changeRequestDetails;
+      expect(section.state).toBe('truncated');
+      const content = section.content as NormalizedDetail;
+      expect(content.commits).toHaveLength(21); // 1 elision entry + the 20 newest (array is oldest-first)
+      expect(content.commits[0]!.message).toContain('5 older commit message(s) omitted');
+      expect(content.commits[0]!.message).toContain('framing exceeded the per-turn prompt cap');
+      // The 20 kept commits are the newest — the tail of the original array — index 5..24, unmodified except the one over the per-message cap.
+      expect(content.commits[1]!.message).toBe('commit 5');
+      expect(content.commits.at(-1)!.message).toContain('… (message truncated: framing exceeded the per-turn prompt cap)');
+      expect(content.commits.at(-1)!.message.length).toBeLessThan(600);
+      // The digest still covers the full, uncapped detail — a capped section stays reopenable in full.
+      expect(section.digest).toBe('digest-cr-1');
+    });
+
+    it('keeps the head of an oversized body, with a truthful character count for what was cut', () => {
+      const envelope = buildBootstrapEnvelope(envelopeInput({
+        memberSections: [{
+          memberId: 'm1',
+          changeRequestDetails: buildBootstrapSection({
+            kind: 'changeRequestDetails',
+            sectionId: 'changeRequestDetails:m1',
+            detail: detail({ body: 'z'.repeat(10_000) }),
+            digest: 'digest-cr-1',
+            providerState: 'complete',
+            maxInlineChars: 1_000_000,
+          }),
+          issueDetails: [],
+        }],
+      }));
+      const capped = withUntrustedContentCapped(envelope, { maxCommits: 20, maxCommitMessageChars: 500, maxBodyChars: 4_000 });
+      const content = capped.untrusted[0]!.changeRequestDetails.content as NormalizedDetail;
+      expect(content.body!.length).toBeLessThan(4_200);
+      expect(content.body).toContain('6000 more character(s) of the description omitted');
+    });
+
+    it('caps issue-details sections too, and leaves attachments and other fields untouched', () => {
+      const bigIssue = buildBootstrapSection({
+        kind: 'issueDetails',
+        sectionId: 'issue:1',
+        detail: detail({ body: 'q'.repeat(10_000) }),
+        digest: 'digest-issue-1',
+        providerState: 'complete',
+        maxInlineChars: 1_000_000,
+      });
+      const memberSections: BootstrapMemberSections = {
+        memberId: 'm1',
+        changeRequestDetails: buildBootstrapSection({ kind: 'changeRequestDetails', sectionId: 'changeRequestDetails:m1', detail: detail(), digest: 'digest-cr-1', providerState: 'complete', maxInlineChars: 1_000_000 }),
+        issueDetails: [bigIssue],
+        attachments: [{ id: 'att-1', label: 'notes.txt', path: 'notes.txt', content: 'unrelated attachment content', truncated: false }],
+      };
+      const envelope = buildBootstrapEnvelope(envelopeInput({ memberSections: [memberSections] }));
+      const capped = withUntrustedContentCapped(envelope);
+      expect((capped.untrusted[0]!.changeRequestDetails.content as NormalizedDetail).body).toBe(detail().body); // small — untouched
+      expect(typeof capped.untrusted[0]!.issueDetails[0]!.content).not.toBe('string');
+      expect((capped.untrusted[0]!.issueDetails[0]!.content as NormalizedDetail).body).toContain('omitted');
+      expect(capped.untrusted[0]!.attachments).toEqual(memberSections.attachments);
+    });
+
+    it('is idempotent: capping an already-capped envelope changes nothing further', () => {
+      const many = Array.from({ length: 25 }, (_, index) => ({ sha: `c${index}`, message: `commit ${index}`, author: 'a' }));
+      const envelope = buildBootstrapEnvelope(envelopeInput({
+        memberSections: [{
+          memberId: 'm1',
+          changeRequestDetails: buildBootstrapSection({ kind: 'changeRequestDetails', sectionId: 'changeRequestDetails:m1', detail: detail({ commits: many }), digest: 'digest-cr-1', providerState: 'complete', maxInlineChars: 1_000_000 }),
+          issueDetails: [],
+        }],
+      }));
+      const once = withUntrustedContentCapped(envelope);
+      const twice = withUntrustedContentCapped(once);
+      expect(twice.untrusted[0]!.changeRequestDetails).toEqual(once.untrusted[0]!.changeRequestDetails);
+    });
+
+    it('does not touch a section already collapsed to a bare-counts summary', () => {
+      const envelope = buildBootstrapEnvelope(envelopeInput());
+      const summarized = withSectionsSummarized(envelope);
+      const cappedAfterSummarized = withUntrustedContentCapped(summarized);
+      expect(cappedAfterSummarized.untrusted[0]!.changeRequestDetails).toBe(summarized.untrusted[0]!.changeRequestDetails);
+    });
+
+    it('has default caps exported for callers that want the same numbers used elsewhere', () => {
+      expect(DEFAULT_UNTRUSTED_CONTENT_CAPS.maxCommits).toBeGreaterThan(0);
+      expect(DEFAULT_UNTRUSTED_CONTENT_CAPS.maxCommitMessageChars).toBeGreaterThan(0);
+      expect(DEFAULT_UNTRUSTED_CONTENT_CAPS.maxBodyChars).toBeGreaterThan(0);
+    });
   });
 });
 
