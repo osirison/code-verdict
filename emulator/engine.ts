@@ -87,6 +87,9 @@ export class GitLabEmulator {
     if (this.world.rateLimited) {
       return json(429, { message: '429 Too Many Requests' }, { 'retry-after': '38' });
     }
+    if (this.world.failures.investigationRateLimited && isInvestigationPath(rawPath)) {
+      return json(429, { message: '429 Too Many Requests' }, { 'retry-after': '30' });
+    }
 
     if (req.method === 'POST' && rawPath === '/api/graphql') {
       return this.graphql(req.body);
@@ -236,6 +239,12 @@ export class GitLabEmulator {
       return this.paginated(items, query);
     }
 
+    // Three routes used to sit here: `repository/compare`, `repository/files/:path`
+    // and `search`. They existed because the GitLab provider answered the five
+    // revision-pinned investigation operations from them. No provider answers one
+    // any more — a change is read from a local object store, never computed by a
+    // forge — so nothing in this product would call them, and an emulator route
+    // nothing calls is a route that quietly stops resembling the platform.
     m = rawPath.match(/^\/api\/v4\/projects\/([^/]+)$/);
     if (method === 'GET' && m) {
       const project = this.findProject(dec(m[1]));
@@ -272,6 +281,12 @@ export class GitLabEmulator {
         .filter((d) => d.project_id === mr.project_id && d.mr_iid === mr.iid)
         .map((d) => this.discussionJson(d));
       return this.paginated(items, query);
+    }
+
+    if (method === 'GET' && sub === '/commits') {
+      return json(200, [
+        { id: mr.head_sha, short_id: mr.head_sha.slice(0, 8), title: mr.title, message: mr.title, author_name: mr.author.name },
+      ]);
     }
 
     let m = sub.match(/^\/discussions\/([^/]+)\/notes$/);
@@ -641,4 +656,18 @@ function randomSha(): string {
   let out = '';
   for (let i = 0; i < 40; i++) out += Math.floor(Math.random() * 16).toString(16);
   return out;
+}
+
+
+/**
+ * Whether a path is one of the detail-retrieval routes, for
+ * `FailureInjection.investigationRateLimited`.
+ *
+ * It used to match the compare, files and search routes, which backed the
+ * provider's five investigation operations. Those routes are gone with the
+ * operations; what a rate limit can still hit is a merge request's own detail
+ * and a linked issue's.
+ */
+function isInvestigationPath(rawPath: string): boolean {
+  return /^\/api\/v4\/projects\/[^/]+\/(merge_requests\/[^/]+(\/|$)|issues\/)/.test(rawPath);
 }

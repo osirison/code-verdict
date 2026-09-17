@@ -10,6 +10,14 @@ export interface ChangesetSubmitMember {
   candidatesFor: (file: string) => readonly AnchorCandidate[] | undefined;
   projectLabel?: string;
   workspaceRootLabel?: string;
+  /**
+   * gitlab-anchor-oldpath-never-set: the finding's pre-rename path in this
+   * member's own diff, in provider spelling — threaded to `composeCommentDrafts`
+   * so `DiffAnchor.oldPath` is set and GitLab's `buildPosition` can position a
+   * comment on a renamed file. `undefined` (or omitted) for an unrenamed file,
+   * or a caller that has not wired this in.
+   */
+  oldPathFor?: (file: string) => string | undefined;
 }
 
 export interface ChangesetMemberPlan {
@@ -60,6 +68,7 @@ export function buildChangesetSubmitPlans(
       member.anchorRefs,
       member.candidatesFor,
       member.workspaceRootLabel,
+      member.oldPathFor,
     );
     const comments = composition.drafts.map((comment) => {
       const item = memberItems.find((candidate) => candidate.id === comment.key);
@@ -84,7 +93,19 @@ export async function performChangesetSubmit(
   connection: Connection,
   plans: readonly ChangesetMemberPlan[],
   previous?: ChangesetSubmitState,
-): Promise<{ complete: boolean; state: ChangesetSubmitState; failures: ChangesetSubmitFailure[] }> {
+): Promise<{
+  complete: boolean;
+  state: ChangesetSubmitState;
+  failures: ChangesetSubmitFailure[];
+  /**
+   * Accepted findings that anchor resolution withheld from every member's
+   * submission — never counted by `complete`, which only tracks the comments
+   * actually attempted, so a caller reporting completion to the reviewer must
+   * read this rather than assume "complete" means "everything accepted was
+   * posted".
+   */
+  withheldCount: number;
+}> {
   const posted = new Set(previous?.postedCommentKeys ?? []);
   const summaries = new Set(previous?.summaryRefs ?? []);
   const requested = new Set(previous?.requestChangesRefs ?? []);
@@ -139,5 +160,6 @@ export async function performChangesetSubmit(
   const complete = allCommentKeys.every((key) => posted.has(key))
     && allRefs.every((key) => summaries.has(key))
     && requestRefs.every((key) => requested.has(key) || refused.has(key));
-  return { complete, state, failures };
+  const withheldCount = plans.reduce((total, plan) => total + plan.withheld.length, 0);
+  return { complete, state, failures, withheldCount };
 }

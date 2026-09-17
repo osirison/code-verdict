@@ -31,6 +31,14 @@ const world = vi.hoisted(() => ({
 
 const view = vi.hoisted(() => ({
   html: '',
+  /**
+   * Every `webview.html` and `webview.options` assignment, in the order the
+   * provider made them — what the missing-CSP test below reads. Order is the
+   * whole assertion there, so a fake that only kept the latest value could
+   * not express it.
+   */
+  assignments: [] as Array<{ member: 'html' | 'options'; html?: string }>,
+  assignedOptions: undefined as unknown,
   postMessage: vi.fn(),
   messageHandler: undefined as ((message: unknown) => void) | undefined,
 }));
@@ -124,6 +132,7 @@ function fakeWebviewView() {
         return view.html;
       },
       set html(value: string) {
+        view.assignments.push({ member: 'html', html: value });
         view.html = value;
       },
       postMessage: view.postMessage,
@@ -131,7 +140,13 @@ function fakeWebviewView() {
         view.messageHandler = handler;
         return { dispose: () => undefined };
       },
-      options: undefined as unknown,
+      set options(value: unknown) {
+        view.assignments.push({ member: 'options' });
+        view.assignedOptions = value;
+      },
+      get options(): unknown {
+        return view.assignedOptions;
+      },
       cspSource: 'test:',
       asWebviewUri: undefined,
     },
@@ -185,11 +200,79 @@ beforeEach(() => {
   world.workItems = [];
   world.gate = undefined;
   view.html = '';
+  view.assignments = [];
+  view.assignedOptions = undefined;
   view.postMessage.mockClear();
   view.messageHandler = undefined;
 });
 
 afterEach(() => clearProviders());
+
+/**
+ * The missing-CSP warning VS Code logged in a real session:
+ *
+ *     [info] ExtensionService#_doActivateExtension osirison.code-verdict,
+ *       activationEvent: 'onView:codeVerdict.sidebar'
+ *     [warning] osirison.code-verdict created a webview without a content
+ *       security policy: https://aka.ms/vscode-webview-missing-csp
+ *
+ * Not one of our documents: every one of them carries the strict CSP
+ * (`webviewCsp.test.ts` holds that line). The document without one was the
+ * empty string the view is *created* with. `WebviewViewPane.activate()`
+ * builds the webview with `contentOptions: {}` and `html: ""`; assigning
+ * `webview.options` afterwards is a content-options change, and VS Code
+ * answers a content-options change by re-sending the html it currently
+ * holds — still `""` if nothing has been assigned yet. The webview parses
+ * that empty document, finds no `<meta http-equiv="Content-Security-Policy">`
+ * and posts `no-csp-found`, which the extension host logs against us.
+ *
+ * So the fix is ordering, and ordering is what this asserts: a document with
+ * the CSP is assigned before the options are, so the first thing VS Code
+ * ever parses for this view already carries one.
+ */
+describe('the first document VS Code parses (missing-CSP warning)', () => {
+  it('assigns a CSP-bearing document before the webview options', async () => {
+    await makeSidebar();
+
+    const members = view.assignments.map((assignment) => assignment.member);
+    expect(members.indexOf('html')).toBe(0);
+    expect(members).toContain('options');
+
+    const first = view.assignments[0]?.html ?? '';
+    expect(first).toContain('<meta http-equiv="Content-Security-Policy"');
+    // Script-free on purpose: the options assignment re-sends this same
+    // document with scripts enabled, and render() can sit behind a cold
+    // fetch for hundreds of milliseconds after that. A placeholder that
+    // armed REGIONS_SCRIPT would post `verdictReady`, mark the view ready,
+    // and let a patch in that window post regions into a document that has
+    // none of their ids — dropped silently, which is the failure mode this
+    // whole file's ready/patch handshake exists to avoid.
+    expect(first).not.toContain('verdictReady');
+
+    // A nonce per render, never one reused across them: the placeholder's
+    // and the first real paint's must differ, or the policy is admitting a
+    // value an earlier document already published.
+    const nonces = view.assignments
+      .filter((assignment) => assignment.member === 'html')
+      .map((assignment) => /content="[^"]*'nonce-([a-f0-9]+)'/.exec(assignment.html ?? '')?.[1]);
+    expect(nonces.length).toBeGreaterThan(1);
+    expect(nonces.every((nonce) => typeof nonce === 'string' && nonce.length > 0)).toBe(true);
+    expect(new Set(nonces).size).toBe(nonces.length);
+  });
+
+  it('carries the CSP on every document it ever assigns, not just the first', async () => {
+    const { sidebar } = await makeSidebar();
+    sidebar.setActiveReview(activeReview());
+    sidebar.refresh();
+    await flush();
+
+    const documents = view.assignments.filter((assignment) => assignment.member === 'html');
+    expect(documents.length).toBeGreaterThan(1);
+    for (const document of documents) {
+      expect(document.html).toContain('<meta http-equiv="Content-Security-Policy"');
+    }
+  });
+});
 
 describe('the sidebar stops fetching on every triage action', () => {
   it('paints the lists screen on the initial render, from one fetch', async () => {
@@ -230,7 +313,7 @@ describe('the sidebar stops fetching on every triage action', () => {
     sidebar.setPendingReview({ headline: '#7', context: 'feat/x', agent: 'agent', added: 1, removed: 0 });
     sidebar.setThreads({ headline: '#7', context: 'feat/x', summary: [], threads: [] });
     sidebar.setActiveRoute('dashboard');
-    sidebar.setActiveRuns([{ key: 'k', label: '#7', state: 'running', elapsedMs: 0 }]);
+    sidebar.setActiveRuns([{ key: 'k', label: '#7', lifecycle: 'investigating', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none' }]);
 
     expect(world.calls).toEqual({ changeRequests: 1, workItems: 1, ciRuns: 1 });
     expect(view.postMessage).toHaveBeenCalledTimes(4);

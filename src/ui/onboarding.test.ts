@@ -37,11 +37,17 @@ const panel = vi.hoisted(() => ({
   },
 }));
 
+const settings = vi.hoisted(() => ({ values: {} as Record<string, unknown> }));
+
 vi.mock('vscode', () => ({
   ViewColumn: { One: 1 },
   window: { createWebviewPanel: () => panel },
   workspace: {
-    getConfiguration: () => ({ get: (_key: string, fallback?: unknown) => fallback }),
+    // Empty by default, so every test that sets nothing sees exactly what the
+    // old fixed `(_key, fallback) => fallback` mock gave it.
+    getConfiguration: () => ({
+      get: (key: string, fallback?: unknown) => (key in settings.values ? settings.values[key] : fallback),
+    }),
   },
   commands: { executeCommand: vi.fn(() => Promise.resolve(undefined)) },
 }));
@@ -89,6 +95,7 @@ beforeEach(() => {
   registerProvider(PROVIDER);
   panel.webview.html = '';
   panel.webview.postMessage.mockClear();
+  settings.values = {};
 });
 
 afterEach(() => {
@@ -164,5 +171,44 @@ describe('OnboardingPanel region patch', () => {
     expect(panel.webview.postMessage).not.toHaveBeenCalled();
     expect(panel.webview.html).toContain('Name your pod');
     expect(panel.webview.html).not.toContain('Welcome to Code Verdict');
+  });
+});
+
+/**
+ * `codeVerdict.instanceUrl` prefills the URL field for the default provider.
+ * The panel renders that value and hands it on as a base URL, so what a
+ * malformed setting resolves to decides both whether the setup screen draws at
+ * all and what the first connection is made against.
+ */
+describe('codeVerdict.instanceUrl prefill', () => {
+  it('prefills a configured string and the provider default host when nothing is configured', async () => {
+    const { OnboardingPanel } = await import('./onboarding.js');
+    OnboardingPanel.show(makeDeps().deps);
+    expect(panel.webview.html).toContain('value="https://gitlab.com"');
+
+    handlers.dispose?.();
+    settings.values['instanceUrl'] = 'https://gitlab.acme.test';
+    OnboardingPanel.show(makeDeps().deps);
+    expect(panel.webview.html).toContain('value="https://gitlab.acme.test"');
+  });
+
+  // The guard used to be `configured !== undefined && configured !== ''`, which
+  // tells an unset key from an empty one but admits anything else. A number,
+  // boolean, object or array passed both tests and became `this.instanceUrl`,
+  // which is typed `string` and goes to `escapeHtml(state.instanceUrl)` in
+  // `onboardingHtml.ts` — so it did not reach the field as "42", it threw
+  // `TypeError: text.replace is not a function` out of the render and the setup
+  // screen never drew at all. Both halves are asserted: it does not throw, and
+  // what it draws is the provider's own default host.
+  it('draws the setup screen on a non-string instead of throwing out of escapeHtml, and prefills the provider default host', async () => {
+    const { OnboardingPanel } = await import('./onboarding.js');
+    for (const bad of [42, true, { url: 'https://gitlab.acme.test' }, ['https://gitlab.acme.test']]) {
+      handlers.dispose?.();
+      panel.webview.html = '';
+      settings.values['instanceUrl'] = bad;
+      expect(() => OnboardingPanel.show(makeDeps().deps), String(bad)).not.toThrow();
+      expect(panel.webview.html, String(bad)).toContain('value="https://gitlab.com"');
+      expect(panel.webview.html, String(bad)).not.toContain(`value="${String(bad)}"`);
+    }
   });
 });

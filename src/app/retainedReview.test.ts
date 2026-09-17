@@ -127,6 +127,52 @@ describe('readRetained', () => {
     // version wrote, and a record without a review cannot render any screen.
     expect(readRetained({ threads: {}, summaryText: '', finalNote: '' } as unknown as SessionDraft)).toBeUndefined();
   });
+
+  it('reads a record with no protocol provenance as legacy, with no plan, activity, or lineage (task 14.2, D16)', () => {
+    const legacy = {
+      review: review(),
+      threads: {},
+      summaryText: '',
+      finalNote: '',
+    } satisfies SessionDraft;
+
+    const retained = readRetained(legacy);
+
+    expect(retained?.protocolProvenance).toBe('legacy-one-shot');
+    expect(retained?.activity).toEqual([]);
+    expect(retained?.lineageId).toBeUndefined();
+    expect(retained?.attempt).toBeUndefined();
+  });
+
+  it('reads a real harness attempt\'s lineage, attempt, and activity back verbatim', () => {
+    const activity = [{
+      runId: 'run-1',
+      lineageId: 'lineage-1',
+      attempt: 2,
+      sequence: 1,
+      occurredAt: '2026-08-28T09:00:00.000Z',
+      phase: 'investigating' as const,
+      elapsedMs: 500,
+      kind: 'actionStarted' as const,
+      action: 'Reading src/a.ts',
+    }];
+    const record = retainedFromRun({
+      review: review(),
+      ranAt: '2026-08-28T09:00:00.000Z',
+      agentId: 'agent:workspace/security',
+      agentLabel: 'Security Reviewer',
+      protocolProvenance: 'harness',
+      lineageId: 'lineage-1',
+      attempt: 2,
+      activity,
+    });
+
+    const retained = readRetained(record);
+    expect(retained?.protocolProvenance).toBe('harness');
+    expect(retained?.lineageId).toBe('lineage-1');
+    expect(retained?.attempt).toBe(2);
+    expect(retained?.activity).toEqual(activity);
+  });
 });
 
 describe('merging UI edits into retained results', () => {

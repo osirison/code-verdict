@@ -21,12 +21,16 @@ import { DEFAULT_POLL_INTERVAL_SECONDS, pollIntervalMs } from '../app/pollSchedu
 import type { ReviewHistory } from '../app/reviewHistory';
 import type { SecretStore } from '../app/storage';
 import {
+  DIGEST_CADENCES,
   NOTIFICATION_EVENTS,
+  NOTIFICATION_MODES,
   type DigestCadence,
+  type NotificationEventKey,
   type NotificationMode,
   type NotificationPrefs,
   type VerdictNotification,
 } from '../domain/notifications';
+import type { ResultCompleteness } from '../domain/harnessLifecycle';
 import { toScmError } from '../platform/errors';
 import { getProvider, tryGetProvider } from '../platform/registry';
 import { NEUTRAL_VOCABULARY } from '../platform/provider';
@@ -91,18 +95,73 @@ export function readPollIntervalSeconds(): number {
     .get<number>('notifications.pollIntervalSeconds', DEFAULT_POLL_INTERVAL_SECONDS);
 }
 
+/**
+ * Pure, and the single place a raw `notifications.*` value becomes a
+ * `NotificationPrefs` — `normalizeHarnessPolicySettings`'s shape
+ * (`harnessPolicyOptions.ts`), for the same reason: `readNotificationPrefs`
+ * below reads, this decides, and nothing revalidates afterwards.
+ *
+ * Each field falls back to its own declared default, never to a neighbouring
+ * value and never to a silently different behaviour:
+ *
+ * - **Mode.** An unlisted string used to pass straight through
+ *   `routeNotification` and then fall off `NotificationCenter.deliver`'s
+ *   `switch`, which has no `default` branch — so `"interrupt"` (wrong case) or
+ *   any typo silently delivered nothing at all, i.e. behaved as `Off` rather
+ *   than as the event's default. That is the worst possible reading of a typo:
+ *   the reviewer configured an event louder and got it switched off.
+ * - **Quiet mode.** A non-boolean was used truthily, so any non-empty string
+ *   turned quiet hours on and demoted every Interrupt to a badge, though the
+ *   setting ships off.
+ * - **Cadence.** `nextDigestFlush` already falls through to the End-of-day
+ *   times for an unrecognized cadence, so the schedule was right — but the
+ *   settings panel picks its active chip with `===`, so an unlisted value
+ *   showed no cadence selected while one was in force. Normalizing here is
+ *   what makes the panel and the schedule describe the same setting.
+ */
+export function normalizeNotificationPrefs(raw: {
+  modes?: Partial<Record<NotificationEventKey, unknown>>;
+  quietMode?: unknown;
+  digestCadence?: unknown;
+}): NotificationPrefs {
+  return {
+    modes: Object.fromEntries(
+      NOTIFICATION_EVENTS.map((event) => {
+        const value = raw.modes?.[event.key];
+        return [event.key, isNotificationMode(value) ? value : event.defaultMode];
+      }),
+    ),
+    quietMode: typeof raw.quietMode === 'boolean' ? raw.quietMode : false,
+    digestCadence: isDigestCadence(raw.digestCadence) ? raw.digestCadence : 'End of day',
+  };
+}
+
+function isNotificationMode(value: unknown): value is NotificationMode {
+  return NOTIFICATION_MODES.includes(value as NotificationMode);
+}
+
+function isDigestCadence(value: unknown): value is DigestCadence {
+  return DIGEST_CADENCES.includes(value as DigestCadence);
+}
+
+/**
+ * The only reader for the notification preferences. The settings panel goes
+ * through it too rather than reading the same keys itself: the panel renders
+ * what is in force, and a second read path is how a panel comes to show a mode
+ * the notifier is not using.
+ */
 export function readNotificationPrefs(): NotificationPrefs {
   const config = vscode.workspace.getConfiguration('codeVerdict');
-  return {
+  return normalizeNotificationPrefs({
     modes: Object.fromEntries(
       NOTIFICATION_EVENTS.map((event) => [
         event.key,
-        config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
+        config.get<unknown>(`notifications.events.${event.key}`),
       ]),
     ),
-    quietMode: config.get<boolean>('notifications.quietMode', false),
-    digestCadence: config.get<DigestCadence>('notifications.digestCadence', 'End of day'),
-  };
+    quietMode: config.get<unknown>('notifications.quietMode'),
+    digestCadence: config.get<unknown>('notifications.digestCadence'),
+  });
 }
 
 export interface NotifierDeps {
@@ -185,28 +244,85 @@ export class VerdictNotifier implements vscode.Disposable {
   }
 
   /**
-   * A run finished — a local event, no poll involved. It now arrives from the
-   * run manager rather than from a panel, which means it can land while the
-   * reviewer is on a different pod entirely.
-   *
-   * The ref is dropped in that case. "Start triage" resolves a ref against the
-   * *active* pod, so carrying one from another pod would open a change request
-   * that pod cannot see; the notification still names the review, and clicking
-   * it reveals the surface instead. The title says which pod, because "Review
-   * ready on !2841" is confusing when !2841 is not in the pod on screen.
+   * A run belonging to another pod names it in the title, because "Review
+   * ready on !2841" is confusing when !2841 is not in the pod on screen —
+   * and drops the `crRef`, since "Start triage" resolves a ref against the
+   * *active* pod and a ref from another pod would open a change request
+   * that pod cannot see.
    */
-  reviewReady(info: { ref?: ChangeRequestRef; refLabel: string; itemCount: number; podId?: string }): void {
+  private otherPodSuffix(podId: string | undefined): { name?: string; dropRef: boolean } {
+    const activePod = this.deps.podStore.activePod;
+    const other =
+      podId !== undefined && activePod !== undefined && podId !== activePod.id
+        ? this.deps.podStore.list().find((pod) => pod.id === podId)
+        : undefined;
+    return { name: other?.name, dropRef: other !== undefined };
+  }
+
+  /**
+   * A run finished successfully — a local event, no poll involved. It now
+   * arrives from the run manager rather than from a panel, which means it
+   * can land while the reviewer is on a different pod entirely (see
+   * `otherPodSuffix`).
+   *
+   * Task 14.7 (spec `review-run-activity`: "the notification distinguishes
+   * complete, partial, failed, and cancelled outcomes"). The `'Partial
+   * results'` headline is defensive, not a case reached today:
+   * `classifyOutcome` (`../app/harnessCompletion.ts`) only reports
+   * `succeeded` for a `complete` outcome, and every partial currently
+   * arrives through `runEnded` instead. It stays because D2 keeps lifecycle
+   * and completeness independent — if a `succeeded + partial` outcome ever
+   * becomes reachable, this must not call it "ready".
+   */
+  reviewReady(info: { ref?: ChangeRequestRef; refLabel: string; itemCount: number; podId?: string; completeness: ResultCompleteness }): void {
     const items =
       info.itemCount === 0 ? 'no items' : `${info.itemCount} item${info.itemCount === 1 ? '' : 's'}`;
-    const activePod = this.deps.podStore.activePod;
-    const otherPod =
-      info.podId !== undefined && activePod !== undefined && info.podId !== activePod.id
-        ? this.deps.podStore.list().find((pod) => pod.id === info.podId)
-        : undefined;
+    const { name, dropRef } = this.otherPodSuffix(info.podId);
+    const headline = info.completeness === 'partial' ? 'Partial results' : 'Review ready';
     this.center.notify({
       key: 'agentFinished',
-      title: `Review ready · ${items} on ${info.refLabel}${otherPod ? ` (${otherPod.name})` : ''}`,
-      crRef: otherPod ? undefined : info.ref,
+      title: `${headline} · ${items} on ${info.refLabel}${name ? ` (${name})` : ''}`,
+      crRef: dropRef ? undefined : info.ref,
+    });
+  }
+
+  /**
+   * The `failed`/`cancelled` counterpart to `reviewReady` (task 14.7):
+   * `ReviewRunManager`'s `onRunOutcome` fires this for every terminal
+   * lifecycle `reviewReady` does not cover, whichever settlement path
+   * produced it (a cooperative result, the cancel grace timeout, or a
+   * genuine crash) — so a run that stops without a triage-ready result
+   * still tells the reviewer it stopped, rather than going silent. Never
+   * announces a partial as though the review finished: "kept as partial"
+   * is the whole of what a validated-but-incomplete result gets to claim.
+   */
+  runEnded(info: { lifecycle: 'failed' | 'cancelled'; completeness: ResultCompleteness; refLabel: string; ref?: ChangeRequestRef; podId?: string; findingCount?: number }): void {
+    const { name, dropRef } = this.otherPodSuffix(info.podId);
+    const verb = info.lifecycle === 'failed' ? 'Review failed' : 'Review cancelled';
+    const kept =
+      info.findingCount !== undefined && info.findingCount > 0
+        ? ` · ${info.findingCount} finding${info.findingCount === 1 ? '' : 's'} kept as partial`
+        : '';
+    this.center.notify({
+      key: 'agentFinished',
+      title: `${verb}${kept} · ${info.refLabel}${name ? ` (${name})` : ''}`,
+      crRef: dropRef ? undefined : info.ref,
+    });
+  }
+
+  /**
+   * Task 14.7: activation's interrupted sweep (`sweepInterruptedRuns`)
+   * closed one or more nonterminal attempts left behind by the last
+   * session — one summary, not a toast per target (a reviewer who left
+   * several running overnight does not need a flood on the next launch).
+   * No single change request to jump to across a batch, so the opener
+   * below reveals the app surface rather than opening one review.
+   */
+  runsInterrupted(count: number): void {
+    if (count === 0) return;
+    this.center.notify({
+      key: 'agentFinished',
+      title: `${count} review${count === 1 ? '' : 's'} interrupted by the restart`,
     });
   }
 

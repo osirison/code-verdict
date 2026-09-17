@@ -213,6 +213,127 @@ describe('a patch never restores a stale value (tasks 9.2, 9.7)', () => {
     expect(document.activeElement?.id).toBe('note-field');
     expect(after.selectionStart).toBe(3);
   });
+
+  /**
+   * The exception the value rule now carries, pinned here rather than only on
+   * the review flow because the markup is synthetic and this page has no
+   * commit script of its own: whatever holds the live value lives in
+   * REGIONS_SCRIPT, not in any screen's wiring, so every patched region on
+   * every panel gets it. A patch whose value is behind the field it came from
+   * is what a debounced commit produces (`setInstructions` re-renders while
+   * the reviewer is still typing), and painting it back loses the keystrokes
+   * that came after it, not just the caret.
+   */
+  it('a value the page watched the reviewer type is held against a patch carrying an older one', () => {
+    const { dom } = loadPage();
+    const document = dom.window.document;
+    patch(dom, { 'db-body': statefulRegion('auth') });
+    const field = document.getElementById('note-field') as HTMLInputElement;
+    field.focus();
+    // Typed the way a keystroke types — the `input` event is the only thing
+    // that distinguishes the reviewer's in-progress text from a value the host
+    // authored, and it is what the test above deliberately omits.
+    field.value = 'auth token rotation';
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    field.setSelectionRange(19, 19);
+
+    // The host re-renders from the text it was handed several keystrokes ago.
+    patch(dom, { 'db-body': statefulRegion('auth tok') });
+
+    const after = document.getElementById('note-field') as HTMLInputElement;
+    expect(after.value).toBe('auth token rotation');
+    // The caret is the giveaway without the value held: setSelectionRange
+    // clamps to 8, the length of the stale text.
+    expect(after.selectionStart).toBe(19);
+  });
+
+  it('releases that hold on a click, the same signal the screens flush their pending commits on', () => {
+    const { dom } = loadPage();
+    const document = dom.window.document;
+    patch(dom, { 'db-body': statefulRegion('auth') });
+    const field = document.getElementById('note-field') as HTMLInputElement;
+    field.focus();
+    field.value = 'auth token rotation';
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+
+    // A click means the reviewer acted on something — the screens commit their
+    // in-progress text on exactly this signal, so the host is current and the
+    // next patch carries its answer, not an echo.
+    document.body.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    patch(dom, { 'db-body': statefulRegion('host authored') });
+
+    const after = document.getElementById('note-field') as HTMLInputElement;
+    expect(after.value).toBe('host authored');
+    // Still focused — the release gives up the value, never the focus.
+    expect(document.activeElement?.id).toBe('note-field');
+  });
+
+  it('a blurred field is inert before any release listener even runs — the focus guard alone accounts for it, not a release', () => {
+    // Named for what this actually pins, not what it looks like it pins:
+    // `field.blur()` moves `document.activeElement` to <body> as part of the
+    // native blur steps, BEFORE any 'blur' listener (capture or not) runs —
+    // proven below by deleting both blur releases and this staying green.
+    // The pre-existing `if (active && active.id)` guard is what this tests;
+    // the two tests after it are what actually pin the blur releases, using a
+    // field that stays `document.activeElement` while the release still runs.
+    const { dom } = loadPage();
+    const document = dom.window.document;
+    patch(dom, { 'db-body': statefulRegion('auth') });
+    const field = document.getElementById('note-field') as HTMLInputElement;
+    field.focus();
+    field.value = 'auth token rotation';
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    field.blur();
+
+    patch(dom, { 'db-body': statefulRegion('host authored') });
+
+    expect((document.getElementById('note-field') as HTMLInputElement).value).toBe('host authored');
+  });
+
+  it('releases that hold on a document-level blur even when focus returns to the same field with no new typing', () => {
+    // Unlike the test above, focus comes BACK to the field before the patch —
+    // `document.activeElement` has an id again, so the guard above cannot
+    // save this one. Only forgetting the typed value on blur does: without
+    // it, the map still has this id mapped to a value equal to the
+    // untouched field, so the hold re-applies as though the reviewer had
+    // never stopped typing.
+    const { dom } = loadPage();
+    const document = dom.window.document;
+    patch(dom, { 'db-body': statefulRegion('auth') });
+    const field = document.getElementById('note-field') as HTMLInputElement;
+    field.focus();
+    field.value = 'auth token rotation';
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    field.blur();
+    field.focus();
+
+    patch(dom, { 'db-body': statefulRegion('host authored') });
+
+    const after = document.getElementById('note-field') as HTMLInputElement;
+    expect(after.value).toBe('host authored');
+    expect(document.activeElement?.id).toBe('note-field');
+  });
+
+  it('releases that hold on a window blur even though the focused field itself never blurs', () => {
+    // The command-palette path (reviewFlowHtml.ts: "The palette reaches
+    // submit directly"): the webview loses OS focus, but no element inside it
+    // ever does — `document.activeElement` never changes, so this is the one
+    // release the document-level blur listener structurally cannot cover.
+    const { dom } = loadPage();
+    const document = dom.window.document;
+    patch(dom, { 'db-body': statefulRegion('auth') });
+    const field = document.getElementById('note-field') as HTMLInputElement;
+    field.focus();
+    field.value = 'auth token rotation';
+    field.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    dom.window.dispatchEvent(new dom.window.Event('blur'));
+
+    patch(dom, { 'db-body': statefulRegion('host authored') });
+
+    const after = document.getElementById('note-field') as HTMLInputElement;
+    expect(after.value).toBe('host authored');
+    expect(document.activeElement?.id).toBe('note-field');
+  });
 });
 
 // ---- per-route view state (design D8, tasks 9.4, 9.6) -----------------------

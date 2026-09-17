@@ -51,6 +51,7 @@ All commands use the `Verdict:` prefix, sentence case after the colon, verb firs
 | Verdict: Refresh | `codeVerdict.refresh` | Re-fetch MRs, issues, pipelines |
 | Verdict: Sign in | `codeVerdict.signIn` | |
 | Verdict: Show API trace | `codeVerdict.showApiTrace` | Reveals the API log; says which setting turns tracing on when it is off |
+| Verdict: Show run diagnostics | `codeVerdict.showRunDiagnostics` | Reveals a metadata-only report of the active review's most recent attempt — phases, coverage, completion clauses, budget, a time summary (total elapsed split into model/provider/host time, retry waits, and the slowest operations), per-model-turn timing, and tool calls; offers to save it as JSON. Every invocation also writes the same report to a file under the extension's log storage, unconditionally — found, not-found, or errored — and names that path in the notification, since the channel is not always visible. No prompts, model output, or secrets. |
 
 Keybindings are scoped with `when: verdict.reviewFocus` so `A` / `R` / `S` never steal typing
 elsewhere. Nothing is bound by default outside that context.
@@ -72,18 +73,77 @@ Not in the palette — reached from a control, a keybinding, or a status-bar seg
 
 ## Settings namespace
 
-`codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.agentLocations`, `codeVerdict.severityFloor`,
-`codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
-`codeVerdict.autoAdvance`, `codeVerdict.context.sectionBudget`, `codeVerdict.context.totalBudget`,
+The full list, 45 keys, matching `package.json` `contributes.configuration`:
+
+`codeVerdict.instanceUrl`, `codeVerdict.agentLocations`, `codeVerdict.showDemoAgent`,
+`codeVerdict.autoAdvance`, `codeVerdict.agentVoice`, `codeVerdict.context.sectionBudget`,
+`codeVerdict.context.totalBudget`,
 `codeVerdict.context.maxLinkedItems`, `codeVerdict.context.includeTitle`,
 `codeVerdict.context.includeDescription`, `codeVerdict.context.includeLinkedItems`,
-`codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
-`codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`,
-`codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`.
+`codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`,
+`codeVerdict.notifications.events.agentFinished`, `codeVerdict.notifications.events.replyPosted`,
+`codeVerdict.notifications.events.authorPushed`, `codeVerdict.notifications.events.pipelineFailed`,
+`codeVerdict.notifications.events.reviewRequested`, `codeVerdict.notifications.events.mentioned`,
+`codeVerdict.notifications.events.threadStale`, `codeVerdict.notifications.digestCadence`,
+`codeVerdict.notifications.pollIntervalSeconds`,
+`codeVerdict.changesets.trailer`, `codeVerdict.changesets.branchDetection`,
+`codeVerdict.trace.api`, `codeVerdict.trace.rawPayloads`,
+`codeVerdict.agentRun.firstOutputSeconds`, `codeVerdict.agentRun.inactivitySeconds`,
+`codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`,
+`codeVerdict.harness.maxElapsedSecondsPerAttempt`, `codeVerdict.harness.maxModelTurnsPerAttempt`,
+`codeVerdict.harness.maxToolRequestsPerAttempt`, `codeVerdict.harness.maxPromptKilobytesPerTurn`,
+`codeVerdict.harness.maxEvidenceMegabytesPerAttempt`,
+`codeVerdict.harness.highRiskReservePercent`, `codeVerdict.harness.verificationReservePercent`,
+`codeVerdict.harness.transientRetriesPerOperation`, `codeVerdict.harness.checkpointCadenceToolCalls`,
+`codeVerdict.harness.retainedCheckpointsPerLineage`, `codeVerdict.harness.maxActivityEventsPerAttempt`,
+`codeVerdict.harness.terminalAttemptHistoryCount`, `codeVerdict.harness.terminalAttemptHistoryMaxAgeDays`,
+`codeVerdict.harness.requireInspectionMinRisk`,
+`codeVerdict.harness.scopeInvestigationToChangedFiles`.
 
-The three `agentRun` settings share one convention: `0` removes that limit. For the two windows
+Seven names that once appeared here are gone, having been declared and read by nothing:
+`codeVerdict.agent`, `codeVerdict.severityFloor`, `codeVerdict.categories`,
+`codeVerdict.minConfidence`, `codeVerdict.extraInstructions`, `codeVerdict.pods` and
+`codeVerdict.shareAcceptRejectRates`. The first five are per-pod state set on the Run review screen
+and in the agent picker; `pods` named a key that only ever lived in global storage. See
+[docs/SETTINGS.md](../../docs/SETTINGS.md) for where each control actually is and for the cleanup
+that removes them from a user's `settings.json`.
+
+The four `agentRun` settings share one convention: `0` removes that limit. For the three windows
 that means "never time out on this"; for `maxConcurrent` it means "run as many reviews at once as
 are triggered".
+
+Most `harness.*` settings bound one review attempt: how long it may run, how many model turns and
+tool calls it may use, how much evidence it may hold, how much of that is held back for high-risk
+files and final verification, how many times a failed step retries, how often it checkpoints, and
+how much history is kept. Two are not bounds. A missing or unusable value falls back to its own
+documented default, never to zero.
+
+`requireInspectionMinRisk` is the one enumerated setting — `low / medium / high` — and its
+default, `medium`, requires every changed file classified medium or high risk to actually be read, not
+just classified, before a review can complete. A file classified low can be skipped — but a host risk
+floor keeps real source code out of `low` regardless of what the reviewing model proposes, so only
+documentation, specification, and similar plain-text files are ever skipped at the default setting.
+Setting this to `low` requires every changed file, including those, to actually be read.
+
+`scopeInvestigationToChangedFiles` is the other non-numeric one, a boolean, and it bounds what the
+model may look at rather than how much of anything it may spend. Off by default; on, it withholds
+three things — reading an unchanged file, searching the repository, and looking up further
+`AGENTS.md` files deeper in the tree. Diff reads and diff searches stay available either way, and
+the root `AGENTS.md` and `CLAUDE.md` are read and sent whichever way it is set, because the host
+reads those itself before the review starts rather than through anything this withholds.
+
+`codeVerdict.trace.rawPayloads`, off by default, is a debugging escape hatch alongside
+`codeVerdict.trace.api`: switching it on writes the full prompt sent to the model and the full
+text it replies with to the "Code Verdict: Agent Trace" output channel, so a reviewer can see
+exactly what was sent and what came back when a run misbehaves. Every other diagnostic surface —
+the Agent Trace channel with the setting off, the API trace, the `agent-trace.log` file the
+extension writes beside that channel, and the run diagnostics report — stays metadata-only (sizes,
+digests, durations, identities) regardless of this setting. Raw content reaches that one live
+channel and nothing Code Verdict itself persists. It is not a claim that nothing reaches a disk:
+VS Code captures the contents of every output channel into its own log directory, so while the
+setting is on, the prompts and replies shown in the channel are in VS Code's logs too. Stating it
+the other way round — "never persisted" — was wrong until 2026-09-11, and the raw channel's
+exemption from redaction is only sound while this distinction is stated accurately.
 
 The access token is never a setting — it lives in the VS Code secret store.
 
@@ -99,6 +159,30 @@ Never state that only the diff is sent or that the whole repository is never sen
 footer: `N changed files + M attachments go to the agent.` Thinking Effort is applied as review
 instructions in the prompt, not as the model provider's native reasoning setting.
 
+## Review run wording
+
+Lifecycle labels are the same word everywhere a run's state is shown — the active review screen, the
+sidebar's active-run list, and the status bar — never a shortened or reworded copy on any one screen:
+`Queued / Planning / Investigating / Verifying / Completing / Waiting / Paused / Resuming /
+Cancelling / Cancelled / Succeeded / Failed / Interrupted`.
+
+A result's completeness is reported separately from its lifecycle and never implied by it. The
+dashboard's Verdict column shows one of: the live lifecycle label while a review is running,
+`submitted`, `no findings` (clean and complete), `N partial` (stopped early, findings kept — always
+with a reason on hover), `interrupted`, `N finding(s)`, or `not run`. `N partial` never appears as a
+plain finding count; a partial result is always named as partial.
+
+Progress is a real count ("N of M") only once a full inventory exists; before that, or with nothing
+to count, progress is elapsed time — never a percentage guessed from an incomplete inventory.
+
+Cancelling a run shows `Cancel`. A run that stopped early with findings already kept offers `Use N
+partial findings`. Reviving an interrupted review is never called "resume" where the reviewer can see
+it — the control reads `Start new attempt from checkpoint`, and when the checkpoint cannot back one
+it instead lists the reasons why, with a plain restart offered in its place. A review from before
+this harness shipped is labeled a legacy review and states plainly that it has no plan, activity, or
+coverage detail, rather than showing none of those and letting the reviewer assume there was nothing
+to record.
+
 ## UI strings as shipped
 
 - Activity bar tooltip: `Verdict`
@@ -110,6 +194,10 @@ instructions in the prompt, not as the model provider's native reasoning setting
 - Onboarding step 1 heading: `Welcome to Code Verdict`
 - Notification titles stay MR-first, not brand-first: `Review ready · 8 items on !2841`
   (the source is already obvious from the icon)
+- A review that stopped short of complete but kept validated findings:
+  `Review failed · 3 findings kept as partial · !2841`, or `Review cancelled · 3 findings kept as
+  partial · !2841`. Never "Review ready" for a result that stopped short of complete.
+- Attempts closed by an editor restart: `2 reviews interrupted by the restart`
 
 ## Category vocabulary
 

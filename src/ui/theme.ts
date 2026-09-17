@@ -427,6 +427,41 @@ export const REGIONS_SCRIPT = `
 ;(() => {
   window.verdictVscode.postMessage({ type: 'verdictReady' });
 
+  // In-progress typing THIS PAGE WATCHED, per element id. A patch paints each
+  // field from the host's state, which for a debounced commit is behind what
+  // the reviewer has typed since: 'setInstructions' renders on every committed
+  // keystroke and again when the context-usage estimate it schedules lands, so
+  // the lagging value arrives over and over. Painting it back into the control
+  // being typed in drops the keystrokes that followed it, then clamps the
+  // restored caret to the end of the shorter text — the caret jumping
+  // backwards and the same stretch being retyped are one defect, not two.
+  //
+  // So a patch's value is held off, but ONLY where this page watched the
+  // reviewer produce the live value: an 'input' event whose value the control
+  // still carries. A value the page never watched is host-authored — a
+  // regenerated summary, a draft the host cleared on a successful send — and
+  // must still win, which is what stops this becoming "the DOM always wins".
+  const typed = new Map();
+  document.addEventListener('input', (ev) => {
+    const el = ev.target;
+    if (el && el.id) typed.set(el.id, el.value);
+  }, true);
+  // Forgotten on click, document blur and window blur — the three signals the
+  // screens' own 'flushCommits' treats as "in-progress text has now been handed
+  // to the host" (reviewFlowHtml.ts). After one of them the host's copy is
+  // current, so the next patch carries its answer, not a stale echo. Residual
+  // race: a click that only repositions the caret while an older patch is still
+  // in flight can still repaint the committed text — self-healing, because that
+  // same click flushed the commit and the render it triggers repaints what the
+  // reviewer actually has.
+  const forgetTyped = () => typed.clear();
+  document.addEventListener('click', forgetTyped, true);
+  document.addEventListener('blur', forgetTyped, true);
+  window.addEventListener('blur', forgetTyped);
+  // A fourth, page-initiated signal: Enter in a reply box sends with no
+  // click or blur. By id, so one field never drops another's watch.
+  window.verdictForgetTypedId = (id) => typed.delete(id);
+
   // The DOM state a patch would otherwise discard (design D8, task 9.1):
   // window scroll, per-container scroll and <details> expansion, captured
   // from elements carrying a stable id — an id is the only handle that can
@@ -449,18 +484,32 @@ export const REGIONS_SCRIPT = `
   // Returns whether every restore verifiably landed — false when an id is
   // missing (a loading skeleton not yet holding the real content) or the
   // window scroll clamped against a document still too short for it.
-  const applyView = (view, focusId, selStart, selEnd) => {
+  const applyView = (view, focus) => {
     let landed = true;
     for (const id of Object.keys(view.open)) {
       const el = document.getElementById(id);
       if (el) el.open = view.open[id]; else landed = false;
     }
-    if (focusId) {
-      const el = document.getElementById(focusId);
+    if (focus) {
+      const el = document.getElementById(focus.id);
       if (el) {
+        // The held value goes back BEFORE the caret: setSelectionRange clamps
+        // to the current value's length, so a caret captured at 29 restored
+        // against a stale 10-character value lands silently at 10.
+        if (focus.value !== undefined && el.value !== focus.value) {
+          el.value = focus.value;
+          // Re-arm the watch on the element's rebuilt self: the 'input'
+          // listener saw the element innerHTML has just destroyed, so without
+          // this the NEXT stale patch finds nothing watched and clobbers what
+          // this one held. The report is that it happens constantly, not once.
+          typed.set(focus.id, focus.value);
+        }
         el.focus();
-        if (selStart != null && selEnd != null) {
-          try { el.setSelectionRange(selStart, selEnd); } catch {}
+        if (focus.start != null && focus.end != null) {
+          // Direction too: without it a shift-extended selection comes back
+          // with its anchor collapsed to the left edge, so extending it
+          // further with the keyboard jumps instead of growing.
+          try { el.setSelectionRange(focus.start, focus.end, focus.dir); } catch {}
         }
       }
     }
@@ -509,15 +558,25 @@ export const REGIONS_SCRIPT = `
     // re-render used to do exactly this). Snapshot focus/selection and the
     // view state above, patch, then restore them.
     //
-    // Restore focus and selection ONLY — never .value: the re-rendered value
-    // is the panel's own state (e.g. a regenerated summary), and restoring a
-    // stale typed value would clobber it. The host holds every editable's
-    // in-progress text (task 9.3), so what the patch paints is already
-    // current and no value restore is ever needed.
+    // The value goes with them only under the 'typed' rule above. It used to
+    // go never, on the premise that a host handler holding in-progress text
+    // does not re-render from it (task 9.3) so the patch is always current;
+    // 'setInstructions' breaks that premise deliberately, because the
+    // context-usage estimate and the resolved '@file' chips have to repaint as
+    // the text changes. The premise is now enforced here rather than assumed.
     const active = document.activeElement;
-    const focusId = active && active.id ? active.id : undefined;
-    let selStart, selEnd;
-    try { selStart = active ? active.selectionStart : undefined; selEnd = active ? active.selectionEnd : undefined; } catch {}
+    let focus;
+    if (active && active.id) {
+      focus = { id: active.id };
+      // Throws on an <input type=checkbox|number>, which has no selection —
+      // focus alone is still worth restoring for those.
+      try {
+        focus.start = active.selectionStart;
+        focus.end = active.selectionEnd;
+        focus.dir = active.selectionDirection ?? undefined;
+      } catch {}
+      if (typed.has(active.id) && typed.get(active.id) === active.value) focus.value = active.value;
+    }
     const before = entering ? undefined : captureView();
     for (const id of Object.keys(data.regions)) {
       // Not every region id exists on every screen (e.g. a page with no
@@ -539,10 +598,10 @@ export const REGIONS_SCRIPT = `
       return;
     }
     if (pendingView) {
-      applyView(pendingView, focusId, selStart, selEnd);
+      applyView(pendingView, focus);
       pendingView = undefined;
     } else {
-      applyView(before, focusId, selStart, selEnd);
+      applyView(before, focus);
     }
   });
 })();

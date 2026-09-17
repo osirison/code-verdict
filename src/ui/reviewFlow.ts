@@ -10,7 +10,7 @@ import { COMMANDS } from '../commands';
 import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
-import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
@@ -40,11 +40,13 @@ import {
   resolveContextReferences,
   type ContextReferenceCache,
 } from '../app/contextReferences';
-import { ReviewHistory } from '../app/reviewHistory';
+import { acceptRateForPod, ReviewHistory } from '../app/reviewHistory';
+import { sha256Hex } from '../app/contentDigest';
 import {
   carryRetainedResult,
   clearSubmitLedger,
   draftKeyFor,
+  partialDraftKeyFor,
   readRetained,
   runKeyForCr,
   screenForRetained,
@@ -55,7 +57,7 @@ import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunMana
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from '../app/submit';
 import { type AnchorCandidate, movedAnchors, resolveAnchor } from '../domain/anchor';
-import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import { diffAnchorCandidates, diffStats, parseHunks } from '../domain/diffHunks';
 import {
   effortForModel,
   effortLabel,
@@ -98,8 +100,8 @@ import {
   modelVisibleWorkspaceRoots,
   pickContextAttachment,
 } from './contextAttachmentPicker';
-import { livenessView } from './runLiveness';
 import { changesetTrailer } from './changesetOptions';
+import { readAutoAdvance } from './reviewPanelOptions';
 import { escapeHtml } from './theme';
 import { renderMarkdown } from './markdown';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
@@ -174,6 +176,22 @@ export class ReviewFlowPanel {
     return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
   }
 
+  /** `codeVerdict.showRunDiagnostics`'s own read: this panel's mirrored `RunRecord` (the same one `render()` builds `runError`/`runProjection` from), if this panel is open at all — no focus requirement, unlike `handleCommand`'s keyboard-command routing. */
+  static activeRunRecord(): RunRecord | undefined {
+    const panel = ReviewFlowPanel.current;
+    return panel && !panel.disposed ? panel.runRecord : undefined;
+  }
+
+  /**
+   * Whether this panel is open at all — `codeVerdict.showRunDiagnostics`'s own "how many review
+   * panels were open" count for its not-found report. Deliberately side-effect-free, unlike
+   * `revealIfOpen`: a diagnostic count must not itself bring a panel into focus.
+   */
+  static isOpen(): boolean {
+    const panel = ReviewFlowPanel.current;
+    return Boolean(panel && !panel.disposed);
+  }
+
   static selectItem(itemId: string): void {
     const panel = ReviewFlowPanel.current;
     if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;
@@ -214,7 +232,10 @@ export class ReviewFlowPanel {
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
   private readonly contextBudgets: ContextBudgets = readContextBudgets();
-  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  // The only agent this panel can name before discovery runs. Which of the
+  // built-ins are offered is `builtInAgents`'s call and needs the pod and the
+  // settings, so the real list arrives with the first `applySelection`.
+  private agents: AgentDescriptor[] = [BUILTIN_AGENT_DESCRIPTOR];
   private agentId: string = BUILTIN_AGENT_DESCRIPTOR.id;
   private agentOpen = false;
   private models: ModelDescriptor[] = [];
@@ -527,7 +548,7 @@ export class ReviewFlowPanel {
         effort: this.selectedEffort(),
       },
     );
-    const promptHash = crypto.createHash('sha256').update(prompt).digest('hex');
+    const promptHash = sha256Hex(prompt);
     const cacheKey = `${model.id}\0${promptHash}`;
     this.contextUsage = undefined;
     this.contextUsageCounter.schedule({
@@ -624,7 +645,7 @@ export class ReviewFlowPanel {
       // open" message with a second, unrelated one.
       const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
       const diffPromise = connection.getChangeRequestDiff(ref);
-      const selectionPromise = loadAgentSelection(selectionFromPod(pod));
+      const selectionPromise = loadAgentSelection(selectionFromPod(pod), pod);
       // The work items resolve whatever the description links. A review that
       // cannot start because that list 404'd is worse than one running on the
       // description alone, so this one degrades to [] instead of rejecting —
@@ -708,11 +729,29 @@ export class ReviewFlowPanel {
 
   // ---- staleness (handoff §6) --------------------------------------------------
 
-  /** The lines a finding can legitimately sit on: current additions only. */
+  /**
+   * The lines a finding can legitimately sit on: every line the diff makes
+   * addressable — additions and context on the new side, removals on the old
+   * side (see `diffAnchorCandidates`) — not just this file's fresh additions.
+   */
   private anchorCandidates(diff: ChangeRequestDiff, file: string): AnchorCandidate[] | undefined {
     const changed = diff.files.find((f) => f.newPath === this.providerFilePath(file));
     if (!changed) return undefined;
-    return addedLines(changed.diff);
+    return diffAnchorCandidates(changed.diff);
+  }
+
+  /**
+   * gitlab-anchor-oldpath-never-set: the finding's pre-rename path, in
+   * provider spelling, so `composeCommentDrafts` can carry it onto
+   * `DiffAnchor.oldPath` — GitLab's `buildPosition` needs BOTH `old_path` and
+   * `new_path` to position a comment on a renamed file, and without this it
+   * silently defaulted `old_path` to `new_path`, mis-positioning the comment.
+   * `undefined` for an unrenamed file, exactly like `composeCommentDrafts`'s
+   * own contract documents.
+   */
+  private oldPathFor(diff: ChangeRequestDiff, file: string): string | undefined {
+    const changed = diff.files.find((f) => f.newPath === this.providerFilePath(file));
+    return changed?.isRenamed ? changed.oldPath : undefined;
   }
 
   private markMoved(diff: ChangeRequestDiff): Set<string> {
@@ -818,7 +857,16 @@ export class ReviewFlowPanel {
    * of the run, which carries its own copy in the snapshot below and is
    * therefore untouched by anything the reviewer changes afterwards.
    */
-  private async run(): Promise<void> {
+  /**
+   * `fromCheckpoint` (task 14.6): builds the exact same `RunInput` either
+   * way — a resumed attempt's compatibility check depends on that freshness
+   * — and only the manager call at the end differs. `resumeRun` returning
+   * `undefined` means the offer went stale between render and click (the
+   * lineage's checkpoint disappeared, or another panel already claimed it);
+   * there is nothing to attach, so this reports it as a notice on the same
+   * picker screen rather than silently starting an unrequested plain run.
+   */
+  private async run(fromCheckpoint = false): Promise<void> {
     if (!this.diff) return;
     const loadToken = this.loadSeq;
     const ref = this.ref;
@@ -834,17 +882,16 @@ export class ReviewFlowPanel {
     const agent = this.selectedAgent();
     const agentLabel = agent.label || agentId;
     const modelId = this.modelId;
-    const model = this.selectedModel();
     const criteria = { ...pod.criteria, categories: [...pod.criteria.categories] };
     const effort = this.selectedEffort();
     const contextBudgets = { ...this.contextBudgets };
     const demo = agentId === DEMO_AGENT_DESCRIPTOR.id;
-    const lmStats = diffStats(diff.files.map((file) => file.diff));
     const input: RunInput = {
       target: {
         kind: 'cr',
         ref,
-        diff,
+        baseSha: diff.baseSha,
+        headSha: diff.headSha,
         reviewContext,
         attachments,
         workspaceRootLabel,
@@ -858,13 +905,6 @@ export class ReviewFlowPanel {
       effort,
       timeouts: agentRunTimeouts(),
       contextBudgets,
-      steps: [
-        `Sending ${agent.label} to ${model?.label ?? 'the model'}…`,
-        `Indexing ${diff.files.length} changed files (+${lmStats.added} −${lmStats.removed})…`,
-        'Cross-referencing module history…',
-        `Scoring findings against ${getProvider(pod.providerId).vocabulary.repoNoun} criteria…`,
-        'Items ready',
-      ],
       demo,
     };
     const concurrency = agentRunConcurrency();
@@ -903,8 +943,20 @@ export class ReviewFlowPanel {
     }
 
     if (!targetIsCurrent()) return;
+    const record = fromCheckpoint ? this.deps.runs.resumeRun(input, concurrency) : this.deps.runs.trigger(input, concurrency);
+    if (record === undefined) {
+      // The resume offer was stale by the time the reviewer clicked it —
+      // never invent an ordinary run instead of the one they asked for.
+      // `interruptedPrior` is recomputed on the next `render()` from the
+      // manager's current state, so a genuinely gone offer stops being
+      // shown at all rather than repeating this notice forever.
+      this.selectionNotices = ["The earlier attempt's checkpoint is no longer available to start a new attempt from."];
+      this.screen = 'agent';
+      this.render();
+      return;
+    }
     this.newRunFromResult = false;
-    this.attachRun(this.deps.runs.trigger(input, concurrency));
+    this.attachRun(record);
     this.screen = 'running';
     this.render();
   }
@@ -993,14 +1045,22 @@ export class ReviewFlowPanel {
    * whether there was one. This is the whole of "a completed review is what a
    * target opens on": one reader, used by `load()`, by a finished run, and by a
    * cancelled one.
+   *
+   * `source` defaults to the complete-review key every one of those callers
+   * wants; `usePartial`'s own call site is the one exception (budget-exhausted
+   * resume feature) — it reads the *separate* durable partial key instead
+   * (`retainedReview.ts`'s `partialDraftKeyFor`/`readRetained`'s own
+   * `{partial: true}` option), so "Use N partial findings" actually opens the
+   * partial review it names rather than whatever complete review this target
+   * happened to retain before.
    */
-  private enterRetained(): boolean {
+  private enterRetained(source: { key: string; partial?: boolean } = { key: this.draftKey() }): boolean {
     // A pending coalesced write may hold newer triage than the store; land it
     // first, or this read would revert the screen to the pre-burst state (a
     // cancelled re-run re-entering the review is the reachable case). The
     // flush's get/update pair is synchronous, so the read below sees it.
     this.draftWriter.flushQuietly();
-    const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(this.draftKey()));
+    const retained = readRetained(this.deps.workspaceState.get<SessionDraft>(source.key), { partial: source.partial });
     if (!retained) {
       // Cleared, not merely left: a change request with no record must not
       // inherit the previous one's, which is what the header line and the
@@ -1188,6 +1248,38 @@ export class ReviewFlowPanel {
         void this.run();
         return;
       }
+      case 'resumeFromCheckpoint': {
+        // Task 14.6 (extended for the budget-exhausted resume feature):
+        // identical context-reference resolution to `run` above — the
+        // `RunInput` a resumed attempt builds must be exactly as fresh as an
+        // ordinary one, since `decideResume` compares it against the stored
+        // checkpoint dimension by dimension. Only the final manager call
+        // differs (`resumeRun` in `run()`, not `trigger()`), gated by
+        // `fromCheckpoint`; the button that dispatches this message is
+        // itself only rendered when either offer said it was live —
+        // `interruptedPrior.resumable` on the `'agent'` picker screen, or
+        // `runError.freshAttempt.resumable` on this failure card. `resumeRun`
+        // itself tells the two apart (`ReviewRun.outcome`, via
+        // `harnessResume.ts`'s `resumeBudgetModeFor`) — this handler need not.
+        const loadToken = this.loadSeq;
+        const target = this.ref;
+        const targetIsCurrent = (): boolean => (
+          !this.disposed && loadToken === this.loadSeq && target === this.ref
+        );
+        await prepareContextReferencesForRun(
+          m.instructions ?? pod.criteria.extraInstructions,
+          pod.criteria.extraInstructions,
+          async (instructions) => {
+            if (!targetIsCurrent()) return;
+            pod.criteria.extraInstructions = instructions;
+            await this.deps.podStore.upsert(pod);
+          },
+          (instructions) => this.resolveInstructionReferences(instructions, targetIsCurrent),
+        );
+        if (!targetIsCurrent()) return;
+        void this.run(true);
+        return;
+      }
       case 'cancel':
         // Two meanings on one message, because the failure screen's "Switch
         // agent" reuses it. A live run is stopped — really stopped, request and
@@ -1202,6 +1294,15 @@ export class ReviewFlowPanel {
         }
         this.deps.runs.cancel(this.runKey());
         return;
+      case 'pauseRun':
+        // Task 14.6: the button only renders when `runControls.canPause` is
+        // true, but a state change can race the click — `pause()` is its
+        // own no-op guard for exactly that, so nothing extra is needed here.
+        this.deps.runs.pause(this.runKey());
+        return;
+      case 'resumeRun':
+        this.deps.runs.resume(this.runKey());
+        return;
       case 'retryRun':
         void this.run();
         return;
@@ -1214,11 +1315,14 @@ export class ReviewFlowPanel {
         await vscode.commands.executeCommand('codeVerdict.selectAgent');
         return;
       case 'usePartial':
-        // The demo agent never produces partials; the lm path reports 0
-        // today — reachable once streaming partial parses land.
+        // The demo agent never produces partials. The lm path's own durable
+        // partial write (`ReviewRunManager.completeAttempt`) is what this
+        // reads back — the separate `partialDraftKeyFor` key, never this
+        // target's complete-review key (`enterRetained`'s own doc comment on
+        // why `usePartial` is its one caller that overrides `source`).
         this.deps.runs.acknowledge(this.runKey());
         this.runRecord = undefined;
-        if (!this.enterRetained()) this.screen = 'agent';
+        if (!this.enterRetained({ key: partialDraftKeyFor(this.ref), partial: true })) this.screen = 'agent';
         break;
       case 'newRun':
         // Open the pickers over a result that stays exactly where it is. Only a
@@ -1251,8 +1355,7 @@ export class ReviewFlowPanel {
         const item = this.review.items.find((i) => i.id === m.itemId);
         const applyFix = m.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item));
         this.review = setVerdict(this.review, m.itemId, m.verdict, applyFix);
-        const auto = vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true);
-        if (auto) {
+        if (readAutoAdvance()) {
           this.selectedId = nextUndecided(this.review, m.itemId)?.id ?? this.selectedId;
         }
         this.persistDraft();
@@ -1327,7 +1430,16 @@ export class ReviewFlowPanel {
               return item;
             }
             const resolved = resolveAnchor(candidates, item);
-            if (resolved.state === 'lost') lost += 1;
+            // `item.line` is always new-side numbering. A resolution on the
+            // old side means the flagged text now only exists as a deletion —
+            // nothing in the *current* file to move this finding's line to —
+            // so for re-anchoring purposes that is a loss, not a move;
+            // rewriting `item.line` from an old-side number would silently
+            // corrupt it into the wrong file's coordinate space.
+            if (resolved.state === 'lost' || resolved.side === 'old') {
+              lost += 1;
+              return item;
+            }
             if (resolved.state !== 'moved') return item;
             moved += 1;
             const delta = resolved.line - item.line;
@@ -1399,9 +1511,17 @@ export class ReviewFlowPanel {
       case 'approve': {
         const connection = await this.connection();
         await connection.approve(this.ref);
+        if (this.disposed) return;
         void vscode.window.showInformationMessage(`Verdict: approved ${this.refLabel()}.`);
-        this.screen = 'agent';
-        break;
+        // Nothing left to review here — renderClean only offers this button
+        // once every candidate is filtered out — so land back on the
+        // dashboard the same way 'backToDashboard' does, instead of parking
+        // the reviewer on the agent-picker screen for a change request they
+        // just signed off on. A rejected `connection.approve` throws before
+        // this point, so `onMessage`'s catch re-renders the still-current
+        // clean screen instead of navigating away.
+        void vscode.commands.executeCommand(COMMANDS.openDashboard);
+        return;
       }
       case 'lowerBar': {
         const floorIndex = SEVERITY_ORDER.indexOf(pod.criteria.severityFloor);
@@ -1523,7 +1643,10 @@ export class ReviewFlowPanel {
     const voice = vscode.workspace
       .getConfiguration('codeVerdict')
       .get<AgentVoice>('agentVoice', 'terse');
-    return composeSummary(this.review, this.agentLabel(), voice);
+    // Anchor resolution, not just verdicts: a headline claiming "posted
+    // inline" for an item that will actually be withheld is exactly the
+    // report the reviewer must never see.
+    return composeSummary(this.review, this.agentLabel(), voice, this.commentDraftComposition()?.withheld);
   }
 
   private commentDraftComposition() {
@@ -1538,6 +1661,7 @@ export class ReviewFlowPanel {
       diff.anchorRefs,
       (file) => this.anchorCandidates(diff, file),
       this.workspaceRootLabel(),
+      (file) => this.oldPathFor(diff, file),
     );
   }
 
@@ -1579,7 +1703,14 @@ export class ReviewFlowPanel {
         this.ref,
         {
           drafts,
-          summary: composeSummaryBody(this.summaryText, this.finalNote, this.review, withheld),
+          // `this.staleHead` is the freshest live head this panel has actually observed
+          // (`pollHead`'s own comment: identical to `this.cr.headSha` unless a poll already found
+          // it moved further); `this.cr?.headSha` is the fallback for a panel `pollHead` never
+          // ticked in. `composeSummaryBody` states the reviewed revision only when it actually
+          // differs from what was reviewed, so a PR reader knows which commit the findings below
+          // describe. Never re-fetched here — submit posts against the same pinned diff the
+          // reviewer triaged, this only decides whether to disclose that it is pinned.
+          summary: composeSummaryBody(this.summaryText, this.finalNote, this.review, withheld, this.staleHead ?? this.cr?.headSha),
           // The author's own request-for-changes is refused the same way their
           // approval is, and `requestChanges` defaults to true — so the summary
           // screen's disabled checkbox is the notice, this is the enforcement.
@@ -1687,8 +1818,15 @@ export class ReviewFlowPanel {
         && !this.postedIndividually
         && result.summaryPosted
         && result.comments.every((outcome) => outcome.ok);
+      // From what actually posted, never from the verdict tally: an accepted
+      // item that could not be anchored (or whose file left the diff) never
+      // reached `performSubmit` at all, and `counts.accepted` cannot see that.
+      const notPostedInline = counts.accepted - this.postedCount;
       this.doneSentence = [
-        `${counts.accepted} inline ${counts.accepted === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
+        `${this.postedCount} inline ${this.postedCount === 1 ? 'comment' : 'comments'} posted${postedAsOneReview ? ' as one review thread' : ''}${this.verdictApplied ? ', changes requested' : ''}.`,
+        notPostedInline > 0
+          ? `${notPostedInline} accepted ${notPostedInline === 1 ? 'finding' : 'findings'} could not be anchored to the diff — see the summary.`
+          : '',
         // Deliberately not phrased as an error: everything the user wrote did
         // land, and there is nothing for them to retry.
         verdictRefused ? `The request for changes was not applied: ${result.requestChangesError?.message ?? 'refused'}.` : '',
@@ -1755,7 +1893,15 @@ export class ReviewFlowPanel {
 
   private async refreshAgents(): Promise<void> {
     if (this.disposed) return;
-    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    // `this.pod()` throws when the last pod was deleted, and this panel is not
+    // disposed when that happens — the watches keep firing into a
+    // `void`-dispatched call, where a throw is an unhandled rejection nobody
+    // catches. `loadAgentSelection` only needs the pod to decide the demo
+    // agent's visibility, so with no pod there is nothing to re-decide and
+    // leaving the pickers exactly as they are is the honest answer.
+    const pod = this.deps.podStore.activePod;
+    if (!pod) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId }, pod);
     if (this.disposed) return;
     this.applySelection(next);
     this.scheduleContextUsage();
@@ -1826,19 +1972,18 @@ export class ReviewFlowPanel {
       ? verdictCounts(this.review)
       : { accepted: 0, rejected: 0, skipped: 0, undecided: 0 };
     const withheldInlineItemIds = this.commentDraftComposition()?.withheld.map((item) => item.id) ?? [];
-    const history = new ReviewHistory(this.deps.globalState).list().filter((r) => r.podId === pod.id);
-    const produced = history.reduce(
-      (n, r) => n + r.counts.accepted + r.counts.rejected + r.counts.skipped,
-      0,
-    );
-    const acceptRate =
-      produced > 0
-        ? Math.round((history.reduce((n, r) => n + r.counts.accepted, 0) / produced) * 100)
-        : undefined;
-    // The same one-entry array `runLmAgent` wraps this context in for the
-    // prompt: the truncation notice has to answer for the prompt that was
-    // sent, and the budget it is measured against counts entry labels too.
+    const acceptRate = acceptRateForPod(new ReviewHistory(this.deps.globalState).list(), pod.id);
+    // The same one-entry array `assembleReviewPrompt` wraps this context in
+    // (task 15.8 removed `runLmAgent`, which used to do this; the pure
+    // builder survives for the pre-run context-usage estimate and wraps
+    // context identically): the truncation notice has to answer for the
+    // prompt that estimate measures, and the budget it is measured against
+    // counts entry labels too.
     const contextEntries: ReviewContextEntry[] = this.reviewContext ? [{ context: this.reviewContext }] : [];
+    // Task 14.6: the one derivation both `runControls` (live pause/resume/
+    // cancel) and `interruptedPrior` (resume-from-checkpoint) read below —
+    // never re-derived per field.
+    const controls = this.deps.runs.controlsFor(this.runKey(), this.ref);
     const state: FlowViewState = {
       vocabulary: getProvider(pod.providerId).vocabulary,
       screen: this.screen,
@@ -1873,18 +2018,83 @@ export class ReviewFlowPanel {
       autoContextItems: this.autoContextItems(),
       contextUsage: this.contextUsage,
       unresolvedContextReferences: this.unresolvedContextReferences,
-      runSteps: this.runRecord?.steps ?? [],
-      runStep: this.runRecord?.step ?? 0,
-      runLive: livenessView(this.runRecord),
+      // Task 14.1 (design.md D14): the shared reducer's own projection and
+      // ordered activity — never a fixed step list or a fragment count.
+      runProjection: this.runRecord?.projection,
+      runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      // Live counts for the phase rail's neighbour line (repo-owner incident:
+      // a healthy run in `verifying` read as "looping" with nothing on
+      // screen to say otherwise) — the same checkpoint `runActivity` already
+      // reads, never a second read of the attempt's state. `findings` counts
+      // only `accepted` candidates, matching `CandidateTracker.
+      // triageFindings()`'s own definition of what a reviewer will actually
+      // see; `modelTurnsUsed` is `budget.modelTurnsUsed` verbatim.
+      runCounts: this.runRecord?.checkpoint
+        ? {
+            findings: this.runRecord.checkpoint.candidates.filter((candidate) => candidate.state === 'accepted').length,
+            modelTurnsUsed: this.runRecord.checkpoint.budget.modelTurnsUsed,
+          }
+        : undefined,
+      runStartedAt: this.runRecord?.startedAt,
+      // `partialCount` reads `RunRecord.partialResult` — `settle`'s own field for exactly this
+      // (`reviewRunManager.ts`), never a hardcoded 0: a failed run's validated findings are real
+      // and the failure card names them accurately, arming both "Use N partial findings" and the
+      // fresh-attempt sentence below with the true count. `freshAttempt` is the budget-exhausted
+      // resume feature's own offer for this failed run — `RunControls.canStartFreshAttempt`/
+      // `.freshAttemptReasons`, gated off `demo` the same way `interruptedPrior` below is (a demo
+      // selection has no checkpoint continuity contract to offer against).
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
-        ? { ...this.runRecord.failure, partialCount: 0 }
+        ? {
+            ...this.runRecord.failure,
+            partialCount: this.runRecord.partialResult?.items.length ?? 0,
+            freshAttempt:
+              controls.canStartFreshAttempt || controls.freshAttemptReasons
+                ? { resumable: controls.canStartFreshAttempt && this.selectedAgent().source !== 'demo', reasons: controls.freshAttemptReasons }
+                : undefined,
+          }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
+      // Task 14.6: both fields below come from the one derivation
+      // (`deriveRunControls`, via `controlsFor`) so this screen and the
+      // running screen's control row can never disagree about what the
+      // manager will accept. Live pause/resume/cancel and the
+      // resume-from-checkpoint offer are structurally exclusive — the
+      // derivation only ever populates one side, never both — because a
+      // target either has a live run to control or a stored interrupted
+      // outcome to offer a new attempt against, never both at once. A
+      // control this run's current lifecycle (or stored outcome) does not
+      // accept is omitted entirely, the same as the running screen's row;
+      // a stale click racing a state change is refused as a silent no-op by
+      // the manager itself either way.
+      runControls: this.runRecord
+        ? { canPause: controls.canPause, canResume: controls.canResume, canCancel: controls.canCancel }
+        : undefined,
+      // The demo agent has no checkpoint continuity contract (`resumeRun`
+      // itself refuses a `demo` input) — a reviewer who switched to it since
+      // the interrupted attempt must see only the restart path, not an
+      // offer that would silently refuse when clicked.
+      interruptedPrior:
+        controls.canResumeFromCheckpoint || controls.resumeReasons
+          ? { resumable: controls.canResumeFromCheckpoint && this.selectedAgent().source !== 'demo', reasons: controls.resumeReasons }
+          : undefined,
       // The retained review stays reachable from the pickers and from a run in
       // flight: neither of them has replaced it yet.
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
         ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.agentLabel(), modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
+        : undefined,
+      // Task 14.2 (design.md D14/D16): the same retained record's own
+      // lineage/activity fields, never re-derived.
+      retainedDetails: this.retained
+        ? {
+            completeness: this.retained.completeness,
+            protocolProvenance: this.retained.protocolProvenance,
+            lineageId: this.retained.lineageId,
+            attempt: this.retained.attempt,
+            limitations: this.retained.limitations,
+            activity: this.retained.activity,
+            conclusion: this.retained.conclusion,
+          }
         : undefined,
       mode: this.mode,
       items,

@@ -17,6 +17,7 @@ import {
   type ModelVisibleWorkspaceRoot,
 } from '../app/modelVisiblePath';
 import { documentCandidates, resolveAnchor } from '../domain/anchor';
+import { escapeMarkdownText, markdownCodeFence, neutralizeCodeFences } from '../domain/markdownSafety';
 import type { ReviewItem, Verdict } from '../domain/types';
 
 export interface InDiffAnchorTarget {
@@ -182,16 +183,29 @@ export class InDiffEditor {
     // than papering the file with every item at once.
     this.thread?.dispose();
     const item = target.item;
+    // Both interpolated values are model-authored and length-bounded only
+    // (`harnessCandidateValidation.ts` checks neither for content), and both are
+    // rendered here as markdown, so neither may be trusted to leave this
+    // widget's own structure intact: a fence run in the body would open a block
+    // that swallows the suggestion below it, and a fence run in the suggestion
+    // would close a fixed ``` early and spill the rest of the suggested code
+    // into the widget as prose. Same two helpers, same reasons, as the posting
+    // path (`../app/submit.ts` and the provider `buildCommentBody`s) — this is
+    // the display-only layer of the identical premise, and it was the site that
+    // the rule reached last. (`vscode.MarkdownString` here is left untrusted —
+    // `isTrusted` is never set, so command links in model text stay inert; this
+    // is about structure, not execution.)
+    const fence = item.suggestion === undefined ? '' : markdownCodeFence(item.suggestion.new);
     const thread = controller.createCommentThread(uri, range, [
       {
         author: { name: target.agentLabel },
         body: new vscode.MarkdownString(
           [
-            `**${item.title}**`,
+            `**${escapeMarkdownText(item.title)}**`,
             '',
-            item.body,
+            neutralizeCodeFences(item.body),
             item.suggestion
-              ? ['', '_Suggested change_', '```suggestion', item.suggestion.new, '```'].join('\n')
+              ? ['', '_Suggested change_', `${fence}suggestion`, item.suggestion.new, fence].join('\n')
               : '',
           ]
             .filter(Boolean)

@@ -219,6 +219,63 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     expect(posted.regions['set-json']).toContain('&quot;codeVerdict.context.sectionBudget&quot;: 6000');
   });
 
+  it('a harness numeric setting patches only harness and JSON, and funnels through the harness config namespace', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+    world.testConnection.mockClear();
+    world.discoverAgents.mockClear();
+
+    handlers.message?.({ type: 'setHarnessNumber', key: 'maxModelTurnsPerAttempt', value: 128 });
+    await flush();
+
+    expect(world.testConnection).not.toHaveBeenCalled();
+    expect(world.discoverAgents).not.toHaveBeenCalled();
+    expect(configBacking.get('harness.maxModelTurnsPerAttempt')).toBe(128);
+    const posted = lastPosted();
+    expect(Object.keys(posted.regions).sort()).toEqual(['set-harness', 'set-json']);
+    expect(posted.regions['set-harness']).toContain('data-harness-number="maxModelTurnsPerAttempt" type="number" min="1" step="1" value="128"');
+    expect(posted.regions['set-json']).toContain('&quot;codeVerdict.harness.maxModelTurnsPerAttempt&quot;: 128');
+  });
+
+  it('a setHarnessNumber message for a key this change does not expose is ignored', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+
+    // Not one of `HARNESS_POLICY_SETTINGS`' keys — a provider page size, deliberately never exposed.
+    handlers.message?.({ type: 'setHarnessNumber', key: 'manifestPageSize', value: 500 });
+    await flush();
+
+    expect(configBacking.has('harness.manifestPageSize')).toBe(false);
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('the risk-coverage control writes the enum setting and rejects a non-risk-level value', async () => {
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+    await SettingsPanel.show(deps);
+    handlers.message?.({ type: 'verdictReady' });
+    panel.webview.postMessage.mockClear();
+
+    handlers.message?.({ type: 'setHarnessMinRisk', value: 'medium' });
+    await flush();
+    expect(configBacking.get('harness.requireInspectionMinRisk')).toBe('medium');
+    const posted = lastPosted();
+    expect(Object.keys(posted.regions).sort()).toEqual(['set-harness', 'set-json']);
+    expect(posted.regions['set-harness']).toMatch(/class="active" data-min-risk="medium"/);
+
+    panel.webview.postMessage.mockClear();
+    handlers.message?.({ type: 'setHarnessMinRisk', value: 'not-a-risk-level' });
+    await flush();
+    expect(configBacking.get('harness.requireInspectionMinRisk')).toBe('medium');
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
   it('the explicit re-test control does call testConnection, and only then does the status change', async () => {
     const { deps } = makeDeps();
     const { SettingsPanel } = await import('./settings.js');
@@ -238,7 +295,7 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     // remaining path that picks up a config edit made outside this page
     // while it was already open (see `testLiveState`'s comment).
     expect(Object.keys(posted.regions).sort()).toEqual(
-      ['set-agents', 'set-connection', 'set-context', 'set-json', 'set-notifications', 'set-privacy'].sort(),
+      ['set-agents', 'set-connection', 'set-context', 'set-harness', 'set-json', 'set-notifications', 'set-privacy'].sort(),
     );
     expect(posted.regions['set-connection']).toContain('connection failed');
   });
@@ -275,5 +332,71 @@ describe('SettingsPanel — the connection test and the agent scan run only on o
     const posted = lastPosted();
     expect(Object.keys(posted.regions).sort()).toEqual(['set-agents']);
     expect(posted.regions['set-agents']).toContain('2 agents');
+  });
+});
+
+/**
+ * The panel and the notifier have to describe one configuration.
+ *
+ * `readNotificationPrefs`/`normalizeNotificationPrefs` (`notifier.ts`) is what
+ * decides what a malformed `notifications.*` value means; this panel renders
+ * what is in force. A second read of the same three keys here — which is what
+ * `buildState` used to do — is how the panel comes to show a quiet-hours
+ * toggle switched on, a cadence chip selected, or a delivery mode chosen that
+ * the notifier is not using, with nothing in the page to say so.
+ *
+ * Driven with the malformed values that actually diverge: the old direct reads
+ * used `get(key, default)`, whose default covers a missing key only, so every
+ * one of these reached the view state unchanged.
+ */
+describe('the settings panel renders the notification preferences the notifier resolved, not the raw settings', () => {
+  it('shows quiet hours off, End of day, and each event\'s own default when settings.json holds values the notifier rejects', async () => {
+    // A truthy non-boolean: the old read handed `'yes'` straight to the view
+    // state, where every `state.quietMode ?` in `settingsHtml.ts` took the
+    // on-branch — while `routeNotification` reads the normalized `false` and
+    // demotes nothing.
+    configBacking.set('notifications.quietMode', 'yes');
+    // An unlisted cadence: `nextDigestFlush` already flushed at End of day for
+    // it, but the panel marks its chip with `===`, so the page showed no
+    // cadence selected at all while one was in force.
+    configBacking.set('notifications.digestCadence', 'hourly');
+    // A mode with the wrong case: `NotificationCenter.deliver`'s switch has no
+    // `default`, so this used to deliver nothing — the panel meanwhile drew a
+    // row with no mode selected, because `setting.mode === mode` matched none
+    // of the four segments.
+    configBacking.set('notifications.events.agentFinished', 'interrupt');
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+
+    await SettingsPanel.show(deps);
+
+    const html = panel.webview.html;
+    expect(html).toContain('data-checked="false"');
+    expect(html).not.toContain('data-checked="yes"');
+    expect(html).toContain('All events use their selected delivery mode.');
+    expect(html).toContain('<button class="chip compact active" data-cadence="End of day">');
+    expect(html).toContain('<button class="active " data-notification="agentFinished" data-mode="Interrupt">');
+    // The settings.json preview is the panel's own claim about what is in the
+    // file, so it has to carry the resolved values too rather than echoing
+    // back the string that produced them.
+    expect(html).toContain('&quot;codeVerdict.notifications.quietMode&quot;: false');
+    expect(html).toContain('&quot;codeVerdict.notifications.digestCadence&quot;: &quot;End of day&quot;');
+    expect(html).not.toContain('&quot;interrupt&quot;');
+  });
+
+  it('passes a well-formed value through untouched, so normalizing is not a second opinion about a valid setting', async () => {
+    configBacking.set('notifications.quietMode', true);
+    configBacking.set('notifications.digestCadence', 'Hourly');
+    configBacking.set('notifications.events.agentFinished', 'Off');
+    const { deps } = makeDeps();
+    const { SettingsPanel } = await import('./settings.js');
+
+    await SettingsPanel.show(deps);
+
+    const html = panel.webview.html;
+    expect(html).toContain('data-checked="true"');
+    expect(html).toContain('Only blockers and direct mentions interrupt you.');
+    expect(html).toContain('<button class="chip compact active" data-cadence="Hourly">');
+    expect(html).toContain('<button class="active off" data-notification="agentFinished" data-mode="Off">');
   });
 });

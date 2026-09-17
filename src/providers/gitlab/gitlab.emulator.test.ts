@@ -7,15 +7,63 @@ import { describe, expect, it } from 'vitest';
 import { GitLabEmulator } from '../../../emulator/engine';
 import { emulatorFetch } from '../../../emulator/fetch';
 import { detectChangesets } from '../../app/changesets';
-import { runDemoChangesetAgent } from '../../app/combinedAgent';
 import { buildChangesetSubmitPlans, performChangesetSubmit } from '../../app/changesetSubmit';
 import { DEFAULT_CRITERIA } from '../../domain/criteria';
 import { addedLines } from '../../domain/diffHunks';
 import { createReview, setVerdict } from '../../domain/reviewState';
-import type { Pod } from '../../domain/types';
+import type { Pod, ReviewItem } from '../../domain/types';
+import type { AgentReviewResponse } from '../../domain/agentResponse';
+import type { ChangeRequestDiff, ChangeRequestRef } from '../../platform/types';
 import { describeProviderContract } from '../../platform/contract/providerContract';
 import { isScmError } from '../../platform/errors';
 import { createGitLabProvider } from './gitlabProvider';
+
+/**
+ * A cross-repository finding built directly from real fetched diffs — the
+ * same "renamed field, stale reader" pattern the deleted demo changeset
+ * agent (`combinedAgent.ts`'s own `crossRepositoryFinding`, removed task
+ * 15.8) used to synthesize, kept here purely as a test fixture so this
+ * end-to-end submit test still has a genuine cross-repository item anchored
+ * on real added lines to post.
+ */
+function findCrossRepositoryFinding(
+  members: readonly { ref: ChangeRequestRef; diff: ChangeRequestDiff }[],
+): ReviewItem | undefined {
+  const gateway = members.find((member) => member.diff.files.some((file) => addedLines(file.diff).some((line) => line.text.includes('expires_at'))));
+  const consoleMember = members.find((member) => member.diff.files.some((file) => addedLines(file.diff).some((line) => /\.expiry\b/.test(line.text))));
+  if (!gateway || !consoleMember) return undefined;
+  const gatewayFile = gateway.diff.files.find((file) => addedLines(file.diff).some((line) => line.text.includes('expires_at')));
+  const consoleFile = consoleMember.diff.files.find((file) => addedLines(file.diff).some((line) => /\.expiry\b/.test(line.text)));
+  const gatewayLine = gatewayFile && addedLines(gatewayFile.diff).find((line) => line.text.includes('expires_at'));
+  const consoleLine = consoleFile && addedLines(consoleFile.diff).find((line) => /\.expiry\b/.test(line.text));
+  if (!gatewayFile || !consoleFile || !gatewayLine || !consoleLine) return undefined;
+  return {
+    id: `cross_${gateway.ref.repoId}_${consoleMember.ref.repoId}_expiry`,
+    repoId: consoleMember.ref.repoId,
+    crNumber: consoleMember.ref.number,
+    file: consoleFile.newPath,
+    anchored: true,
+    line: consoleLine.line,
+    severity: 'blocker',
+    category: 'apiContract',
+    confidence: 94,
+    title: 'Response field renamed in the gateway but still read in the console',
+    body: 'One member publishes expires_at while another still reads expiry. Both can pass independently and fail when deployed together.',
+    code: consoleLine.text.trim(),
+    cross: true,
+    spans: [
+      { repoId: gateway.ref.repoId, location: `${gatewayFile.newPath}:${gatewayLine.line}`, role: 'renames the field' },
+      { repoId: consoleMember.ref.repoId, location: `${consoleFile.newPath}:${consoleLine.line}`, role: 'still reads the old name' },
+    ],
+    suggestion: { old: consoleLine.text.trim(), new: consoleLine.text.replace(/\.expiry\b/, '.expires_at').trim() },
+    answers: {
+      explain: 'Each repository tests one side of the contract, so neither suite observes the mismatch.',
+      fix: 'Read expires_at in the consumer, or publish both names for one compatibility release.',
+      similar: 'Search changeset members for other reads of expiry and expires_at.',
+      why: 'The combined diff contains a producer rename and a consumer that retains the old field.',
+    },
+  };
+}
 
 const INSTANCE_URL = 'https://gitlab.emulator.local';
 const TOKEN = 'glpat-emulator';
@@ -27,12 +75,24 @@ function connect(emulator: GitLabEmulator, token = TOKEN) {
   });
 }
 
+// `!2833`'s base/head are `rng.hex(40)` — deterministic for seed 1, but not a
+// literal worth hardcoding; read off a reference world instead.
+const referenceMr = new GitLabEmulator({ seed: 1 }).world.mergeRequests.find(
+  (mr) => mr.project_id === 9101 && mr.iid === 2833,
+);
+if (!referenceMr) throw new Error('Seed 1 no longer seeds project 9101 MR !2833');
+
 describeProviderContract('gitlab provider against the emulator', {
   capabilities: createGitLabProvider().capabilities,
   makeConnection: () => connect(new GitLabEmulator({ seed: 1 })),
   makeFailingConnection: () => {
     const emulator = new GitLabEmulator({ seed: 1 });
     emulator.world.failures = { discussionPostFailAt: 2, discussionPostFailStatus: 400 };
+    return connect(emulator);
+  },
+  makeRateLimitedDetailConnection: () => {
+    const emulator = new GitLabEmulator({ seed: 1 });
+    emulator.world.failures = { investigationRateLimited: true };
     return connect(emulator);
   },
   inputs: {
@@ -79,12 +139,16 @@ describe('end-to-end flows against the emulator', () => {
       projectPath: member.projectPath,
       diff: await conn.getChangeRequestDiff(member.ref),
     })));
-    const response = runDemoChangesetAgent(
-      members,
-      { ...DEFAULT_CRITERIA, categories: [...DEFAULT_CRITERIA.categories, 'apiContract'] },
-    ).response;
-    const cross = response.items.find((item) => item.cross);
+    const cross = findCrossRepositoryFinding(members);
     expect(cross).toMatchObject({ repoId: '9210', crNumber: '1509', file: 'src/api/session.ts', line: 41 });
+    const response: AgentReviewResponse = {
+      schemaVersion: '1',
+      agentId: 'verdict.demo-agent',
+      agentLabel: 'Verdict · Demo Review',
+      headSha: members.map((member) => `${member.ref.repoId}!${member.ref.number}:${member.diff.headSha}`).join('|'),
+      items: cross ? [cross] : [],
+      candidates: [],
+    };
 
     let review = createReview({
       repoId: 'changeset', crNumber: changeset?.id ?? '', agentId: response.agentId,
@@ -223,5 +287,83 @@ describe('end-to-end flows against the emulator', () => {
       expect(isScmError(e) && e.kind === 'rateLimited').toBe(true);
       expect(isScmError(e) ? e.retryAfterSeconds : undefined).toBe(38);
     }
+  });
+});
+
+/**
+ * The GitLab half of A1-suggestion-fence-forgery, which the GitHub provider has been pinned against
+ * since the fence widening was added there (`../github/github.emulator.test.ts`) and this provider
+ * was not: `buildCommentBody` wrapped `draft.suggestion.new` in a fixed ` ```suggestion:-0+N ` /
+ * ` ``` ` fence, and `suggestion.new` is model-authored replacement code that
+ * `harnessCandidateValidation.ts` bounds for length and never inspects for content. A ``` run
+ * inside it — an example fence in a markdown fix, or one steered in by prompt injection from the
+ * change's own text — closed the real fence early, and everything after it posted as a second,
+ * independent ```suggestion block with its own Apply control, carrying code that passed no
+ * validation, no contradiction check and no reviewer triage under the reviewer's own account.
+ *
+ * Asserted through the emulator rather than on `buildCommentBody` directly so the claim is about
+ * the bytes that reach the server and come back on the note, not about a pure function in
+ * isolation.
+ */
+describe('a GitLab suggestion cannot forge its own fence (A1)', () => {
+  it('widens the fence past any ``` run the suggestion itself contains, so the whole suggestion stays inside one Apply block', async () => {
+    const emulator = new GitLabEmulator({ seed: 6 });
+    const conn = connect(emulator);
+    const ref = { repoId: '9101', number: '2841' };
+    const diff = await conn.getChangeRequestDiff(ref);
+
+    const maliciousNew = "return sanitize(input);\n```\n\n```suggestion:-0+0\nrequire('child_process').exec(process.env.EXFIL_URL)";
+    const result = await conn.submitReview(ref, {
+      comments: [{
+        key: 'a',
+        body: 'x',
+        anchor: { filePath: 'src/auth/token.ts', line: 63, refs: diff.anchorRefs },
+        suggestion: { old: 'y', new: maliciousNew },
+      }],
+    });
+    expect(result.comments[0]?.ok).toBe(true);
+
+    // Located by its own payload rather than by position: the seeded world already holds
+    // discussions on this merge request, and a fence-shaped `find` would match the forgery too.
+    const threads = await conn.listThreads(ref);
+    const posted = threads.find((thread) => thread.notes[0]?.body.includes('return sanitize(input);'))?.notes[0]?.body ?? '';
+
+    const openMatch = /^(`{3,})suggestion:-0\+0$/m.exec(posted);
+    expect(openMatch, `no fence opener found in: ${posted}`).not.toBeNull();
+    const fenceLength = openMatch![1]!.length;
+    // Widened strictly past 3: the suggestion's own longest backtick run (3) can no longer match.
+    expect(fenceLength).toBeGreaterThan(3);
+    const fence = '`'.repeat(fenceLength);
+    const openIdx = posted.indexOf(`${fence}suggestion:-0+0`);
+    const afterOpen = openIdx + fence.length + 'suggestion:-0+0'.length + 1; // + the newline
+    const closeIdx = posted.indexOf(fence, afterOpen);
+    expect(closeIdx).toBeGreaterThan(-1);
+    // Every byte of the payload — its own fake fence markers included — sits verbatim inside the
+    // one real block. Nothing is escaped or rewritten: a suggestion has to stay applyable code.
+    expect(posted.slice(afterOpen, closeIdx)).toBe(`${maliciousNew}\n`);
+    // And nothing past the real close opens a second Apply block. Searched from after the close
+    // rather than over the whole note, because the widened opener itself contains ```suggestion as
+    // a substring one character in.
+    expect(posted.indexOf('```suggestion', closeIdx + fence.length)).toBe(-1);
+  });
+
+  it('keeps the ordinary three-backtick fence when the suggestion contains no backticks, so a benign fix posts unchanged', async () => {
+    const emulator = new GitLabEmulator({ seed: 7 });
+    const conn = connect(emulator);
+    const ref = { repoId: '9101', number: '2841' };
+    const diff = await conn.getChangeRequestDiff(ref);
+
+    await conn.submitReview(ref, {
+      comments: [{
+        key: 'a',
+        body: 'x',
+        anchor: { filePath: 'src/auth/token.ts', line: 63, refs: diff.anchorRefs },
+        suggestion: { old: 'y', new: "logger.error('refresh failed')" },
+      }],
+    });
+
+    const threads = await conn.listThreads(ref);
+    const posted = threads.find((thread) => thread.notes[0]?.body.includes('refresh failed'))?.notes[0]?.body ?? '';
+    expect(posted).toContain("```suggestion:-0+0\nlogger.error('refresh failed')\n```");
   });
 });

@@ -9,7 +9,24 @@ import type { ReviewRun } from '../app/reviewRuns';
 import type { PodData } from '../app/podQuery';
 import type { Pod } from '../domain/types';
 import type { ChangeRequest } from '../platform/types';
+import type { RunProjection } from '../domain/harnessActivity';
 import { formatClock, toViewState } from './dashboardState';
+
+/** A minimal `RunProjection` fixture — task 14.4's dashboard rows read the same shared shape the active review screen and sidebar do, never a dashboard-local re-derivation. */
+function projection(lifecycle: RunProjection['lifecycle'], over: Partial<RunProjection> = {}): RunProjection {
+  return {
+    runId: 'run-1',
+    lineageId: 'lineage-1',
+    attempt: 1,
+    lifecycle,
+    completeness: 'none',
+    elapsedMs: 0,
+    progressMode: 'indeterminate',
+    attention: 'none',
+    limitations: [],
+    ...over,
+  };
+}
 
 beforeAll(() => registerBuiltInProviders());
 
@@ -108,6 +125,46 @@ describe('AI review pill', () => {
   });
 });
 
+// changeset-dashboard-ignores-active-run: the per-CR `rows` array already outranks a retained outcome
+// with a live run (`aiPill`'s own "a run in flight outranks every recorded outcome" rule); the
+// `changesets` band never consulted `activeRuns` at all, even though the extension populates it under
+// exactly this key (`runKeyForChangeset`) and the changeset panel this card opens already shows the
+// running screen at the same instant.
+describe('changesets band reflects an in-flight review', () => {
+  function changesetData(): PodData {
+    return {
+      pod,
+      changeRequests: [
+        { ...cr('1'), description: 'Part-of: #10' },
+        { ...cr('2'), description: 'Part-of: #10' },
+      ],
+      workItems: [],
+      ciRuns: [],
+      fetchedAt: Date.parse('2026-08-25T12:00:00.000Z'),
+    };
+  }
+
+  it('a running changeset review is reflected on the dashboard card, not just its pre-run label', () => {
+    const withoutActive = toViewState(changesetData(), now, new Set(), undefined, new Map());
+    // Sanity: detection actually produced the changeset this test is about.
+    expect(withoutActive.changesets).toHaveLength(1);
+    expect(withoutActive.changesets?.[0]).toMatchObject({ id: 'trailer:10', state: '2 to review', stateClass: 'pill-warn' });
+
+    const active = new Map([['changeset:trailer:10', projection('investigating')]]);
+    const withActive = toViewState(changesetData(), now, new Set(), undefined, new Map(), active);
+    // The live lifecycle wins over the pre-run "N to review" label — the same precedence the per-CR
+    // pill already gives a run in flight.
+    expect(withActive.changesets?.[0]?.id).toBe('trailer:10');
+    expect(withActive.changesets?.[0]?.state).not.toBe('2 to review');
+  });
+
+  it('a changeset with no active run keeps its ordinary blocked/to-review/ready label untouched', () => {
+    const active = new Map([['changeset:some-other-id', projection('investigating')]]);
+    const state = toViewState(changesetData(), now, new Set(), undefined, new Map(), active);
+    expect(state.changesets?.[0]).toMatchObject({ state: '2 to review', stateClass: 'pill-warn' });
+  });
+});
+
 describe('AI review coverage', () => {
   it('counts rows on this dashboard, never the whole history — the numerator could outrun the denominator', () => {
     // Two entries for change requests that are not open rows here: another
@@ -174,28 +231,61 @@ describe('a row whose review is running', () => {
     ...over,
   });
 
-  it('says a review is running, over whatever the last one concluded', () => {
+  it('says a review is running, over whatever the last one concluded — but keeps that retained review visible as a note (task 14.4)', () => {
     const state = toViewState(
       data(['1']),
       now,
       new Set(),
       undefined,
       new Map([['9101!1', run()]]),
-      new Map([['9101!1', 'running']]),
+      new Map([['9101!1', projection('investigating')]]),
     );
-    expect(state.rows[0]?.ai.label).toBe('running…');
+    expect(state.rows[0]?.ai.label).toBe('Investigating');
+    expect(state.rows[0]?.ai.cls).toBe('pill-agent');
+    // The rerun's pill never conflates with, or hides, the retained review
+    // it might replace — the two facts stay visually distinct.
+    expect(state.rows[0]?.ai.note).toBe('prev: 3 findings');
   });
 
-  it('says a review is queued, over a submitted review', () => {
+  it('says a review is queued, over a submitted review — and names the retained submission as prev', () => {
     const state = toViewState(
       data(['1']),
       now,
       new Set(['9101!1']),
       undefined,
       new Map(),
-      new Map([['9101!1', 'queued']]),
+      new Map([['9101!1', projection('queued')]]),
     );
-    expect(state.rows[0]?.ai.label).toBe('queued');
+    expect(state.rows[0]?.ai.label).toBe('Queued');
+    expect(state.rows[0]?.ai.note).toBe('prev: submitted');
+  });
+
+  it('renders three distinguishable states for one target: a retained complete review, an active rerun over it, and a settled partial rerun (task 14.4/14.8)', () => {
+    const retainedOnly = toViewState(data(['1']), now, new Set(), undefined, new Map([['9101!1', run()]]));
+    const activeRerun = toViewState(
+      data(['1']),
+      now,
+      new Set(),
+      undefined,
+      new Map([['9101!1', run()]]),
+      new Map([['9101!1', projection('verifying')]]),
+    );
+    const partialRerun = toViewState(
+      data(['1']),
+      now,
+      new Set(),
+      undefined,
+      new Map([['9101!1', run({ outcome: 'partial', findingCount: 2, limitations: [{ code: 'coverage', message: 'Coverage did not reach every high-risk file.' }] })]]),
+    );
+
+    const pills = [retainedOnly, activeRerun, partialRerun].map((s) => `${s.rows[0]?.ai.label}|${s.rows[0]?.ai.note ?? ''}`);
+    // Every one of the three reads differently — never any two the same string.
+    expect(new Set(pills).size).toBe(3);
+    expect(retainedOnly.rows[0]?.ai).toEqual({ label: '3 findings', cls: 'pill-warn' });
+    expect(activeRerun.rows[0]?.ai.label).toBe('Verifying');
+    expect(activeRerun.rows[0]?.ai.note).toBe('prev: 3 findings');
+    expect(partialRerun.rows[0]?.ai.label).toBe('2 partial');
+    expect(partialRerun.rows[0]?.ai.title).toBe('Coverage did not reach every high-risk file.');
   });
 
   it('goes back to the recorded outcome once the run is over', () => {
@@ -216,6 +306,28 @@ describe('a row whose review is running', () => {
     expect(state.rows[0]?.ai.label).toBe('interrupted');
   });
 
+  it('names why an interrupted run cannot resume, when the sweep collected reasons (task 14.6)', () => {
+    const state = toViewState(
+      data(['1']),
+      now,
+      new Set(),
+      undefined,
+      new Map([
+        [
+          '9101!1',
+          run({
+            outcome: 'interrupted',
+            findingCount: 0,
+            resumable: false,
+            resumeReasons: [{ code: 'checkpointIntegrity', message: 'The stored snapshot no longer hashes to the digest its checkpoint recorded.' }],
+          }),
+        ],
+      ]),
+    );
+    expect(state.rows[0]?.ai.label).toBe('interrupted');
+    expect(state.rows[0]?.ai.title).toBe('The stored snapshot no longer hashes to the digest its checkpoint recorded.');
+  });
+
   it('leaves rows with no run in flight alone', () => {
     const state = toViewState(
       data(['1', '2']),
@@ -223,8 +335,8 @@ describe('a row whose review is running', () => {
       new Set(),
       undefined,
       new Map(),
-      new Map([['9101!1', 'running']]),
+      new Map([['9101!1', projection('investigating')]]),
     );
-    expect(state.rows.map((row) => row.ai.label)).toEqual(['running…', 'not run']);
+    expect(state.rows.map((row) => row.ai.label)).toEqual(['Investigating', 'not run']);
   });
 });

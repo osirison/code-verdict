@@ -385,8 +385,10 @@ review criteria — the next run uses them."
   End of day).
 - **Data & privacy** — a paragraph stating exactly what leaves the machine ("Diff hunks, file paths
   and your criteria go to the Copilot agent you selected. Nothing reaches GitLab until you press
-  Submit — rejected findings and their rationale never leave this machine."), plus a
-  "Share accept/reject rates with your team" toggle whose note explains both states.
+  Submit — rejected findings and their rationale never leave this machine."). The paragraph is the
+  whole section: it carried a "Share accept/reject rates with your team" toggle, which went when
+  `codeVerdict.shareAcceptRejectRates` was removed — nothing ever read that setting, so the toggle
+  wrote a value no code path acted on while its own note said rates were being shared.
 - **settings.json** — a live 12px/1.75 JetBrains Mono preview of the `codeVerdict.*` keys reflecting
   every control above, with an "Open in editor" link and a note that the token is not a setting.
 

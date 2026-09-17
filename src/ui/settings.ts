@@ -4,7 +4,7 @@ import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { readToken, type SecretStore } from '../app/storage';
 import { COMMANDS } from '../commands';
-import { NOTIFICATION_EVENTS, type NotificationMode } from '../domain/notifications';
+import { NOTIFICATION_EVENTS } from '../domain/notifications';
 import { discoverAgents } from '../app/agentDefinitions';
 import { agentSearchRoots } from './agentLocations';
 import {
@@ -25,6 +25,14 @@ import {
   readContextSourceDefaults,
   readContextUsageEnabled,
 } from './contextOptions';
+import { isRiskLevel } from '../domain/harnessCoverage';
+import {
+  harnessPolicyToSettingValues,
+  HARNESS_POLICY_SETTINGS,
+  readHarnessPolicy,
+  readRequireInspectionMinRisk,
+} from './harnessPolicyOptions';
+import { readNotificationPrefs } from './notifier';
 
 const CONTEXT_BUDGET_KEYS = {
   sectionBudget: 'context.sectionBudget',
@@ -38,6 +46,9 @@ const CONTEXT_TOGGLE_KEYS = {
   includeLinkedItems: 'context.includeLinkedItems',
   usageEnabled: 'contextUsage.enabled',
 } as const;
+
+/** Every harness numeric setting's key — `settings.ts`'s own membership check before writing a `setHarnessNumber` message, so a malformed message cannot write to an arbitrary config path. */
+const HARNESS_NUMBER_SETTING_KEYS = new Set(HARNESS_POLICY_SETTINGS.map((mapping) => mapping.settingKey));
 
 export interface SettingsPanelDeps {
   podStore: PodStore;
@@ -141,23 +152,30 @@ export class SettingsPanel {
   }
 
   private buildState(pod: { providerId: string; instanceUrl: string }): SettingsViewState {
-    const config = vscode.workspace.getConfiguration('codeVerdict');
     const vocabulary = getProvider(pod.providerId).vocabulary;
     const contextBudgets = readContextBudgets();
     const contextSources = readContextSourceDefaults();
+    // The notifier's own reader, not a second read of the same three keys:
+    // this panel shows what is in force, and `normalizeNotificationPrefs`
+    // is what decides that. Reading the keys here as well is how a panel
+    // comes to render a mode or a cadence the notifier is not using.
+    const prefs = readNotificationPrefs();
     return {
       vocabulary,
       instanceUrl: pod.instanceUrl,
       connectionStatus: this.connectionStatus,
       connected: this.connected,
       hasToken: this.hasToken,
-      quietMode: config.get<boolean>('notifications.quietMode', false),
-      digestCadence: config.get<SettingsViewState['digestCadence']>('notifications.digestCadence', 'End of day'),
-      shareRates: config.get<boolean>('shareAcceptRejectRates', false),
+      quietMode: prefs.quietMode,
+      digestCadence: prefs.digestCadence,
       context: {
         ...contextBudgets,
         ...contextSources,
         usageEnabled: readContextUsageEnabled(),
+      },
+      harness: {
+        ...harnessPolicyToSettingValues(readHarnessPolicy()),
+        requireInspectionMinRisk: readRequireInspectionMinRisk(),
       },
       agentLocations: this.agentLocations,
       notifications: NOTIFICATION_EVENTS.map((event) => ({
@@ -167,7 +185,7 @@ export class SettingsPanel {
         // Capitalized: it opens the label, and every other row is sentence-cased.
         label: event.label.replace(/\bCI run\b/, cap(vocabulary.ciNoun)),
         hint: event.hint.replace(/\bCI run\b/, vocabulary.ciNoun),
-        mode: config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
+        mode: prefs.modes[event.key] ?? event.defaultMode,
       })),
     };
   }
@@ -269,10 +287,23 @@ export class SettingsPanel {
         this.paint(['set-context', 'set-json']);
         return;
       }
-      case 'setShareRates':
-        await config.update('shareAcceptRejectRates', message.value, vscode.ConfigurationTarget.Global);
-        this.paint(['set-privacy', 'set-json']);
+      case 'setHarnessNumber': {
+        // The client's own `min`/`max` (set per field in `harnessRegion`, task 17.2) already
+        // gate what gets posted; this is only the same courtesy `setContextBudget` above pays —
+        // a malformed message cannot write to a config path outside the known harness settings.
+        // `normalizeHarnessPolicy` (`../domain/harnessPolicy.ts`) is the actual safety net,
+        // applied wherever `readHarnessPolicy` is read, regardless of what lands in settings.json.
+        if (!HARNESS_NUMBER_SETTING_KEYS.has(message.key) || !Number.isFinite(message.value)) return;
+        await config.update(`harness.${message.key}`, message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-harness', 'set-json']);
         return;
+      }
+      case 'setHarnessMinRisk': {
+        if (!isRiskLevel(message.value)) return;
+        await config.update('harness.requireInspectionMinRisk', message.value, vscode.ConfigurationTarget.Global);
+        this.paint(['set-harness', 'set-json']);
+        return;
+      }
       case 'openSettingsJson':
         await vscode.commands.executeCommand('workbench.action.openSettingsJson');
         return;

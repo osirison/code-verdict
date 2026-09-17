@@ -35,6 +35,7 @@ function windowMs(value: number | undefined, fallbackMs: number): number {
 export function agentRunTimeouts(): AgentRunTimeouts {
   const config = vscode.workspace.getConfiguration('codeVerdict');
   return {
+    firstOutputMs: windowMs(config.get<number>('agentRun.firstOutputSeconds'), DEFAULT_AGENT_RUN_TIMEOUTS.firstOutputMs),
     inactivityMs: windowMs(config.get<number>('agentRun.inactivitySeconds'), DEFAULT_AGENT_RUN_TIMEOUTS.inactivityMs),
     ceilingMs: windowMs(config.get<number>('agentRun.ceilingSeconds'), DEFAULT_AGENT_RUN_TIMEOUTS.ceilingMs),
   };

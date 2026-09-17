@@ -52,3 +52,23 @@ export function toScmError(e: unknown): ScmError {
   if (e instanceof Error) return new ScmError('unknown', e.message, { cause: e });
   return new ScmError('unknown', String(e));
 }
+
+/**
+ * Kinds a bounded retry policy may safely retry (design.md D12,
+ * `add-agentic-review-harness` task 3.5). Fails closed: every other kind,
+ * including `unknown`, is a terminal domain outcome the policy must not
+ * retry blindly — e.g. a `staleAnchor` retry would resend the identical
+ * request and get the identical refusal.
+ */
+const RETRYABLE_SCM_ERROR_KINDS: ReadonlySet<ScmErrorKind> = new Set(['rateLimited', 'network']);
+
+/**
+ * Whether a bounded retry policy may retry this failure, reusing `kind` and
+ * `retryAfterSeconds` — the existing taxonomy already carries Retry-After or
+ * reset guidance (`retryAfterSeconds`) through `rateLimited`; this adds the
+ * one thing it lacked, an explicit retryable signal, so a caller never has
+ * to special-case kinds itself.
+ */
+export function isRetryableScmError(error: ScmError): boolean {
+  return RETRYABLE_SCM_ERROR_KINDS.has(error.kind);
+}

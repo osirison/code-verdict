@@ -52,6 +52,131 @@ describe('resolveAnchor', () => {
   });
 });
 
+describe('resolveAnchor — sides (mandate A: widen past added-only)', () => {
+  // A hunk that rewrote the middle of a function: one context line either
+  // side of the change, one removed statement, one added statement.
+  const CANDIDATES = [
+    { line: 40, text: 'function handle(req) {', side: 'new' as const },
+    { line: 41, text: '  const id = req.params.id;', side: 'new' as const },
+    { line: 42, text: '  return store.get(id, token);', side: 'new' as const },
+    { line: 43, text: '}', side: 'new' as const },
+    { line: 41, text: '  return store.get(id);', side: 'old' as const },
+  ];
+
+  it('anchors exactly on a context line — never reachable through added lines alone', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 40, code: 'function handle(req) {' });
+    expect(result).toEqual({ state: 'exact', line: 40, side: 'new' });
+  });
+
+  it('drift-matches a context line that shifted, still on the new side', () => {
+    const shifted = CANDIDATES.map((c) => (c.side === 'new' ? { ...c, line: c.line + 2 } : c));
+    const result = resolveAnchor(shifted, { line: 43, code: '}' });
+    expect(result).toEqual({ state: 'moved', line: 45, side: 'new' });
+  });
+
+  it('anchors a finding about a deletion onto the old side, side LEFT', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 41, code: '  return store.get(id);' });
+    // The new side has no match for this exact text (the rewrite dropped the
+    // token argument), so the old-side deletion is matched. Even if the line
+    // numbers coincidentally equal, line numbers on the old side (old-file
+    // numbering) and the anchor (always new-file numbering) are in different
+    // spaces, so this can only be 'moved', never 'exact'.
+    expect(result).toEqual({ state: 'moved', line: 41, side: 'old' });
+  });
+
+  it('drift-matches a deletion that moved on the old side, once the new side has no match', () => {
+    const shiftedOld = CANDIDATES.map((c) => (c.side === 'old' ? { ...c, line: c.line + 3 } : c));
+    const result = resolveAnchor(shiftedOld, { line: 41, code: '  return store.get(id);' });
+    expect(result).toEqual({ state: 'moved', line: 44, side: 'old' });
+  });
+
+  it('never treats an old-side candidate as exact even when its line number coincidentally matches anchor.line — the candidate is in old-file numbering, anchor.line is always new-file', () => {
+    // A deleted line whose old-file number happens to equal the anchor's
+    // new-file number. Before the fix, line-number equality alone triggered
+    // the 'exact' shortcut even on the old side, incorrectly marking a deleted
+    // line's ghost match as 'exact'. Now the shortcut is gated to the new side
+    // only, so this yields 'moved', not 'exact'.
+    const result = resolveAnchor([{ line: 145, text: 'return null;', side: 'old' }], {
+      line: 145,
+      code: 'return null;',
+    });
+    expect(result).toEqual({ state: 'moved', line: 145, side: 'old' });
+  });
+
+  it('still matches exactly on new-side candidates at the same line', () => {
+    // Verify that the fix to gate the 'exact' shortcut to the new side only
+    // does not break genuine new-side exact matches. A context line or added
+    // line on the new side that matches both line number and text must still
+    // resolve as 'exact'.
+    const result = resolveAnchor(
+      [
+        { line: 145, text: 'return null;', side: 'new' },
+        { line: 145, text: 'return null;', side: 'old' },
+      ],
+      { line: 145, code: 'return null;' },
+    );
+    expect(result).toEqual({ state: 'exact', line: 145, side: 'new' });
+  });
+
+  it('never lets an old-side line win over a real new-side match, however close its number', () => {
+    // A deleted line numbered exactly where the finding's new-side code also
+    // matches, nearer in number than the true new-side line would ever be
+    // negative distance from — the new-side pass must still win outright,
+    // the old side never even consulted.
+    const withCloserGhost = [
+      ...CANDIDATES,
+      { line: 42, text: '  return store.get(id, token);', side: 'old' as const },
+    ];
+    const result = resolveAnchor(withCloserGhost, { line: 42, code: '  return store.get(id, token);' });
+    expect(result).toEqual({ state: 'exact', line: 42, side: 'new' });
+  });
+
+  it('reports lost, not old-side, when neither side has the code at all', () => {
+    const result = resolveAnchor(CANDIDATES, { line: 41, code: 'somethingElseEntirely();' });
+    expect(result).toEqual({ state: 'lost', line: 41 });
+  });
+
+  /**
+   * Among two or more trim-identical old-side candidates, ranking by
+   * `Math.abs(candidate.line - anchor.line)` used to pick whichever one's
+   * OLD-file line number happened to be numerically closest to `anchor.line`
+   * — which is always NEW-file numbering (`resolveAnchor`'s own doc comment,
+   * and every real caller: `submit.ts` passes `item.line`). This file's own
+   * header calls exactly that comparison "meaningless" ("old-side line 60
+   * and new-side line 60 do not describe the same place in the file") and
+   * names it as the reason the two sides are searched in separate passes —
+   * yet the old-side pass's own tie-break performed it anyway. The fix
+   * removes the ranking for the old side rather than replacing it with
+   * another distance the two numbers were never comparable by: the first
+   * matching candidate in document order wins, deterministically, and
+   * changing only the OTHER candidate's numeric position must never flip
+   * the pick.
+   */
+  it('never ranks two same-text old-side candidates by numeric closeness to the new-side anchor line — the first in document order wins regardless of which one a stale new-side number happens to sit nearer to', () => {
+    const duplicateOldText = [
+      { line: 40, text: 'function handle(req) {', side: 'new' as const },
+      { line: 15, text: 'return null;', side: 'old' as const },
+      { line: 460, text: 'return null;', side: 'old' as const },
+    ];
+    const anchor = { line: 145, code: 'return null;' };
+    const first = resolveAnchor(duplicateOldText, anchor);
+    expect(first).toEqual({ state: 'moved', line: 15, side: 'old' });
+
+    // Retargeting the second candidate to a line number far closer to
+    // `anchor.line` (145) than the first candidate's (15) must not flip the
+    // pick — before the fix, this exact retargeting did flip it (distance 5
+    // vs 130), proving the choice was driven by the invalid cross-space
+    // comparison rather than document order.
+    const retargeted = [
+      duplicateOldText[0]!,
+      duplicateOldText[1]!,
+      { ...duplicateOldText[2]!, line: 140 },
+    ];
+    const second = resolveAnchor(retargeted, anchor);
+    expect(second).toEqual({ state: 'moved', line: 15, side: 'old' });
+  });
+});
+
 describe('movedAnchors', () => {
   const items = [
     { id: 'f1', file: 'src/a.ts', line: 4, code: '  return cache.get(key);' },

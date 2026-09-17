@@ -1,7 +1,7 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
-import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources, type AgentSelectionState } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
@@ -38,10 +38,12 @@ import {
   resolveContextReferences,
   type ContextReferenceCache,
 } from '../app/contextReferences';
-import { ReviewHistory } from '../app/reviewHistory';
+import { acceptRateForPod, ReviewHistory } from '../app/reviewHistory';
+import { sha256Hex } from '../app/contentDigest';
 import {
   carryRetainedResult,
   changesetDraftKeyFor,
+  changesetPartialDraftKeyFor,
   clearChangesetSubmitLedger,
   readRetained,
   runKeyForChangeset,
@@ -49,10 +51,10 @@ import {
   type ChangesetDraft,
 } from '../app/retainedReview';
 import { CoalescedDraftWriter } from '../app/draftWriter';
-import type { ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
+import type { ChangesetRunMember, ReviewRunManager, RunInput, RunRecord } from '../app/reviewRunManager';
 import type { KeyValueStore, SecretStore } from '../app/storage';
 import { composeSummaryBody } from '../app/submit';
-import { addedLines, diffStats, parseHunks } from '../domain/diffHunks';
+import { addedLines, diffAnchorCandidates, diffStats, parseHunks } from '../domain/diffHunks';
 import {
   effortForModel,
   effortLabel,
@@ -83,10 +85,10 @@ import {
   pickContextAttachment,
 } from './contextAttachmentPicker';
 import { changesetDetectionOptions } from './changesetOptions';
+import { readAutoAdvance } from './reviewPanelOptions';
 import { flowCommandMessage, isTriageOnlyMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
-import { livenessView } from './runLiveness';
 import { escapeHtml } from './theme';
 import { AppSurface, type AppRoute } from './appSurface';
 import { locateInWorkspace } from './inDiffEditor';
@@ -148,6 +150,22 @@ export class ChangesetReviewPanel {
     return Boolean(panel && !panel.disposed && panel.route.panel.active !== false);
   }
 
+  /** `codeVerdict.showRunDiagnostics`'s own read: this panel's mirrored `RunRecord` (the same one `render()` builds `runError`/`runProjection` from), if this panel is open at all — no focus requirement, unlike `handleCommand`'s keyboard-command routing. */
+  static activeRunRecord(): RunRecord | undefined {
+    const panel = ChangesetReviewPanel.current;
+    return panel && !panel.disposed ? panel.runRecord : undefined;
+  }
+
+  /**
+   * Whether this panel is open at all — `codeVerdict.showRunDiagnostics`'s own "how many review
+   * panels were open" count for its not-found report. Deliberately side-effect-free, unlike
+   * `revealIfOpen`: a diagnostic count must not itself bring a panel into focus.
+   */
+  static isOpen(): boolean {
+    const panel = ChangesetReviewPanel.current;
+    return Boolean(panel && !panel.disposed);
+  }
+
   static selectItem(itemId: string): void {
     const panel = ChangesetReviewPanel.current;
     if (!panel || panel.disposed || !panel.review?.items.some((item) => item.id === itemId)) return;
@@ -165,7 +183,10 @@ export class ChangesetReviewPanel {
   private focusWatch?: vscode.Disposable;
   private changeset!: DetectedChangeset;
   private members: ChangesetAgentMember[] = [];
-  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  // The only agent this panel can name before discovery runs — same reason as
+  // `ReviewFlowPanel`: `builtInAgents` needs the pod and the settings, so the
+  // real list arrives with the first `applySelection`.
+  private agents: AgentDescriptor[] = [BUILTIN_AGENT_DESCRIPTOR];
   private agentId = BUILTIN_AGENT_DESCRIPTOR.id;
   private models: ModelDescriptor[] = [];
   private modelId?: string;
@@ -385,11 +406,31 @@ export class ChangesetReviewPanel {
     return [...entries.values()];
   }
 
+  /**
+   * The full member shape (with each member's whole fetched diff), still
+   * needed by the pre-run context-usage estimate below
+   * (`assembleChangesetReviewPrompt`, `scheduleContextUsage`) — a prompt-size
+   * estimate for display, never a review execution. `runMembers` is the
+   * slimmer sibling that actually starts a run (task 15.8): the harness
+   * fetches diffs itself, in bounded pages, once it has a live `Connection`,
+   * so `RunInput` carries only the revision identity.
+   */
   private promptMembers(): ChangesetAgentMember[] {
     return this.members.map((member) => ({
       ...member,
       context: this.promptContext(member),
       attachments: this.attachmentsForMember(member),
+    }));
+  }
+
+  /** Task 15.8: `promptMembers()`, slimmed to what `RunInput` carries — see that method's own doc comment. */
+  private runMembers(): ChangesetRunMember[] {
+    return this.promptMembers().map((member) => ({
+      ref: member.ref,
+      baseSha: member.diff.baseSha,
+      headSha: member.diff.headSha,
+      context: member.context,
+      attachments: member.attachments,
     }));
   }
 
@@ -510,7 +551,7 @@ export class ChangesetReviewPanel {
       this.pod().criteria,
       { contextBudgets: this.contextBudgets, effort: this.selectedEffort() },
     );
-    const promptHash = crypto.createHash('sha256').update(prompt).digest('hex');
+    const promptHash = sha256Hex(prompt);
     this.contextUsage = undefined;
     this.contextUsageCounter.schedule({
       cacheKey: `${model.id}\0${promptHash}`,
@@ -573,7 +614,7 @@ export class ChangesetReviewPanel {
             workspaceRootSourceUri: workspaceRootForProject(projectIdentifiers, workspaceRoots)?.sourceUri,
           };
         })),
-        loadAgentSelection(selectionFromPod(pod)),
+        loadAgentSelection(selectionFromPod(pod), pod),
       ]);
       this.members = members;
       await this.resolveInstructionReferences(pod.criteria.extraInstructions);
@@ -657,7 +698,6 @@ export class ChangesetReviewPanel {
    */
   private async run(): Promise<void> {
     const pod = this.pod();
-    const runVocabulary = getProvider(pod.providerId).vocabulary;
     const effort = this.selectedEffort();
     pod.agentId = this.agentId;
     pod.modelId = this.modelId;
@@ -676,7 +716,7 @@ export class ChangesetReviewPanel {
     }
 
     const input: RunInput = {
-      target: { kind: 'changeset', changesetId: this.changesetId, members: this.promptMembers() },
+      target: { kind: 'changeset', changesetId: this.changesetId, members: this.runMembers() },
       refLabel: this.changeset.name,
       podId: pod.id,
       criteria: pod.criteria,
@@ -686,13 +726,6 @@ export class ChangesetReviewPanel {
       effort,
       timeouts: agentRunTimeouts(),
       contextBudgets: this.contextBudgets,
-      steps: [
-        'Resolving agent from Copilot workspace…',
-        `Indexing every diff across ${this.members.length} ${runVocabulary.changeRequestNounPlural}…`,
-        'Cross-referencing contracts between repositories…',
-        `Scoring findings against ${runVocabulary.repoNoun} criteria…`,
-        'Items ready',
-      ],
       demo,
     };
 
@@ -749,12 +782,21 @@ export class ChangesetReviewPanel {
    * The clean branch used to persist nothing at all, so a reload after a clean
    * re-run walked back into the *previous* run's findings; a clean record is
    * what stops that as well as making the clean screen re-openable.
+   *
+   * `source` defaults to the complete-review key every ordinary caller wants;
+   * `usePartial`'s own call site is the one exception (budget-exhausted resume
+   * feature) — it reads the *separate* durable partial key instead
+   * (`retainedReview.ts`'s `changesetPartialDraftKeyFor`/`readRetained`'s own
+   * `{partial: true}` option), mirroring `ReviewFlowPanel.enterRetained`'s own
+   * `source` parameter, so "Use N partial findings" actually opens the partial
+   * review it names rather than whatever complete review this changeset
+   * happened to retain before.
    */
-  private enterRetained(): boolean {
+  private enterRetained(source: { key: string; partial?: boolean } = { key: this.draftKey() }): boolean {
     // A pending coalesced write may hold newer triage than the store; land it
     // first so this read cannot revert the screen (see `ReviewFlowPanel`).
     this.draftWriter.flushQuietly();
-    const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(this.draftKey()));
+    const retained = readRetained(this.deps.workspaceState.get<ChangesetDraft>(source.key), { partial: source.partial });
     if (!retained) {
       this.retained = undefined;
       this.review = undefined;
@@ -884,11 +926,23 @@ export class ChangesetReviewPanel {
         }
         this.deps.runs.cancel(this.runKey());
         return;
+      case 'pauseRun':
+        // changeset-panel-no-live-controls fix: the button only renders when `runControls.canPause`
+        // is true (`state()`'s own derivation, mirroring `ReviewFlowPanel`) — `pause()` is its own
+        // no-op guard against a state change racing the click, so nothing extra is needed here.
+        this.deps.runs.pause(this.runKey());
+        return;
+      case 'resumeRun':
+        this.deps.runs.resume(this.runKey());
+        return;
       case 'retryRun': case 'rerun': void this.run(); return;
       case 'usePartial':
         this.deps.runs.acknowledge(this.runKey());
         this.runRecord = undefined;
-        if (!this.enterRetained()) this.screen = 'agent';
+        // The separate durable partial key (`enterRetained`'s own doc comment on why `usePartial` is
+        // its one caller that overrides `source`) — never this changeset's complete-review key,
+        // which a failed run never wrote.
+        if (!this.enterRetained({ key: changesetPartialDraftKeyFor(this.changesetId), partial: true })) this.screen = 'agent';
         break;
       case 'newRun':
         // The pickers, over a result that stays exactly where it is, started
@@ -915,7 +969,7 @@ export class ChangesetReviewPanel {
           message.verdict,
           message.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item)),
         );
-        if (vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true)) {
+        if (readAutoAdvance()) {
           this.selectedId = nextUndecided(this.review, message.itemId)?.id ?? this.selectedId;
         }
         this.persist();
@@ -1033,7 +1087,8 @@ export class ChangesetReviewPanel {
   private generateSummary(): string {
     if (!this.review) return '';
     const voice = vscode.workspace.getConfiguration('codeVerdict').get<AgentVoice>('agentVoice', 'terse');
-    return composeSummary(this.review, this.agentLabel(), voice);
+    // Anchor resolution, not just verdicts — see composeSummary's doc comment.
+    return composeSummary(this.review, this.agentLabel(), voice, this.withheldInlineItems());
   }
 
   private async ask(item: Review['items'][number], preset: AskPreset, text?: string): Promise<void> {
@@ -1096,7 +1151,17 @@ export class ChangesetReviewPanel {
         const changed = member.diff.files.find((candidate) => (
           modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
         ));
-        return changed ? addedLines(changed.diff) : undefined;
+        return changed ? diffAnchorCandidates(changed.diff) : undefined;
+      },
+      // gitlab-anchor-oldpath-never-set: this member's own pre-rename path,
+      // so a renamed file's comment lands with GitLab's required
+      // old_path/new_path pair rather than old_path silently defaulting to
+      // new_path.
+      oldPathFor: (file: string) => {
+        const changed = member.diff.files.find((candidate) => (
+          modelVisiblePath(candidate.newPath, member.workspaceRootLabel) === file
+        ));
+        return changed?.isRenamed ? changed.oldPath : undefined;
       },
       projectLabel: member.projectPath,
       workspaceRootLabel: member.workspaceRootLabel,
@@ -1126,7 +1191,16 @@ export class ChangesetReviewPanel {
     const provider = getProvider(pod.providerId);
     const issueRef = this.changeset.linkedIssue ? ` (${this.changeset.linkedIssue})` : '';
     const footer = `Part of changeset “${this.changeset.name}”${issueRef} — reviewed together across ${this.members.length} repositories with ${this.agentLabel()}.`;
-    const summary = `${composeSummaryBody(this.summaryText, this.finalNote, this.review)}\n\n---\n\n${footer}`;
+    // The shared prose ONCE, with no finding sections baked in: this string
+    // becomes `summaryText` for a SECOND `composeSummaryBody` call per member
+    // inside `buildChangesetSubmitPlans`, which appends that member's own
+    // finding sections scoped to its own items. Composing the full changeset
+    // review's sections here too — as the `copyMarkdown` clipboard preview
+    // correctly does, for a human reading one combined document — would
+    // duplicate every member's own unanchored/withheld findings into its
+    // posted summary: once from this call spanning every member, once more
+    // from the per-member call that follows.
+    const summary = `${composeSummaryBody(this.summaryText, this.finalNote)}\n\n---\n\n${footer}`;
     const plans = buildChangesetSubmitPlans(
       this.review,
       this.submitMembers(),
@@ -1162,6 +1236,10 @@ export class ChangesetReviewPanel {
         agentLabel: this.agentLabel(),
         submittedAt,
         counts,
+        // Actual outcomes, not the verdict tally: an accepted item withheld
+        // for want of a current diff anchor is counted by `counts.accepted`
+        // but never reached `submitReview`, so it must not be counted here.
+        postedComments: memberItems.filter((item) => result.state.postedCommentKeys.includes(item.id)).length,
         threads: Object.fromEntries(memberItems.flatMap((item) => {
           const threadId = result.state.threadIds[item.id];
           return threadId ? [[item.id, threadId]] : [];
@@ -1196,7 +1274,10 @@ export class ChangesetReviewPanel {
       );
     }
     const counts = verdictCounts(this.review);
-    this.doneSentence = `${counts.accepted} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}. ${counts.rejected} dismissed findings stayed local.`;
+    const withheldClause = result.withheldCount > 0
+      ? ` ${result.withheldCount} accepted ${result.withheldCount === 1 ? 'finding' : 'findings'} could not be anchored to the diff — see the summary.`
+      : '';
+    this.doneSentence = `${result.state.postedCommentKeys.length} inline comments posted across ${this.members.length} ${getProvider(this.pod().providerId).vocabulary.changeRequestNounPlural}.${withheldClause} ${counts.rejected} dismissed findings stayed local.`;
     this.submitError = undefined;
     this.screen = 'done';
     this.deps.onSubmitted?.();
@@ -1236,7 +1317,14 @@ export class ChangesetReviewPanel {
 
   private async refreshAgents(): Promise<void> {
     if (this.disposed) return;
-    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    // Same guard, same reason as `ReviewFlowPanel.refreshAgents`: the last pod
+    // can be deleted while this panel stays open, `this.pod()` throws once it
+    // is, and the watch dispatches this with `void` — so the throw would be an
+    // unhandled rejection. No pod means nothing to re-decide about the demo
+    // agent's visibility, so the pickers stay as they are.
+    const pod = this.deps.podStore.activePod;
+    if (!pod) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId }, pod);
     if (this.disposed) return;
     this.applySelection(next);
     this.scheduleContextUsage();
@@ -1300,8 +1388,7 @@ export class ChangesetReviewPanel {
     const totalFiles = this.members.reduce((count, member) => count + member.diff.files.length, 0);
     // "The summed diff stat" (spec §15) — literal sums over the member diffs.
     const memberStats = diffStats(this.members.flatMap((member) => member.diff.files.map((file) => file.diff)));
-    const history = new ReviewHistory(this.deps.globalState).list().filter((record) => record.podId === pod.id);
-    const produced = history.reduce((count, record) => count + record.counts.accepted + record.counts.rejected + record.counts.skipped, 0);
+    const acceptRate = acceptRateForPod(new ReviewHistory(this.deps.globalState).list(), pod.id);
     const vocabulary = getProvider(pod.providerId).vocabulary;
     // The same contexts the prompt carries, under labels a human reads instead
     // of the wire format's — see ReviewContextView.truncated for why the
@@ -1309,6 +1396,9 @@ export class ChangesetReviewPanel {
     const contextEntries = this.members.flatMap((member) => (member.context
       ? [{ context: member.context, label: `${member.projectPath} · ${vocabulary.formatCrRef(member.ref.number)}` }]
       : []));
+    // changeset-panel-no-live-controls fix: the one derivation `runControls` below reads — see that
+    // field's own comment for why `ref` is `undefined`.
+    const runControls = this.deps.runs.controlsFor(this.runKey(), undefined);
     const state: FlowViewState = {
       vocabulary,
       screen: this.screen,
@@ -1348,17 +1438,59 @@ export class ChangesetReviewPanel {
       autoContextItems: this.autoContextItems(),
       contextUsage: this.contextUsage,
       unresolvedContextReferences: this.unresolvedContextReferences,
-      acceptRate: produced > 0 ? Math.round((history.reduce((count, record) => count + record.counts.accepted, 0) / produced) * 100) : undefined,
-      runSteps: this.runRecord?.steps ?? [],
-      runStep: this.runRecord?.step ?? 0,
-      runLive: livenessView(this.runRecord),
+      acceptRate,
+      // Task 14.1 (design.md D14): the shared reducer's own projection and
+      // ordered activity — never a fixed step list or a fragment count.
+      runProjection: this.runRecord?.projection,
+      runActivity: this.runRecord?.checkpoint?.activityLog.events,
+      // changeset-missing-live-counts-line fix: the same live findings/model-turns cue commit
+      // 602a827 added to `ReviewFlowPanel` for the identical incident ("a healthy run sitting in
+      // verifying read as looping because nothing on screen said which phase it had reached") — read
+      // off the identical `RunRecord.checkpoint` type both panels share, never a second definition.
+      runCounts: this.runRecord?.checkpoint
+        ? {
+            findings: this.runRecord.checkpoint.candidates.filter((candidate) => candidate.state === 'accepted').length,
+            modelTurnsUsed: this.runRecord.checkpoint.budget.modelTurnsUsed,
+          }
+        : undefined,
+      runStartedAt: this.runRecord?.startedAt,
+      // `partialCount` reads `RunRecord.partialResult` — `settle`'s own field for exactly this
+      // (`reviewRunManager.ts`, generic across target kinds) — never a hardcoded 0: a failed
+      // changeset run's validated findings are real and durably saved (`changesetPartialDraftKeyFor`),
+      // and the failure card must name them accurately, mirroring `ReviewFlowPanel`'s own fix for the
+      // single-CR case.
       runError: this.runRecord?.status === 'failed' && this.runRecord.failure
-        ? { ...this.runRecord.failure, partialCount: 0 }
+        ? { ...this.runRecord.failure, partialCount: this.runRecord.partialResult?.items.length ?? 0 }
         : undefined,
       runQueued: this.runRecord?.status === 'queued',
+      // changeset-panel-no-live-controls fix: the same live pause/resume/cancel derivation
+      // `ReviewFlowPanel` already reads — `undefined` for `ref` because a changeset target has no
+      // per-ref stored `ReviewRun` to consult (`ReviewRunManager.controlsFor`'s own doc comment: "pass
+      // `undefined` for a changeset key and only the live branch can ever apply"), so this offer is
+      // never the resume-from-checkpoint one (that stays structurally absent for a changeset target,
+      // by design — a changeset never sets `interruptedPrior`/`runError.freshAttempt` either).
+      // Without this field, `runControlsRow` (the shared renderer both panels call) rendered nothing
+      // past `queued`: a running changeset review had no way to pause or stop itself from its own
+      // panel at all.
+      runControls: this.runRecord
+        ? { canPause: runControls.canPause, canResume: runControls.canResume, canCancel: runControls.canCancel }
+        : undefined,
       retainedAvailable: this.retained !== undefined && (this.screen === 'running' || this.newRunFromResult),
       retainedMeta: this.retained
         ? { ranAt: this.retained.ranAt, agentLabel: this.retained.agentLabel ?? this.selectedAgent().label, modelLabel: this.reviewModelLabel(), effortLabel: effortLabel(this.retained.draft.review.effort) }
+        : undefined,
+      // Task 14.2 (design.md D14/D16): the same retained record's own
+      // lineage/activity fields, never re-derived.
+      retainedDetails: this.retained
+        ? {
+            completeness: this.retained.completeness,
+            protocolProvenance: this.retained.protocolProvenance,
+            lineageId: this.retained.lineageId,
+            attempt: this.retained.attempt,
+            limitations: this.retained.limitations,
+            activity: this.retained.activity,
+            conclusion: this.retained.conclusion,
+          }
         : undefined,
       mode: this.mode,
       items,

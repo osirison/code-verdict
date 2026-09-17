@@ -102,11 +102,11 @@ Alternative rejected: encode partial as another lifecycle state. Cancellation, f
 - Thinking-effort level and rendered instruction digest
 - Criteria and extra-instruction digest
 - Context-control selections, auto-context enablement, explicit attachment content digests, and member ownership
-- Root base-revision `AGENTS.md` source identity or explicit absence
+- Root base-revision `AGENTS.md`/`CLAUDE.md` source identity and composed text, or explicit absence (owner-mandated: `CLAUDE.md` is a fallback and companion when `AGENTS.md` is missing or when both exist)
 - Provider investigation capability signature
 - Host tool-contract and harness-policy versions
 
-The snapshot is created before admission dispatch and never reads mutable pod, picker, workspace, branch, or agent-file state again. A pre-completion head check uses the provider and fails the completion gate when any member head changed.
+The snapshot is created before admission dispatch and never reads mutable pod, picker, workspace, branch, or agent-file state again. A pre-completion head check uses the provider, and the completion gate requires only that the check was performed and resolved; a head that resolved to a different sha is disclosed on the result rather than blocking it (D11).
 
 Alternative rejected: re-resolve agent, model, context, or policy at each turn. That makes a resumed or long-running review depend on unrelated edits made after trigger and allows evidence and policy to drift inside one result.
 
@@ -116,7 +116,7 @@ Bootstrap has a fixed authoritative envelope and a collection of reopenable cont
 
 Reopenable sections contain normalized full linked-issue details and normalized full change-request details: metadata, title, body, commits, review discussion, labels, check summaries, and relationships. They exclude the patch and full CI logs. Each section has an identifier, digest, complete/truncated state, and retrieval cursor. Large sections contribute a bounded summary and retrieval reference to bootstrap; the exact details remain available through host tools.
 
-The bootstrap builder counts tokens against the selected model. It first replaces reopenable content with references, then shortens non-normative descriptions without removing field identities or trust boundaries. If the minimum authoritative envelope still exceeds the input limit, no model request is made. The run fails with completeness `none`, a bootstrap-overflow limitation, and no claim of investigation.
+The bootstrap builder counts tokens against the selected model. It first replaces reopenable content with references, then shortens non-normative descriptions, then — last, since it is authoritative instruction the repository owner wrote — drops composed root-policy text down to identity plus a stated reason, all without removing field identities or trust boundaries. If the minimum authoritative envelope still exceeds the input limit, no model request is made. The run fails with completeness `none`, a bootstrap-overflow limitation, and no claim of investigation.
 
 All author-controlled text is wrapped as untrusted data with explicit source type and boundary. Model-visible host contracts never share a delimiter or authority channel with issue, change-request, commit, discussion, file, diff, or attachment content.
 
@@ -153,7 +153,7 @@ The initial tool catalog is host-owned and versioned:
 | `readFile` | Member, explicit base or head SHA, path, bounded line range | Revision-pinned supporting source |
 | `searchRepository` | Member, explicit base or head SHA, query, path scope, cursor | Bounded unchanged or changed source discovery |
 | `searchDiff` | Member, base/head, query, path scope, cursor | Bounded discovery inside changed content |
-| `resolvePolicy` | Member, changed path | Applicable root-to-leaf base-revision `AGENTS.md` chain |
+| `resolvePolicy` | Member, changed path | Applicable root-to-leaf base-revision `AGENTS.md`/`CLAUDE.md` chain |
 | `getChangeRequestDetails` | Member, section, cursor | Reopen normalized target details |
 | `getIssueDetails` | Member, issue identity, section, cursor | Reopen normalized linked-issue details |
 | `submitCandidateFinding` | Candidate plus source citations | Incremental schema and evidence validation |
@@ -175,7 +175,7 @@ Alternative rejected: give the model a shell or unrestricted workspace search. N
 
 GitLab, GitHub, and fixture providers implement the same conformance suite. A provider that cannot guarantee a capability declares it unavailable; neutral code never substitutes current branch data or infers completeness from a short response. Existing `ScmError.rateLimited` metadata supplies `Retry-After` or reset guidance to the dispatcher.
 
-Root and nested `AGENTS.md` resolution uses repeated provider `readFile` operations at the base SHA. The host walks repository-root to changed-file directory, records explicit absence, merges policy in order, and caches by member/base/path. Policy is authoritative instruction but remains non-citable.
+Root and nested `AGENTS.md`/`CLAUDE.md` resolution uses repeated provider `readFile` operations at the base SHA. The host walks repository-root to changed-file directory, checking both files at each level — `CLAUDE.md` is a fallback and companion, never a silent alias: an `AGENTS.md`-only or `CLAUDE.md`-only level uses that file's content; a level with both uses one deduplicated copy when they are byte-identical and both, clearly named, when they differ. The host records explicit absence only when both files are confirmed absent at a level, merges policy in order, and caches by member/base/path. The composed root-level identity and text (not identity alone) travel into the run snapshot and reach the model's very first prompt, framed as authoritative instruction that remains non-citable; a level where neither file could be read (as opposed to one it checked and found empty) is reported as unavailable, distinguishably, rather than folded into the same "no policy" line. A level where one file was read and the other could not be keeps the policy that was read and is reported present, with the unread file and the reason named on the policy line and recorded as a limitation — the half-checked case must read as neither a complete policy nor no policy.
 
 Alternative rejected: download a platform-specific review bundle. A monolithic bundle recreates the context-limit problem, prevents bounded retries, and pushes GitHub/GitLab shapes above the provider layer.
 
@@ -202,7 +202,7 @@ interface EvidenceSource {
 
 `sourceId` is stable inside the lineage and identifies one immutable payload; `digest` verifies the exact bytes. A resume may import a persisted source only when its exact content is retained and its digest and snapshot still match. Otherwise the new attempt refetches it and records a new source linked to the prior metadata. Findings store source identifier, digest, and location so validation never resolves against a later read by path alone.
 
-Only exact evidence returned to the model is eligible. Bootstrap summaries, omitted pages, unavailable ranges, intent, and `AGENTS.md` policy cannot support findings. Explicit citable attachments from the context-controls change enter as `attachment` sources bound to their snapshot digest. Other repository reads are citable only as supporting source.
+Only exact evidence returned to the model is eligible. Bootstrap summaries, omitted pages, unavailable ranges, intent, and `AGENTS.md`/`CLAUDE.md` policy cannot support findings. Explicit citable attachments from the context-controls change enter as `attachment` sources bound to their snapshot digest. Other repository reads are citable only as supporting source.
 
 Diff evidence can establish a changed line as an inline primary target. Unchanged base/head evidence may corroborate behavior involving changed code but cannot become an unannounced primary target. An explicit attachment may be a primary out-of-diff target and follows the upstream summary-routing rule.
 
@@ -210,9 +210,13 @@ Alternative rejected: validate citations by refetching path and line at completi
 
 ### D9: Validate candidate findings when submitted and again at completion
 
-`submitCandidateFinding` validates schema, member identity, source identifiers, digests, locations, citable status, revision compatibility, primary-target eligibility, severity, confidence, and category. It returns accepted, repairable, or rejected with bounded public reasons. Accepted candidates retain provenance but remain provisional.
+`submitCandidateFinding` validates schema, member identity, source identifiers, digests, locations, citable status, revision compatibility, primary-target eligibility, severity, confidence, category, and primary citation width. It returns accepted, repairable, or rejected with bounded public reasons. Accepted candidates retain provenance but remain provisional.
 
-Synthesis groups candidates by primary location and semantic claim. Verification asks the same selected model/persona to challenge each claim against cited sources and search for contradiction. The host then reruns citation validation, applies deterministic deduplication, and records validation outcomes. An unresolved candidate, fetch, repair, or contradiction blocks complete status.
+Synthesis groups candidates by primary location and semantic claim. Verification asks the same selected model/persona to challenge each claim against cited sources and search for contradiction. The host then reruns citation validation, applies deterministic deduplication, and records validation outcomes. An unresolved candidate, fetch, repair, or contradiction blocks complete status. A citation whose contradiction check the host cannot honestly perform (its own span exceeds the verifier's fixed evidence-excerpt window) blocks completion only bounded: the refusal names the candidate and the exact width limit so the model can resubmit narrower, and if the same candidate's check is skipped identically for three consecutive verification passes, that candidate ships recorded unverifiable-as-cited and stops counting against completion — never held hostage forever by a citation whose own reason for failing never changes between passes.
+
+Incident finding (a self-review that retired twelve candidates this way in one run, none ever resubmitted): the "resubmit narrower" refusal above is real but arrives only at the contradiction-check stage, potentially hours and several attempts after the candidate was accepted — by then the model has moved on, and a model that never acts on it rides the three-pass bound to a late, avoidable limitation. So `submitCandidateFinding` now rejects, repairably, any primary citation whose own span already exceeds the verifier's fixed evidence-excerpt window, at the moment the model just chose it and the context is cheap to revisit — the same actionable wording ("resubmit citing at most N characters"), against the identical width limit, just moved to where investigation budget still remains rather than where it does not. This catches a citation that names an entire file for a one-line claim on its first submission instead of letting it ride, unresubmitted, to the three-pass cap.
+
+For a citation the width check still lets through — one validation could not honestly measure, or one seeded verbatim from a resumed attempt's checkpoint predating this check — the contradiction-check stage adds one further, explicitly named relaxation of "never ask about bytes the model did not cite": when the full cited span will not fit the excerpt window, but the finding's own claim line (its most specific pointer to the defect, already proven to sit inside the cited range at validation time) anchors to a span that does fit, the excerpt windows around that claim line instead of refusing outright — disclosing in the verifier's own prompt that the citation was wider than could be shown and this window centers on the claimed line, not the full citation. This is a narrowing of what would otherwise be an outright refusal, never a widening of what would otherwise be shown: a citation with no usable line anchor at all still ships unverifiable-as-cited exactly as before.
 
 The existing parsing boundary moves from "parse one final JSON object" to "parse one protocol message". Existing criteria filtering remains a host operation after validation, not a model-controlled choice.
 
@@ -243,7 +247,7 @@ Alternative rejected: use token consumption or model turn count as progress. Bot
 The model's `requestCompletion` message triggers this predicate:
 
 ```text
-headUnchanged
+headVerified
 AND inventoryCompleteForEveryMember
 AND everyFileClassified
 AND configuredRiskCoverageSatisfied
@@ -257,7 +261,11 @@ AND finalVerificationComplete
 
 If the predicate passes, zero validated findings produces a complete clean review and one or more produces a complete findings review. If it fails and validated findings remain, the run persists a partial result plus coverage and limitation report. If it fails with no retainable finding, the run fails with completeness `none`. Cancellation may preserve already validated findings only as partial and never replace a complete retained review.
 
-Unavailable oversized patches, incomplete provider inventories, exhausted budgets, timeouts, provider limits, and changed heads are named completion blockers. A repairable early completion request returns bounded missing conditions when enough reserved budget remains; otherwise the run finalizes truthfully.
+Unavailable oversized patches, incomplete provider inventories, exhausted budgets, timeouts, and provider limits are named completion blockers. A repairable early completion request returns bounded missing conditions when enough reserved budget remains; otherwise the run finalizes truthfully.
+
+A moved target head is deliberately never one of those blockers. `headVerified` requires only that the host actually checked the current head before completion — an unperformed or unresolvable check is a `providerLimit` blocker, since "unknown" says nothing truthful either way — never that the checked value still matches the snapshot. The owner's principle: a review evaluated against pinned revision X is valid regardless of what the branch did afterward, so a resolved-but-different head is disclosed, not blocked — the outcome carries a `headMovedDuringReview` limitation naming the pinned and moved shas, present whether the gate otherwise passes or fails, and inline comments keep anchoring to the reviewed revision (evidence is never relabelled to a head the model never saw). A resumed attempt from a checkpoint whose branch already moved inherits the identical disclosure, never a refusal: completion still succeeds against that same pin.
+
+Alternative rejected (and reverted): treat a moved head as an unrepairable completion blocker, so an attempt whose branch moved mid-review could only ever finalize as `partial`/`failed`, and a resumed attempt against the same pinned snapshot was refused outright as provably doomed. Multi-hour reviews on active branches then burned repeated fresh budgets against a check no further investigation could ever satisfy, for a fact — the branch moved — that the pinned review's own findings remain entirely valid despite.
 
 Alternative rejected: trust the model's assertion that review is complete. The model cannot know about provider truncation, stale head, unresolved host candidates, or budget reserves unless the host evaluates them.
 
@@ -269,7 +277,11 @@ At admission, investigation budget is partitioned into ordinary work, unvisited/
 
 Transient network, rate-limit, and provider failures use bounded retry. Provider `Retry-After` or reset metadata takes precedence; otherwise exponential backoff with jitter applies under the elapsed-time budget. Protocol repair has a separate limit and never retries tool side effects. `submitCandidateFinding` and read tools are idempotent by request identifier.
 
+A model round trip that stalls — produces no output at all within its first-output window, or goes silent mid-reply past its inactivity window — uses this same bounded retry, classified through an explicit caller-supplied predicate rather than the provider-failure taxonomy above (a model timeout is this host's own timer firing, not provider HTTP reality). A model that keeps producing output but exceeds the whole run-window ceiling, and a reviewer-initiated cancellation, are never retried: the former is answering too slowly for a cause a retry cannot fix, the latter is the outcome that was asked for. Every retry of a round trip is absorbed under the turn's single model-turn budget reservation, exactly as a retried tool call is absorbed under its own single reservation.
+
 A long backoff moves the run to `waiting`, checkpoints it, and releases its global execution slot. When eligible, it returns through `resuming` without losing target ownership or queue fairness. Budget exhaustion emits a limitation and proceeds only to allowed validation and persistence work.
+
+A reviewer who starts a new attempt from a checkpoint a budget-exhaustion (or other completion-gate) blocker left behind gets a distinct budget shape from D13's interrupted-attempt resume below: every other checkpoint field (plan, coverage, validated findings) still carries forward, but pool consumption and both reserves start at zero, since the new attempt exists precisely to give the review more budget to work with — carrying the exhausted total forward would defeat the request. This is its own case, never the same "budget consumed so far" contract D13 states for a crash.
 
 Alternative rejected: one token budget shared by all work. It permits early low-risk exploration to consume the resources needed for untouched high-risk files and verification.
 
@@ -287,7 +299,7 @@ Alternative rejected: one token budget shared by all work. It permits early low-
 
 It never records raw prompts, raw model fragments, hidden reasoning, secrets, full tool arguments, full output blobs, cancellation handles, model stream handles, or provider clients. `AgentTrace` remains a separate diagnostic channel but records only request identifiers, model identity, phase, byte/token counts, timings, digests, error codes, and redacted summaries.
 
-Activation closes every persisted nonterminal attempt as `interrupted` before rendering. Resume creates a new attempt in the same lineage only when checkpoint version, digest integrity, repository identity, head SHA, model, resolved agent instructions, criteria, effort, context controls, policy, provider capabilities, and required evidence are compatible. The UI lists every incompatibility and offers restart. No code path labels the new request as a reconnected stream.
+Activation closes every persisted nonterminal attempt as `interrupted` before rendering. Resume creates a new attempt in the same lineage only when checkpoint version, digest integrity, repository identity, head SHA, model, resolved agent instructions, criteria, effort, context controls, policy, provider capabilities, and required evidence are compatible. The UI lists every incompatibility and offers restart. No code path labels the new request as a reconnected stream. A resumed attempt preserves the plan and its revision history, coverage, validated findings and their validation state, and budget consumed so far — this last clause governs a crash (a checkpoint the activation sweep closed as `interrupted`, or one a crash's own best-effort write already closed as `failed` before the sweep got to it). A checkpoint a live attempt closed as `failed` in the ordinary course of its own turn loop (D12, most commonly a budget-exhaustion blocker) is a distinct resume case: plan, coverage, and findings still carry forward, but budget consumption starts fresh — see D12.
 
 Compaction preserves terminal transitions, plan revisions, failures, checkpoints, coverage changes, and result events. It may coalesce routine repeated tool-progress events while keeping aggregate counts and first/last timestamps. If eviction removes data required to validate citations or resume, the checkpoint becomes incompatible rather than silently weaker.
 

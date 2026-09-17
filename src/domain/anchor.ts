@@ -8,10 +8,27 @@
  * go?" — so the answer lives here rather than in three UI layers.
  */
 
-/** A line of a candidate haystack: the file on disk, or the added lines of a diff. */
+/**
+ * A line of a candidate haystack: the file on disk, or one line the diff
+ * makes addressable. `side` names which half of the diff the line's number
+ * belongs to — 'new' (the default, and the only side `documentCandidates`
+ * ever produces) for an added or context line, numbered in the file that
+ * results; 'old' for a removed line, numbered in the file that preceded it.
+ * The two are different numbering spaces over the same text — see
+ * `resolveAnchor` for why they are never searched together.
+ */
 export interface AnchorCandidate {
   line: number;
   text: string;
+  side?: 'old' | 'new';
+  /**
+   * The paired old-file line number, present only when this candidate is an
+   * unchanged context line (`diffAnchorCandidates` is the only producer that
+   * ever sets it). An added line has nothing to pair with on the old side,
+   * so this stays undefined there — and for an old-side (removed) candidate
+   * it would be redundant with `line` itself, so it is never set either.
+   */
+  oldLine?: number;
 }
 
 export type AnchorState =
@@ -26,6 +43,10 @@ export interface AnchorResolution {
   state: AnchorState;
   /** The line the finding should now point at; the original when `lost`. */
   line: number;
+  /** Which side `line` is numbered on. Absent when `state` is `lost`. */
+  side?: 'old' | 'new';
+  /** The matched candidate's paired old-file line — see `AnchorCandidate.oldLine`. Absent when `state` is `lost`, or when the match carried no pairing. */
+  oldLine?: number;
 }
 
 /**
@@ -37,32 +58,80 @@ function same(a: string, b: string): boolean {
 }
 
 /**
+ * Search one side's candidates only. `anchor.line` is always in the caller's
+ * own space for that pass — pass 1 in `resolveAnchor` searches it against the
+ * new side (where a `ReviewItem.line` is always recorded), pass 2 against the
+ * old side. Mixing the two spaces in one nearest-match search would be
+ * meaningless — old-side line 60 and new-side line 60 do not describe the
+ * same place in the file — and a coincidental old-side hit closer in number
+ * than the true new-side one would win the wrong match.
+ *
+ * `rankByDistance` names whether `candidate.line` and `anchor.line` actually
+ * share a numbering space for THIS pass — true only for the new-side pass,
+ * where both are new-file line numbers and "nearest" is a real position
+ * comparison. The old-side pass's `anchor.line` is new-side numbering (every
+ * `ReviewItem.line` always is), so ranking two same-text old-side candidates
+ * by `Math.abs(candidate.line - anchor.line)` would be exactly the
+ * meaningless cross-space comparison this file's own two-pass split exists
+ * to avoid — false here disables it and falls back to the first matching
+ * candidate in `candidates`' own order (document order, for every producer
+ * of this shape) instead: deterministic, and never a distance the two
+ * numbers were never comparable by in the first place.
+ *
+ * The 'exact' shortcut also requires `rankByDistance` — a line number match
+ * is only exact when the two numbers share a numbering space. On the new side,
+ * both are new-file numbers. On the old side, `candidate.line` is old-file
+ * numbering while `anchor.line` is always new-file, so coincidental numeric
+ * equality means nothing — the candidate at best moved, never exact.
+ */
+function resolveOnSide(
+  candidates: readonly AnchorCandidate[],
+  anchor: { line: number; code: string },
+  rankByDistance: boolean,
+): AnchorResolution | undefined {
+  const code = anchor.code;
+  const exact = rankByDistance && candidates.find((c) => c.line === anchor.line && same(c.text, code));
+  if (exact) return { state: 'exact', line: anchor.line, side: exact.side, oldLine: exact.oldLine };
+  let best: AnchorCandidate | undefined;
+  for (const candidate of candidates) {
+    if (!same(candidate.text, code)) continue;
+    if (!best) {
+      best = candidate;
+      continue;
+    }
+    if (rankByDistance && Math.abs(candidate.line - anchor.line) < Math.abs(best.line - anchor.line)) {
+      best = candidate;
+    }
+  }
+  return best ? { state: 'moved', line: best.line, side: best.side, oldLine: best.oldLine } : undefined;
+}
+
+/**
  * Resolve one finding against the current text.
  *
  * When the code appears more than once (a repeated `return null;`), the match
  * nearest the original line wins — a finding drifts by a few lines far more
  * often than it teleports across the file.
+ *
+ * Two passes, never merged: every finding's recorded line is new-side
+ * numbering, so the new side (additions and context — the code as it reads
+ * today) is searched first. Only when nothing there matches does the old
+ * side (removed lines) get a look, for the finding that is *about* a
+ * deletion — the code it flags exists only in the file as it was. A finding
+ * still exactly or nearly where it was read is therefore always resolved on
+ * the new side, never on an old-side line that happens to share its number.
  */
 export function resolveAnchor(
   candidates: readonly AnchorCandidate[],
   anchor: { line: number; code: string },
 ): AnchorResolution {
-  const code = anchor.code;
-  if (code.trim() === '') return { state: 'lost', line: anchor.line };
-  if (candidates.some((c) => c.line === anchor.line && same(c.text, code))) {
-    return { state: 'exact', line: anchor.line };
-  }
-  let best: AnchorCandidate | undefined;
-  for (const candidate of candidates) {
-    if (!same(candidate.text, code)) continue;
-    if (
-      !best ||
-      Math.abs(candidate.line - anchor.line) < Math.abs(best.line - anchor.line)
-    ) {
-      best = candidate;
-    }
-  }
-  return best ? { state: 'moved', line: best.line } : { state: 'lost', line: anchor.line };
+  if (anchor.code.trim() === '') return { state: 'lost', line: anchor.line };
+  const newSide = candidates.filter((c) => (c.side ?? 'new') === 'new');
+  const oldSide = candidates.filter((c) => c.side === 'old');
+  return (
+    resolveOnSide(newSide, anchor, true) ??
+    resolveOnSide(oldSide, anchor, false) ?? { state: 'lost', line: anchor.line }
+  );
 }
 
 /** The whole document as candidates — `text.split('\n')` with 1-based numbers. */

@@ -187,17 +187,29 @@ An accepted finding that cites a file the diff does not touch SHALL NOT be poste
 - **THEN** the finding remains eligible for an inline comment because its file is changed
 - **AND** the reported line goes through the existing anchor matcher for exact, moved, or lost resolution
 
-#### Scenario: A changed-file finding has no current added-line match
+#### Scenario: A changed-file finding anchors to any line the diff makes addressable
 
-- **WHEN** an accepted finding cites a changed file but its code does not match any current added line
+- **WHEN** an accepted finding's reported line falls on an added line, an unchanged context line, or a removed line inside the changed file's diff hunks
+- **THEN** the finding anchors inline on that line — an added or context line posts on the new-file side, a removed line posts on the old-file side
+- **AND** a finding is no longer withheld merely because its line is a context or removed line rather than an addition
+
+#### Scenario: A finding's reported line is trusted when its code cannot be matched at all
+
+- **WHEN** an accepted finding's code does not trim-equal any line the diff makes addressable, but the reported line itself is an added or context line on the new side
+- **THEN** the finding still anchors inline on its reported line, since the reported line is the primary anchor and code matching failing everywhere does not mean the location is wrong — a multi-line or paraphrased `code` field can never equal any one line's text
+- **AND** the posted comment carries no suggested-fix fence, since the content a fix would replace was never verified to still be what the finding thinks it is
+
+#### Scenario: A changed-file finding has no current diff-line match
+
+- **WHEN** an accepted finding cites a changed file, its code does not trim-equal any line currently addressable in that file's diff, AND its reported line is not itself an added or context line either
 - **THEN** no invalid inline comment is sent to the provider
 - **AND** the finding remains classified as anchored by changed-file membership
 - **AND** the review summary names the finding and states that it was withheld from inline submission
 
-#### Scenario: A changed-file finding moved to another added line
+#### Scenario: A changed-file finding moved to another current diff line
 
-- **WHEN** an accepted finding's code moved from its reported line to another current added line in the same changed file
-- **THEN** the inline comment uses the resolved current line
+- **WHEN** an accepted finding's code moved from its reported line to another line the diff still makes addressable in the same changed file
+- **THEN** the inline comment uses the resolved current line, on whichever side (new or old) the matched line actually belongs to
 - **AND** the finding remains classified as anchored by changed-file membership
 
 #### Scenario: Attachment-only finding routes to summary

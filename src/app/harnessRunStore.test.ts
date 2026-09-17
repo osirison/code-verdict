@@ -1,0 +1,1465 @@
+import { describe, expect, it } from 'vitest';
+import { appendActivityEvent, createActivityLog } from './harnessActivityLog';
+import type { ContradictedFindingRecord } from './harnessAttempt';
+import { buildCheckpoint, computeSnapshotDigest, type CheckpointBuildInput, type PersistedCheckpoint } from './harnessCheckpoint';
+import { checkCheckpointIntegrity } from './harnessResume';
+import { createHarnessRunStore, type HarnessRunStore, type RetentionPolicy } from './harnessRunStore';
+import type { TrackedCandidate, ValidatedFinding, CitedEvidenceRef } from './harnessCandidateValidation';
+import { evidenceProducerOf, type LedgerEvidenceSource } from './harnessEvidenceLedger';
+import type { KeyValueStore } from './storage';
+import { sha256Hex } from './contentDigest';
+import {
+  LEGACY_CHANGESET_DRAFT,
+  LEGACY_RETAINED_CLEAN,
+  LEGACY_RETAINED_TRIAGE_DRAFT,
+  LEGACY_RUN_HISTORY,
+  PRE_LOCAL_GIT_LINEAGE_KEY,
+  PRE_LOCAL_GIT_LINEAGE_RECORD_JSON,
+  preLocalGitLineageRecord,
+} from './migrationFixtures';
+import { draftKeyFor, changesetDraftKeyFor } from './retainedReview';
+import { readLegacyReview, readLegacyRunHistory } from '../domain/harnessMigration';
+import type { BudgetConsumption, MemberCoverage } from '../domain/harnessCoverage';
+import { DEFAULT_CRITERIA } from '../domain/criteria';
+import { DEFAULT_HARNESS_POLICY, HARNESS_POLICY_VERSION, normalizeHarnessPolicy, type HarnessPolicy } from '../domain/harnessPolicy';
+import { HARNESS_TOOL_CONTRACT_VERSION } from '../domain/harnessTools';
+import { baseRevisionKindOf } from '../domain/reviewRunSnapshot';
+import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
+
+// ---- Test-only backing store: a real JSON round-trip, unlike a plain Map ------------
+// `vscode.Memento` actually persists to disk between sessions; a plain in-memory Map
+// would let `undefined` fields and non-JSON values survive a "write" silently, which a
+// real workspace store never does. Round-tripping through `JSON.stringify`/`.parse`
+// here is what makes this suite's "every field survives" claim mean something.
+
+function jsonMemoryStore(): KeyValueStore {
+  const map = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => (map.has(key) ? (JSON.parse(JSON.stringify(map.get(key)))) as T : undefined),
+    update: async (key, value) => {
+      if (value === undefined) {
+        map.delete(key);
+        return;
+      }
+      map.set(key, JSON.parse(JSON.stringify(value)));
+    },
+    keys: () => [...map.keys()],
+  };
+}
+
+/** Reaches into the backing store directly — for tests that must plant a malformed/corrupt raw value the store's own write path would never itself produce. */
+function seedRaw(store: KeyValueStore, key: string, raw: unknown): void {
+  void store.update(key, raw);
+}
+
+/**
+ * Like `jsonMemoryStore` but stores the exact JS value it is handed, with no `JSON.stringify`/`.parse`
+ * pass on either side — the one way to seed a value JSON cannot represent at all (`NaN`/`Infinity`,
+ * which `JSON.stringify` silently turns into `null`). A real workspace store never persists either
+ * value, but this suite still needs to prove the parser refuses them outright rather than merely
+ * refusing the `null` `JSON.stringify` would have reduced them to.
+ */
+function rawMemoryStore(): KeyValueStore {
+  const map = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => (map.has(key) ? (map.get(key) as T) : undefined),
+    update: async (key, value) => {
+      if (value === undefined) {
+        map.delete(key);
+        return;
+      }
+      map.set(key, value);
+    },
+    keys: () => [...map.keys()],
+  };
+}
+
+const RUN_ID = 'run-1';
+
+function testSnapshot(overrides: Partial<ReviewRunSnapshot> = {}): ReviewRunSnapshot {
+  return {
+    schemaVersion: '1',
+    runId: RUN_ID,
+    lineageId: 'lineage-1',
+    attempt: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    targetKind: 'cr',
+    members: [
+      {
+        memberId: 'm1',
+        providerId: 'fixture',
+        instanceUrl: 'https://example.test',
+        ref: { repoId: 'repo-1', number: '42' },
+        baseSha: 'base1',
+        headSha: 'head1',
+        providerCapabilitySignature: 'sig-1',
+        rootAgentsPolicy: { present: false },
+        context: { autoContextEnabled: false, titleIncluded: false, descriptionIncluded: false, linkedItemIdsIncluded: [], attachments: [] },
+      },
+    ],
+    agentId: 'built-in',
+    agentInstructions: 'Review the change carefully.',
+    agentInstructionsDigest: 'digest-instructions',
+    personaLabel: 'Built-in reviewer',
+    modelId: 'test-model',
+    effort: 'none',
+    effortInstructionDigest: 'digest-effort',
+    criteria: DEFAULT_CRITERIA,
+    extraInstructionsDigest: 'digest-extra',
+    toolContractVersion: HARNESS_TOOL_CONTRACT_VERSION,
+    harnessPolicyVersion: HARNESS_POLICY_VERSION,
+    ...overrides,
+  };
+}
+
+const ZERO_BUDGET: BudgetConsumption = { modelTurnsUsed: 2, toolCallsUsed: 4, evidenceBytesUsed: 64, elapsedMs: 500, highRiskReserveUsed: 0, verificationReserveUsed: 0 };
+const ZERO_COVERAGE: readonly MemberCoverage[] = [{ memberId: 'm1', manifestComplete: true, totalFiles: 1, files: [] }];
+
+function fakeSource(sourceId: string, exactContent: string, overrides: Partial<LedgerEvidenceSource> = {}): LedgerEvidenceSource {
+  return {
+    sourceId,
+    digest: sha256Hex(exactContent),
+    kind: 'diff',
+    repositoryId: 'repo-1',
+    baseSha: 'base1',
+    headSha: 'head1',
+    completeness: 'complete',
+    citable: true,
+    exactContent,
+    runId: RUN_ID,
+    lineageId: 'lineage-1',
+    attempt: 1,
+    memberId: 'm1',
+    origin: 'diffPage',
+    producedBy: 'provider',
+    trust: 'untrusted',
+    sequence: 1,
+    locations: [],
+    byteLength: Buffer.byteLength(exactContent, 'utf8'),
+    ...overrides,
+  };
+}
+
+function citedRef(source: LedgerEvidenceSource): CitedEvidenceRef {
+  return { sourceId: source.sourceId, digest: source.digest, origin: source.origin, memberId: source.memberId, repositoryId: source.repositoryId, baseSha: source.baseSha, headSha: source.headSha, path: 'file1.ts', range: { startLine: 1, endLine: 1 } };
+}
+
+function acceptedCandidate(candidateId: string, primary: LedgerEvidenceSource): TrackedCandidate {
+  const finding: ValidatedFinding = {
+    candidateId,
+    memberId: 'm1',
+    routing: 'inline',
+    item: { id: candidateId, file: 'file1.ts', anchored: true, line: 1, severity: 'major', category: 'security', confidence: 80, title: 'A finding', body: 'Body.', code: '' },
+    provenance: { protocolProvenance: 'harness', citations: [], validatedAt: '2026-01-01T00:00:00.000Z' },
+    evidence: { repositoryId: primary.repositoryId, baseSha: primary.baseSha, headSha: primary.headSha, primary: citedRef(primary), supporting: [] },
+  };
+  return { candidateId, state: 'accepted', repairs: 0, reasons: [], finding };
+}
+
+function checkpointInput(overrides: Partial<CheckpointBuildInput> = {}): CheckpointBuildInput {
+  return {
+    checkpointId: 'ckpt-1',
+    runId: RUN_ID,
+    lineageId: 'lineage-1',
+    attempt: 1,
+    phase: 'investigating',
+    reason: 'phaseBoundary',
+    occurredAt: '2026-01-01T00:00:00.000Z',
+    elapsedMs: 1000,
+    snapshotDigest: 'snap-digest-1',
+    activityEvents: [],
+    evidenceSources: [],
+    candidates: [],
+    contradicted: [],
+    budget: ZERO_BUDGET,
+    coverage: ZERO_COVERAGE,
+    unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+    ...overrides,
+  };
+}
+
+const GENEROUS_RETENTION: RetentionPolicy = {
+  retainedCheckpointsPerLineage: 100,
+  maxCheckpointBytesPerLineage: 10 * 1024 * 1024,
+  terminalAttemptHistoryCount: 100,
+  terminalAttemptHistoryMaxAgeDays: 3650,
+};
+
+/** A minimal, syntactically-valid checkpoint with a caller-chosen `bytes` value — used by the bounds tests, which need precise control over accounted size without depending on real serialization arithmetic. */
+function fakeCheckpoint(overrides: Partial<PersistedCheckpoint> & { checkpointId: string }): PersistedCheckpoint {
+  return {
+    runId: RUN_ID,
+    lineageId: 'lineage-1',
+    attempt: 1,
+    phase: 'investigating',
+    reason: 'phaseBoundary',
+    occurredAt: '2026-01-01T00:00:00.000Z',
+    elapsedMs: 0,
+    snapshotDigest: 'snap-digest-1',
+    projection: { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, lifecycle: 'investigating', completeness: 'none', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+    activity: [],
+    evidence: [],
+    candidates: [],
+    contradicted: [],
+    budget: ZERO_BUDGET,
+    coverage: ZERO_COVERAGE,
+    unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+    retry: { waiting: false, transientAttempts: 0 },
+    bytes: 10,
+    compatible: true,
+    incompatibilityReasons: [],
+    ...overrides,
+  };
+}
+
+describe('HarnessRunStore (11.1): a fully populated checkpoint round-trips, digests included', () => {
+  it('writeSnapshot + writeCheckpoint, then every field survives a real JSON round-trip', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    const snapshot = testSnapshot();
+    const primary = fakeSource('ev_a00000000000000000000000000000', 'exact primary diff bytes');
+    const uncited = fakeSource('ev_b00000000000000000000000000000', 'exact bytes nobody cited', { kind: 'searchExcerpt', origin: 'repositorySearch' });
+    const candidate = acceptedCandidate('cand-1', primary);
+
+    // A real activity log, built through the production pipeline (not hand-built literals): a
+    // plan, a completed tool call, and a failed one — so the store's own `parseActivityEvent` and
+    // `parsePlan` are exercised against genuinely valid data, not only against the malformed cases
+    // the fail-closed tests below cover.
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'planCreated', plan: { revision: 1, items: [{ id: 'p1', description: 'Investigate file1.ts.', state: 'active' }] } },
+      { occurredAt: '2026-01-01T00:00:00.000Z', phase: 'planning', elapsedMs: 0 },
+    );
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolFailed', tool: 'readDiff', target: 'file2.ts', reason: 'The provider returned unavailable.' },
+      { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
+    );
+    const contradicted: ContradictedFindingRecord[] = [{ candidateId: 'cand-2', reason: 'The model found the cited evidence does not support this claim.' }];
+
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, evidenceSources: [primary, uncited], candidates: [candidate], contradicted }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    expect(built.plan).toBeDefined(); // sanity: the fixture actually produced a plan to round-trip
+    expect(built.activity.length).toBeGreaterThanOrEqual(3);
+    expect(built.contradicted).toHaveLength(1);
+
+    await runStore.writeSnapshot(snapshot);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.readSnapshot('lineage-1', 1)).toEqual(snapshot);
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    expect(readBack).toBeDefined();
+    expect(readBack?.checkpointId).toBe(built.checkpointId);
+    // The rich, previously-untested fields: activity, plan, and the recomputed projection.
+    expect(readBack?.activity).toEqual(built.activity);
+    expect(readBack?.plan).toEqual(built.plan);
+    expect(readBack?.projection).toEqual(built.projection);
+    expect(readBack?.candidates).toEqual(built.candidates);
+    expect(readBack?.contradicted).toEqual(built.contradicted);
+    expect(readBack?.budget).toEqual(built.budget);
+    expect(readBack?.coverage).toEqual(built.coverage);
+    expect(readBack?.retry).toEqual(built.retry);
+    expect(readBack?.bytes).toBe(built.bytes);
+    expect(readBack?.compatible).toBe(built.compatible);
+
+    // Digests: the cited source's exact content and digest survive byte-identical; the uncited
+    // source keeps only metadata and digest.
+    const primaryRecord = readBack?.evidence.find((e) => e.sourceId === primary.sourceId);
+    const uncitedRecord = readBack?.evidence.find((e) => e.sourceId === uncited.sourceId);
+    expect(primaryRecord?.exactContent).toBe(primary.exactContent);
+    expect(primaryRecord?.digest).toBe(primary.digest);
+    expect(sha256Hex(primaryRecord?.exactContent ?? '')).toBe(primaryRecord?.digest);
+    expect(uncitedRecord?.exactContent).toBeUndefined();
+    expect(uncitedRecord?.digest).toBe(uncited.digest);
+
+    expect(runStore.lineageIdsForRun(RUN_ID)).toEqual(['lineage-1']);
+    expect(runStore.checkpointsFor('lineage-1', 1)).toHaveLength(1);
+    expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1);
+  });
+
+  it(
+    "a toolCompleted/toolFailed event's ActivityCallMetadata (durationMs, memberId, bytesSent/Received, " +
+      'resultState, retryWaitMs, retryCount) survives a real JSON checkpoint round-trip — this parser used to ' +
+      'drop the whole metadata bag on every read, silently, even though the write side already validated it',
+    async () => {
+      const backing = jsonMemoryStore();
+      const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+      let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.', durationMs: 42, memberId: 'm1', bytesReceived: 128, resultState: 'complete' },
+        { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+      );
+      log = appendActivityEvent(
+        log,
+        { kind: 'toolFailed', tool: 'modelTurn', reason: 'Still failing after 3 transient retry(ies).', durationMs: 99, bytesSent: 500, bytesReceived: 0, retryWaitMs: 3000, retryCount: 3 },
+        { occurredAt: '2026-01-01T00:00:02.000Z', phase: 'investigating', elapsedMs: 2000 },
+      );
+
+      const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+      await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+      const readBack = runStore.latestCheckpoint('lineage-1');
+      expect(readBack?.activity).toEqual(built.activity);
+      const completed = readBack?.activity.find((e) => e.kind === 'toolCompleted');
+      expect(completed).toMatchObject({ durationMs: 42, memberId: 'm1', bytesReceived: 128, resultState: 'complete' });
+      const failed = readBack?.activity.find((e) => e.kind === 'toolFailed');
+      expect(failed).toMatchObject({ durationMs: 99, bytesSent: 500, bytesReceived: 0, retryWaitMs: 3000, retryCount: 3 });
+    },
+  );
+
+  it("a coverageChanged fact's requiredTotal survives a real JSON checkpoint round-trip alongside requiredInspected", async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'coverageChanged', coverage: { classified: 8, total: 10, inspected: 5, requiredInspected: 3, requiredTotal: 4 } },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    expect(readBack?.activity).toEqual(built.activity);
+    const coverageChanged = readBack?.activity.find((e) => e.kind === 'coverageChanged');
+    expect(coverageChanged).toMatchObject({ coverage: { classified: 8, total: 10, inspected: 5, requiredInspected: 3, requiredTotal: 4 } });
+  });
+
+  it('a coverageChanged fact persisted before requiredTotal existed still parses, carrying requiredInspected alone', async () => {
+    // A checkpoint written by an earlier build: requiredInspected without the requiredTotal field
+    // this change adds. It must still round-trip rather than fail the whole record closed —
+    // requiredTotal is optional precisely so an old persisted shape stays valid.
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'coverageChanged', coverage: { classified: 2, total: 2, inspected: 2, requiredInspected: 9 } },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1000 },
+    );
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    const coverageChanged = readBack?.activity.find((e) => e.kind === 'coverageChanged');
+    expect(coverageChanged).toMatchObject({ coverage: { classified: 2, total: 2, inspected: 2, requiredInspected: 9 } });
+    if (coverageChanged?.kind === 'coverageChanged') expect(coverageChanged.coverage.requiredTotal).toBeUndefined();
+  });
+
+  it('a member-scoped plan item\'s memberId survives a real JSON checkpoint round-trip, and a shared item stays without one (task 13.3)', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      {
+        kind: 'planCreated',
+        plan: {
+          revision: 1,
+          items: [
+            { id: 'core-1', description: 'Inspect authorization changes.', state: 'active', memberId: 'core' },
+            { id: 'shared-1', description: 'Confirm the billing schema matches core.', state: 'pending' },
+          ],
+        },
+      },
+      { occurredAt: '2026-01-01T00:00:00.000Z', phase: 'planning', elapsedMs: 0 },
+    );
+
+    const built = buildCheckpoint(checkpointInput({ activityEvents: log.events }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeSnapshot(testSnapshot());
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const readBack = runStore.latestCheckpoint('lineage-1');
+    expect(readBack?.plan?.items[0]).toEqual({ id: 'core-1', description: 'Inspect authorization changes.', state: 'active', memberId: 'core' });
+    expect(readBack?.plan?.items[1]).not.toHaveProperty('memberId');
+  });
+
+  it('writeCheckpoint is idempotent by checkpointId: writing the same checkpoint twice does not duplicate it', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    const built = buildCheckpoint(checkpointInput(), DEFAULT_HARNESS_POLICY);
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1);
+  });
+
+  it('reading an unknown lineage returns undefined, never fabricated data', () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    expect(runStore.readLineage('never-written')).toBeUndefined();
+    expect(runStore.readSnapshot('never-written', 1)).toBeUndefined();
+    expect(runStore.checkpointsFor('never-written')).toEqual([]);
+    expect(runStore.latestCheckpoint('never-written')).toBeUndefined();
+  });
+});
+
+// ---- The production incident: a terminal write whose own projection mis-derives non-terminal
+// (a late/out-of-order-sequence activity event lands after the writer's own terminalResult fact,
+// so `reduceActivity`'s "read the last event by sequence" rule picks the wrong one) must still land
+// the attempt's terminal marker — from the writer's own `intendedTerminal` declaration, never from
+// the mis-derived projection — and must surface the disagreement rather than silently resolve it. ----
+describe('HarnessRunStore (incident fix): writeCheckpoint trusts a declared intendedTerminal over a mis-derived projection', () => {
+  it('lands the terminal marker from the declaration, and records the projection disagreement, when a late-sequenced event outranks the terminalResult fact', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    // Constructed directly (bypassing `appendActivityEvent`'s own forward-sequencing) to reproduce
+    // exactly what the incident's own diagnosis found: a `terminalResult` fact at sequence 1, but a
+    // second, unrelated activity event that landed at sequence 2 — `dedupeAndSort`'s own
+    // sort-by-sequence rule (`harnessActivityCompaction.ts`) then makes THAT event the log's last one,
+    // so `deriveLifecycle` (`harnessActivityProjection.ts`) reads its non-terminal phase instead of the
+    // terminal fact that, in wall-clock terms, actually happened last.
+    const activityEvents = [
+      {
+        runId: RUN_ID,
+        lineageId: 'lineage-1',
+        attempt: 1,
+        sequence: 1,
+        occurredAt: '2026-01-01T00:00:05.000Z',
+        phase: 'persisting' as const,
+        elapsedMs: 5000,
+        kind: 'terminalResult' as const,
+        lifecycle: 'failed' as const,
+        completeness: 'partial' as const,
+        limitations: [],
+      },
+      {
+        runId: RUN_ID,
+        lineageId: 'lineage-1',
+        attempt: 1,
+        sequence: 2,
+        occurredAt: '2026-01-01T00:00:03.000Z',
+        phase: 'investigating' as const,
+        elapsedMs: 3000,
+        kind: 'toolCompleted' as const,
+        tool: 'readDiff',
+        summary: 'A late tool result arriving after the terminal write.',
+        target: 'file1.ts',
+      },
+    ];
+
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents, intendedTerminal: { lifecycle: 'failed', completeness: 'partial' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    // Sanity: the projection really does mis-derive non-terminal here, exactly like the incident.
+    expect(built.projection.lifecycle).toBe('investigating');
+    expect(built.intendedTerminal).toEqual({ lifecycle: 'failed', completeness: 'partial' });
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const record = runStore.readLineage('lineage-1');
+    // The marker lands — the exact thing the incident's own lineage never got — from the declaration,
+    // never from the mis-derived projection.
+    expect(record?.terminalAttempts).toEqual([
+      {
+        attempt: 1,
+        lifecycle: 'failed',
+        completeness: 'partial',
+        occurredAt: built.occurredAt,
+        projectedDisagreement: { lifecycle: 'investigating', completeness: built.projection.completeness },
+      },
+    ]);
+    // The checkpoint's own projection is untouched — still what `reduceActivity` computed, for every
+    // display/reduction purpose that reads it.
+    expect(runStore.latestCheckpoint('lineage-1')?.projection.lifecycle).toBe('investigating');
+  });
+
+  it('an absent intendedTerminal falls back to today\'s projection-derived decision, unchanged', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    const built = buildCheckpoint(checkpointInput(), DEFAULT_HARNESS_POLICY); // no activity: projection is 'queued', non-terminal, no declaration
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.readLineage('lineage-1')?.terminalAttempts).toEqual([]);
+  });
+
+  it('a declaration that agrees with the projection lands a marker with no disagreement recorded', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(log, { kind: 'terminalResult', lifecycle: 'succeeded', completeness: 'complete', limitations: [] }, { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'persisting', elapsedMs: 1000 });
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, intendedTerminal: { lifecycle: 'succeeded', completeness: 'complete' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    expect(built.projection.lifecycle).toBe('succeeded'); // sanity: declaration and projection genuinely agree here
+
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.readLineage('lineage-1')?.terminalAttempts).toEqual([{ attempt: 1, lifecycle: 'succeeded', completeness: 'complete', occurredAt: built.occurredAt }]);
+  });
+
+  it('intendedTerminal survives a real JSON checkpoint round-trip, and a checkpoint persisted before this field existed still parses with it absent', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(log, { kind: 'terminalResult', lifecycle: 'failed', completeness: 'none', limitations: [] }, { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'persisting', elapsedMs: 1000 });
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, intendedTerminal: { lifecycle: 'failed', completeness: 'none' } }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    expect(runStore.latestCheckpoint('lineage-1')?.intendedTerminal).toEqual({ lifecycle: 'failed', completeness: 'none' });
+
+    // A pre-existing persisted checkpoint (older schema, no `intendedTerminal` field at all) still
+    // parses, with the field simply absent — never fabricated, never failing the whole record closed.
+    const legacyBuilt = buildCheckpoint(checkpointInput({ checkpointId: 'ckpt-legacy', lineageId: 'lineage-2' }), DEFAULT_HARNESS_POLICY);
+    const legacyRaw = JSON.parse(JSON.stringify(legacyBuilt)) as Record<string, unknown>;
+    expect(legacyRaw.intendedTerminal).toBeUndefined();
+    await runStore.writeCheckpoint(legacyBuilt, GENEROUS_RETENTION);
+    expect(runStore.latestCheckpoint('lineage-2')?.intendedTerminal).toBeUndefined();
+  });
+});
+
+// ---- Persisted root-policy text stays byte-bounded (6784d7c's fix let a real AGENTS.md/CLAUDE.md
+// reach a snapshot's rootAgentsPolicy.text; writeSnapshot itself must not let that grow the stored
+// record without limit). ----
+describe('HarnessRunStore: writeSnapshot caps a persisted rootAgentsPolicy.text at 64 KiB per member', () => {
+  const OVER_CAP_TEXT = 'x'.repeat(64 * 1024 + 1);
+  const UNDER_CAP_TEXT = 'Small repository policy.\n';
+
+  function memberWithPolicy(memberId: string, policyText: string): ReviewRunSnapshot['members'][number] {
+    return {
+      ...testSnapshot().members[0]!,
+      memberId,
+      rootAgentsPolicy: { present: true, sourceId: `agents-policy:base1:.:${memberId}`, digest: `policy-digest-${memberId}`, text: policyText, files: ['agentsMd'] },
+    };
+  }
+
+  it('a policy text at or under the cap round-trips byte-identical', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', UNDER_CAP_TEXT)] });
+    await runStore.writeSnapshot(snapshot);
+    expect(runStore.readSnapshot('lineage-1', 1)).toEqual(snapshot);
+  });
+
+  it('a policy text over the cap is replaced with textOmittedReason on the stored copy; identity fields survive', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', OVER_CAP_TEXT)] });
+    await runStore.writeSnapshot(snapshot);
+
+    const stored = runStore.readSnapshot('lineage-1', 1);
+    const storedPolicy = stored?.members[0]?.rootAgentsPolicy;
+    expect(storedPolicy).toMatchObject({
+      present: true,
+      sourceId: 'agents-policy:base1:.:m1',
+      digest: 'policy-digest-m1',
+      files: ['agentsMd'],
+      textOmittedReason: expect.stringContaining('exceeds 65536 bytes'),
+    });
+    expect(storedPolicy && 'text' in storedPolicy ? (storedPolicy as { text?: string }).text : undefined).toBeUndefined();
+
+    // The caller's own in-memory snapshot — what a live attempt still reads from — is never mutated.
+    expect(snapshot.members[0]?.rootAgentsPolicy).toMatchObject({ text: OVER_CAP_TEXT });
+  });
+
+  it('two members sharing the same over-cap policy each get their own textOmittedReason (cap-only: no cross-member dedup)', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({
+      members: [memberWithPolicy('m1', OVER_CAP_TEXT), memberWithPolicy('m2', OVER_CAP_TEXT)],
+    });
+    await runStore.writeSnapshot(snapshot);
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members).toHaveLength(2);
+    for (const member of stored.members) {
+      expect(member.rootAgentsPolicy).toMatchObject({ present: true, textOmittedReason: expect.any(String) });
+    }
+  });
+
+  it('a present:false rootAgentsPolicy (absent or unavailable) is untouched by the cap', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({
+      members: [{ ...testSnapshot().members[0]!, rootAgentsPolicy: { present: false, unavailableReason: 'This source does not support pinned file reads.' } }],
+    });
+    await runStore.writeSnapshot(snapshot);
+    expect(runStore.readSnapshot('lineage-1', 1)).toEqual(snapshot);
+  });
+
+  // The invariant the cap depends on: a checkpoint's `snapshotDigest` is computed from the live,
+  // uncapped in-memory snapshot the moment a checkpoint is built; `checkCheckpointIntegrity` later
+  // recomputes the same formula from whatever `readSnapshot` returns — the *capped* stored copy for
+  // any member whose policy text was over the bound. Without `computeSnapshotDigest`'s own
+  // text/textOmittedReason projection (`harnessCheckpoint.ts`), those two would disagree for every
+  // such run, and a resume that never actually diverged would be refused as "no longer hashes to
+  // digest". This is the real writeSnapshot -> writeCheckpoint -> readSnapshot round trip, not the
+  // formula tested in isolation (`harnessResume.test.ts`'s own `computeSnapshotDigest round-trip`).
+  it('an over-cap policy text never breaks checkCheckpointIntegrity — the digest is computed the same way before and after capping', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const snapshot = testSnapshot({ members: [memberWithPolicy('m1', OVER_CAP_TEXT)] });
+
+    // Mirrors the real call order (`harnessRuntime.ts`): the checkpoint's digest is computed from
+    // the snapshot still in memory, uncapped, *before* `writeSnapshot` ever runs.
+    const digestAtBuildTime = computeSnapshotDigest(snapshot);
+    const built = buildCheckpoint(checkpointInput({ snapshotDigest: digestAtBuildTime }), DEFAULT_HARNESS_POLICY);
+
+    await runStore.writeSnapshot(snapshot);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ textOmittedReason: expect.any(String) }); // sanity: the cap actually fired
+    const latest = runStore.latestCheckpoint('lineage-1')!;
+    expect(checkCheckpointIntegrity(stored, latest)).toEqual([]);
+  });
+
+  /**
+   * The cap rebuilds the `present` arm field by field, so every field added to that arm has to be
+   * named in it — and `companionUnavailable` is hashed (only `text`/`textOmittedReason` are
+   * projected away). A field left out of the rebuild survives in memory, vanishes on write, and the
+   * two hashes stop matching: every run with an over-cap policy is then refused on resume as "no
+   * longer hashes to digest", for a snapshot nothing actually diverged in. Both halves are asserted
+   * because either alone would miss it — the survival check alone would pass if the field were kept
+   * but hashed differently, and the integrity check alone reports the symptom without the cause.
+   */
+  it('an unreadable companion survives the text cap, so an over-cap policy that half-checked its files still passes checkCheckpointIntegrity', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const member = memberWithPolicy('m1', OVER_CAP_TEXT);
+    const snapshot = testSnapshot({
+      members: [{ ...member, rootAgentsPolicy: { ...member.rootAgentsPolicy, companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' } } as ReviewRunSnapshot['members'][number]['rootAgentsPolicy'] }],
+    });
+
+    const digestAtBuildTime = computeSnapshotDigest(snapshot);
+    const built = buildCheckpoint(checkpointInput({ snapshotDigest: digestAtBuildTime }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeSnapshot(snapshot);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ textOmittedReason: expect.any(String) }); // sanity: the cap actually fired
+    // The consequence first, then the cause: a field the rebuild drops is a snapshot that no longer
+    // hashes to the digest its own checkpoint recorded.
+    expect(checkCheckpointIntegrity(stored, runStore.latestCheckpoint('lineage-1')!)).toEqual([]);
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' } });
+  });
+});
+
+describe('HarnessRunStore.listLineages: the one way to find a target after ordinary completion, when nothing durable links a target to its lineage id', () => {
+  it('finds every lineage the backing store actually holds, with no lineageId or runId supplied up front', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-a', runId: 'run-a' }));
+    await runStore.writeCheckpoint(buildCheckpoint(checkpointInput({ lineageId: 'lineage-a', runId: 'run-a' }), DEFAULT_HARNESS_POLICY), GENEROUS_RETENTION);
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-b', runId: 'run-b' }));
+    await runStore.writeCheckpoint(buildCheckpoint(checkpointInput({ lineageId: 'lineage-b', runId: 'run-b' }), DEFAULT_HARNESS_POLICY), GENEROUS_RETENTION);
+
+    const found = runStore.listLineages().map((record) => record.lineageId).sort();
+    expect(found).toEqual(['lineage-a', 'lineage-b']);
+  });
+
+  it('is empty when nothing has ever run', () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    expect(runStore.listLineages()).toEqual([]);
+  });
+
+  it('is empty rather than throwing when the backing store has no keys() (a minimal test double)', async () => {
+    const map = new Map<string, unknown>();
+    const noKeysStore = {
+      get: <T>(key: string) => map.get(key) as T | undefined,
+      update: async (key: string, value: unknown) => { map.set(key, value); },
+    };
+    const runStore = createHarnessRunStore(noKeysStore, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot());
+    expect(runStore.listLineages()).toEqual([]);
+  });
+
+  it('drops a corrupt lineage entry rather than surfacing it, same as readLineage', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-good' }));
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-bad', { schemaVersion: '1', runId: 'x' /* missing lineageId/snapshots/... */ });
+
+    expect(runStore.listLineages().map((record) => record.lineageId)).toEqual(['lineage-good']);
+  });
+});
+
+describe('HarnessRunStore.lineageKeyCount: the raw count listLineages cannot give, once a corrupt entry is silently dropped', () => {
+  it('is zero when nothing has ever run', () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    expect(runStore.lineageKeyCount()).toBe(0);
+  });
+
+  it('counts a key that failed to parse alongside one that parsed, so the two can be told apart', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-good' }));
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-bad', { schemaVersion: '1', runId: 'x' /* missing lineageId/snapshots/... */ });
+
+    expect(runStore.lineageKeyCount()).toBe(2);
+    expect(runStore.listLineages()).toHaveLength(1);
+  });
+
+  it('is zero rather than throwing when the backing store has no keys() (a minimal test double)', async () => {
+    const map = new Map<string, unknown>();
+    const noKeysStore = {
+      get: <T>(key: string) => map.get(key) as T | undefined,
+      update: async (key: string, value: unknown) => { map.set(key, value); },
+    };
+    const runStore = createHarnessRunStore(noKeysStore, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot());
+    expect(runStore.lineageKeyCount()).toBe(0);
+  });
+});
+
+describe('HarnessRunStore (11.2): the marker test at the actual persistence boundary', () => {
+  it('scans every key the backing store actually holds after writeSnapshot + writeCheckpoint — no planted marker survives outside the one deliberate exception', async () => {
+    const backing = jsonMemoryStore();
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+
+    const SECRET_MARKER = 'MARKER_SECRET_store_9f3e7a2c';
+    const PROMPT_MARKER = 'MARKER_RAW_PROMPT_store_7f3a2b1c';
+    const UNCITED_MARKER = 'MARKER_UNCITED_EVIDENCE_store_ab12cd';
+    const CITED_MARKER = 'MARKER_CITED_EVIDENCE_store_should_survive_77aa';
+
+    let log = createActivityLog(RUN_ID, 'lineage-1', 1);
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolFailed', tool: 'readDiff', target: 'file1.ts', reason: `Bearer sk-live-${SECRET_MARKER}1234567890` },
+      { occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0 },
+    );
+    log = appendActivityEvent(
+      log,
+      { kind: 'toolFailed', tool: 'modelTurn', reason: `${'System prompt leaking: '.repeat(20)}${PROMPT_MARKER}` },
+      { occurredAt: '2026-01-01T00:00:01.000Z', phase: 'investigating', elapsedMs: 1 },
+    );
+
+    const uncited = fakeSource('ev_x00000000000000000000000000000', `full tool-output text containing ${UNCITED_MARKER}`, { kind: 'searchExcerpt', origin: 'repositorySearch' });
+    const cited = fakeSource('ev_y00000000000000000000000000000', `exact diff bytes containing ${CITED_MARKER}`);
+    const candidate = acceptedCandidate('cand-1', cited);
+
+    const built = buildCheckpoint(
+      checkpointInput({ activityEvents: log.events, evidenceSources: [uncited, cited], candidates: [candidate] }),
+      DEFAULT_HARNESS_POLICY,
+    );
+
+    await runStore.writeSnapshot(testSnapshot());
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    // Walk *everything* actually held by the backing store — the lineage record, the run index,
+    // and any legacy keys that might coexist — not just the one checkpoint object built above.
+    const everything = (backing.keys?.() ?? []).map((key) => backing.get(key)).map((value) => JSON.stringify(value)).join('\n');
+
+    expect(everything).not.toContain('sk-live-');
+    expect(everything).not.toContain(SECRET_MARKER);
+    expect(everything).not.toContain(PROMPT_MARKER);
+    expect(everything).not.toContain(UNCITED_MARKER);
+    // The one deliberate exception actually happened at the persistence boundary too.
+    expect(everything).toContain(CITED_MARKER);
+  });
+});
+
+describe('HarnessRunStore (11.4): each HarnessPolicy bound triggers eviction at its limit and not before', () => {
+  async function writeN(runStore: HarnessRunStore, n: number, bytesEach: number, policy: RetentionPolicy): Promise<void> {
+    for (let i = 1; i <= n; i += 1) {
+      await runStore.writeCheckpoint(
+        fakeCheckpoint({ checkpointId: `ckpt-${i}`, occurredAt: `2026-01-01T00:00:0${i}.000Z`, elapsedMs: i, bytes: bytesEach }),
+        policy,
+      );
+    }
+  }
+
+  it('retainedCheckpointsPerLineage: exactly at the limit nothing is evicted; one past it, the oldest is dropped', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, retainedCheckpointsPerLineage: 2 };
+    const atLimit = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await writeN(atLimit, 2, 10, policy);
+    expect(atLimit.checkpointsFor('lineage-1').map((c) => c.checkpointId)).toEqual(['ckpt-1', 'ckpt-2']);
+
+    const overLimit = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await writeN(overLimit, 3, 10, policy);
+    const remaining = overLimit.checkpointsFor('lineage-1').map((c) => c.checkpointId);
+    expect(remaining).toEqual(['ckpt-2', 'ckpt-3']); // ckpt-1 (oldest) evicted
+  });
+
+  it('maxCheckpointBytesPerLineage: aggregate at the bound survives; one checkpoint past it evicts the oldest whole checkpoint', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, retainedCheckpointsPerLineage: 100, maxCheckpointBytesPerLineage: 900 };
+    const atLimit = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await writeN(atLimit, 3, 300, policy); // 900 total, exactly at the bound
+    expect(atLimit.checkpointsFor('lineage-1')).toHaveLength(3);
+
+    const overLimit = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await writeN(overLimit, 3, 400, policy); // 1200 total; evict oldest (400) -> 800, under 900
+    const remaining = overLimit.checkpointsFor('lineage-1').map((c) => c.checkpointId);
+    expect(remaining).toEqual(['ckpt-2', 'ckpt-3']);
+  });
+
+  it('a single checkpoint that alone exceeds the per-lineage byte bound is marked incompatible rather than stripped or dropped', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, maxCheckpointBytesPerLineage: 500 };
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: 'ckpt-huge', bytes: 5000 }), policy);
+
+    const stored = runStore.latestCheckpoint('lineage-1');
+    expect(stored).toBeDefined();
+    // Still there — evicting it entirely would be a silent loss, not a truthful incompatibility.
+    expect(stored?.checkpointId).toBe('ckpt-huge');
+    expect(stored?.compatible).toBe(false);
+    expect(stored?.incompatibilityReasons.length).toBeGreaterThan(0);
+  });
+
+  it('terminalAttemptHistoryCount is enforced per target (runId), across every lineage under it: the oldest terminal attempt is dropped once a newer one exceeds the count', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, terminalAttemptHistoryCount: 1 };
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-a', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-a',
+        lineageId: 'lineage-a',
+        occurredAt: '2026-01-01T00:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-a', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-b', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-b',
+        lineageId: 'lineage-b',
+        occurredAt: '2026-01-01T12:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-b', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+
+    // Lineage A's terminal attempt is older than lineage B's, and only 1 terminal attempt is kept
+    // per target — A's checkpoint data and snapshot are gone; B's survive.
+    expect(runStore.checkpointsFor('lineage-a')).toEqual([]);
+    expect(runStore.readSnapshot('lineage-a', 1)).toBeUndefined();
+    expect(runStore.checkpointsFor('lineage-b')).toHaveLength(1);
+    expect(runStore.readSnapshot('lineage-b', 1)).toBeDefined();
+  });
+
+  // harness-lineage-keys-never-deleted: the test above proves the lineage's CONTENTS are gone; this
+  // proves the lineage's own persisted KEY (and the run index's entry for it) are gone too, not left
+  // behind as a permanent `{schemaVersion, runId, lineageId, snapshots:{}, checkpoints:[],
+  // terminalAttempts:[]}` husk — the unbounded-growth class this fix closes.
+  it('a lineage every attempt of which has aged out of terminal-attempt history has its own key deleted, and the run index key too once it empties', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, terminalAttemptHistoryCount: 1 };
+    const store = jsonMemoryStore();
+    const runStore = createHarnessRunStore(store, { now: () => Date.parse('2026-01-02T00:00:00.000Z') });
+
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-only', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-only',
+        lineageId: 'lineage-only',
+        occurredAt: '2026-01-01T00:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-only', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+    expect(store.keys?.()).toContain('codeVerdict.harness.lineage.lineage-only');
+
+    // A second, later terminal attempt on a DIFFERENT lineage under the same target (runId) is what
+    // triggers re-evaluation of the count bound and evicts `lineage-only` entirely — every attempt it
+    // ever had.
+    await runStore.writeSnapshot(testSnapshot({ lineageId: 'lineage-newer', attempt: 1 }));
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-newer',
+        lineageId: 'lineage-newer',
+        occurredAt: '2026-01-01T12:00:00.000Z',
+        projection: { runId: RUN_ID, lineageId: 'lineage-newer', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+
+    // The husk is gone — not merely empty — so a long-lived workspace's single blob does not grow one
+    // permanent, never-reclaimed key per review ever run.
+    expect(store.keys?.()).not.toContain('codeVerdict.harness.lineage.lineage-only');
+    expect(runStore.listLineages().map((l) => l.lineageId)).not.toContain('lineage-only');
+    expect(runStore.lineageKeyCount()).toBe(1); // only lineage-newer's own key remains
+  });
+
+  it('terminalAttemptHistoryMaxAgeDays evicts using the injected clock: an attempt older than the window is dropped even under the count bound', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, terminalAttemptHistoryCount: 10, terminalAttemptHistoryMaxAgeDays: 1 };
+    let nowMs = Date.parse('2026-01-01T00:00:00.000Z');
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => nowMs });
+
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-old',
+        occurredAt: new Date(nowMs).toISOString(),
+        projection: { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+    expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1); // not yet stale relative to itself
+
+    // Advance the clock 3 days and record a second, unrelated terminal attempt (a resumed lineage
+    // under the same target) — this is what triggers re-evaluation of the age bound.
+    nowMs += 3 * 24 * 60 * 60 * 1000;
+    await runStore.writeCheckpoint(
+      fakeCheckpoint({
+        checkpointId: 'ckpt-new',
+        lineageId: 'lineage-2',
+        attempt: 1,
+        occurredAt: new Date(nowMs).toISOString(),
+        projection: { runId: RUN_ID, lineageId: 'lineage-2', attempt: 1, lifecycle: 'succeeded', completeness: 'complete', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+      }),
+      policy,
+    );
+
+    expect(runStore.checkpointsFor('lineage-1')).toEqual([]); // aged out
+    expect(runStore.checkpointsFor('lineage-2')).toHaveLength(1); // recent, survives
+  });
+});
+
+// Two checkpoints written in the same millisecond share an `occurredAt` exactly — ISO strings carry
+// no finer granularity, and one attempt can cross two phase boundaries inside one millisecond. The
+// ordering comparator used to break that tie on `checkpointId`, which is `ckpt_` plus 16 random
+// bytes (`mintId`, `harnessAttempt.ts`): reproducible for one pair of ids, but unrelated to which
+// checkpoint was actually written first, so the tie was decided by whatever the random ids happened
+// to be. Both tests here construct the tie directly with hand-chosen ids rather than racing a clock
+// — a timing-based repro would inherit the same intermittency it is meant to close — and give the
+// LATER-written checkpoint the lexicographically SMALLER id, the arrangement under which the old
+// comparator is wrong every single run.
+describe('HarnessRunStore: two checkpoints sharing one millisecond are ordered by write order, never by their random checkpointIds', () => {
+  const MIDPHASE_ID = 'ckpt_ffffffffffffffffffffffffffffffff'; // written first, sorts LAST lexicographically
+  const TERMINAL_ID = 'ckpt_00000000000000000000000000000000'; // written second, sorts FIRST lexicographically
+  const TIED_AT = '2026-01-01T00:00:05.000Z';
+
+  it('latestCheckpoint returns the terminal checkpoint written second, not the mid-phase one it shares a timestamp with, even though the terminal id sorts first', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    // Both checkpoints are built through `buildCheckpoint` over real activity, not hand-set
+    // projections: `parsePersistedCheckpoint` recomputes `projection` from the persisted activity on
+    // every read (`reduceActivityForRead`), so a hand-set projection would never be what a reader
+    // actually sees. The lifecycles asserted below are therefore the ones a real caller reads back.
+    let midPhaseLog = createActivityLog(RUN_ID, 'lineage-1', 1);
+    midPhaseLog = appendActivityEvent(
+      midPhaseLog,
+      { kind: 'toolCompleted', tool: 'readDiff', target: 'file1.ts', summary: '1 unit(s) returned.' },
+      { occurredAt: TIED_AT, phase: 'investigating', elapsedMs: 5000 },
+    );
+    const midPhase = buildCheckpoint(
+      checkpointInput({ checkpointId: MIDPHASE_ID, occurredAt: TIED_AT, phase: 'investigating', activityEvents: midPhaseLog.events }),
+      DEFAULT_HARNESS_POLICY,
+    );
+
+    let terminalLog = createActivityLog(RUN_ID, 'lineage-1', 1);
+    terminalLog = appendActivityEvent(
+      terminalLog,
+      { kind: 'terminalResult', lifecycle: 'failed', completeness: 'partial', limitations: [] },
+      { occurredAt: TIED_AT, phase: 'persisting', elapsedMs: 5000 },
+    );
+    const terminal = buildCheckpoint(
+      checkpointInput({ checkpointId: TERMINAL_ID, occurredAt: TIED_AT, phase: 'persisting', activityEvents: terminalLog.events }),
+      DEFAULT_HARNESS_POLICY,
+    );
+    // Sanity: the two really are distinguishable by lifecycle, and really do share a timestamp.
+    expect(midPhase.projection.lifecycle).toBe('investigating');
+    expect(terminal.projection.lifecycle).toBe('failed');
+    expect(midPhase.occurredAt).toBe(terminal.occurredAt);
+
+    await runStore.writeCheckpoint(midPhase, GENEROUS_RETENTION);
+    await runStore.writeCheckpoint(terminal, GENEROUS_RETENTION);
+
+    // The live symptom: a caller reading back an attempt that has already ended was told it was
+    // still mid-phase, because the mid-phase checkpoint sorted last on the strength of its id alone.
+    const latest = runStore.latestCheckpoint('lineage-1');
+    expect(latest?.checkpointId).toBe(TERMINAL_ID);
+    expect(latest?.projection.lifecycle).toBe('failed');
+
+    // `checkpointsFor`'s own documented contract — "oldest to newest" — over the same tied pair.
+    // Persisted order is this comparator's sorted output, so this is what a restart reads back too,
+    // not an in-memory-only ordering.
+    expect(runStore.checkpointsFor('lineage-1').map((c) => c.checkpointId)).toEqual([MIDPHASE_ID, TERMINAL_ID]);
+  });
+
+  it('retainedCheckpointsPerLineage evicts the older member of a same-timestamp pair, never the newer one whose random id happens to sort first', async () => {
+    const policy: RetentionPolicy = { ...GENEROUS_RETENTION, retainedCheckpointsPerLineage: 2 };
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => Date.parse('2026-01-01T00:00:00.000Z') });
+
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: MIDPHASE_ID, occurredAt: TIED_AT }), policy);
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: TERMINAL_ID, occurredAt: TIED_AT }), policy);
+    // A third checkpoint one second later pushes the lineage one past the count bound, so the
+    // eviction boundary falls exactly between the two tied checkpoints — the only arrangement in
+    // which a tie decides which checkpoint is lost rather than merely which is listed first.
+    await runStore.writeCheckpoint(fakeCheckpoint({ checkpointId: 'ckpt-later', occurredAt: '2026-01-01T00:00:06.000Z' }), policy);
+
+    // Silent data loss if the tie goes the wrong way: the newer checkpoint is evicted and the older
+    // one it superseded is kept, with nothing recorded anywhere to say it happened.
+    const remaining = runStore.checkpointsFor('lineage-1').map((c) => c.checkpointId);
+    expect(remaining).toEqual([TERMINAL_ID, 'ckpt-later']);
+    expect(remaining).not.toContain(MIDPHASE_ID);
+  });
+});
+
+describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and unknown-enum persisted blobs all fail closed on read', () => {
+  const validLineage = () => ({
+    schemaVersion: '1',
+    runId: RUN_ID,
+    lineageId: 'lineage-1',
+    snapshots: {},
+    checkpoints: [
+      {
+        checkpointId: 'ckpt-1',
+        runId: RUN_ID,
+        lineageId: 'lineage-1',
+        attempt: 1,
+        phase: 'investigating',
+        reason: 'phaseBoundary',
+        occurredAt: '2026-01-01T00:00:00.000Z',
+        elapsedMs: 0,
+        snapshotDigest: 'digest',
+        projection: { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, lifecycle: 'investigating', completeness: 'none', elapsedMs: 0, progressMode: 'indeterminate', attention: 'none', limitations: [] },
+        activity: [],
+        evidence: [],
+        candidates: [],
+        contradicted: [],
+        budget: ZERO_BUDGET,
+        coverage: [],
+        unresolved: { unresolvedFetches: 0, unresolvedCandidates: 0 },
+        retry: { waiting: false, transientAttempts: 0 },
+        bytes: 10,
+        compatible: true,
+        incompatibilityReasons: [],
+      },
+    ],
+    terminalAttempts: [],
+  });
+
+  it.each([
+    // unknown-enum: a recognized-shape field carrying a value outside its own enum.
+    ['unknown checkpoint phase', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { phase: string }).phase = 'reasoning'; }],
+    ['unknown checkpoint reason', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { reason: string }).reason = 'becauseISaidSo'; }],
+    ['unknown projection lifecycle', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { lifecycle: string } }).projection.lifecycle = 'executing'; }],
+    ['unknown projection completeness', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { completeness: string } }).projection.completeness = 'done'; }],
+    // wrong-typed: a required field present, but as the wrong primitive type.
+    ['wrong-typed: checkpointId is a number', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).checkpointId = 42; }],
+    ['wrong-typed: elapsedMs is a string', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = '1000'; }],
+    ['wrong-typed: compatible is a string, not a boolean', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).compatible = 'true'; }],
+    // truncated: a required field missing entirely, as a byte-cut-short blob would produce.
+    ['truncated: checkpoint missing its budget field', (r: ReturnType<typeof validLineage>) => { delete (r.checkpoints[0] as unknown as Record<string, unknown>).budget; }],
+    ['truncated: checkpoint missing its retry field', (r: ReturnType<typeof validLineage>) => { delete (r.checkpoints[0] as unknown as Record<string, unknown>).retry; }],
+    ['truncated: lineage record missing its terminalAttempts field', (r: ReturnType<typeof validLineage>) => { delete (r as unknown as Record<string, unknown>).terminalAttempts; }],
+    // malformed: a field present with a value of the wrong overall shape (not an array where one is required).
+    ['malformed: checkpoints is not an array', (r: ReturnType<typeof validLineage>) => { (r as unknown as Record<string, unknown>).checkpoints = 'not-an-array'; }],
+    // wrong-typed: a toolFailed event's own optional ActivityCallMetadata (Fix 1's parseCallMetadata) — a
+    // present-but-negative retryCount fails the whole event, and so the whole record, closed rather than
+    // being silently dropped down to just the required fields.
+    [
+      'wrong-typed: a toolFailed event carries a negative retryCount',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'toolFailed', tool: 'modelTurn', reason: 'stalled', retryCount: -1 },
+        ];
+      },
+    ],
+    // wrong-typed: a coverageChanged fact's requiredTotal (mirrors requiredInspected's own check).
+    [
+      'wrong-typed: a coverageChanged event carries a string requiredTotal',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredTotal: 'two' } },
+        ];
+      },
+    ],
+    // wrong-typed (out of range): `parseCoverageProgress`'s own non-negative-finite check, one entry
+    // per field, mirroring `sanitizeFact`'s identical write-side rule for the same five fields
+    // (`harnessActivityLog.ts`). A negative number survives the store's own JSON round trip
+    // (`jsonMemoryStore`) unchanged, so this fixture reaches the parser's finiteness check itself
+    // rather than the wrong-typed check above it.
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative classified',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: -1, inspected: 1 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative inspected',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: -1 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative total',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, total: -3 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative requiredInspected',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredInspected: -2 } },
+        ];
+      },
+    ],
+    [
+      'wrong-typed (out of range): a coverageChanged event carries a negative requiredTotal',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, requiredTotal: -4 } },
+        ];
+      },
+    ],
+  ])('%s makes the whole lineage record fail closed (undefined), not partially trusted', async (_label, corrupt) => {
+    const backing = jsonMemoryStore();
+    const record = validLineage();
+    corrupt(record);
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+    expect(runStore.checkpointsFor('lineage-1')).toEqual([]);
+  });
+
+  // `JSON.stringify` silently turns `NaN`/`Infinity` into `null` before they would ever reach the
+  // parser through the store's own write path (see `jsonMemoryStore`'s own header comment) — which
+  // means the it.each suite above, built on that store, can never actually exercise any of this
+  // module's finiteness checks with either value; it would only ever see the already-`null` result
+  // and fail on the `typeof` branch instead. `rawMemoryStore` skips that pass so these values reach
+  // the parser exactly as written, proving the finiteness check itself refuses them rather than
+  // merely refusing the `null` a real store would have reduced them to. The real reader is
+  // `extension.ts`'s `context.globalState.get`, which is not JSON-reduced either: a hand-edited or
+  // corrupted global-state value carrying `1e999` parses as `Infinity` from valid strict JSON.
+  //
+  // One case per numeric field whose writer refuses a negative or non-finite value, which is what
+  // makes each of these sharp: `typeof === 'number'` alone admits `Infinity`, and a `< 0` or
+  // `< 1` comparison admits `NaN`, so every one of these fields was reachable with a value its own
+  // write side would never have produced — and nothing downstream re-checks any of them.
+  it.each([
+    [
+      'a coverageChanged event carries NaN as classified',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: NaN, inspected: 1 } },
+        ];
+      },
+    ],
+    [
+      'a coverageChanged event carries Infinity as total',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, total: Infinity } },
+        ];
+      },
+    ],
+    // An event's own `elapsedMs`: `harnessActivityLog.ts`'s `validEventFields` refuses a non-finite
+    // one on the way in, and `reduceActivity`'s `last?.elapsedMs ?? 0` does not fire for one on the
+    // way out, so an accepted `Infinity` here becomes the projection clock `elapsedClock` paints as
+    // "Infinity:NaN" on the run stopwatch and the time line.
+    [
+      'an activity event carries Infinity as elapsedMs',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: Infinity, kind: 'resuming' },
+        ];
+      },
+    ],
+    // `sequence` is the log's own ordering key, and `validSequence` — the same function the write
+    // side applies, imported rather than copied — requires a positive integer.
+    [
+      'an activity event carries NaN as sequence',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: NaN, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'resuming' },
+        ];
+      },
+    ],
+    ['the checkpoint itself carries Infinity as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = Infinity; }],
+    ['the checkpoint itself carries a negative elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = -1; }],
+    ['the persisted projection carries NaN as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { elapsedMs: number } }).projection.elapsedMs = NaN; }],
+    ['the persisted budget carries NaN as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { budget: BudgetConsumption }).budget = { ...ZERO_BUDGET, elapsedMs: NaN }; }],
+    [
+      'a tracked candidate carries NaN as its repair count',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [{ candidateId: 'cand-1', state: 'unresolved', repairs: NaN, reasons: [] }];
+      },
+    ],
+    // `parseCandidateFinding` requires a finite 0-100 confidence on the way in; `NaN` passed both
+    // the `< 0` and the `> 100` comparison on the way back out.
+    [
+      'an accepted finding carries NaN as its confidence',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.item as { confidence: number }).confidence = NaN;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
+      },
+    ],
+    // A finding's own span, held to `normalizeEvidenceRange` — the same function
+    // `parseCandidateFinding` required it to pass when the model submitted it, which rejects
+    // anything that is not a positive integer.
+    [
+      'an accepted finding carries Infinity as its line',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.item as { line: number }).line = Infinity;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
+      },
+    ],
+    // An evidence range's `startLine < 1` bound is the same shape: `NaN` is not less than 1, so a
+    // citation whose span cannot be rendered at all was read back as a valid one.
+    [
+      'a cited evidence range carries NaN as startLine',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.evidence.primary.range as { startLine: number }).startLine = NaN;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
+      },
+    ],
+  ])('%s makes the whole lineage record fail closed (undefined), not coerced to null and refused for the wrong reason', (_label, corrupt) => {
+    const backing = rawMemoryStore();
+    const record = validLineage();
+    corrupt(record);
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+    expect(runStore.checkpointsFor('lineage-1')).toEqual([]);
+  });
+
+  it('an unknown evidence kind fails the whole record closed', async () => {
+    const backing = jsonMemoryStore();
+    const record = validLineage();
+    (record.checkpoints[0] as { evidence: unknown[] }).evidence = [{ sourceId: 'ev_x', digest: 'd', kind: 'transcript', origin: 'diffPage', memberId: 'm1', repositoryId: 'repo-1', baseSha: 'b', headSha: 'h', completeness: 'complete', locations: [], fetchedInAttempt: 1 }];
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+  });
+
+  /**
+   * `add-local-git-investigation` task 10.1: which source produced a payload is
+   * a stored fact, so a diagnostics report read back off disk after the run has
+   * ended can still say where the evidence came from. The three cases here are
+   * the three a stored record can be in — stamped, written before the field
+   * existed, and corrupt.
+   */
+  it('round-trips an evidence record’s producing source, reads an unstamped one as the provider, and fails a bogus one closed', async () => {
+    const evidenceRecord = (extra: Record<string, unknown>) => ({
+      sourceId: 'ev_00000000000000000000000000000001',
+      digest: 'd',
+      kind: 'diff',
+      origin: 'diffPage',
+      memberId: 'm1',
+      repositoryId: 'repo-1',
+      baseSha: 'b',
+      headSha: 'h',
+      completeness: 'complete',
+      locations: [],
+      fetchedInAttempt: 1,
+      ...extra,
+    });
+    const read = (extra: Record<string, unknown>) => {
+      const backing = jsonMemoryStore();
+      const record = validLineage();
+      (record.checkpoints[0] as { evidence: unknown[] }).evidence = [evidenceRecord(extra)];
+      seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+      return createHarnessRunStore(backing, { now: () => 0 }).readLineage('lineage-1');
+    };
+
+    expect(read({ producedBy: 'localGit' })?.checkpoints[0]?.evidence[0]?.producedBy).toBe('localGit');
+    // Written before the field existed. Absence is read as the provider by
+    // `evidenceProducerOf`, never stored as one here — the parser reports what
+    // the record actually carries.
+    expect(read({})?.checkpoints[0]?.evidence[0]?.producedBy).toBeUndefined();
+    expect(evidenceProducerOf(read({})!.checkpoints[0]!.evidence[0]!)).toBe('provider');
+    expect(read({ producedBy: 'forge' })).toBeUndefined();
+  });
+
+  /**
+   * `add-local-git-investigation` task 10.6, at the layer that actually carries
+   * a resume. A checkpoint's coverage is what `applyCoverageSeed` replays onto
+   * the next attempt's inventory, so a declined-content flag that does not
+   * survive this parser is a flag the resumed run does not have — and a
+   * low-risk file without it no longer blocks completion, which is how a run
+   * ends complete and clean over content nobody was served.
+   */
+  it('round-trips a declined-content file record, leaves an older one absent, and fails a bogus one closed', async () => {
+    const read = (extra: Record<string, unknown>) => {
+      const backing = jsonMemoryStore();
+      const record = validLineage();
+      (record.checkpoints[0] as { coverage: unknown[] }).coverage = [
+        { memberId: 'm1', manifestComplete: true, totalFiles: 1, files: [{ path: 'docs/notes.md', memberId: 'm1', state: 'classified', risk: 'low', ...extra }] },
+      ];
+      seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+      return createHarnessRunStore(backing, { now: () => 0 }).readLineage('lineage-1');
+    };
+
+    expect(read({ contentDeclined: true })?.checkpoints[0]?.coverage[0]?.files[0]?.contentDeclined).toBe(true);
+    expect(read({})?.checkpoints[0]?.coverage[0]?.files[0]?.contentDeclined).toBeUndefined();
+    expect(read({ contentDeclined: 'yes' })).toBeUndefined();
+
+    // The same round trip for the other fact a still-classified file can carry:
+    // a read that resolved to nothing the source established.
+    expect(read({ readFailed: true })?.checkpoints[0]?.coverage[0]?.files[0]?.readFailed).toBe(true);
+    expect(read({})?.checkpoints[0]?.coverage[0]?.files[0]?.readFailed).toBeUndefined();
+    expect(read({ readFailed: 'yes' })).toBeUndefined();
+  });
+
+  it('an unknown candidate tracker state fails the whole record closed', async () => {
+    const backing = jsonMemoryStore();
+    const record = validLineage();
+    (record.checkpoints[0] as { candidates: unknown[] }).candidates = [{ candidateId: 'cand-1', state: 'pondering', repairs: 0, reasons: [] }];
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+  });
+
+  it('an unrecognized activity event kind fails the whole record closed', async () => {
+    const backing = jsonMemoryStore();
+    const record = validLineage();
+    (record.checkpoints[0] as { activity: unknown[] }).activity = [
+      { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'thoughtStream' },
+    ];
+    seedRaw(backing, 'codeVerdict.harness.lineage.lineage-1', record);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.readLineage('lineage-1')).toBeUndefined();
+  });
+
+  it('a malformed run index (not an array of strings) fails closed to an empty lineage list, not a thrown error', () => {
+    const backing = jsonMemoryStore();
+    seedRaw(backing, 'codeVerdict.harness.run.run-1', { schemaVersion: '1', runId: 'run-1', lineageIds: [42, null] });
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    expect(runStore.lineageIdsForRun('run-1')).toEqual([]);
+  });
+});
+
+describe('HarnessRunStore (11.1): coexists with legacy persisted shapes without touching or fabricating over them', () => {
+  it('legacy run-history and retained-draft keys survive untouched alongside harness writes in the same store', async () => {
+    const backing = jsonMemoryStore();
+    await backing.update('codeVerdict.reviewRuns', LEGACY_RUN_HISTORY);
+    const draftKey = draftKeyFor({ repoId: 'repo-1', number: '2841' });
+    await backing.update(draftKey, LEGACY_RETAINED_TRIAGE_DRAFT);
+    const cleanKey = draftKeyFor({ repoId: 'repo-1', number: '2842' });
+    await backing.update(cleanKey, LEGACY_RETAINED_CLEAN);
+    const changesetKey = changesetDraftKeyFor('cs-legacy-1');
+    await backing.update(changesetKey, LEGACY_CHANGESET_DRAFT);
+
+    const runStore = createHarnessRunStore(backing, { now: () => 0 });
+    await runStore.writeSnapshot(testSnapshot());
+    await runStore.writeCheckpoint(buildCheckpoint(checkpointInput(), DEFAULT_HARNESS_POLICY), GENEROUS_RETENTION);
+
+    // Legacy keys are byte-identical to what was written — the harness store never reads or
+    // rewrites anything outside its own `codeVerdict.harness.*` namespace.
+    expect(backing.get('codeVerdict.reviewRuns')).toEqual(LEGACY_RUN_HISTORY);
+    expect(backing.get(draftKey)).toEqual(LEGACY_RETAINED_TRIAGE_DRAFT);
+    expect(backing.get(cleanKey)).toEqual(LEGACY_RETAINED_CLEAN);
+    expect(backing.get(changesetKey)).toEqual(LEGACY_CHANGESET_DRAFT);
+
+    // A target that only has legacy data (no harness lineage was ever written for it) reads as
+    // absent, never fabricated as an empty-but-present harness record.
+    expect(runStore.readLineage('some-legacy-only-target')).toBeUndefined();
+
+    // The existing legacy-read functions (task 2.7) still read these fixtures the same way,
+    // proving co-existence rather than replacement: no plan/evidence/coverage is invented for them.
+    const legacyRead = readLegacyReview(LEGACY_RETAINED_TRIAGE_DRAFT.review);
+    expect(legacyRead.protocolProvenance).toBe('legacy-one-shot');
+    expect(Object.keys(legacyRead).sort()).toEqual(['completeness', 'crNumber', 'protocolProvenance', 'repoId'].sort());
+    const findingsRun = LEGACY_RUN_HISTORY.find((run) => run.outcome === 'findings')!;
+    expect(readLegacyRunHistory(findingsRun)).toEqual({ completeness: 'complete', protocolProvenance: 'legacy-one-shot' });
+  });
+});
+
+describe('HarnessRunStore: determinism', () => {
+  it('never reads a wall clock itself — two stores given the same injected now() behave identically regardless of real time', async () => {
+    const fixedNow = () => 12345;
+    const storeA = createHarnessRunStore(jsonMemoryStore(), { now: fixedNow });
+    const storeB = createHarnessRunStore(jsonMemoryStore(), { now: fixedNow });
+    const built = buildCheckpoint(checkpointInput(), DEFAULT_HARNESS_POLICY);
+    await storeA.writeCheckpoint(built, GENEROUS_RETENTION);
+    await storeB.writeCheckpoint(built, GENEROUS_RETENTION);
+    expect(storeA.latestCheckpoint('lineage-1')).toEqual(storeB.latestCheckpoint('lineage-1'));
+  });
+});
+
+// Keeps `HarnessPolicy`/`normalizeHarnessPolicy` imports meaningful (a real caller resolves
+// `RetentionPolicy` from a full policy, never hand-assembles the four fields as this file's other
+// tests do for precise control) — proves the slice type is satisfied by a real normalized policy.
+describe('RetentionPolicy is satisfied by a real, normalized HarnessPolicy', () => {
+  it('a HarnessPolicy value can be passed directly to writeCheckpoint without adaptation', async () => {
+    const policy: HarnessPolicy = normalizeHarnessPolicy({ retainedCheckpointsPerLineage: 2, maxCheckpointBytesPerLineage: 1024 });
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const built = buildCheckpoint(checkpointInput(), policy);
+    await runStore.writeCheckpoint(built, policy);
+    expect(runStore.checkpointsFor('lineage-1')).toHaveLength(1);
+  });
+});
+
+/**
+ * Baseline for `add-local-git-investigation`, task 1.5. Reads the recorded
+ * pre-change lineage record (`migrationFixtures.ts`) through the store's own
+ * read path and states what a member snapshot written today does and does not
+ * carry.
+ *
+ * Its job is to be here, unchanged, when task 9.7 needs to prove that absence
+ * of `baseRevisionKind` reads as `targetBranchTip` and absence of
+ * `investigationSource` reads as the provider. That proof is only worth
+ * anything if the record it runs against is genuinely a record — which is why
+ * the fixture is text and why the last assertion below reads the text itself.
+ */
+describe('HarnessRunStore: the member snapshot shape stored before local-git investigation (task 1.5)', () => {
+  function storeWithPreLocalGitRecord(): HarnessRunStore {
+    const backing = jsonMemoryStore();
+    seedRaw(backing, PRE_LOCAL_GIT_LINEAGE_KEY, preLocalGitLineageRecord());
+    return createHarnessRunStore(backing, { now: () => 0 });
+  }
+
+  it('reads back as a valid snapshot — the record is one the current store accepts, not a hypothetical', () => {
+    const snapshot = storeWithPreLocalGitRecord().readSnapshot('lineage-pre-local-git', 1);
+    expect(snapshot).toBeDefined();
+    expect(snapshot?.members).toHaveLength(1);
+  });
+
+  it('carries baseSha and providerCapabilitySignature, and neither of the two fields this change adds', () => {
+    const snapshot = storeWithPreLocalGitRecord().readSnapshot('lineage-pre-local-git', 1);
+    const stored = snapshot?.members[0] as unknown as Record<string, unknown>;
+    // `pull.base.sha` — the tip of the target branch, which is what `baseSha`
+    // means in every record written up to now.
+    expect(stored.baseSha).toBe('7c1de9a0b2f3c4d5e6f708192a3b4c5d6e7f8091');
+    expect(stored.headSha).toBe('9f2c1ab4e5d6708192a3b4c5d6e7f8091a2b3c4d');
+    expect(typeof stored.providerCapabilitySignature).toBe('string');
+    // Absent, not undefined-valued: a stored record has no key here at all,
+    // and 9.7's reading of absence has to hold for that, not for a field
+    // someone wrote as `undefined`.
+    expect('baseRevisionKind' in stored).toBe(false);
+    expect('investigationSource' in stored).toBe(false);
+  });
+
+  it('is a recording rather than a construction — the two new field names appear nowhere in the stored text', () => {
+    expect(PRE_LOCAL_GIT_LINEAGE_RECORD_JSON).not.toContain('baseRevisionKind');
+    expect(PRE_LOCAL_GIT_LINEAGE_RECORD_JSON).not.toContain('investigationSource');
+  });
+
+  /**
+   * Task 5.4, read through the store rather than over a hand-built object: the
+   * question is what a record already on somebody's disk means now that
+   * `baseSha` means the merge base, and the only honest way to ask it is with
+   * a record that was written before the field existed.
+   */
+  it('reads its missing baseRevisionKind as a target-branch tip, the commit it actually holds', () => {
+    const snapshot = storeWithPreLocalGitRecord().readSnapshot('lineage-pre-local-git', 1);
+    const stored = snapshot!.members[0]!;
+    expect(baseRevisionKindOf(stored)).toBe('targetBranchTip');
+    // Not a merge base, which is what reading the field as "unknown, assume
+    // current meaning" would have made it — and what would have made the
+    // stored commit compare equal to a merge base that is a different commit.
+    expect(baseRevisionKindOf(stored)).not.toBe('mergeBase');
+  });
+});

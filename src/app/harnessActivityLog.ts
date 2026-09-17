@@ -1,0 +1,402 @@
+/**
+ * The ordered, append-only activity log for one attempt: the typed facts a
+ * caller may add, and the sole function that turns a fact into a full
+ * `ActivityEvent` (tasks 5.1/5.2 of `add-agentic-review-harness`,
+ * design.md D2/D5/D14, spec `review-run-activity`).
+ *
+ * `ActivityEvent` and its common `runId`/`lineageId`/`attempt`/`sequence`/
+ * `occurredAt`/`phase`/`elapsedMs` fields already exist in
+ * `../domain/harnessActivity` (task 2.3) — this module does not redefine
+ * that union. What it adds is the app-layer surface the design's builder
+ * and reducer actually run on: `ActivityLog` (the ordered container),
+ * `ActivityFact` (what a caller supplies — everything in `ActivityEvent`
+ * except the base fields, which the log itself assigns), and
+ * `appendActivityEvent`, the only sanctioned way to add one. Every fact is
+ * validated and sanitized inside `appendActivityEvent`
+ * (`./harnessActivitySanitizer`) before it can become part of the log, so
+ * nothing unsanitized can reach it short of hand-constructing an
+ * `ActivityEvent` and skipping this module entirely — which no other module
+ * in this change does.
+ */
+import { canonicalStringify } from './contentDigest';
+import { isPlanItemState, isRunPhase } from '../domain/harnessActivity';
+import type { ActivityCallMetadata, ActivityEvent, Limitation, PlanItem, RunPhase } from '../domain/harnessActivity';
+import { isResultCompleteness, isRunLifecycle } from '../domain/harnessLifecycle';
+import type { AttemptNumber, LineageId, RunId } from '../domain/harnessLifecycle';
+import { sanitizePublicText } from './harnessActivitySanitizer';
+import { isEchoableIdentifier } from '../domain/harnessProtocol';
+
+/** Mirrors `ActivityEventBase` (`../domain/harnessActivity`, not exported there) — every event kind carries these. */
+interface ActivityEventCommonFields {
+  runId: RunId;
+  lineageId: LineageId;
+  attempt: AttemptNumber;
+  sequence: number;
+  occurredAt: string;
+  phase: RunPhase;
+  elapsedMs: number;
+}
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** What a caller supplies to add one event — the base fields are assigned by `appendActivityEvent`, never by the caller. */
+export type ActivityFact = DistributiveOmit<ActivityEvent, keyof ActivityEventCommonFields>;
+
+/** The base fields only the caller (a future `HarnessAttempt`) can know: current phase, wall-clock time, and elapsed time. */
+export interface ActivityContext {
+  occurredAt: string;
+  phase: RunPhase;
+  elapsedMs: number;
+}
+
+export interface ActivityLog {
+  readonly runId: RunId;
+  readonly lineageId: LineageId;
+  readonly attempt: AttemptNumber;
+  readonly events: readonly ActivityEvent[];
+}
+
+/** A fresh, empty log for one attempt. Sequence numbering restarts at 1 regardless of any prior attempt's last sequence. */
+export function createActivityLog(runId: RunId, lineageId: LineageId, attempt: AttemptNumber): ActivityLog {
+  return { runId, lineageId, attempt, events: [] };
+}
+
+function nextSequence(log: ActivityLog): number {
+  const last = log.events[log.events.length - 1];
+  return last ? last.sequence + 1 : 1;
+}
+
+function knownPlanItemIds(events: readonly ActivityEvent[]): Set<string> {
+  const ids = new Set<string>();
+  for (const event of events) {
+    if (event.kind === 'planCreated' || event.kind === 'planRevised') {
+      for (const item of event.plan.items) ids.add(item.id);
+    }
+  }
+  return ids;
+}
+
+/** `undefined` in, `undefined` out; present-but-unsanitizable fails the whole fact closed. */
+function sanitizeOptionalText(raw: string | undefined): { ok: false } | { ok: true; value: string | undefined } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  const cleaned = sanitizePublicText(raw);
+  return cleaned === undefined ? { ok: false } : { ok: true, value: cleaned };
+}
+
+function sanitizePlanItems(items: readonly PlanItem[]): readonly PlanItem[] | undefined {
+  const cleaned: PlanItem[] = [];
+  const ids = new Set<string>();
+  for (const item of items) {
+    // The same echoability rule the model-facing protocol enforces on every
+    // identifier it parses (`domain/harnessProtocol.ts`'s `isEchoableIdentifier`):
+    // no control characters, no leading or trailing whitespace. That parser is
+    // the one real path a model-supplied id reaches this module through today,
+    // and it already rejects a control character or edge whitespace before a
+    // plan is ever created — but this module's own header promises nothing
+    // unsanitized can reach the log short of hand-constructing an event, and a
+    // checkpoint read from disk is exactly that other path (`harnessRunStore.ts`'s
+    // `parsePlanItem` only type-checks `id`, it does not echo-check it).
+    if (item.id.trim() === '' || ids.has(item.id) || !isEchoableIdentifier(item.id)) return undefined; // fail closed: empty, duplicate, or unechoable id
+    if (!isPlanItemState(item.state)) return undefined;
+    const description = sanitizePublicText(item.description);
+    if (description === undefined) return undefined;
+    if (item.memberId !== undefined && (item.memberId.trim() === '' || !isEchoableIdentifier(item.memberId))) return undefined; // fail closed: present-but-blank or unechoable member id
+    ids.add(item.id);
+    cleaned.push({ id: item.id, description, state: item.state, ...(item.memberId !== undefined ? { memberId: item.memberId } : {}) });
+  }
+  return cleaned;
+}
+
+/** `undefined` in, `{ok:true, value: undefined}` out; present-but-negative-or-non-finite fails the whole fact closed — mirrors `sanitizeFact`'s existing `coverageChanged` numeric checks. */
+function sanitizeOptionalNonNegativeFinite(raw: number | undefined): { ok: false } | { ok: true; value: number | undefined } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  return Number.isFinite(raw) && raw >= 0 ? { ok: true, value: raw } : { ok: false };
+}
+
+/**
+ * Validates the optional timing/size fields `toolCompleted`/`toolFailed` may carry
+ * (`ActivityCallMetadata`, `../domain/harnessActivity.ts`) — every one host-computed, never model
+ * text, so no `sanitizePublicText` pass is needed, but every numeric field still fails the whole
+ * fact closed if negative or non-finite (matching `coverageChanged`'s own rule), `memberId` fails
+ * closed if present-but-blank (matching `sanitizePlanItems`' own rule), and `resultState` is
+ * bounded to a short identifier token (matching `sanitizeLimitations`' own bound on `code`) since
+ * it is a `HostToolResult.state` value, never free text.
+ */
+function sanitizeCallMetadata(fact: ActivityCallMetadata): { ok: false } | { ok: true; value: ActivityCallMetadata } {
+  const durationMs = sanitizeOptionalNonNegativeFinite(fact.durationMs);
+  const bytesSent = sanitizeOptionalNonNegativeFinite(fact.bytesSent);
+  const bytesReceived = sanitizeOptionalNonNegativeFinite(fact.bytesReceived);
+  const retryWaitMs = sanitizeOptionalNonNegativeFinite(fact.retryWaitMs);
+  const retryCount = sanitizeOptionalNonNegativeFinite(fact.retryCount);
+  if (!durationMs.ok || !bytesSent.ok || !bytesReceived.ok || !retryWaitMs.ok || !retryCount.ok) return { ok: false };
+  if (fact.memberId !== undefined && (fact.memberId.trim() === '' || !isEchoableIdentifier(fact.memberId))) return { ok: false };
+  if (fact.resultState !== undefined && !/^[A-Za-z][A-Za-z0-9]*$/.test(fact.resultState)) return { ok: false };
+  return {
+    ok: true,
+    value: {
+      ...(durationMs.value !== undefined ? { durationMs: durationMs.value } : {}),
+      ...(fact.memberId !== undefined ? { memberId: fact.memberId } : {}),
+      ...(bytesSent.value !== undefined ? { bytesSent: bytesSent.value } : {}),
+      ...(bytesReceived.value !== undefined ? { bytesReceived: bytesReceived.value } : {}),
+      ...(fact.resultState !== undefined ? { resultState: fact.resultState } : {}),
+      ...(retryWaitMs.value !== undefined ? { retryWaitMs: retryWaitMs.value } : {}),
+      ...(retryCount.value !== undefined ? { retryCount: retryCount.value } : {}),
+    },
+  };
+}
+
+function sanitizeLimitations(limitations: readonly Limitation[]): readonly Limitation[] | undefined {
+  const cleaned: Limitation[] = [];
+  for (const limitation of limitations) {
+    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(limitation.code)) return undefined; // fail closed: a code is a short token, not free text
+    const message = sanitizePublicText(limitation.message);
+    if (message === undefined) return undefined;
+    // `candidateId` (task: banner aggregation) is model-supplied text, same trust level as
+    // `message` — put through the identical `sanitizePublicText` pass rather than assumed clean,
+    // and dropped (not fail-closed) when it fails: a limitation this module already accepted must
+    // not be discarded over an attribution field that only ever narrows how it renders, never what
+    // it says.
+    const candidateId = limitation.candidateId === undefined ? undefined : sanitizePublicText(limitation.candidateId);
+    cleaned.push({ code: limitation.code, message, ...(candidateId !== undefined ? { candidateId } : {}) });
+  }
+  return cleaned;
+}
+
+/**
+ * Fail-closed per-kind validation and sanitization: `undefined` means
+ * `appendActivityEvent` must refuse the fact and leave the log unchanged.
+ * `knownItemIds` is a thunk so the scan over every existing event only runs
+ * for the one fact kind that needs it.
+ */
+function sanitizeFact(fact: ActivityFact, knownItemIds: () => Set<string>): ActivityFact | undefined {
+  switch (fact.kind) {
+    case 'planCreated':
+    case 'planRevised': {
+      const items = sanitizePlanItems(fact.plan.items);
+      if (!items) return undefined;
+      if (fact.plan.rationale === undefined) return { ...fact, plan: { revision: fact.plan.revision, items } };
+      const rationale = sanitizePublicText(fact.plan.rationale);
+      if (rationale === undefined) return undefined;
+      return { ...fact, plan: { revision: fact.plan.revision, items, rationale } };
+    }
+    case 'planItemStateChanged':
+      // Fail closed: no plan in this log ever declared this identifier.
+      return knownItemIds().has(fact.itemId) ? fact : undefined;
+    case 'actionStarted': {
+      const action = sanitizePublicText(fact.action);
+      if (action === undefined) return undefined;
+      const target = sanitizeOptionalText(fact.target);
+      if (!target.ok) return undefined;
+      return target.value === undefined ? { ...fact, action } : { ...fact, action, target: target.value };
+    }
+    case 'toolCompleted': {
+      const tool = sanitizePublicText(fact.tool);
+      const summary = sanitizePublicText(fact.summary);
+      const target = sanitizeOptionalText(fact.target);
+      const metadata = sanitizeCallMetadata(fact);
+      if (tool === undefined || summary === undefined || !target.ok || !metadata.ok) return undefined;
+      return { ...fact, tool, summary, ...(target.value !== undefined ? { target: target.value } : {}), ...metadata.value };
+    }
+    case 'toolFailed': {
+      const tool = sanitizePublicText(fact.tool);
+      const reason = sanitizePublicText(fact.reason);
+      const target = sanitizeOptionalText(fact.target);
+      const metadata = sanitizeCallMetadata(fact);
+      if (tool === undefined || reason === undefined || !target.ok || !metadata.ok) return undefined;
+      return { ...fact, tool, reason, ...(target.value !== undefined ? { target: target.value } : {}), ...metadata.value };
+    }
+    case 'coverageChanged': {
+      const { classified, total, inspected, requiredInspected, requiredTotal } = fact.coverage;
+      const nonNegativeFinite = (n: number) => Number.isFinite(n) && n >= 0;
+      if (!nonNegativeFinite(classified) || !nonNegativeFinite(inspected)) return undefined;
+      if (total !== undefined && !nonNegativeFinite(total)) return undefined;
+      if (requiredInspected !== undefined && !nonNegativeFinite(requiredInspected)) return undefined;
+      if (requiredTotal !== undefined && !nonNegativeFinite(requiredTotal)) return undefined;
+      return fact;
+    }
+    case 'checkpoint': {
+      const checkpointId = sanitizePublicText(fact.checkpointId);
+      return checkpointId === undefined ? undefined : { ...fact, checkpointId };
+    }
+    case 'waiting':
+    case 'paused': {
+      const reason = sanitizePublicText(fact.reason);
+      return reason === undefined ? undefined : { ...fact, reason };
+    }
+    case 'resuming':
+    case 'cancelling':
+    case 'cancelled':
+      return fact;
+    case 'partialResult': {
+      const limitations = sanitizeLimitations(fact.limitations);
+      return limitations === undefined ? undefined : { ...fact, limitations };
+    }
+    case 'terminalResult': {
+      if (!isRunLifecycle(fact.lifecycle) || !isResultCompleteness(fact.completeness)) return undefined;
+      const limitations = sanitizeLimitations(fact.limitations);
+      return limitations === undefined ? undefined : { ...fact, limitations };
+    }
+    default: {
+      const exhaustive: never = fact;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * The base-field checks `validContext` and `mergeActivityEvents` both need: a real `RunPhase`, a
+ * finite non-negative `elapsedMs`, and an `occurredAt` `Date.parse` can actually read. Split out of
+ * `validContext` so `mergeActivityEvents` can run the identical per-event field validation
+ * `appendActivityEvent` always has, without also asserting monotonicity against `log`'s own last
+ * event — a batch is sorted and merged as a whole below, not appended one event at a time, so that
+ * comparison belongs to the merge's own ordering, not to whether one event's fields are well-formed.
+ */
+function validEventFields(phase: unknown, elapsedMs: unknown, occurredAt: unknown): boolean {
+  if (!isRunPhase(phase)) return false;
+  if (typeof elapsedMs !== 'number' || !Number.isFinite(elapsedMs) || elapsedMs < 0) return false;
+  if (typeof occurredAt !== 'string' || Number.isNaN(Date.parse(occurredAt))) return false;
+  return true;
+}
+
+/**
+ * A log's own `sequence` is always a positive integer (`nextSequence` starts at 1 and increments by
+ * 1); an incoming event claiming anything else — `NaN` included — cannot be a real member of this
+ * log's ordering. Exported so `harnessRunStore.ts`'s `parseActivityEvent` holds a persisted
+ * `sequence` to this exact test on the way back in, rather than keeping a second copy of it that
+ * could drift from the one the write side applies.
+ */
+export function validSequence(sequence: unknown): sequence is number {
+  return typeof sequence === 'number' && Number.isInteger(sequence) && sequence >= 1;
+}
+
+function validContext(log: ActivityLog, context: ActivityContext): boolean {
+  if (!validEventFields(context.phase, context.elapsedMs, context.occurredAt)) return false;
+  const last = log.events[log.events.length - 1];
+  if (!last) return true;
+  // Elapsed time and wall-clock time must not run backwards within one attempt.
+  if (context.elapsedMs < last.elapsedMs) return false;
+  if (Date.parse(context.occurredAt) < Date.parse(last.occurredAt)) return false;
+  return true;
+}
+
+/**
+ * The only sanctioned way to add an event. A fact that fails validation or
+ * sanitization, or a context that is malformed or moves time backwards,
+ * leaves the log byte-for-byte unchanged (fail closed) — it is never
+ * possible to observe a log that partially reflects a rejected fact.
+ */
+export function appendActivityEvent(log: ActivityLog, fact: ActivityFact, context: ActivityContext): ActivityLog {
+  if (!validContext(log, context)) return log;
+  const sanitized = sanitizeFact(fact, () => knownPlanItemIds(log.events));
+  if (!sanitized) return log;
+  // Base fields plus a validated fact of one kind together satisfy `ActivityEvent`; TS cannot
+  // verify that merge across a distributive Omit, hence the assertion.
+  const event = {
+    runId: log.runId,
+    lineageId: log.lineageId,
+    attempt: log.attempt,
+    sequence: nextSequence(log),
+    occurredAt: context.occurredAt,
+    phase: context.phase,
+    elapsedMs: context.elapsedMs,
+    ...sanitized,
+  } as ActivityEvent;
+  return { ...log, events: [...log.events, event] };
+}
+
+/**
+ * Reconciles an externally supplied batch of already-sequenced events
+ * (checkpoint rehydration, a transport that can redeliver or reorder) into
+ * this log. An event whose `runId`/`lineageId`/`attempt` does not match this
+ * log's own identity is dropped (fail closed — attempt boundaries are never
+ * crossed), as is one whose `sequence` this log already holds. Within one
+ * batch, a sequence may be claimed once: a second event carrying it is
+ * dropped when it is byte-identical to the first and rejects the WHOLE batch
+ * when it is not. The result is sorted by sequence; merging the same batch
+ * twice is a no-op.
+ *
+ * **The failure this closes.** `seen` was built once, from the events already
+ * stored, and the filter never added an accepted sequence back into it — so
+ * the "already present" rule only ever saw the log, never the batch being
+ * merged. Executed against this function before the fix:
+ *
+ *     input:  one batch, two events, both sequence 1
+ *     result: events after merge: 2, sequences: 1,1
+ *
+ * The doc comment above claimed both halves and only the second was true.
+ * After the first merge those sequences are stored, so re-merging the same
+ * batch really was a no-op; a duplicate *inside* one batch was accepted
+ * twice. A sequence is this log's ordering key and its identity for replay:
+ * two events sharing one means replayed activity can apply an event twice,
+ * and `nextSequence` (which reads the last event) can hand the same number
+ * out again.
+ *
+ * **Why identical duplicates are kept and differing ones are not.** The two
+ * causes are different bugs and deserve different answers. A transport that
+ * redelivers sends the same event twice — nothing is lost by keeping one, and
+ * rejecting the batch over it would throw away every legitimate event beside
+ * it. Two *different* events sharing a sequence cannot both be right: the
+ * sender assigned one number to two facts, which is a defect at the source,
+ * and silently keeping either one hides it behind a log that looks complete.
+ * Failing the whole batch closed is what `sanitizePlanItems` above already
+ * does for a duplicate plan-item id, and what `appendActivityEvent` does for
+ * any rejected fact: the log is left byte-for-byte unchanged rather than
+ * partially reflecting an input nobody can interpret. Sameness is decided by
+ * `canonicalStringify` (`./contentDigest`), the codebase's one structural
+ * comparison, so field order in the delivered object cannot make two copies
+ * of one event look like two events.
+ */
+export function mergeActivityEvents(log: ActivityLog, incoming: readonly ActivityEvent[]): ActivityLog {
+  const stored = new Set(log.events.map((event) => event.sequence));
+  const claimed = new Map<number, ActivityEvent>();
+  // Seeded from the stored log and grown as a `planCreated`/`planRevised`
+  // event is accepted below, so a batch that rehydrates a plan and a state
+  // change on it together validates the state change against the plan it
+  // arrived with, not only against what was already on disk.
+  const knownIds = knownPlanItemIds(log.events);
+  // Processed in sequence order, never raw arrival order: this function exists precisely for "a
+  // transport that can redeliver or reorder" (this function's own doc comment above), and
+  // `knownIds` is grown incrementally as a `planCreated`/`planRevised` event is accepted below — so
+  // a `planItemStateChanged` event that arrives earlier in the array than the `planCreated` it
+  // depends on must still be validated *after* that plan is known, not before. Sorting once here
+  // (stable, so same-sequence duplicates keep their relative arrival order for the "first wins,
+  // second must be identical" rule below) is the only change needed; nothing downstream assumes
+  // `incoming`'s own array order.
+  const orderedIncoming = [...incoming].sort((a, b) => a.sequence - b.sequence);
+  for (const event of orderedIncoming) {
+    if (event.runId !== log.runId || event.lineageId !== log.lineageId || event.attempt !== log.attempt) continue;
+    // The same fail-closed field validation `appendActivityEvent`'s own `validContext` applies to a
+    // caller-supplied context — a garbage `phase`, a negative/non-finite `elapsedMs`, an unparsable
+    // `occurredAt`, or a non-positive-integer `sequence` (`nextSequence` never produces anything
+    // else) is exactly as untrustworthy arriving through a redelivering/reordering transport as it
+    // would be from a caller, and this module's own header promises nothing unsanitized reaches the
+    // log either way. Checked before `sequence` is used as a `Set`/`Map` key below, so a `NaN` or
+    // fractional sequence can never be claimed or compared against `stored`.
+    if (!validEventFields(event.phase, event.elapsedMs, event.occurredAt) || !validSequence(event.sequence)) continue;
+    if (stored.has(event.sequence)) continue;
+    // Every incoming event's own fact fields are put through the same fail-closed sanitization
+    // `appendActivityEvent` applies to a caller-supplied fact — this module's own header promises
+    // nothing unsanitized reaches the log, and a transport that can redeliver or reorder is not a
+    // more trustworthy source than a caller. An event that does not sanitize cleanly is dropped
+    // rather than accepted verbatim; it is not the same failure as two different facts sharing a
+    // sequence, so it does not refuse the rest of the batch.
+    const { runId, lineageId, attempt, sequence, occurredAt, phase, elapsedMs, ...rawFact } = event;
+    const sanitized = sanitizeFact(rawFact as ActivityFact, () => knownIds);
+    if (!sanitized) continue;
+    const sanitizedEvent = { runId, lineageId, attempt, sequence, occurredAt, phase, elapsedMs, ...sanitized } as ActivityEvent;
+    if (sanitizedEvent.kind === 'planCreated' || sanitizedEvent.kind === 'planRevised') {
+      for (const item of sanitizedEvent.plan.items) knownIds.add(item.id);
+    }
+    const first = claimed.get(sequence);
+    if (first === undefined) {
+      claimed.set(sequence, sanitizedEvent);
+      continue;
+    }
+    // Fail closed: one sequence, two different facts. Nothing here can tell which the run actually
+    // produced, so the batch is refused whole rather than resolved by arrival order.
+    if (canonicalStringify(first) !== canonicalStringify(sanitizedEvent)) return log;
+  }
+  if (claimed.size === 0) return log;
+  const merged = [...log.events, ...claimed.values()].sort((a, b) => a.sequence - b.sequence);
+  return { ...log, events: merged };
+}

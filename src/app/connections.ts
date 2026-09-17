@@ -4,6 +4,7 @@ import { ScmError } from '../platform/errors';
 import type { Pod } from '../domain/types';
 import type { SecretStore } from './storage';
 import { readToken } from './storage';
+import { registerSecretValue } from './harnessActivitySanitizer';
 
 /**
  * Acquires a host-supplied session. Injected so the app layer stays free of
@@ -47,6 +48,16 @@ export function sessionAvailableFor(providerId: string, instanceUrl: string): bo
  * Build the credential for a pod from the modes its provider declares for that
  * host, best first. A session pod stores no secret, so a missing secret is only
  * an error when the mode that needs one is the mode in play.
+ *
+ * Both branches below hand the secret to `registerSecretValue`
+ * (`./harnessActivitySanitizer`) before returning it. This is the single point
+ * in the extension where a credential of either kind becomes a value the rest
+ * of the code can hold, which is what makes it the right place and the only
+ * place: the redactor's strongest layer is the one that knows the actual
+ * secret rather than guessing at the syntax around it, and that layer is only
+ * as complete as this call site is. Registering here — rather than in each
+ * provider, or beside each thing that logs — means a future channel that logs
+ * something nobody anticipated is covered without being told about it.
  */
 async function credentialForPod(pod: Pod, secrets: SecretStore): Promise<Credential> {
   const declared: readonly AuthMode[] = getProvider(pod.providerId).authModesFor(pod.instanceUrl);
@@ -58,12 +69,18 @@ async function credentialForPod(pod: Pod, secrets: SecretStore): Promise<Credent
     if (mode === 'none') return { kind: 'none' };
     if (mode === 'session' && acquireSession) {
       const accessToken = await acquireSession(pod.providerId, pod.instanceUrl);
-      if (accessToken !== undefined) return { kind: 'session', accessToken };
+      if (accessToken !== undefined) {
+        registerSecretValue(accessToken);
+        return { kind: 'session', accessToken };
+      }
       continue;
     }
     if (mode === 'token') {
       const token = await readToken(secrets, pod.providerId, pod.instanceUrl);
-      if (token !== undefined && token !== '') return { kind: 'token', token };
+      if (token !== undefined && token !== '') {
+        registerSecretValue(token);
+        return { kind: 'token', token };
+      }
       continue;
     }
   }

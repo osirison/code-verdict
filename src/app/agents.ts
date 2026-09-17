@@ -86,8 +86,43 @@ export const DEMO_AGENT_DESCRIPTOR: AgentDescriptor = {
   instructions: '',
 };
 
-/** Always offered, in this order, before anything discovered on disk. */
-export const BUILT_IN_AGENTS: readonly AgentDescriptor[] = [BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR];
+/**
+ * Why the demo agent may appear in a picker at all. It is a debugging tool
+ * that produces findings nobody asked a model for, so it is hidden unless one
+ * of these three says otherwise.
+ */
+export interface DemoAgentVisibility {
+  /** `codeVerdict.showDemoAgent` — the reviewer asked to see it. */
+  setting: boolean;
+  /**
+   * The agent ids the surface is about to claim as selected: what the pod has
+   * stored and what the panel currently holds. A picker that renders a
+   * selection missing from its own list, or that reports "the agent X was not
+   * found" about an agent this build simply chose not to list, describes
+   * something that is not so — so a selected demo agent is listed.
+   */
+  selectedAgentIds: readonly (string | undefined)[];
+  /**
+   * The pod is on the sample-data provider. Its change requests exist in no
+   * repository, it is what onboarding hands someone who has no token yet, and
+   * `renderRunReview` blocks the run button for any agent that needs a chat
+   * model when none is available. The demo agent is the only one that needs
+   * none, so hiding it there leaves that pod with no review it can run.
+   */
+  podReviewsSampleData: boolean;
+}
+
+/**
+ * The built-ins a picker offers, in this order, before anything discovered on
+ * disk. The default review is always among them; the demo agent is not — see
+ * `DemoAgentVisibility`.
+ */
+export function builtInAgents(visibility: DemoAgentVisibility): AgentDescriptor[] {
+  const showDemo = visibility.setting
+    || visibility.podReviewsSampleData
+    || visibility.selectedAgentIds.includes(DEMO_AGENT_ID);
+  return showDemo ? [BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR] : [BUILTIN_AGENT_DESCRIPTOR];
+}
 
 /** The demo agent produces findings without a model; every other agent needs one. */
 export function agentNeedsModel(agent: AgentDescriptor | undefined): boolean {

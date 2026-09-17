@@ -16,6 +16,7 @@ import type { ReviewHistory } from '../app/reviewHistory';
 import type { SecretStore } from '../app/storage';
 import { STALE_SNAPSHOT_MS } from '../app/notificationCenter';
 import { pollIntervalMs } from '../app/pollSchedule';
+import { NOTIFICATION_EVENTS } from '../domain/notifications';
 
 const world = vi.hoisted(() => ({
   polls: 0,
@@ -25,6 +26,7 @@ const world = vi.hoisted(() => ({
   failWith: undefined as unknown,
   focus: undefined as undefined | ((state: { focused: boolean }) => void),
   crs: [] as unknown[],
+  settings: {} as Record<string, unknown>,
 }));
 
 vi.mock('vscode', () => ({
@@ -44,7 +46,11 @@ vi.mock('vscode', () => ({
     showQuickPick: () => Promise.resolve(undefined),
   },
   workspace: {
-    getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback }),
+    // Empty by default, so every test that does not set a key sees exactly
+    // what the old fixed `(_key, fallback) => fallback` mock gave it.
+    getConfiguration: () => ({
+      get: (key: string, fallback: unknown) => (key in world.settings ? world.settings[key] : fallback),
+    }),
   },
   env: { openExternal: () => undefined },
   Uri: { parse: () => undefined },
@@ -159,6 +165,7 @@ describe('the poll that stands down', () => {
     world.failWith = undefined;
     world.focus = undefined;
     world.crs = [];
+    world.settings = {};
     clearProviders();
     registerProvider(PROVIDER);
   });
@@ -312,6 +319,7 @@ describe('the cadence has to stay inside the window the engine still diffs', () 
     world.failWith = undefined;
     world.focus = undefined;
     world.crs = [];
+    world.settings = {};
     clearProviders();
     registerProvider(PROVIDER);
   });
@@ -458,5 +466,153 @@ describe('the cadence has to stay inside the window the engine still diffs', () 
     world.focus?.({ focused: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(world.polls).toBe(2);
+  });
+});
+
+/**
+ * Task 14.7 (spec `review-run-activity`: "the notification distinguishes
+ * complete, partial, failed, and cancelled outcomes"). `reviewReady` and
+ * `runEnded` are local events — no poll involved — routed straight through
+ * the notification engine under its ordinary `agentFinished` policy
+ * (default `Interrupt`, delivered as a toast the mocked `vscode.window.
+ * showInformationMessage` records into `world.infos`).
+ */
+describe('terminal notifications distinguish complete, partial, failed, cancelled and interrupted (task 14.7)', () => {
+  beforeEach(() => {
+    world.infos = [];
+    world.warnings = [];
+    clearProviders();
+    registerProvider(PROVIDER);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+  });
+
+  it('says "ready" for a complete result', async () => {
+    const { notifier } = await notifierFor();
+    notifier.reviewReady({ ref: { repoId: 'acme/repo-0', number: '7' }, refLabel: '!7', itemCount: 3, podId: 'pod-1', completeness: 'complete' });
+    expect(world.infos).toEqual(['Review ready · 3 items on !7']);
+  });
+
+  it('never says "ready" for a partial result — a succeeded outcome can still be incomplete (D2)', async () => {
+    const { notifier } = await notifierFor();
+    notifier.reviewReady({ ref: { repoId: 'acme/repo-0', number: '7' }, refLabel: '!7', itemCount: 2, podId: 'pod-1', completeness: 'partial' });
+    expect(world.infos).toEqual(['Partial results · 2 items on !7']);
+    expect(world.infos[0]).not.toContain('ready');
+  });
+
+  it('reports a failed run, naming the findings kept as a partial when there were any', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'failed', completeness: 'partial', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1', findingCount: 2 });
+    expect(world.infos).toEqual(['Review failed · 2 findings kept as partial · !7']);
+  });
+
+  it('reports a failed run with nothing validated, naming no finding count', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'failed', completeness: 'none', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1' });
+    expect(world.infos).toEqual(['Review failed · !7']);
+  });
+
+  it('reports a cancelled run distinctly from a failed one, never as a timeout or a clean review', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runEnded({ lifecycle: 'cancelled', completeness: 'none', refLabel: '!7', ref: { repoId: 'acme/repo-0', number: '7' }, podId: 'pod-1' });
+    expect(world.infos).toEqual(['Review cancelled · !7']);
+  });
+
+  it('summarizes activation\'s interrupted sweep once, not one toast per target, and says nothing when nothing was interrupted', async () => {
+    const { notifier } = await notifierFor();
+    notifier.runsInterrupted(0);
+    expect(world.infos).toEqual([]);
+    notifier.runsInterrupted(3);
+    expect(world.infos).toEqual(['3 reviews interrupted by the restart']);
+  });
+});
+
+/**
+ * The read path for `codeVerdict.notifications.*` — what a malformed value in
+ * settings.json resolves to. Separate from the poll tests above because it
+ * never starts a notifier: `normalizeNotificationPrefs` is pure and
+ * `readNotificationPrefs` is one configuration read.
+ */
+describe('notification preference read path', () => {
+  beforeEach(() => {
+    world.settings = {};
+  });
+
+  it('resolves every event, quiet mode and the cadence to their declared defaults when nothing is configured', async () => {
+    const { readNotificationPrefs } = await import('./notifier.js');
+    expect(readNotificationPrefs()).toEqual({
+      modes: Object.fromEntries(NOTIFICATION_EVENTS.map((event) => [event.key, event.defaultMode])),
+      quietMode: false,
+      digestCadence: 'End of day',
+    });
+  });
+
+  it('passes a configured value through when it is one of the declared ones', async () => {
+    const { readNotificationPrefs } = await import('./notifier.js');
+    world.settings['notifications.events.agentFinished'] = 'Off';
+    world.settings['notifications.quietMode'] = true;
+    world.settings['notifications.digestCadence'] = 'Hourly';
+    const prefs = readNotificationPrefs();
+    expect(prefs.modes.agentFinished).toBe('Off');
+    expect(prefs.quietMode).toBe(true);
+    expect(prefs.digestCadence).toBe('Hourly');
+  });
+
+  // The sharp one. An unlisted mode used to reach `NotificationCenter.deliver`,
+  // whose `switch` has a case per declared mode and no `default` — so the
+  // notification fell off the end and was delivered nowhere. A typo therefore
+  // read as `Off`, the quietest possible mode, when the reviewer had been
+  // trying to configure the event at all. It must read as that event's own
+  // default instead, which for `agentFinished` is the loudest one.
+  it('reads an undeclared mode as that event\'s own default, never as the silent Off the old switch fell through to', async () => {
+    const { readNotificationPrefs, normalizeNotificationPrefs } = await import('./notifier.js');
+    world.settings['notifications.events.agentFinished'] = 'interrupt';
+    expect(readNotificationPrefs().modes.agentFinished).toBe('Interrupt');
+    for (const bad of ['Loud', '', 0, true, null, { mode: 'Off' }, ['Off']]) {
+      expect(normalizeNotificationPrefs({ modes: { pipelineFailed: bad } }).modes.pipelineFailed, String(bad))
+        .toBe('Digest');
+    }
+  });
+
+  // Quiet mode was used truthily by `routeNotification`, so any non-empty
+  // string switched quiet hours on and demoted every Interrupt to a badge —
+  // the opposite of the shipped default, from a value that is not a boolean at
+  // all. A falsy non-boolean has to land on the default too, not merely happen
+  // to look like it: `false` and "fell back to false" must not be the same
+  // code path by accident, which is why `'Off'` (truthy) is asserted here.
+  it('reads a non-boolean quiet mode as off rather than letting a truthy string demote every interrupt', async () => {
+    const { normalizeNotificationPrefs } = await import('./notifier.js');
+    for (const bad of ['true', 'Off', 1, 0, null, {}, []]) {
+      expect(normalizeNotificationPrefs({ quietMode: bad }, ).quietMode, String(bad)).toBe(false);
+    }
+  });
+
+  // `nextDigestFlush` already treats an unrecognized cadence as End of day, so
+  // the schedule was never wrong — the settings panel was: it marks its active
+  // chip with `===`, so an unlisted value showed no cadence selected while one
+  // was in force. Normalizing at the read is what makes the two agree.
+  it('reads an undeclared cadence as End of day, the same one the flush schedule already used', async () => {
+    const { normalizeNotificationPrefs } = await import('./notifier.js');
+    for (const bad of ['hourly', 'Weekly', 17, null, {}]) {
+      expect(normalizeNotificationPrefs({ digestCadence: bad }).digestCadence, String(bad)).toBe('End of day');
+    }
+  });
+
+  // Per-field fallback, not all-or-nothing: one bad key must not discard the
+  // six good ones beside it, and must not leave a partly-built prefs object.
+  it('falls back only the malformed field, leaving every well-formed neighbour configured', async () => {
+    const { readNotificationPrefs } = await import('./notifier.js');
+    world.settings['notifications.events.agentFinished'] = 'nonsense';
+    world.settings['notifications.events.mentioned'] = 'Interrupt';
+    world.settings['notifications.quietMode'] = 'yes';
+    world.settings['notifications.digestCadence'] = 'Hourly';
+    const prefs = readNotificationPrefs();
+    expect(prefs.modes.agentFinished).toBe('Interrupt');
+    expect(prefs.modes.mentioned).toBe('Interrupt');
+    expect(prefs.quietMode).toBe(false);
+    expect(prefs.digestCadence).toBe('Hourly');
   });
 });

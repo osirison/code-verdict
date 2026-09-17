@@ -50,8 +50,8 @@ describe('registerBuiltInProviders', () => {
       .testConnection();
 
     expect(status.ok).toBe(true);
-    expect(s.lines[0]).toMatch(/^\[\d+\] start GET https:\/\/gl\.example\.test\/api\/v4\/user$/);
-    expect(s.lines[1]).toMatch(/^\[\d+\] done in \d+ms: 200$/);
+    expect(s.lines[0]).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3} \[\d+\] start GET https:\/\/gl\.example\.test\/api\/v4\/user$/);
+    expect(s.lines[1]).toMatch(/^\d{2}:\d{2}:\d{2}\.\d{3} \[\d+\] done in \d+ms: 200$/);
     // The Authorization header carries the token on every one of these calls.
     for (const line of s.lines) expect(line).not.toContain(TOKEN);
   });

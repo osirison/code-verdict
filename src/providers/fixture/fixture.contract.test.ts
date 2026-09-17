@@ -9,6 +9,11 @@ describeProviderContract('fixture', {
     conn.simulate.staleAnchorKeys = new Set(['fails']);
     return conn;
   },
+  makeRateLimitedDetailConnection: () => {
+    const conn = new FixtureConnection();
+    conn.simulate.investigationRateLimited = true;
+    return conn;
+  },
   inputs: {
     repository: 'https://gitlab.com/hve/platform/core',
     group: 'group 4821',
