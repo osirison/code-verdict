@@ -11,6 +11,7 @@
  * hand-typed JSON — a hand-typed `runId` mismatch between a snapshot and its activity events is
  * exactly how an earlier fixture in this same change silently failed to parse.
  */
+import type { TraceableFetch as ApiTraceableFetch } from './app/apiTrace';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -44,6 +45,12 @@ const state = vi.hoisted(() => ({
   // always-write-to-disk behavior is verified against this, not against a stub that would let
   // `writeFile` vacuously "succeed" without anything to read back.
   fsFiles: new Map<string, string>(),
+  /** `codeVerdict.*` values this test put in settings.json; empty means "unset, use the caller's default". */
+  settings: {} as Record<string, unknown>,
+  /** Every `WorkspaceConfiguration.update` this activation attempted. */
+  settingsUpdates: [] as Array<{ key: string; value: unknown }>,
+  /** Makes every settings write throw — a read-only settings file, or a VS Code that refuses an undeclared key. */
+  settingsUpdateThrows: false,
 }));
 
 function disposable(): { dispose(): void } {
@@ -102,7 +109,21 @@ vi.mock('vscode', () => {
       tabGroups: { all: [], onDidChangeTabs: () => disposable() },
     },
     workspace: {
-      getConfiguration: () => ({ get: (_k: string, d: unknown) => d, update: async () => {}, has: () => false, inspect: () => undefined }),
+      getConfiguration: () => ({
+        // `state.settings` is empty by default, so a test that sets nothing
+        // sees exactly what the old fixed `(_k, d) => d` / `inspect: () => undefined`
+        // stub gave it. A key put there reads as a user-scope value, which is
+        // what the dead-settings migration inspects before it writes.
+        get: (k: string, d: unknown) => (k in state.settings ? state.settings[k] : d),
+        update: async (k: string, v: unknown) => {
+          state.settingsUpdates.push({ key: k, value: v });
+          if (state.settingsUpdateThrows) throw new Error('settings.json is read-only');
+          if (v === undefined) delete state.settings[k];
+          else state.settings[k] = v;
+        },
+        has: () => false,
+        inspect: (k: string) => (k in state.settings ? { globalValue: state.settings[k] } : undefined),
+      }),
       onDidChangeConfiguration: () => disposable(),
       workspaceFolders: undefined,
       onDidChangeWorkspaceFolders: () => disposable(),
@@ -335,6 +356,11 @@ function agentTraceChannel(): { name: string; lines: string[]; shown: boolean } 
   return chan;
 }
 
+/** Drains the microtasks a `void`-called activation task needs before its effects are observable. */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+
 async function invokeShowRunDiagnostics(): Promise<void> {
   const fn = state.handlers.get('codeVerdict.showRunDiagnostics');
   if (!fn) throw new Error('codeVerdict.showRunDiagnostics was never registered');
@@ -351,6 +377,9 @@ beforeEach(() => {
   state.quickPickImpl = async () => undefined;
   state.quickPickCalls = 0;
   state.fsFiles.clear();
+  state.settings = {};
+  state.settingsUpdates = [];
+  state.settingsUpdateThrows = false;
 });
 
 /** The one file `writeDiagnosticsReportToDisk` wrote for the invocation under test — throws if none did, since every invocation must write exactly one. */
@@ -743,5 +772,116 @@ describe('the object-cache eviction timer cannot take the extension context down
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * `codeVerdict.trace.api` switches the sink `apiTrace.ts` writes every request
+ * line to. It is off by default and turning it on logs full request and
+ * response bodies into an output channel VS Code captures into its own log
+ * directory, so what a malformed value resolves to is a disclosure question,
+ * not a cosmetic one.
+ */
+describe('codeVerdict.trace.api only turns tracing on for a real boolean true', () => {
+  /** One traced call through the same `apiTrace` module instance activation wired its sink into. */
+  async function traceOneCall(): Promise<void> {
+    const { tracedFetch } = await import('./app/apiTrace.js');
+    const inner: ApiTraceableFetch = async () => ({ ok: true, status: 200, headers: { get: () => null } });
+    await tracedFetch(inner)('https://example.test/api/v4/user', { method: 'GET' });
+  }
+
+  /**
+   * The most recent one. A test that activates twice gets two channels, and the
+   * sink `applyApiTraceSetting` installed last is the one pointing at the
+   * second — reading the first would report the earlier activation's setting.
+   */
+  function apiChannelLines(): string[] {
+    const chan = [...state.channels].reverse().find((c) => c.name === 'Verdict: API');
+    if (!chan) throw new Error('Verdict: API channel was never created');
+    return chan.lines;
+  }
+
+  it('writes request lines when the setting is exactly true, and none at all when it is unset', async () => {
+    await activateWith(memoryStore());
+    await traceOneCall();
+    expect(apiChannelLines()).toEqual([]);
+
+    state.settings['trace.api'] = true;
+    await activateWith(memoryStore());
+    await traceOneCall();
+    expect(apiChannelLines().join('\n')).toContain('https://example.test/api/v4/user');
+  });
+
+  // The guard this asserts. `get('trace.api', false)` applies its default to a
+  // missing key only, so every other value reached `setApiTraceSink` and was
+  // read truthily: `"true"`, `"yes"` or `1` in settings.json switched full
+  // request and response body logging on, from a value the reviewer never
+  // successfully set. Off is the shipped default and the only safe reading.
+  it('stays off for a truthy non-boolean, never logging a request on a value that merely coerces to true', async () => {
+    for (const bad of ['true', 'yes', 1, {}, []] as unknown[]) {
+      state.settings['trace.api'] = bad;
+      await activateWith(memoryStore());
+      await traceOneCall();
+      expect(apiChannelLines(), String(bad)).toEqual([]);
+      state.channels.length = 0;
+    }
+  });
+});
+
+/**
+ * The seven settings this version no longer declares are swept out of the
+ * user's configuration at activation (`ui/settingsMigration.ts`). Its own tests
+ * cover which keys and which scopes; these cover the one thing only activation
+ * can show — that the sweep runs, and that it cannot be what stops the
+ * extension starting.
+ */
+describe('activation removes the settings this version no longer declares', () => {
+  it('removes a dead key left in the user\'s settings and says so once, without touching a live setting beside it', async () => {
+    state.settings['severityFloor'] = 'minor';
+    state.settings['shareAcceptRejectRates'] = true;
+    state.settings['harness.maxModelTurnsPerAttempt'] = 64;
+
+    await activateWith(memoryStore());
+    await flushMicrotasks();
+
+    expect(state.settingsUpdates.map((u) => u.key).sort()).toEqual(['severityFloor', 'shareAcceptRejectRates']);
+    expect(state.settings['harness.maxModelTurnsPerAttempt']).toBe(64);
+    const told = state.messages.filter(([, text]) => text.includes('no longer has'));
+    expect(told).toHaveLength(1);
+    expect(told[0]?.[1]).toContain('codeVerdict.severityFloor');
+    expect(told[0]?.[1]).toContain('codeVerdict.shareAcceptRejectRates');
+  });
+
+  it('says nothing on an activation with no dead key to remove, and writes nothing', async () => {
+    await activateWith(memoryStore());
+    await flushMicrotasks();
+
+    expect(state.settingsUpdates).toEqual([]);
+    expect(state.messages.filter(([, text]) => text.includes('no longer has'))).toEqual([]);
+  });
+
+  // The rule the whole migration is built around: a settings cleanup must never
+  // be what stops the extension starting. A settings file the editor cannot
+  // write — and, inferred rather than confirmed because this suite mocks
+  // `vscode`, a VS Code that refuses `update()` on a key no longer in the
+  // manifest — must leave activation completed and its commands registered.
+  it('completes activation with every command registered even when every settings write throws', async () => {
+    state.settings['pods'] = [{ id: 'pod-1' }];
+    state.settingsUpdateThrows = true;
+
+    await expect(activateWith(memoryStore())).resolves.toBeUndefined();
+    await flushMicrotasks();
+
+    expect(state.handlers.has('codeVerdict.openDashboard')).toBe(true);
+    // The value stays put, which is the honest outcome of a refused write —
+    // never a report that it was removed.
+    expect(state.settings['pods']).toEqual([{ id: 'pod-1' }]);
+    expect(state.messages.filter(([, text]) => text.includes('no longer has'))).toEqual([]);
+    // And the refusal is not swallowed into silence: the per-write catch names
+    // the key and the scope in the same Agent Trace channel activation's
+    // build-identity banner writes to. Without that catch the rejection escapes
+    // `removeDeadSettings` and no line is written at all, which is the only
+    // observable difference between "skipped it and carried on" and "died".
+    expect(agentTraceChannel().lines.join('\n')).toContain('could not remove codeVerdict.pods from user settings');
   });
 });

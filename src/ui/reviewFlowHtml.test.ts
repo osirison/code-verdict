@@ -1599,6 +1599,32 @@ describe('the agent and model pickers (spec: review-agents)', () => {
     expect(html).not.toMatch(/id="run"[^>]*disabled/);
   });
 
+  /**
+   * The no-model remedy line used to name the demo agent unconditionally.
+   * Since `builtInAgents` put that agent behind `codeVerdict.showDemoAgent`,
+   * a reviewer on a real pod with no Copilot session reads "pick the demo
+   * agent" directly above a picker that lists no such row — the screen naming
+   * a way out that is not on it. Asserting the absence of the word "demo",
+   * not just the presence of replacement wording, is what makes this sharp.
+   */
+  it('does not offer the demo agent as the way out of having no model when the picker is not listing it', () => {
+    const html = run({ models: [], modelId: undefined, agents: [BUILTIN], agentId: BUILTIN.id });
+    expect(html).toContain('No model available');
+    expect(html).not.toContain('demo');
+    expect(html).toContain('sign in to Copilot — every agent offered here needs a model');
+  });
+
+  /**
+   * The other half: on the sample-data pod, and on a pod that already holds
+   * the demo agent, it *is* listed with the setting off — so the line keyed
+   * off the list, not off the setting, still names the real way out there.
+   */
+  it('still offers the demo agent as the way out of having no model when the picker is listing it', () => {
+    const html = run({ models: [], modelId: undefined, agents: [BUILTIN, DEMO], agentId: BUILTIN.id });
+    expect(html).toContain('No model available');
+    expect(html).toContain('sign in to Copilot, or pick the demo agent');
+  });
+
   it('renders thinking effort as a plain-text second segment with the Configure Model tooltip', () => {
     const html = run({ effort: 'xhigh' });
     const picker = html.slice(html.indexOf('<div class="model-picker-split">'), html.indexOf('<div class="crit-grid">'));

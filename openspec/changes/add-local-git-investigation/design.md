@@ -563,9 +563,9 @@ separate from "no common ancestor exists" (`mergeBaseNotFound`), and neither sub
 
 The host supplies an investigation source for the one pod whose change exists in no repository
 (11.10). That decision shipped keyed on the run's `demo` flag — and `demo` is set from the selected
-*agent*, not the pod (`ui/reviewFlow.ts`: `agentId === DEMO_AGENT_DESCRIPTOR.id`). The demo agent is
-in `BUILT_IN_AGENTS` and is offered on every pod, so choosing it on a real GitHub or GitLab change
-request handed the review the built-in sample dataset. The sample registry is keyed by head sha, so a
+*agent*, not the pod (`ui/reviewFlow.ts`: `agentId === DEMO_AGENT_DESCRIPTOR.id`). The demo agent was
+at that point in `BUILT_IN_AGENTS` and offered on every pod, so choosing it on a real GitHub or GitLab
+change request handed the review the built-in sample dataset. The sample registry is keyed by head sha, so a
 real head matched nothing: the manifest answered notFound, every read answered unavailable, and the
 run could not complete. It failed honestly rather than inventing findings, and it failed on a pod
 where the demo agent used to work.
@@ -575,6 +575,13 @@ any other agent, against the local object store: it is a `HarnessParticipant` th
 results, deriving its deterministic findings from the patch bytes a `readDiff` returns, so a real
 diff is exactly what it wants. The alternative — offering the demo agent only on a demo pod — was
 rejected because it removes a capability from reviewers to work around a wiring mistake.
+
+`add-demo-agent-visibility-setting` has since put the demo agent behind `codeVerdict.showDemoAgent`,
+default off, so it is no longer listed on every pod. That does not disturb this decision and is not
+the rejected alternative above: the capability is still there for any reviewer who turns the setting
+on, and a pod that already holds the demo agent keeps it listed either way. The source a run is
+handed is still keyed on the pod's provider and never on the selected agent, which is the whole of
+D11 — and that is what keeps the demo agent correct on a connected pod when someone does enable it.
 
 The same flag also gated whether the run got an object cache at all, one line below, which is the
 same bug: that is keyed on whether a source was supplied.

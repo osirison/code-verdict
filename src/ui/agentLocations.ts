@@ -22,6 +22,23 @@ function rootId(prefix: string, path: string): string {
   return `${prefix}-${path.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase()}`;
 }
 
+/**
+ * The configured locations, or none. `Array.isArray` rather than `?? []`,
+ * because `get` hands back whatever settings.json holds and the two non-array
+ * cases both fail badly: a bare string is iterable, so `"/srv/agents"` would
+ * enter the loop below as eleven one-character locations and produce eleven
+ * search roots; a number, boolean or object is not iterable at all, so
+ * `for…of` would throw `TypeError` out of `agentSearchRoots` into agent
+ * discovery and the settings panel's location scan — neither of which has a
+ * caller that can handle it. A malformed setting means no extra locations,
+ * which is the declared default; every workspace folder's own agent directory
+ * above is unaffected either way.
+ */
+function configuredLocations(): readonly unknown[] {
+  const value = vscode.workspace.getConfiguration('codeVerdict').get<unknown>('agentLocations');
+  return Array.isArray(value) ? value : [];
+}
+
 export function agentSearchRoots(): AgentSearchRoot[] {
   const folders = vscode.workspace.workspaceFolders ?? [];
   const roots: AgentSearchRoot[] = folders.map((folder) => ({
@@ -33,8 +50,7 @@ export function agentSearchRoots(): AgentSearchRoot[] {
     source: 'workspace',
   }));
 
-  const configured = vscode.workspace.getConfiguration('codeVerdict').get<string[]>('agentLocations') ?? [];
-  for (const entry of configured) {
+  for (const entry of configuredLocations()) {
     if (typeof entry !== 'string' || entry.trim() === '') continue;
     const uri = resolveLocation(entry.trim(), folders);
     if (!uri) continue;

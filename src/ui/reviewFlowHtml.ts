@@ -889,12 +889,20 @@ function modelPicker(s: FlowViewState, agent: AgentDescriptor | undefined): stri
     </div>`;
   }
   if (s.models.length === 0) {
+    // Only name the demo agent as a way out when it is in `s.agents` — since
+    // `builtInAgents` put it behind `codeVerdict.showDemoAgent`, a real pod
+    // with the setting off has no demo row to pick, and this line telling the
+    // reviewer to pick one would send them looking for something the picker
+    // beside it does not list. Keyed off the list rather than off the setting
+    // so it stays right for the sample-data pod and for a pod that already
+    // holds the demo agent, both of which are offered it regardless.
+    const demoOffered = s.agents.some((candidate) => candidate.source === 'demo');
     return `<div class="agent-select">
       <div class="picker-label">Model</div>
       <div class="model-picker-split effort-hidden">
         <button class="agent-row model-picker-name inert" id="model-inert" disabled>
           <span class="agent-name">No model available</span>
-          <span class="agent-origin">sign in to Copilot, or pick the demo agent</span>
+          <span class="agent-origin">${demoOffered ? 'sign in to Copilot, or pick the demo agent' : 'sign in to Copilot — every agent offered here needs a model'}</span>
         </button>
         ${effortSegment(true)}
       </div>

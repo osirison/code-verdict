@@ -60,6 +60,7 @@ import { AppSurface } from './ui/appSurface';
 import { changesetDetectionOptions } from './ui/changesetOptions';
 import { routeToActiveReviewCommand } from './ui/flowCommands';
 import { readPollIntervalSeconds, VerdictNotifier } from './ui/notifier';
+import { removeDeadSettings } from './ui/settingsMigration';
 import { readHarnessCoverageRules, readResolvedHarnessPolicy } from './ui/harnessPolicyOptions';
 import { objectCacheRoot } from './localgit/objectCache';
 import { createObjectCache, type ObjectCache } from './localgit/objectAcquisition';
@@ -213,6 +214,34 @@ async function writeBuildIdentityToAgentTrace(context: vscode.ExtensionContext, 
   }
 }
 
+/**
+ * Runs the dead-settings sweep with this file's two existing report surfaces: a
+ * single summary toast (the shape `notifier.runsInterrupted` already uses for
+ * the other thing activation does on its own) and a durable line in the same
+ * "Code Verdict: Agent Trace" channel the build-identity banner above writes
+ * to. Both stay silent when there was nothing to remove.
+ *
+ * Wrapped as a whole in addition to the per-write catches inside the migration:
+ * a settings cleanup must never be able to fail an activation, and that has to
+ * hold even for a failure the module itself did not anticipate.
+ */
+async function removeDeadSettingsAtActivation(now: () => number): Promise<void> {
+  try {
+    await removeDeadSettings({
+      notify: (message) => void vscode.window.showInformationMessage(`Verdict: ${message}`),
+      trace: (line) => {
+        try {
+          sharedAgentTraceSink().appendLine(`${formatTimeOfDay(now())} ${line}`);
+        } catch {
+          // Best-effort, like every other line this file writes into a shared channel.
+        }
+      },
+    });
+  } catch {
+    // Never break activation over settings housekeeping — see this function's own doc comment.
+  }
+}
+
 /** `codeVerdict.showRunDiagnostics`'s secondary notification for a not-found report — short, pointing at the channel for the real detail, never a replacement for it. */
 function hintForNotFound(reason: DiagnosticsNotFoundReason): string {
   switch (reason.kind) {
@@ -241,8 +270,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // on, so "Verdict: Show API trace" always has something to reveal — the
   // setting switches the sink, and with no sink the wrapper is inert.
   const apiTraceChannel = vscode.window.createOutputChannel('Verdict: API');
+  // `typeof`, not `get('trace.api', false)`: that default covers a missing key
+  // only, so any other value in settings.json reached `setApiTraceSink` and was
+  // read truthily. This switch turns on logging of full request and response
+  // bodies into a channel VS Code captures into its own log directory, so a
+  // malformed value must resolve to off — the shipped default — rather than to
+  // whatever it happens to coerce to.
   const apiTracingEnabled = (): boolean =>
-    vscode.workspace.getConfiguration('codeVerdict').get<boolean>('trace.api', false);
+    vscode.workspace.getConfiguration('codeVerdict').get<unknown>('trace.api') === true;
   // "Verdict: Show API trace" itself has no early return that skips `show(true)` — unlike run
   // diagnostics, this command was never silently producing nothing. But an empty channel with the
   // explanation living only in a notification the reviewer can miss is the same shape of confusion,
@@ -343,6 +378,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // `sharedAgentTraceSink()` is called here (rather than waiting for the first model call) so the
   // channel exists in the Output picker from activation, and this line is the first thing in it.
   void writeBuildIdentityToAgentTrace(context, traceNow);
+
+  // Seven settings this extension used to declare are gone from the manifest
+  // (`ui/settingsMigration.ts`), which turns every copy left in a user's
+  // settings.json into an unknown-setting warning on a key they were told was a
+  // setting. Swept here on every activation rather than once behind a stored
+  // flag: a stale key can arrive later in a workspace file opened for the first
+  // time, and inspecting before writing makes an already-clean configuration
+  // cost nothing and say nothing.
+  //
+  // Scheduled and swallowed, exactly like the build-identity line above and the
+  // cache eviction before it: this is housekeeping, and no part of it may be
+  // what stops the extension starting.
+  void removeDeadSettingsAtActivation(traceNow);
 
   // The session bridge: `connections.ts` stays vscode-free, so the editor's
   // account API is injected here. A provider that declares the 'session' mode
@@ -452,7 +500,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the built-in sample dataset. The sample registry is keyed by head sha, so
     // a real head missed every entry: the manifest answered notFound, every
     // read answered unavailable, and the run could not complete. The demo agent
-    // is offered everywhere and now runs everywhere, against whatever the pod's
+    // is now behind `codeVerdict.showDemoAgent` (`builtInAgents`) rather than on
+    // every pod, but wherever it is offered it runs against whatever the pod's
     // own source is — it produces findings from the diff bytes it reads through
     // the ordinary tool calls, so a real diff is exactly what it wants.
     investigationSource: ({ providerId }) => (providerId === SAMPLE_DATA_PROVIDER_ID ? createDemoInvestigationSource() : undefined),

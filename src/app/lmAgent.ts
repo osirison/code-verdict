@@ -447,7 +447,11 @@ export async function runHarnessModelTurn(
  * other output-channel line", and that is what `package.json`'s own description now says.
  */
 function rawPayloadTracingEnabled(): boolean {
-  return vscode.workspace.getConfiguration('codeVerdict').get<boolean>('trace.rawPayloads', false);
+  // `=== true`, not `get('trace.rawPayloads', false)`: the two-argument default
+  // applies to a missing key only, so anything else in settings.json was read
+  // truthily and a non-boolean switched unredacted prompt and response logging
+  // on. Off is the shipped default and the safe reading of a malformed value.
+  return vscode.workspace.getConfiguration('codeVerdict').get<unknown>('trace.rawPayloads') === true;
 }
 
 /**

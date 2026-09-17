@@ -118,7 +118,13 @@ vi.mock('vscode', () => ({
 
 vi.mock('./agentRefresh', () => ({
   loadAgentSelection: (...args: unknown[]) => world.loadAgentSelection(...args),
-  watchAgentSources: () => [],
+  // The callback is kept rather than dropped: it is the only way into
+  // `refreshAgents`, which is what a saved agent file, a changed Copilot model
+  // list or a toggled `codeVerdict.showDemoAgent` actually reaches.
+  watchAgentSources: (onChange: () => void) => {
+    world.agentSourcesChanged = onChange;
+    return [];
+  },
 }));
 
 vi.mock('../app/lmAgent', async (importOriginal) => {
@@ -157,6 +163,7 @@ const world = vi.hoisted(() => ({
   /** Every platform call, so triage actions can be asserted to make none. */
   calls: { changeRequests: 0, diffs: 0, workItems: 0, submits: 0 },
   changeRequests: [] as ReturnType<typeof changeRequest>[],
+  agentSourcesChanged: undefined as (() => void) | undefined,
   loadAgentSelection: vi.fn(),
   discoverModels: vi.fn(),
   findReferenceFile: vi.fn(),
@@ -414,6 +421,7 @@ beforeEach(() => {
   statusBarItems.length = 0;
   executeCommand.mockClear();
   world.changeRequests = [changeRequest(), changeRequest(REF_B, 'Change B')];
+  world.agentSourcesChanged = undefined;
   world.loadAgentSelection.mockReset().mockResolvedValue({
     agents: [BUILTIN_AGENT_DESCRIPTOR],
     models: [{ id: 'lm:acme/turbo', label: 'Turbo' }],
@@ -456,6 +464,40 @@ describe('ReviewFlowPanel.isOpen: codeVerdict.showRunDiagnostics\'s side-effect-
 
     handlers.dispose?.();
     expect(ReviewFlowPanel.isOpen()).toBe(false);
+  });
+});
+
+/**
+ * `loadAgentSelection` needs the pod now — it is what decides whether the demo
+ * agent is listed — and `pod()` throws once the last pod is deleted, which
+ * "Verdict: Delete pod" allows with this panel still open. The watch dispatches
+ * `refreshAgents` with `void`, so that throw is an unhandled rejection: nothing
+ * reports it to the reviewer and the pickers stop updating for the rest of the
+ * session. Asserted on the rejection itself, not on the call count, because the
+ * throw happens *before* `loadAgentSelection` is reached and the count is
+ * identical either way.
+ */
+describe('the agent-source watch outlives the last pod', () => {
+  it('re-reads nothing instead of rejecting when the pod is gone, because the watch callback is void-dispatched and nothing would catch the throw', async () => {
+    const rejections: unknown[] = [];
+    const record = (reason: unknown): void => { rejections.push(reason); };
+    process.on('unhandledRejection', record);
+    try {
+      const h = await harness();
+      await h.open();
+      const callsAtLoad = world.loadAgentSelection.mock.calls.length;
+      (h.deps.podStore as unknown as { activePod: unknown }).activePod = undefined;
+
+      world.agentSourcesChanged?.();
+      // Two macrotask turns: one for the rejected promise to settle, one for
+      // Node to decide nobody handled it and emit `unhandledRejection`.
+      for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(rejections.map(String)).toEqual([]);
+      expect(world.loadAgentSelection.mock.calls.length).toBe(callsAtLoad);
+    } finally {
+      process.off('unhandledRejection', record);
+    }
   });
 });
 

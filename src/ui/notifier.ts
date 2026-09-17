@@ -21,8 +21,11 @@ import { DEFAULT_POLL_INTERVAL_SECONDS, pollIntervalMs } from '../app/pollSchedu
 import type { ReviewHistory } from '../app/reviewHistory';
 import type { SecretStore } from '../app/storage';
 import {
+  DIGEST_CADENCES,
   NOTIFICATION_EVENTS,
+  NOTIFICATION_MODES,
   type DigestCadence,
+  type NotificationEventKey,
   type NotificationMode,
   type NotificationPrefs,
   type VerdictNotification,
@@ -92,18 +95,73 @@ export function readPollIntervalSeconds(): number {
     .get<number>('notifications.pollIntervalSeconds', DEFAULT_POLL_INTERVAL_SECONDS);
 }
 
+/**
+ * Pure, and the single place a raw `notifications.*` value becomes a
+ * `NotificationPrefs` — `normalizeHarnessPolicySettings`'s shape
+ * (`harnessPolicyOptions.ts`), for the same reason: `readNotificationPrefs`
+ * below reads, this decides, and nothing revalidates afterwards.
+ *
+ * Each field falls back to its own declared default, never to a neighbouring
+ * value and never to a silently different behaviour:
+ *
+ * - **Mode.** An unlisted string used to pass straight through
+ *   `routeNotification` and then fall off `NotificationCenter.deliver`'s
+ *   `switch`, which has no `default` branch — so `"interrupt"` (wrong case) or
+ *   any typo silently delivered nothing at all, i.e. behaved as `Off` rather
+ *   than as the event's default. That is the worst possible reading of a typo:
+ *   the reviewer configured an event louder and got it switched off.
+ * - **Quiet mode.** A non-boolean was used truthily, so any non-empty string
+ *   turned quiet hours on and demoted every Interrupt to a badge, though the
+ *   setting ships off.
+ * - **Cadence.** `nextDigestFlush` already falls through to the End-of-day
+ *   times for an unrecognized cadence, so the schedule was right — but the
+ *   settings panel picks its active chip with `===`, so an unlisted value
+ *   showed no cadence selected while one was in force. Normalizing here is
+ *   what makes the panel and the schedule describe the same setting.
+ */
+export function normalizeNotificationPrefs(raw: {
+  modes?: Partial<Record<NotificationEventKey, unknown>>;
+  quietMode?: unknown;
+  digestCadence?: unknown;
+}): NotificationPrefs {
+  return {
+    modes: Object.fromEntries(
+      NOTIFICATION_EVENTS.map((event) => {
+        const value = raw.modes?.[event.key];
+        return [event.key, isNotificationMode(value) ? value : event.defaultMode];
+      }),
+    ),
+    quietMode: typeof raw.quietMode === 'boolean' ? raw.quietMode : false,
+    digestCadence: isDigestCadence(raw.digestCadence) ? raw.digestCadence : 'End of day',
+  };
+}
+
+function isNotificationMode(value: unknown): value is NotificationMode {
+  return NOTIFICATION_MODES.includes(value as NotificationMode);
+}
+
+function isDigestCadence(value: unknown): value is DigestCadence {
+  return DIGEST_CADENCES.includes(value as DigestCadence);
+}
+
+/**
+ * The only reader for the notification preferences. The settings panel goes
+ * through it too rather than reading the same keys itself: the panel renders
+ * what is in force, and a second read path is how a panel comes to show a mode
+ * the notifier is not using.
+ */
 export function readNotificationPrefs(): NotificationPrefs {
   const config = vscode.workspace.getConfiguration('codeVerdict');
-  return {
+  return normalizeNotificationPrefs({
     modes: Object.fromEntries(
       NOTIFICATION_EVENTS.map((event) => [
         event.key,
-        config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
+        config.get<unknown>(`notifications.events.${event.key}`),
       ]),
     ),
-    quietMode: config.get<boolean>('notifications.quietMode', false),
-    digestCadence: config.get<DigestCadence>('notifications.digestCadence', 'End of day'),
-  };
+    quietMode: config.get<unknown>('notifications.quietMode'),
+    digestCadence: config.get<unknown>('notifications.digestCadence'),
+  });
 }
 
 export interface NotifierDeps {

@@ -10,7 +10,6 @@ const state: SettingsViewState = {
   hasToken: true,
   quietMode: false,
   digestCadence: 'End of day',
-  shareRates: false,
   context: {
     sectionBudget: 4_000,
     totalBudget: 12_000,
@@ -63,6 +62,14 @@ describe('settings fidelity (spec §11)', () => {
     expect(html).toContain('Rotate token');
     expect(html).toContain('••••••••');
     expect(html).toContain('The selected agent and model receive diff hunks, file paths, your review criteria, selected attachment contents and paths, and, when enabled, the merge request title, description, and linked issues.');
+    // The Data & privacy section keeps its disclosure paragraph and nothing
+    // else. It used to carry a "Share accept/reject rates with your team"
+    // toggle whose setting no code path read, so the control wrote a value
+    // nothing acted on while its own subnote said aggregate rates were being
+    // shared. Pinned by absence, because "the paragraph is still there" cannot
+    // tell a section with one control from a section with none.
+    expect(html).not.toContain('share-rates');
+    expect(html).not.toContain('setShareRates');
   });
 
   it('wires controls through typed CSP-safe messages', () => {

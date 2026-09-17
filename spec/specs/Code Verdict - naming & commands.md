@@ -73,14 +73,22 @@ Not in the palette — reached from a control, a keybinding, or a status-bar seg
 
 ## Settings namespace
 
-`codeVerdict.instanceUrl`, `codeVerdict.agent`, `codeVerdict.agentLocations`, `codeVerdict.severityFloor`,
-`codeVerdict.categories`, `codeVerdict.minConfidence`, `codeVerdict.extraInstructions`,
-`codeVerdict.autoAdvance`, `codeVerdict.context.sectionBudget`, `codeVerdict.context.totalBudget`,
+The full list, 45 keys, matching `package.json` `contributes.configuration`:
+
+`codeVerdict.instanceUrl`, `codeVerdict.agentLocations`, `codeVerdict.showDemoAgent`,
+`codeVerdict.autoAdvance`, `codeVerdict.agentVoice`, `codeVerdict.context.sectionBudget`,
+`codeVerdict.context.totalBudget`,
 `codeVerdict.context.maxLinkedItems`, `codeVerdict.context.includeTitle`,
 `codeVerdict.context.includeDescription`, `codeVerdict.context.includeLinkedItems`,
-`codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`, `codeVerdict.trace.api`,
-`codeVerdict.trace.rawPayloads`,
-`codeVerdict.pods`, `codeVerdict.agentRun.inactivitySeconds`,
+`codeVerdict.contextUsage.enabled`, `codeVerdict.notifications.quietMode`,
+`codeVerdict.notifications.events.agentFinished`, `codeVerdict.notifications.events.replyPosted`,
+`codeVerdict.notifications.events.authorPushed`, `codeVerdict.notifications.events.pipelineFailed`,
+`codeVerdict.notifications.events.reviewRequested`, `codeVerdict.notifications.events.mentioned`,
+`codeVerdict.notifications.events.threadStale`, `codeVerdict.notifications.digestCadence`,
+`codeVerdict.notifications.pollIntervalSeconds`,
+`codeVerdict.changesets.trailer`, `codeVerdict.changesets.branchDetection`,
+`codeVerdict.trace.api`, `codeVerdict.trace.rawPayloads`,
+`codeVerdict.agentRun.firstOutputSeconds`, `codeVerdict.agentRun.inactivitySeconds`,
 `codeVerdict.agentRun.ceilingSeconds`, `codeVerdict.agentRun.maxConcurrent`,
 `codeVerdict.harness.maxElapsedSecondsPerAttempt`, `codeVerdict.harness.maxModelTurnsPerAttempt`,
 `codeVerdict.harness.maxToolRequestsPerAttempt`, `codeVerdict.harness.maxPromptKilobytesPerTurn`,
@@ -89,22 +97,40 @@ Not in the palette — reached from a control, a keybinding, or a status-bar seg
 `codeVerdict.harness.transientRetriesPerOperation`, `codeVerdict.harness.checkpointCadenceToolCalls`,
 `codeVerdict.harness.retainedCheckpointsPerLineage`, `codeVerdict.harness.maxActivityEventsPerAttempt`,
 `codeVerdict.harness.terminalAttemptHistoryCount`, `codeVerdict.harness.terminalAttemptHistoryMaxAgeDays`,
-`codeVerdict.harness.requireInspectionMinRisk`.
+`codeVerdict.harness.requireInspectionMinRisk`,
+`codeVerdict.harness.scopeInvestigationToChangedFiles`.
 
-The three `agentRun` settings share one convention: `0` removes that limit. For the two windows
+Seven names that once appeared here are gone, having been declared and read by nothing:
+`codeVerdict.agent`, `codeVerdict.severityFloor`, `codeVerdict.categories`,
+`codeVerdict.minConfidence`, `codeVerdict.extraInstructions`, `codeVerdict.pods` and
+`codeVerdict.shareAcceptRejectRates`. The first five are per-pod state set on the Run review screen
+and in the agent picker; `pods` named a key that only ever lived in global storage. See
+[docs/SETTINGS.md](../../docs/SETTINGS.md) for where each control actually is and for the cleanup
+that removes them from a user's `settings.json`.
+
+The four `agentRun` settings share one convention: `0` removes that limit. For the three windows
 that means "never time out on this"; for `maxConcurrent` it means "run as many reviews at once as
 are triggered".
 
-Every `harness.*` setting bounds one review attempt: how long it may run, how many model turns and
+Most `harness.*` settings bound one review attempt: how long it may run, how many model turns and
 tool calls it may use, how much evidence it may hold, how much of that is held back for high-risk
 files and final verification, how many times a failed step retries, how often it checkpoints, and
-how much history is kept. A missing or unusable value falls back to its own documented default, never
-to zero. `requireInspectionMinRisk` is the one non-numeric setting — `low / medium / high` — and its
+how much history is kept. Two are not bounds. A missing or unusable value falls back to its own
+documented default, never to zero.
+
+`requireInspectionMinRisk` is the one enumerated setting — `low / medium / high` — and its
 default, `medium`, requires every changed file classified medium or high risk to actually be read, not
 just classified, before a review can complete. A file classified low can be skipped — but a host risk
 floor keeps real source code out of `low` regardless of what the reviewing model proposes, so only
 documentation, specification, and similar plain-text files are ever skipped at the default setting.
 Setting this to `low` requires every changed file, including those, to actually be read.
+
+`scopeInvestigationToChangedFiles` is the other non-numeric one, a boolean, and it bounds what the
+model may look at rather than how much of anything it may spend. Off by default; on, it withholds
+three things — reading an unchanged file, searching the repository, and looking up further
+`AGENTS.md` files deeper in the tree. Diff reads and diff searches stay available either way, and
+the root `AGENTS.md` and `CLAUDE.md` are read and sent whichever way it is set, because the host
+reads those itself before the review starts rather than through anything this withholds.
 
 `codeVerdict.trace.rawPayloads`, off by default, is a debugging escape hatch alongside
 `codeVerdict.trace.api`: switching it on writes the full prompt sent to the model and the full

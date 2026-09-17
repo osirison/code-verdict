@@ -1,7 +1,7 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
-import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR } from '../app/agents';
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources, type AgentSelectionState } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
@@ -85,6 +85,7 @@ import {
   pickContextAttachment,
 } from './contextAttachmentPicker';
 import { changesetDetectionOptions } from './changesetOptions';
+import { readAutoAdvance } from './reviewPanelOptions';
 import { flowCommandMessage, isTriageOnlyMessage } from './flowCommands';
 import type { AutoContextItemView, ContextUsageView, FlowMessage, FlowScreen, FlowViewState, TriageItemView } from './reviewFlowHtml';
 import { renderReviewFlowBody, renderReviewFlowHtml, renderReviewFlowLoadingHtml, reviewFlowCrumb } from './reviewFlowHtml';
@@ -182,7 +183,10 @@ export class ChangesetReviewPanel {
   private focusWatch?: vscode.Disposable;
   private changeset!: DetectedChangeset;
   private members: ChangesetAgentMember[] = [];
-  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  // The only agent this panel can name before discovery runs — same reason as
+  // `ReviewFlowPanel`: `builtInAgents` needs the pod and the settings, so the
+  // real list arrives with the first `applySelection`.
+  private agents: AgentDescriptor[] = [BUILTIN_AGENT_DESCRIPTOR];
   private agentId = BUILTIN_AGENT_DESCRIPTOR.id;
   private models: ModelDescriptor[] = [];
   private modelId?: string;
@@ -610,7 +614,7 @@ export class ChangesetReviewPanel {
             workspaceRootSourceUri: workspaceRootForProject(projectIdentifiers, workspaceRoots)?.sourceUri,
           };
         })),
-        loadAgentSelection(selectionFromPod(pod)),
+        loadAgentSelection(selectionFromPod(pod), pod),
       ]);
       this.members = members;
       await this.resolveInstructionReferences(pod.criteria.extraInstructions);
@@ -965,7 +969,7 @@ export class ChangesetReviewPanel {
           message.verdict,
           message.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item)),
         );
-        if (vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true)) {
+        if (readAutoAdvance()) {
           this.selectedId = nextUndecided(this.review, message.itemId)?.id ?? this.selectedId;
         }
         this.persist();
@@ -1313,7 +1317,14 @@ export class ChangesetReviewPanel {
 
   private async refreshAgents(): Promise<void> {
     if (this.disposed) return;
-    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    // Same guard, same reason as `ReviewFlowPanel.refreshAgents`: the last pod
+    // can be deleted while this panel stays open, `this.pod()` throws once it
+    // is, and the watch dispatches this with `void` — so the throw would be an
+    // unhandled rejection. No pod means nothing to re-decide about the demo
+    // agent's visibility, so the pickers stay as they are.
+    const pod = this.deps.podStore.activePod;
+    if (!pod) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId }, pod);
     if (this.disposed) return;
     this.applySelection(next);
     this.scheduleContextUsage();

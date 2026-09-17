@@ -139,11 +139,6 @@
           "default": "",
           "description": "Base URL of the platform instance this pod connects to. Empty uses the chosen provider's default host. The access token is never a setting — it lives in the VS Code secret store."
         },
-        "codeVerdict.agent": {
-          "type": "string",
-          "default": "",
-          "description": "Id of the review agent. Agents are *.agent.md files; the model that runs one is stored per pod, not here."
-        },
         "codeVerdict.agentLocations": {
           "type": "array",
           "items": {
@@ -152,54 +147,10 @@
           "default": [],
           "description": "Extra directories to search for *.agent.md agent definitions, absolute or workspace-relative. Searched in addition to each workspace folder's default agent folder, never instead of it."
         },
-        "codeVerdict.severityFloor": {
-          "type": "string",
-          "enum": [
-            "nit",
-            "minor",
-            "major",
-            "blocker"
-          ],
-          "default": "minor",
-          "description": "Report findings at or above this severity."
-        },
-        "codeVerdict.categories": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "enum": [
-              "security",
-              "concurrency",
-              "errorHandling",
-              "performance",
-              "craftsmanship",
-              "apiContract",
-              "tests",
-              "docs",
-              "style"
-            ]
-          },
-          "default": [
-            "security",
-            "concurrency",
-            "errorHandling",
-            "performance",
-            "craftsmanship",
-            "tests"
-          ],
-          "description": "Review categories the agent looks for."
-        },
-        "codeVerdict.minConfidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 100,
-          "default": 70,
-          "description": "Minimum agent confidence for a finding to be reported."
-        },
-        "codeVerdict.extraInstructions": {
-          "type": "string",
-          "default": "",
-          "description": "Free-text instructions appended to every review request."
+        "codeVerdict.showDemoAgent": {
+          "type": "boolean",
+          "default": false,
+          "description": "DEBUGGING ONLY — leave this off otherwise. Offers the \"Verdict · Demo Review\" agent in the agent picker. That agent calls no model: it makes up deterministic findings from the diff text, so it is useful for exercising the review, triage and submit screens without spending a Copilot request, and useless as a review. Two cases show it whether this is on or off, because hiding it there would misreport or break something: a pod that already has it selected still shows it rather than being silently switched to another agent, and the sample-data demo pod still offers it because it is the only agent that can review anything there without a chat model."
         },
         "codeVerdict.autoAdvance": {
           "type": "boolean",
@@ -471,11 +422,6 @@
           "default": 60,
           "description": "Shortest gap between background checks for updates, in seconds. This is a floor, not the interval: one check costs several requests per watched repository plus one per review awaiting replies, so the effective gap grows with the size of the pod to keep background polling inside the platform's hourly request budget."
         },
-        "codeVerdict.shareAcceptRejectRates": {
-          "type": "boolean",
-          "default": false,
-          "description": "Share aggregate accept/reject rates while keeping finding text and rationale local."
-        },
         "codeVerdict.changesets.trailer": {
           "type": "string",
           "default": "Part-of:",
@@ -495,11 +441,6 @@
           "type": "boolean",
           "default": false,
           "description": "DEBUGGING ONLY — leave this off otherwise. Writes the full, unredacted prompt sent to the model and the full, unredacted text it replies with to the \"Code Verdict: Agent Trace\" output channel, and to nowhere else this extension writes. Nothing raw reaches anything Code Verdict persists — not the activity log, checkpoints, retained review details, the run diagnostics report, or the agent-trace.log file this extension writes itself — whether this is on or off. It is not a promise that nothing reaches a disk: VS Code captures the contents of every output channel into its own log directory, so while this is on, the prompts and replies shown in that channel are in VS Code's logs too."
-        },
-        "codeVerdict.pods": {
-          "type": "array",
-          "default": [],
-          "description": "Pods (named sets of watched repositories). Managed by the extension; edit through the UI."
         }
       }
     },

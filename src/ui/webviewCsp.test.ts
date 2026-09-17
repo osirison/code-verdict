@@ -142,7 +142,6 @@ const settingsState = {
   hasToken: true,
   quietMode: false,
   digestCadence: 'End of day',
-  shareRates: false,
   notifications: [],
   agentLocations: [],
 } as unknown as settingsHtml.SettingsViewState;

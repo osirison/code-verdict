@@ -81,10 +81,18 @@ export class OnboardingPanel {
     // it only prefills the default provider — the single-provider case it was
     // written for. Picking GitHub must not inherit a GitLab URL someone set
     // before this build, which would route the API at <gitlab host>/api/v3.
-    const configured = vscode.workspace.getConfiguration('codeVerdict').get<string>('instanceUrl');
+    // `typeof`, not the `!== undefined` this used to check: the empty-string
+    // test told it apart from an unset key, but a number, an object or an array
+    // passed both tests and became `this.instanceUrl`, which is typed `string`
+    // and reaches `escapeHtml(state.instanceUrl)` in `onboardingHtml.ts`. That
+    // threw `TypeError: text.replace is not a function` out of the render, so
+    // the whole setup screen failed to open — not a wrong value in the field, a
+    // panel that never drew. A non-string is a malformed setting, so it
+    // prefills the provider's default host instead.
+    const configured = vscode.workspace.getConfiguration('codeVerdict').get<unknown>('instanceUrl');
     const provider = getProvider(this.providerId);
     this.instanceUrl =
-      configured !== undefined && configured !== '' && this.providerId === defaultProviderId()
+      typeof configured === 'string' && configured !== '' && this.providerId === defaultProviderId()
         ? configured
         : provider.host.defaultInstanceUrl;
     route.onLeave(() => {

@@ -1129,6 +1129,33 @@ describe('agent trace, exercised through runHarnessModelTurn (issue #35)', () =>
     expect(sink.lines.join('\n')).not.toContain(MARKER);
   });
 
+  // The setting is `"type": "boolean"` in the manifest, but nothing enforces that: `get` hands
+  // back whatever settings.json holds, and the two-argument `get(key, false)` this used to call
+  // applies its default to a missing key only. Every other value was therefore read truthily, so
+  // `"true"`, `"yes"` or `1` switched full unredacted prompt and response logging on — into a
+  // channel VS Code captures into its own log directory — from a value the reviewer never
+  // successfully turned on. Off is the shipped default and the only safe reading of a malformed
+  // value, so this asserts the markers stay out of the sink for each of them.
+  it('codeVerdict.trace.rawPayloads set to a truthy non-boolean stays off, never logging the raw prompt on a value that only coerces to true', async () => {
+    for (const bad of ['true', 'yes', 1, {}, []] as unknown[]) {
+      getConfiguration.mockReturnValue({ get: (key: string, fallback: unknown) => (key === 'trace.rawPayloads' ? bad : fallback) });
+      try {
+        const { runHarnessModelTurn } = await import('./lmAgent.js');
+        const MARKER = 'MARKER_RAW_DEBUG_NONBOOL_5c7d2e';
+        sendRequest.mockImplementation(async (_messages: unknown, _options: unknown, token: FakeToken) =>
+          fragmentStream(token, [{ delayMs: 10, text: `response ${MARKER}` }]),
+        );
+        const sink = fakeSink();
+        const promise = runHarnessModelTurn('lm:acme/turbo', `prompt ${MARKER}`, { trace: sink });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await promise;
+        expect(sink.lines.join('\n'), String(bad)).not.toContain(MARKER);
+      } finally {
+        getConfiguration.mockReturnValue({ get: (_key: string, fallback: unknown) => fallback });
+      }
+    }
+  });
+
   it('codeVerdict.trace.rawPayloads on: the full prompt and response text reach the trace sink, and only the trace sink', async () => {
     getConfiguration.mockReturnValue({ get: (key: string, fallback: unknown) => (key === 'trace.rawPayloads' ? true : fallback) });
     try {

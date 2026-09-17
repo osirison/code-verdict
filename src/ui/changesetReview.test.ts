@@ -23,6 +23,7 @@ const world = vi.hoisted(() => ({
   calls: { changeRequests: 0, workItems: 0, ciRuns: 0, diffs: 0 },
   crs: [] as ChangeRequest[],
   submissions: [] as Array<{ ref: ChangeRequestRef; submission: ReviewSubmission }>,
+  agentSourcesChanged: undefined as (() => void) | undefined,
 }));
 
 /** The one `AppSurface` panel, with every full `webview.html` assignment logged. */
@@ -113,7 +114,13 @@ vi.mock('./agentRefresh', () => ({
       modelId: 'lm:acme/turbo',
       selectionNotices: [],
     }),
-  watchAgentSources: () => [],
+  // Kept rather than dropped: the callback is the only way into
+  // `refreshAgents`, which is what a saved agent file, a changed model list or
+  // a toggled `codeVerdict.showDemoAgent` reaches while the panel is open.
+  watchAgentSources: (onChange: () => void) => {
+    world.agentSourcesChanged = onChange;
+    return [];
+  },
 }));
 
 const CHANGESET_ID = 'manual:tenant1';
@@ -295,7 +302,7 @@ async function openPanel(seed: ChangesetDraft = retainedChangesetRecord(), runs:
     CHANGESET_ID,
   );
   await flush();
-  return { workspaceState };
+  return { workspaceState, podStore: podStore as unknown as { activePod: Pod | undefined } };
 }
 
 function lastPosted(): { type: string; regions: Record<string, string> } {
@@ -317,6 +324,36 @@ beforeEach(async () => {
   panel.state.htmlLog.length = 0;
   panel.state.messageHandler = undefined;
   panel.webview.postMessage.mockClear();
+  world.agentSourcesChanged = undefined;
+});
+
+/**
+ * The twin of `reviewFlow.test.ts`'s "the agent-source watch outlives the last
+ * pod". `loadAgentSelection` needs the pod now — it is what decides whether the
+ * demo agent is listed — and `pod()` throws once the last pod is deleted, which
+ * "Verdict: Delete pod" allows with this panel still open. The watch dispatches
+ * `refreshAgents` with `void`, so that throw is an unhandled rejection nobody
+ * reports and the pickers stop updating for the rest of the session.
+ */
+describe('the agent-source watch outlives the last pod', () => {
+  it('re-reads nothing instead of rejecting when the pod is gone, because the watch callback is void-dispatched and nothing would catch the throw', async () => {
+    const rejections: unknown[] = [];
+    const record = (reason: unknown): void => { rejections.push(reason); };
+    process.on('unhandledRejection', record);
+    try {
+      const opened = await openPanel();
+      opened.podStore.activePod = undefined;
+
+      world.agentSourcesChanged?.();
+      // Two macrotask turns: one for the rejected promise to settle, one for
+      // Node to decide nobody handled it and emit `unhandledRejection`.
+      for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(rejections.map(String)).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', record);
+    }
+  });
 });
 
 describe('ChangesetReviewPanel.isOpen: codeVerdict.showRunDiagnostics\'s side-effect-free "is a panel open" count', () => {

@@ -63,7 +63,6 @@ export interface SettingsViewState {
   hasToken: boolean;
   quietMode: boolean;
   digestCadence: DigestCadence;
-  shareRates: boolean;
   context: ContextSettingsView;
   harness: HarnessSettingsView;
   notifications: NotificationSettingView[];
@@ -105,7 +104,6 @@ export type SettingsMessage =
   | { type: 'setNotification'; key: string; mode: NotificationMode }
   | { type: 'setQuietMode'; value: boolean }
   | { type: 'setDigestCadence'; value: DigestCadence }
-  | { type: 'setShareRates'; value: boolean }
   | {
     type: 'setContextBudget';
     key: 'sectionBudget' | 'totalBudget' | 'maxLinkedItems';
@@ -364,16 +362,22 @@ function harnessRegion(state: SettingsViewState): string {
     </section>`;
 }
 
+/**
+ * The disclosure paragraph alone. It carried a "Share accept/reject rates with your team" toggle
+ * until `codeVerdict.shareAcceptRejectRates` was removed: nothing ever read that setting, so the
+ * toggle wrote a value no code path acted on while its own subnote told the reviewer aggregate
+ * rates were being shared. A control that does nothing is worse than no control, so the toggle went
+ * with the setting rather than being left switched off — and this region still has the paragraph,
+ * which is the part that was always true.
+ */
 function privacyRegion(state: SettingsViewState): string {
   const e = escapeHtml;
   return `<section class="section"><div class="label">Data &amp; privacy</div>
       <p class="note">The selected agent and model receive diff hunks, file paths, your review criteria, selected attachment contents and paths, and, when enabled, the ${e(state.vocabulary.changeRequestNoun)} title, description, and linked ${e(state.vocabulary.workItemNounPlural)}. Nothing reaches ${e(state.vocabulary.platformName)} until you press Submit — rejected findings and their rationale never leave this machine.</p>
-      <button class="toggle" id="share-rates" data-checked="${state.shareRates}"><span class="box">${state.shareRates ? '☑' : '☐'}</span><span>Share accept/reject rates with your team</span></button>
-      <span class="subnote">${state.shareRates ? 'Aggregate rates are shared; finding text and rejection rationale stay local.' : 'Rates remain local to this VS Code profile.'}</span>
     </section>`;
 }
 
-/** Derived from notifications/quietMode/digestCadence/shareRates — every case that changes one of those patches this region alongside its own. */
+/** Derived from notifications/quietMode/digestCadence — every case that changes one of those patches this region alongside its own. */
 function jsonPreviewRegion(state: SettingsViewState): string {
   const preview = JSON.stringify({
     'codeVerdict.notifications': Object.fromEntries(state.notifications.map((setting) => [setting.key, setting.mode])),
@@ -400,7 +404,6 @@ function jsonPreviewRegion(state: SettingsViewState): string {
     'codeVerdict.harness.terminalAttemptHistoryCount': state.harness.terminalAttemptHistoryCount,
     'codeVerdict.harness.terminalAttemptHistoryMaxAgeDays': state.harness.terminalAttemptHistoryMaxAgeDays,
     'codeVerdict.harness.requireInspectionMinRisk': state.harness.requireInspectionMinRisk,
-    'codeVerdict.shareAcceptRejectRates': state.shareRates,
   }, null, 2);
   return `<section class="section"><div class="settings-head"><span class="label">settings.json</span><button class="link" id="open-json">Open in editor</button></div>
       <pre>${escapeHtml(preview)}</pre><span class="hint">Every control above writes here. The access token is not a setting — it lives in the VS Code secret store.</span>
@@ -439,11 +442,11 @@ export function renderSettingsRegions(state: SettingsViewState): Record<Settings
  * markup needs no re-binding at all — every control below matches on
  * `closest()` instead of binding to the element the initial render produced.
  *
- * The quiet-hours and share-rates toggles read their current state off the
- * button's own `data-checked` attribute rather than a module-level variable:
- * the host repaints this region after every change, so the attribute is
- * always current and there is nothing left for a client-side variable to
- * cache (and no way for it to desync from a patch it did not cause).
+ * The quiet-hours toggle reads its current state off the button's own
+ * `data-checked` attribute rather than a module-level variable: the host
+ * repaints this region after every change, so the attribute is always current
+ * and there is nothing left for a client-side variable to cache (and no way
+ * for it to desync from a patch it did not cause).
  */
 const SCRIPT = `
   const vscode = window.verdictVscode;
@@ -475,10 +478,6 @@ const SCRIPT = `
   document.addEventListener('click', (ev) => {
     const button = ev.target.closest('[data-context-toggle]');
     if (button) post({ type: 'setContextToggle', key: button.dataset.contextToggle, value: button.dataset.enabled !== 'true' });
-  });
-  document.addEventListener('click', (ev) => {
-    const el = ev.target.closest('#share-rates');
-    if (el) post({ type: 'setShareRates', value: el.dataset.checked !== 'true' });
   });
   document.addEventListener('change', (ev) => {
     const input = ev.target.closest('[data-harness-number]');

@@ -10,7 +10,7 @@ import { COMMANDS } from '../commands';
 import { toScmError } from '../platform/errors';
 import { connectionForPod } from '../app/connections';
 import type { AgentDescriptor, ModelDescriptor } from '../app/agents';
-import { BUILTIN_AGENT_DESCRIPTOR, BUILT_IN_AGENTS, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
+import { BUILTIN_AGENT_DESCRIPTOR, DEMO_AGENT_DESCRIPTOR } from '../app/agents';
 import { type SkippedDefinition } from '../app/agentDefinitions';
 import { loadAgentSelection, watchAgentSources } from './agentRefresh';
 import { preferredModelFor, selectionFromPod } from '../app/podSelection';
@@ -101,6 +101,7 @@ import {
   pickContextAttachment,
 } from './contextAttachmentPicker';
 import { changesetTrailer } from './changesetOptions';
+import { readAutoAdvance } from './reviewPanelOptions';
 import { escapeHtml } from './theme';
 import { renderMarkdown } from './markdown';
 import { InDiffEditor, locateInWorkspace } from './inDiffEditor';
@@ -231,7 +232,10 @@ export class ReviewFlowPanel {
   /** Collapsed until asked for: the findings are what the triage screen is for. */
   private contextOpen = false;
   private readonly contextBudgets: ContextBudgets = readContextBudgets();
-  private agents: AgentDescriptor[] = [...BUILT_IN_AGENTS];
+  // The only agent this panel can name before discovery runs. Which of the
+  // built-ins are offered is `builtInAgents`'s call and needs the pod and the
+  // settings, so the real list arrives with the first `applySelection`.
+  private agents: AgentDescriptor[] = [BUILTIN_AGENT_DESCRIPTOR];
   private agentId: string = BUILTIN_AGENT_DESCRIPTOR.id;
   private agentOpen = false;
   private models: ModelDescriptor[] = [];
@@ -641,7 +645,7 @@ export class ReviewFlowPanel {
       // open" message with a second, unrelated one.
       const crsPromise = connection.listOpenChangeRequests([ref.repoId]);
       const diffPromise = connection.getChangeRequestDiff(ref);
-      const selectionPromise = loadAgentSelection(selectionFromPod(pod));
+      const selectionPromise = loadAgentSelection(selectionFromPod(pod), pod);
       // The work items resolve whatever the description links. A review that
       // cannot start because that list 404'd is worse than one running on the
       // description alone, so this one degrades to [] instead of rejecting —
@@ -1351,8 +1355,7 @@ export class ReviewFlowPanel {
         const item = this.review.items.find((i) => i.id === m.itemId);
         const applyFix = m.applyFix && Boolean(item?.suggestion) && Boolean(item && isReviewItemAnchored(item));
         this.review = setVerdict(this.review, m.itemId, m.verdict, applyFix);
-        const auto = vscode.workspace.getConfiguration('codeVerdict').get<boolean>('autoAdvance', true);
-        if (auto) {
+        if (readAutoAdvance()) {
           this.selectedId = nextUndecided(this.review, m.itemId)?.id ?? this.selectedId;
         }
         this.persistDraft();
@@ -1890,7 +1893,15 @@ export class ReviewFlowPanel {
 
   private async refreshAgents(): Promise<void> {
     if (this.disposed) return;
-    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId });
+    // `this.pod()` throws when the last pod was deleted, and this panel is not
+    // disposed when that happens — the watches keep firing into a
+    // `void`-dispatched call, where a throw is an unhandled rejection nobody
+    // catches. `loadAgentSelection` only needs the pod to decide the demo
+    // agent's visibility, so with no pod there is nothing to re-decide and
+    // leaving the pickers exactly as they are is the honest answer.
+    const pod = this.deps.podStore.activePod;
+    if (!pod) return;
+    const next = await loadAgentSelection({ agentId: this.agentId, modelId: this.modelId }, pod);
     if (this.disposed) return;
     this.applySelection(next);
     this.scheduleContextUsage();

@@ -1299,7 +1299,7 @@ describe('a pinned revision that could not be obtained, on a new attempt in an e
  * **The live failure this group was rewritten for.** That line used to read
  * `demo ? sample : undefined`, and `demo` is the *run's* flag, which
  * `ui/reviewFlow.ts` sets from `agentId === DEMO_AGENT_DESCRIPTOR.id` — the
- * selected agent, not the pod. The demo agent is in `BUILT_IN_AGENTS` and is
+ * selected agent, not the pod. The demo agent was in `BUILT_IN_AGENTS` and was
  * offered on every pod. So choosing it on a real GitHub or GitLab change
  * request handed the review the built-in sample dataset: the sample registry is
  * keyed by head sha, a real head matched nothing, the manifest answered

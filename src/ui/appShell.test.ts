@@ -65,7 +65,6 @@ const settingsState: SettingsViewState = {
   hasToken: true,
   quietMode: false,
   digestCadence: 'End of day',
-  shareRates: false,
   notifications: [{ key: 'reviewReplies', label: 'Replies to your reviews', hint: 'Author replied', mode: 'Badge' }],
   agentLocations: [],
 };

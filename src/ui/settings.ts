@@ -4,7 +4,7 @@ import { connectionForPod } from '../app/connections';
 import type { PodStore } from '../app/pods';
 import { readToken, type SecretStore } from '../app/storage';
 import { COMMANDS } from '../commands';
-import { NOTIFICATION_EVENTS, type NotificationMode } from '../domain/notifications';
+import { NOTIFICATION_EVENTS } from '../domain/notifications';
 import { discoverAgents } from '../app/agentDefinitions';
 import { agentSearchRoots } from './agentLocations';
 import {
@@ -32,6 +32,7 @@ import {
   readHarnessPolicy,
   readRequireInspectionMinRisk,
 } from './harnessPolicyOptions';
+import { readNotificationPrefs } from './notifier';
 
 const CONTEXT_BUDGET_KEYS = {
   sectionBudget: 'context.sectionBudget',
@@ -151,19 +152,22 @@ export class SettingsPanel {
   }
 
   private buildState(pod: { providerId: string; instanceUrl: string }): SettingsViewState {
-    const config = vscode.workspace.getConfiguration('codeVerdict');
     const vocabulary = getProvider(pod.providerId).vocabulary;
     const contextBudgets = readContextBudgets();
     const contextSources = readContextSourceDefaults();
+    // The notifier's own reader, not a second read of the same three keys:
+    // this panel shows what is in force, and `normalizeNotificationPrefs`
+    // is what decides that. Reading the keys here as well is how a panel
+    // comes to render a mode or a cadence the notifier is not using.
+    const prefs = readNotificationPrefs();
     return {
       vocabulary,
       instanceUrl: pod.instanceUrl,
       connectionStatus: this.connectionStatus,
       connected: this.connected,
       hasToken: this.hasToken,
-      quietMode: config.get<boolean>('notifications.quietMode', false),
-      digestCadence: config.get<SettingsViewState['digestCadence']>('notifications.digestCadence', 'End of day'),
-      shareRates: config.get<boolean>('shareAcceptRejectRates', false),
+      quietMode: prefs.quietMode,
+      digestCadence: prefs.digestCadence,
       context: {
         ...contextBudgets,
         ...contextSources,
@@ -181,7 +185,7 @@ export class SettingsPanel {
         // Capitalized: it opens the label, and every other row is sentence-cased.
         label: event.label.replace(/\bCI run\b/, cap(vocabulary.ciNoun)),
         hint: event.hint.replace(/\bCI run\b/, vocabulary.ciNoun),
-        mode: config.get<NotificationMode>(`notifications.events.${event.key}`, event.defaultMode),
+        mode: prefs.modes[event.key] ?? event.defaultMode,
       })),
     };
   }
@@ -300,10 +304,6 @@ export class SettingsPanel {
         this.paint(['set-harness', 'set-json']);
         return;
       }
-      case 'setShareRates':
-        await config.update('shareAcceptRejectRates', message.value, vscode.ConfigurationTarget.Global);
-        this.paint(['set-privacy', 'set-json']);
-        return;
       case 'openSettingsJson':
         await vscode.commands.executeCommand('workbench.action.openSettingsJson');
         return;
