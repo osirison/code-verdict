@@ -266,7 +266,7 @@ describe('cursor provenance (task 9.8 item 2)', () => {
     expect(wrongScope).toMatchObject({ state: 'refused', code: 'forgedCursor' });
   });
 
-  it('a bootstrap-pre-issued cursor is accepted by a fresh dispatcher instance on the matching reopen call (task 9.6 handover gap 1)', async () => {
+  it('a bootstrap-pre-issued cursor is accepted by a fresh dispatcher instance on the matching reopen call, and the reopen actually succeeds rather than merely dodging forgedCursor — the member\'s changeRequestNumber check (finding-15) refuses this same path as revisionMismatch when the number is mis-scoped, so excluding only forgedCursor would not catch that regression (task 9.6 handover gap 1)', async () => {
     const detail: NormalizedDetail = { title: 'T', labels: [], commits: [], discussion: [], checkSummaries: [], relationships: [], unavailableSections: [] };
     const detailResult: ChangeRequestDetailResult = { snapshot: SNAPSHOT, state: 'complete', value: detail };
     const connection = fakeConnection({ getChangeRequestDetails: async () => detailResult });
@@ -279,7 +279,12 @@ describe('cursor provenance (task 9.8 item 2)', () => {
       elapsedMs: 0,
       request: { number: '42', section: 'discussion', cursor: 'bootstrap-cursor-1' },
     });
-    expect(result).not.toMatchObject({ state: 'refused', code: 'forgedCursor' });
+    // Positive success assertion, not `not.toMatchObject({ state: 'refused', code: 'forgedCursor' })`:
+    // that excluded only one of the two refusal codes reachable on this exact path (`forgedCursor` and,
+    // since finding-15, `revisionMismatch` when the member's changeRequestNumber and the request's
+    // `number` diverge) and would keep passing if a future mis-scoping of the number check broke this
+    // reopen via the other code.
+    expect(result).toMatchObject({ state: 'complete' });
   });
 });
 

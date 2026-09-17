@@ -36,7 +36,10 @@
  * model or host — can name a repository or a commit, so the `revisionMismatch`
  * step no longer compares a copy of the pin against the member's; see
  * `snapshotOf` for the three live incidents that removed the copy, and
- * `validate` for the one thing `revisionMismatch` still answers.
+ * `validate` for the two things `revisionMismatch` still answers. The
+ * change-request `number` is the one target identifier a request still names
+ * for itself — `snapshot` does not identify which change request — so that one
+ * is held against the member's own `changeRequestNumber` there.
  *
  * **Cursor provenance** is host state with no prior module (D6's tools are
  * the first thing that hands the model an opaque continuation token). The
@@ -65,6 +68,7 @@
 import { canonicalStringify, sha256Hex } from './contentDigest';
 import type { AgentCancellationToken } from './lmAgent';
 import type { AgentsPolicyChain, AgentsPolicyLevel, AgentsPolicyResolver } from './harnessAgentsPolicy';
+import { POLICY_FILE_NAMES } from '../domain/reviewRunSnapshot';
 import { sanitizeErrorReason } from './harnessActivitySanitizer';
 import type { BudgetTracker, ReservationPurpose } from './harnessBudgets';
 import {
@@ -225,6 +229,12 @@ export interface ResolvePolicyLevelEcho {
   /** Present only for `state: 'present'`, and only the ledger's own identifiers — never the resolver's internal `agents-policy:...` id (D8: only a ledger-minted id is ever citable/lookupable). */
   readonly sourceId?: string;
   readonly digest?: string;
+  /**
+   * Why this level is less than it looks. For `unavailable`, why nothing could be read. For
+   * `present`, set only when one of the two files was read and the other could not be — the level
+   * is genuinely present, and a model told only "present" would take a half-read policy for a whole
+   * one. Sanitized either way: the text can be a source's own error message.
+   */
   readonly reason?: string;
 }
 
@@ -516,6 +526,10 @@ function cursorScopeFields(request: HostToolRequest): Record<string, unknown> {
     case 'searchDiff':
       return { query: request.request.query, pathScope: request.request.pathScope };
     case 'getChangeRequestDetails':
+      // No `number` here, deliberately: `validate` pins it to the member's own `changeRequestNumber`
+      // before this runs, so every cursor for this member is already a cursor for one number. Adding
+      // it to the scope instead would mean adding it to `preIssuedCursors`' synthetic request below
+      // as well, or bootstrap's pre-registered reopen cursors would start refusing as `forgedCursor`.
       return { section: request.request.section };
     case 'getIssueDetails':
       return { issueRepoId: request.request.issueRepoId, issueNumber: request.request.issueNumber, section: request.request.section };
@@ -839,18 +853,40 @@ export function createHostToolDispatcher(options: HostToolDispatcherOptions): Ho
       // comparison is gone: `snapshotOf` supplies the pin from the member, so a request cannot
       // disagree with it (the history, and the 87-of-319 run that ended it, are recorded there).
       //
-      // The code stays, with exactly one live source: a `revision` on `readFile` or
-      // `searchRepository` that is not `base` or `head`. That is a choice between two named
-      // values, not a transcription, and it stays the model's to make. The model's own path
-      // cannot reach here with a bad one — `harnessProtocol.ts` rejects anything but
-      // base/head/old/new first, as a parse failure — so this fires for a caller that is not the
-      // protocol parser. `HostToolRequest` is exported and the dispatcher is a public seam;
-      // `harnessToolDispatcher.test.ts` exercises this arm with `revision: 'sideways' as never`,
-      // which is precisely a host caller that got the type wrong at runtime. Typed callers cannot
-      // trip it, which is the point: it is the one thing left that a wrong revision could be.
+      // The code stays, with two live sources, both about what a request names for itself rather
+      // than about a copied pin.
+      //
+      // First: a `revision` on `readFile` or `searchRepository` that is not `base` or `head`. That
+      // is a choice between two named values, not a transcription, and it stays the model's to
+      // make. The model's own path cannot reach here with a bad one — `harnessProtocol.ts` rejects
+      // anything but base/head/old/new first, as a parse failure — so this fires for a caller that
+      // is not the protocol parser. `HostToolRequest` is exported and the dispatcher is a public
+      // seam; `harnessToolDispatcher.test.ts` exercises this arm with `revision: 'sideways' as
+      // never`, which is precisely a host caller that got the type wrong at runtime. Typed callers
+      // cannot trip it, which is the point: it is the one thing left that a wrong revision could
+      // be. Second: `getChangeRequestDetails`'s `number`, immediately below.
       const revision = pinnedRevisionOf(request);
       if (revision !== undefined && !isPinnedRevision(revision)) {
         return { ok: false, result: refused(request, 'revisionMismatch', `"${String(revision)}" is not a valid pinned revision.`) };
+      }
+
+      // The second live source, and the only identifier a request still names for itself. `number`
+      // is repo-scoped (`ChangeRequestDetailRequest.number`: "snapshot alone does not identify
+      // which change request"), so `snapshotOf`'s three values do not constrain it, and
+      // `handleGetChangeRequestDetails` forwards the model's value to the provider verbatim —
+      // a member pinned to #42 could otherwise fetch #999's discussion and have it registered in
+      // the ledger under m1, citable, with nothing recording which change request it came from.
+      // Refused rather than silently overridden with the member's own number, because the tool
+      // catalog tells the model exactly what to send here ("the change-request number given for
+      // that member above"), so a different value is a mistake it can act on. This sits ahead of
+      // the cursor check on purpose: replaying a #42 cursor under #999 is refused for the number
+      // it lied about, not as a `forgedCursor`. Correction first in the message, per the refusal
+      // wording lesson recorded on `snapshotOf`.
+      if (request.tool === 'getChangeRequestDetails' && member.changeRequestNumber !== undefined && request.request.number !== member.changeRequestNumber) {
+        return {
+          ok: false,
+          result: refused(request, 'revisionMismatch', `Member ${member.memberId}'s change request is ${member.changeRequestNumber}; this request named ${String(request.request.number)}.`),
+        };
       }
     }
 
@@ -1242,7 +1278,19 @@ export function createHostToolDispatcher(options: HostToolDispatcherOptions): Ho
         resolvedPolicyLevels.set(cacheKey, source);
         freshBytes += source.byteLength;
       }
-      levels.push({ directory: level.directory, state: 'present', sourceId: source.sourceId, digest: source.digest });
+      // The same disclosure the bootstrap prompt's `## Repository policy` line makes for the root
+      // level (`harnessModelSeam.ts`), applied to every level this tool echoes: a level whose
+      // companion file could not be read is `present` and incomplete at once, and `state` alone
+      // cannot say the second half.
+      levels.push({
+        directory: level.directory,
+        state: 'present',
+        sourceId: source.sourceId,
+        digest: source.digest,
+        ...(level.companionUnavailable !== undefined
+          ? { reason: `${POLICY_FILE_NAMES[level.companionUnavailable.file]} could not be read: ${sanitizedReason(level.companionUnavailable.reason)}` }
+          : {}),
+      });
     }
     return { result: contentResult(request, 'complete', { tool: 'resolvePolicy', levels }, levels.length), evidenceBytes: freshBytes };
   }

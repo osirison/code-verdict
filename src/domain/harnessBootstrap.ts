@@ -215,6 +215,13 @@ export const HOST_TOOL_CATALOG: readonly BootstrapToolSchema[] = HOST_TOOL_DEFIN
  * when `text` existed but had to be dropped to fit the model's input limit, the latter when
  * `present` is `false` because the host could not determine presence at all — as opposed to a
  * confirmed absence, which carries neither field.
+ *
+ * `companionUnavailable` is the third: `present` is `true`, one of the two files was read, and the
+ * other could not be. Without it the render names the file that contributed and says nothing about
+ * the one that did not, which reads identically to a companion the host confirmed does not exist —
+ * so a model told "root AGENTS.md present" would have no way to know a `CLAUDE.md` full of rules
+ * went unread. Its `reason` can be a source's own `error.message`, so the render neutralizes it the
+ * way it neutralizes every other unframed untrusted value.
  */
 export interface BootstrapPolicySource {
   readonly present: boolean;
@@ -225,6 +232,7 @@ export interface BootstrapPolicySource {
   readonly identical?: boolean;
   readonly textOmittedReason?: string;
   readonly unavailableReason?: string;
+  readonly companionUnavailable?: { readonly file: PolicyFileKind; readonly reason: string };
 }
 
 /**

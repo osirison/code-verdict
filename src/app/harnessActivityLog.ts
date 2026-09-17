@@ -258,8 +258,14 @@ function validEventFields(phase: unknown, elapsedMs: unknown, occurredAt: unknow
   return true;
 }
 
-/** A log's own `sequence` is always a positive integer (`nextSequence` starts at 1 and increments by 1); an incoming event claiming anything else — `NaN` included — cannot be a real member of this log's ordering. */
-function validSequence(sequence: unknown): sequence is number {
+/**
+ * A log's own `sequence` is always a positive integer (`nextSequence` starts at 1 and increments by
+ * 1); an incoming event claiming anything else — `NaN` included — cannot be a real member of this
+ * log's ordering. Exported so `harnessRunStore.ts`'s `parseActivityEvent` holds a persisted
+ * `sequence` to this exact test on the way back in, rather than keeping a second copy of it that
+ * could drift from the one the write side applies.
+ */
+export function validSequence(sequence: unknown): sequence is number {
   return typeof sequence === 'number' && Number.isInteger(sequence) && sequence >= 1;
 }
 

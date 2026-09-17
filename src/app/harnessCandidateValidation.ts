@@ -143,6 +143,29 @@ function boundedString(value: unknown, required: boolean): string | undefined {
   return value.length > MAX_TEXT_FIELD_LENGTH ? value.slice(0, MAX_TEXT_FIELD_LENGTH) : value;
 }
 
+/**
+ * The two rules every optional free-text field in this parser obeys, in one place so they cannot
+ * drift apart per field (`body`, `code`, `rule`, `reference` each had their own spelling, and only
+ * `code` carried the second rule).
+ *
+ * 1. A literal `null` normalizes to absent *before* the value is parsed — the model-facing protocol
+ *    documents optional fields as "omitted or sent as null; both mean absent", the same rule
+ *    `endLine` follows above, so a null must never be handed to the parser and then judged
+ *    "present but wrong".
+ * 2. Present but not a string is a protocol violation, reported as a `schema` reason rather than
+ *    coerced away. `harnessProtocol.ts`'s D5 rule 1 requires a wrong-typed field be rejected,
+ *    "never a best-effort coercion"; the one exemption it grants this parser is for *oversized*
+ *    fields (truncate at `MAX_TEXT_FIELD_LENGTH`), not wrong-typed ones. Silently returning
+ *    `undefined` here made a `body: 42` an accepted finding with an empty body and nothing on the
+ *    thread to repair.
+ */
+function optionalText(value: unknown, field: string, reasons: ValidationReason[]): string | undefined {
+  const present = value === null ? undefined : value;
+  const parsed = boundedString(present, false);
+  if (present !== undefined && parsed === undefined) reasons.push({ code: 'schema', message: `${field} must be a string when present.` });
+  return parsed;
+}
+
 /** Fail-closed schema parse of a model-supplied candidate. Returns the reasons instead of a candidate when anything is off. */
 export function parseCandidateFinding(raw: unknown): { candidate: CandidateFinding } | { reasons: ValidationReason[] } {
   const reasons: ValidationReason[] = [];
@@ -172,15 +195,13 @@ export function parseCandidateFinding(raw: unknown): { candidate: CandidateFindi
   }
   const title = boundedString(raw.title, true);
   if (!title) reasons.push({ code: 'schema', message: 'title is required.' });
-  const body = boundedString(raw.body, false) ?? '';
-  // Same "omitted or null both mean absent" rule as endLine above, audited across every optional
-  // field in this parser: a literal null must normalize to undefined *before* the field is parsed
-  // or type-checked, never be handed to the parser and then judged "present but wrong".
-  const rawCode = raw.code === null ? undefined : raw.code;
-  const code = boundedString(rawCode, false);
-  if (rawCode !== undefined && code === undefined) reasons.push({ code: 'schema', message: 'code must be a string when present.' });
-  const rule = boundedString(raw.rule === null ? undefined : raw.rule, false);
-  const reference = boundedString(raw.reference === null ? undefined : raw.reference, false);
+  // `optionalText` carries both optional-field rules for all four of these (null means absent;
+  // present-but-not-a-string is a reported schema violation, never a silent coercion). `body` is
+  // the only one with a non-undefined absence: an omitted body is a legitimate empty body.
+  const body = optionalText(raw.body, 'body', reasons) ?? '';
+  const code = optionalText(raw.code, 'code', reasons);
+  const rule = optionalText(raw.rule, 'rule', reasons);
+  const reference = optionalText(raw.reference, 'reference', reasons);
   const rawSuggestion = raw.suggestion === null ? undefined : raw.suggestion;
   let suggestion: { old: string; new: string } | undefined;
   if (rawSuggestion !== undefined) {

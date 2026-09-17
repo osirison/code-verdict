@@ -478,9 +478,11 @@ describe('resume import (D8 / task 7.9 resume evidence reuse)', () => {
  * is on the record rather than inferred afterwards from whatever source is
  * selected now.
  *
- * The distinction is not academic. A changeset member served by a local object
- * store and one served by its provider sit in the same ledger; a run whose
- * preferred source was unavailable for one member uses the other for it; and a
+ * The distinction is not academic, and it is not per run. Within one member the
+ * five pinned operations and `AGENTS.md` come from its investigation source
+ * while change-request and issue detail still come from the provider, which no
+ * object store can answer; a record stored before this field existed reads as
+ * provider-served, because the provider was the only source there was; and a
  * resumed attempt imports records a different attempt fetched. In all three,
  * "which source produced this" has a per-record answer and no per-run one.
  */

@@ -37,7 +37,11 @@
  * exactly the case `unavailable` exists for, since policy text is
  * authoritative instruction and a silently truncated read would hand the
  * model a policy framed as complete that might be missing the clause that
- * mattered). `ReviewRunAgentsPolicySource` (task 2.2)
+ * mattered). A `present` level whose *companion* file was the unreadable one
+ * stays `present` — one policy really was read — and carries
+ * `companionUnavailable` saying which file was not and why, so a half-checked
+ * level never renders identically to a fully checked one.
+ * `ReviewRunAgentsPolicySource` (task 2.2)
  * only has two top-level states, so `rootAgentsPolicySourceFor` folds
  * `unavailable` into `present: false` for the snapshot — but, unlike before,
  * it now also carries `unavailableReason` on that fold so an honest
@@ -93,6 +97,15 @@ export type AgentsPolicyLevel =
       readonly files: readonly PolicyFileKind[];
       /** Present only when `files` names both — whether their content was byte-identical (deduplicated) or differed (both included). */
       readonly identical?: boolean;
+      /**
+       * Present only when one file contributed and the *other* came back `unavailable`: which
+       * companion the host could not confirm either way, and why. Absent when both files were
+       * actually checked — one present and the other genuinely `absent` carries nothing here, which
+       * is what keeps "the companion does not exist" distinguishable from "the companion was never
+       * read". `file` is host data, not parsed out of `reason`: a failed read's reason is the
+       * source's own `error.message` and may name no file at all.
+       */
+      readonly companionUnavailable?: { readonly file: PolicyFileKind; readonly reason: string };
     }
   | { readonly directory: string; readonly state: 'absent' }
   | { readonly directory: string; readonly state: 'unavailable'; readonly reason: string };
@@ -159,9 +172,14 @@ async function fetchFile(
   // exists to prevent: policy content is authoritative instruction (D7, file header above), so a
   // partial file silently digested as "present" would hand the model a policy framed as complete that
   // might omit the clause that mattered. Treated as `unavailable` instead — not a confirmed absence,
-  // and not confirmed content either — so the honest "could not be checked" line and the
-  // `rootPolicyUnavailable` limitation (`harnessRuntime.ts`) both fire exactly as they do for any other
-  // read this resolver could not fully trust.
+  // and not confirmed content either. What that makes of the *level* is `combineLevel`'s call, not
+  // this function's: if the companion file is not present either, the level itself folds to
+  // `unavailable` and `harnessRuntime.ts`'s `rootPolicyUnavailable` limitation fires the same honest
+  // "could not be checked" line as any other fully-unreadable root. If the companion *is* present,
+  // the level stays `present` — a policy really was read, just not this file — carrying
+  // `companionUnavailable` naming this file instead, and `harnessRuntime.ts` pushes the distinct
+  // `rootPolicyCompanionUnavailable` limitation: some rules reached the model and an unknown number
+  // from this file did not, which is a different fact from none reaching it at all.
   if (result.state === 'paginated' || result.state === 'truncated') {
     return {
       ...file,
@@ -178,15 +196,25 @@ async function fetchFile(
 /**
  * Combines one directory's two independent file outcomes into the single three-valued level the
  * rest of the harness reasons about. Any file present makes the level `present` — a level with one
- * readable file and one unreadable companion is still `present`, on the theory that "a policy was
- * found and applied" is the fact that matters operationally; it does not, on its own, push the
- * `harnessRuntime.ts` `selectionLimitations` entry that a level with *nothing* readable does (see
- * that call site's own doc comment) — the reviewer can already see, from the render naming exactly
- * which file(s) contributed, that the other file's status was never confirmed either way. Both
- * files absent is the only way to reach `absent`: a genuine "neither file exists here" fact the host
- * actually checked, not an assumption. Anything else — one or both unavailable, none present — folds
- * to `unavailable`, because "no policy" cannot be asserted when a check that could have found one
- * never completed.
+ * readable file and one unreadable companion is still `present`, because "a policy was found and
+ * applied" is the fact that matters operationally.
+ *
+ * That mixed level carries `companionUnavailable`, and it has to. The claim this comment used to
+ * make — that the reviewer can see the companion's status from the render naming which file(s)
+ * contributed — was false: one file present with the other *absent* and one file present with the
+ * other *never read* both render as `files: ['agentsMd']`, byte for byte, so the rules in an
+ * unreadable `CLAUDE.md` were dropped with nothing said. The honest-absent requirement is not
+ * scoped to levels with nothing readable ("a level the host could not fully check … is reported
+ * distinguishably as unavailable, with the reviewer told the principles were not read"), and a
+ * half-checked level is a level the host could not fully check. The three-valued `state` has no
+ * room for it — the level really is `present` — so the disclosure rides alongside the state
+ * instead, and `harnessRuntime.ts` pushes its own limitation for it, distinct from the one a level
+ * with nothing readable pushes.
+ *
+ * Both files absent is the only way to reach `absent`: a genuine "neither file exists here" fact the
+ * host actually checked, not an assumption. Anything else — one or both unavailable, none present —
+ * folds to `unavailable`, because "no policy" cannot be asserted when a check that could have found
+ * one never completed.
  */
 function combineLevel(directory: string, sourceId: string, agents: PolicyFileOutcome, claude: PolicyFileOutcome): AgentsPolicyLevel {
   const present = [agents, claude].filter((outcome): outcome is Extract<PolicyFileOutcome, { state: 'present' }> => outcome.state === 'present');
@@ -194,7 +222,21 @@ function combineLevel(directory: string, sourceId: string, agents: PolicyFileOut
     const files = present.map((outcome) => outcome.kind);
     if (present.length === 1) {
       const only = present[0]!;
-      return { directory, state: 'present', sourceId, digest: sha256Hex(only.content), content: only.content, citable: false, files };
+      // Only reachable with exactly one file present: two present files leave no third outcome to
+      // be unavailable, so the both-present branch below needs no companion clause.
+      const companion = [agents, claude].find(
+        (outcome): outcome is Extract<PolicyFileOutcome, { state: 'unavailable' }> => outcome.state === 'unavailable',
+      );
+      return {
+        directory,
+        state: 'present',
+        sourceId,
+        digest: sha256Hex(only.content),
+        content: only.content,
+        citable: false,
+        files,
+        ...(companion ? { companionUnavailable: { file: companion.kind, reason: companion.reason } } : {}),
+      };
     }
     const [first, second] = present as [Extract<PolicyFileOutcome, { state: 'present' }>, Extract<PolicyFileOutcome, { state: 'present' }>];
     const identical = first.content === second.content;
@@ -283,6 +325,10 @@ export function composeAgentsPolicyText(chain: AgentsPolicyChain): string | unde
  * checked" line and a `harnessRuntime.ts` `selectionLimitations` entry are both possible downstream,
  * where a genuinely `absent` root (both files checked, neither exists) carries no reason at all and
  * renders as plain absence.
+ *
+ * A `present` root's `companionUnavailable` rides across the same fold, for the same reason: the
+ * snapshot is what every downstream surface reads, so a companion the host never read has to be on
+ * it or the disclosure stops at this function (see `combineLevel`'s own comment).
  */
 export function rootAgentsPolicySourceFor(chain: AgentsPolicyChain): ReviewRunAgentsPolicySource {
   const root = chain.levels[0];
@@ -294,6 +340,7 @@ export function rootAgentsPolicySourceFor(chain: AgentsPolicyChain): ReviewRunAg
       text: root.content,
       files: root.files,
       ...(root.identical !== undefined ? { identical: root.identical } : {}),
+      ...(root.companionUnavailable !== undefined ? { companionUnavailable: root.companionUnavailable } : {}),
     };
   }
   if (root?.state === 'unavailable') return { present: false, unavailableReason: root.reason };

@@ -42,7 +42,12 @@ export interface InvestigationSourceContractHarness {
   headSha: string;
   /** The commit that head's diff is against. */
   baseSha: string;
-  /** A non-binary path present in the diff at `baseSha..headSha`. */
+  /**
+   * A non-binary path present in the diff at `baseSha..headSha`, whose *content* differs between
+   * the two revisions — not merely a rename or a mode change. The revision-pin case below reads it
+   * at both pins and requires two different answers, which is the only way to catch a source that
+   * echoes the requested revision back while serving one revision's text for both.
+   */
   changedFilePath: string;
   /** A path known to be binary at `headSha`; omit to skip the binary case. */
   binaryFilePath?: string;
@@ -71,6 +76,14 @@ export interface InvestigationSourceContractHarness {
   noMatchQuery: string;
   /** A search query guaranteed to match at least once under `changedFilePath`. */
   matchQuery: string;
+  /**
+   * A query matching text the change *added*: present at `headSha`, absent from `baseSha`
+   * everywhere this source searches. Required, not optional, and deliberately so — the
+   * revision-pinned search case is the one that failed to exist while a shipped source searched
+   * head content for every `revision: 'base'` request, and a field a new harness may omit would
+   * leave that hole open for the next implementation.
+   */
+  headOnlyQuery: string;
 }
 
 export function describeInvestigationSourceContract(label: string, harness: InvestigationSourceContractHarness): void {
@@ -156,6 +169,31 @@ export function describeInvestigationSourceContract(label: string, harness: Inve
     }
 
     if (caps.fileReads.supported) {
+      /**
+       * The pin `FileRange.revision` exists to prove (`platform/types.ts`: "every result echoes
+       * that pin back so a caller can prove the provider answered the exact requested revision
+       * instead of a branch tip"). Every other read case in this suite asks for `head`, and that
+       * gap is why a shipped source served head text for a `revision: 'base'` request — echoing
+       * `"base"` over it — without a single case failing.
+       *
+       * Both halves of the assertion carry weight. `not.toBe` alone would pass on a source that
+       * answered `unavailable` to every base read, since an absent text differs from a present one
+       * as readily as a base text does; requiring a value first is what makes the difference a
+       * statement about two revisions rather than about one missing answer.
+       */
+      it('answers a base-revision read from the base revision, never the head\'s text under a base label', async () => {
+        const source = await harness.makeSource();
+        const bound = (caps.fileReads.pageBound ?? caps.pagination).maxPageSize;
+        const range = { snapshot: snapshotAt(harness.headSha), path: inv.changedFilePath, startLine: 1, endLine: bound };
+        const atBase = investigationResultValue(await source.readFile({ ...range, revision: 'base' }));
+        const atHead = investigationResultValue(await source.readFile({ ...range, revision: 'head' }));
+        expect(atBase?.text, `a base read of ${inv.changedFilePath} must carry text, not an unavailable`).toBeDefined();
+        expect(atHead?.text).toBeDefined();
+        expect(atBase?.revision).toBe('base');
+        expect(atHead?.revision).toBe('head');
+        expect(atBase?.text).not.toBe(atHead?.text);
+      });
+
       it('bounds a file range read to the declared page bound', async () => {
         const source = await harness.makeSource();
         const bound = (caps.fileReads.pageBound ?? caps.pagination).maxPageSize;
@@ -198,6 +236,25 @@ export function describeInvestigationSourceContract(label: string, harness: Inve
         const source = await harness.makeSource();
         const result = await source.searchRepository({ snapshot: snapshotAt(harness.headSha), revision: 'head', query: inv.matchQuery });
         expect(investigationResultValue(result)?.length ?? 0).toBeGreaterThan(0);
+      });
+
+      /**
+       * The read case's counterpart, for the operation that has no per-result `revision` echo to
+       * check: a search is pinned by its request alone, so text the change added must not be found
+       * at the base revision. The head half is the control — without it a source that searched
+       * nothing at all would pass on the empty base result.
+       *
+       * `complete` and empty, never `unavailable`: the source searched the base revision and the
+       * text is genuinely not there, which is a different answer from "could not search".
+       */
+      it('scopes a repository search to the requested revision: text the change added is not found at the base revision', async () => {
+        const source = await harness.makeSource();
+        const snapshot = snapshotAt(harness.headSha);
+        const atHead = await source.searchRepository({ snapshot, revision: 'head', query: inv.headOnlyQuery });
+        expect(investigationResultValue(atHead)?.length ?? 0, `${inv.headOnlyQuery} must match at head, or the base half proves nothing`).toBeGreaterThan(0);
+        const atBase = await source.searchRepository({ snapshot, revision: 'base', query: inv.headOnlyQuery });
+        expect(atBase.state).toBe('complete');
+        expect(investigationResultValue(atBase)).toEqual([]);
       });
     }
 

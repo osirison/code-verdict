@@ -215,6 +215,25 @@ describe('validateCandidate (task 7.6)', () => {
       .toMatchObject({ reasons: [{ code: 'schema' }] });
   });
 
+  it('reports a present-but-non-string body, rule and reference as schema violations instead of coercing the content away, the rule only code used to carry', () => {
+    const fixture = setup();
+    // The sharp part is that these are *accepted-looking* values: every required field is valid, so
+    // before `optionalText` carried the rule for all four fields the parse returned a candidate with
+    // `body: ''` and no reasons at all — the model was never told its own content had been dropped.
+    expect(parseCandidateFinding(candidate(fixture, { body: 42 }))).toMatchObject({ reasons: [{ code: 'schema', message: 'body must be a string when present.' }] });
+    expect(parseCandidateFinding(candidate(fixture, { rule: { id: 'no-eval' } }))).toMatchObject({ reasons: [{ code: 'schema', message: 'rule must be a string when present.' }] });
+    expect(parseCandidateFinding(candidate(fixture, { reference: true }))).toMatchObject({ reasons: [{ code: 'schema', message: 'reference must be a string when present.' }] });
+    // One reason per violated field, not just the first: the phase's repair budget is two attempts,
+    // so a model that got all three wrong has to learn all three from one refusal.
+    expect(parseCandidateFinding(candidate(fixture, { body: 42, rule: { id: 'no-eval' }, reference: true }))).toMatchObject({
+      reasons: [
+        { message: 'body must be a string when present.' },
+        { message: 'rule must be a string when present.' },
+        { message: 'reference must be a string when present.' },
+      ],
+    });
+  });
+
   it('rejects an unknown member before touching citations', () => {
     const fixture = setup();
     expect(validateCandidate(candidate(fixture, { memberId: 'm9' }), fixture.context)).toMatchObject({ state: 'rejected', reasons: [{ code: 'unknownMember' }] });

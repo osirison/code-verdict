@@ -619,6 +619,35 @@ describe('HarnessRunStore: writeSnapshot caps a persisted rootAgentsPolicy.text 
     const latest = runStore.latestCheckpoint('lineage-1')!;
     expect(checkCheckpointIntegrity(stored, latest)).toEqual([]);
   });
+
+  /**
+   * The cap rebuilds the `present` arm field by field, so every field added to that arm has to be
+   * named in it — and `companionUnavailable` is hashed (only `text`/`textOmittedReason` are
+   * projected away). A field left out of the rebuild survives in memory, vanishes on write, and the
+   * two hashes stop matching: every run with an over-cap policy is then refused on resume as "no
+   * longer hashes to digest", for a snapshot nothing actually diverged in. Both halves are asserted
+   * because either alone would miss it — the survival check alone would pass if the field were kept
+   * but hashed differently, and the integrity check alone reports the symptom without the cause.
+   */
+  it('an unreadable companion survives the text cap, so an over-cap policy that half-checked its files still passes checkCheckpointIntegrity', async () => {
+    const runStore = createHarnessRunStore(jsonMemoryStore(), { now: () => 0 });
+    const member = memberWithPolicy('m1', OVER_CAP_TEXT);
+    const snapshot = testSnapshot({
+      members: [{ ...member, rootAgentsPolicy: { ...member.rootAgentsPolicy, companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' } } as ReviewRunSnapshot['members'][number]['rootAgentsPolicy'] }],
+    });
+
+    const digestAtBuildTime = computeSnapshotDigest(snapshot);
+    const built = buildCheckpoint(checkpointInput({ snapshotDigest: digestAtBuildTime }), DEFAULT_HARNESS_POLICY);
+    await runStore.writeSnapshot(snapshot);
+    await runStore.writeCheckpoint(built, GENEROUS_RETENTION);
+
+    const stored = runStore.readSnapshot('lineage-1', 1)!;
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ textOmittedReason: expect.any(String) }); // sanity: the cap actually fired
+    // The consequence first, then the cause: a field the rebuild drops is a snapshot that no longer
+    // hashes to the digest its own checkpoint recorded.
+    expect(checkCheckpointIntegrity(stored, runStore.latestCheckpoint('lineage-1')!)).toEqual([]);
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({ companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' } });
+  });
 });
 
 describe('HarnessRunStore.listLineages: the one way to find a target after ordinary completion, when nothing durable links a target to its lineage id', () => {
@@ -1100,11 +1129,18 @@ describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and un
 
   // `JSON.stringify` silently turns `NaN`/`Infinity` into `null` before they would ever reach the
   // parser through the store's own write path (see `jsonMemoryStore`'s own header comment) — which
-  // means the it.each suite above, built on that store, can never actually exercise
-  // `parseCoverageProgress`'s finiteness check with either value; it would only ever see the
-  // already-`null` result and fail on the `typeof` branch instead. `rawMemoryStore` skips that pass so
-  // these two values reach the parser exactly as written, proving the finiteness check itself refuses
-  // them rather than merely refusing the `null` a real store would have reduced them to.
+  // means the it.each suite above, built on that store, can never actually exercise any of this
+  // module's finiteness checks with either value; it would only ever see the already-`null` result
+  // and fail on the `typeof` branch instead. `rawMemoryStore` skips that pass so these values reach
+  // the parser exactly as written, proving the finiteness check itself refuses them rather than
+  // merely refusing the `null` a real store would have reduced them to. The real reader is
+  // `extension.ts`'s `context.globalState.get`, which is not JSON-reduced either: a hand-edited or
+  // corrupted global-state value carrying `1e999` parses as `Infinity` from valid strict JSON.
+  //
+  // One case per numeric field whose writer refuses a negative or non-finite value, which is what
+  // makes each of these sharp: `typeof === 'number'` alone admits `Infinity`, and a `< 0` or
+  // `< 1` comparison admits `NaN`, so every one of these fields was reachable with a value its own
+  // write side would never have produced — and nothing downstream re-checks any of them.
   it.each([
     [
       'a coverageChanged event carries NaN as classified',
@@ -1120,6 +1156,69 @@ describe('HarnessRunStore (11.1/11.8): truncated, malformed, wrong-typed, and un
         (r.checkpoints[0] as { activity: unknown[] }).activity = [
           { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'coverageChanged', coverage: { classified: 1, inspected: 1, total: Infinity } },
         ];
+      },
+    ],
+    // An event's own `elapsedMs`: `harnessActivityLog.ts`'s `validEventFields` refuses a non-finite
+    // one on the way in, and `reduceActivity`'s `last?.elapsedMs ?? 0` does not fire for one on the
+    // way out, so an accepted `Infinity` here becomes the projection clock `elapsedClock` paints as
+    // "Infinity:NaN" on the run stopwatch and the time line.
+    [
+      'an activity event carries Infinity as elapsedMs',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: 1, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: Infinity, kind: 'resuming' },
+        ];
+      },
+    ],
+    // `sequence` is the log's own ordering key, and `validSequence` — the same function the write
+    // side applies, imported rather than copied — requires a positive integer.
+    [
+      'an activity event carries NaN as sequence',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { activity: unknown[] }).activity = [
+          { runId: RUN_ID, lineageId: 'lineage-1', attempt: 1, sequence: NaN, occurredAt: '2026-01-01T00:00:00.000Z', phase: 'investigating', elapsedMs: 0, kind: 'resuming' },
+        ];
+      },
+    ],
+    ['the checkpoint itself carries Infinity as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = Infinity; }],
+    ['the checkpoint itself carries a negative elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as unknown as Record<string, unknown>).elapsedMs = -1; }],
+    ['the persisted projection carries NaN as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { projection: { elapsedMs: number } }).projection.elapsedMs = NaN; }],
+    ['the persisted budget carries NaN as elapsedMs', (r: ReturnType<typeof validLineage>) => { (r.checkpoints[0] as { budget: BudgetConsumption }).budget = { ...ZERO_BUDGET, elapsedMs: NaN }; }],
+    [
+      'a tracked candidate carries NaN as its repair count',
+      (r: ReturnType<typeof validLineage>) => {
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [{ candidateId: 'cand-1', state: 'unresolved', repairs: NaN, reasons: [] }];
+      },
+    ],
+    // `parseCandidateFinding` requires a finite 0-100 confidence on the way in; `NaN` passed both
+    // the `< 0` and the `> 100` comparison on the way back out.
+    [
+      'an accepted finding carries NaN as its confidence',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.item as { confidence: number }).confidence = NaN;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
+      },
+    ],
+    // A finding's own span, held to `normalizeEvidenceRange` — the same function
+    // `parseCandidateFinding` required it to pass when the model submitted it, which rejects
+    // anything that is not a positive integer.
+    [
+      'an accepted finding carries Infinity as its line',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.item as { line: number }).line = Infinity;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
+      },
+    ],
+    // An evidence range's `startLine < 1` bound is the same shape: `NaN` is not less than 1, so a
+    // citation whose span cannot be rendered at all was read back as a valid one.
+    [
+      'a cited evidence range carries NaN as startLine',
+      (r: ReturnType<typeof validLineage>) => {
+        const candidate = acceptedCandidate('cand-1', fakeSource('ev_1', 'const a = 1;'));
+        (candidate.finding!.evidence.primary.range as { startLine: number }).startLine = NaN;
+        (r.checkpoints[0] as { candidates: unknown[] }).candidates = [candidate];
       },
     ],
   ])('%s makes the whole lineage record fail closed (undefined), not coerced to null and refused for the wrong reason', (_label, corrupt) => {

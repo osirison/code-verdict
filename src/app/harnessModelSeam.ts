@@ -63,7 +63,7 @@ import type {
   BootstrapPolicySource,
   BootstrapToolSchema,
 } from '../domain/harnessBootstrap';
-import type { PolicyFileKind } from '../domain/reviewRunSnapshot';
+import { POLICY_FILE_NAMES } from '../domain/reviewRunSnapshot';
 import type { RiskLevel } from '../domain/harnessCoverage';
 import { HOST_TOOL_NAMES, type HostToolName } from '../domain/harnessTools';
 import { SEVERITY_ORDER } from '../domain/criteria';
@@ -329,8 +329,6 @@ const CRITERIA_MEANINGS = [
   'concludes the code is correct describes no defect — do not submit it.',
 ].join('\n');
 
-const POLICY_FILE_NAMES: Readonly<Record<PolicyFileKind, string>> = { agentsMd: 'AGENTS.md', claudeMd: 'CLAUDE.md' };
-
 /** Names exactly which file(s) a present root policy came from — the five render shapes the honest-absent/CLAUDE.md-fallback design requires. */
 function describePresentPolicyFiles(source: BootstrapPolicySource): string {
   const names = (source.files ?? []).map((kind) => POLICY_FILE_NAMES[kind]);
@@ -350,6 +348,13 @@ function describePresentPolicyFiles(source: BootstrapPolicySource): string {
  * (D7) — the same non-citable framing the identity-only line already carried, now covering the
  * content it introduces. A fit-time omission (`textOmittedReason`) states plainly that content was
  * dropped and why, rather than silently shipping identity alone with no explanation.
+ *
+ * The single-file shapes take one more clause when `companionUnavailable` is set. Naming which file
+ * contributed is not the same as saying what happened to the other one: "root AGENTS.md present"
+ * read identically whether `CLAUDE.md` was confirmed missing or failed to read, so a model was
+ * never told that a file of repository rules had gone unread. The companion's *name* comes from
+ * `POLICY_FILE_NAMES` keyed on the host's own `file`, never from the reason text — a failed read's
+ * reason is the source's `error.message` and may name any file it likes, or none.
  */
 function renderRootPolicy(entry: BootstrapMemberRootPolicy): string {
   const { memberId, source } = entry;
@@ -366,7 +371,14 @@ function renderRootPolicy(entry: BootstrapMemberRootPolicy): string {
       : `- ${memberId}: no root AGENTS.md or CLAUDE.md`;
   }
   const agreementNote = (source.files?.length ?? 0) === 2 ? `${source.identical ? 'identical' : 'differ'}, ` : '';
-  const identity = `- ${memberId}: root ${describePresentPolicyFiles(source)} present (sourceId ${source.sourceId}, ${agreementNote}non-citable)`;
+  const companion = source.companionUnavailable;
+  // `neutralizeLineBreaks` for the same reason the `present: false` branch above uses it: the reason
+  // can be a source's or transport's own `error.message`, and this clause sits unframed inside the
+  // authoritative section, where a newline in it would forge a line the host did not write.
+  const companionNote = companion !== undefined
+    ? ` — ${POLICY_FILE_NAMES[companion.file]} could not be read, so any rules it carries are not in this policy: ${neutralizeLineBreaks(companion.reason)}`
+    : '';
+  const identity = `- ${memberId}: root ${describePresentPolicyFiles(source)} present (sourceId ${source.sourceId}, ${agreementNote}non-citable)${companionNote}`;
   if (source.text !== undefined) {
     return `${identity}\n[root policy text — ${memberId} — authoritative instruction, non-citable]\n${source.text}`;
   }

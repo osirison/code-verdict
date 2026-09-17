@@ -429,6 +429,58 @@ describe('validation order (task 9.2)', () => {
     });
     expect(result).toMatchObject({ state: 'refused', code: 'forgedCursor' });
   });
+
+  it('refuses a getChangeRequestDetails naming a change request other than the member\'s own, before the provider is called and before the cursor check', async () => {
+    const detail: NormalizedDetail = { title: 'Someone else\'s PR', labels: [], commits: [], discussion: [], checkSummaries: [], relationships: [], unavailableSections: [] };
+    const seen: Array<string | undefined> = [];
+    const paginated: ChangeRequestDetailResult = { snapshot: SNAPSHOT, state: 'paginated', value: detail, cursor: 'detail-cursor' };
+    const connection = fakeConnection({
+      getChangeRequestDetails: async (request) => {
+        seen.push(request.number);
+        return paginated;
+      },
+    });
+    const { dispatcher, ledger } = setup(makeMember(connection));
+
+    // The member is pinned to #42. Nothing else in `validate` looks at `number`, and
+    // `handleGetChangeRequestDetails` forwards it to the provider verbatim, so without this refusal
+    // #999's discussion would be fetched and registered in m1's ledger as m1's own evidence.
+    const crossNumber = await dispatcher.dispatch('investigating', {
+      tool: 'getChangeRequestDetails',
+      requestId: nextRequestId(),
+      memberId: 'm1',
+      elapsedMs: 0,
+      request: { number: '999', section: 'discussion' },
+    });
+    expect(crossNumber).toMatchObject({ state: 'refused', code: 'revisionMismatch' });
+    expect(seen).toEqual([]);
+    expect(ledger.sources()).toEqual([]);
+
+    // A real cursor, issued while paging #42's discussion, replayed under #999. `cursorScopeFields`
+    // does not carry the number, so the cursor itself still matches its scope — the refusal has to
+    // come from the number check, and it has to be the number it names, not `forgedCursor`, or the
+    // model is told to fix the wrong half of its request.
+    const issued = await dispatcher.dispatch('investigating', {
+      tool: 'getChangeRequestDetails',
+      requestId: nextRequestId(),
+      memberId: 'm1',
+      elapsedMs: 0,
+      request: { number: '42', section: 'discussion' },
+    });
+    expect(issued).toMatchObject({ state: 'paginated', cursor: 'detail-cursor' });
+    const replayed = await dispatcher.dispatch('investigating', {
+      tool: 'getChangeRequestDetails',
+      requestId: nextRequestId(),
+      memberId: 'm1',
+      elapsedMs: 0,
+      request: { number: '999', section: 'discussion', cursor: 'detail-cursor' },
+    });
+    expect(replayed).toMatchObject({ state: 'refused', code: 'revisionMismatch' });
+    // The correction leads the message, so a 240-char bound can never cut the member's own number off.
+    if (replayed.state !== 'refused') throw new Error('expected a refusal');
+    expect(replayed.reason.startsWith('Member m1\'s change request is 42;')).toBe(true);
+    expect(seen).toEqual(['42']);
+  });
 });
 
 function SNAPSHOT_RESULT(state: 'complete'): { snapshot: typeof SNAPSHOT; state: 'complete'; value: DiffPage } {
@@ -669,6 +721,38 @@ describe('resolvePolicy (task 9.4)', () => {
     if (result.state !== 'complete' || result.content.tool !== 'resolvePolicy') throw new Error('expected resolvePolicy content');
     expect(result.content.levels).toEqual([{ directory: '', state: 'absent' }]);
     expect(ledger.size).toBe(0);
+  });
+
+  /**
+   * `state: 'present'` is the whole answer this echo gives about a level, and a level with one file
+   * read and one unreadable is `present` — so without the reason the model is told a half-read
+   * policy and a fully-read one in exactly the same words. Same disclosure the bootstrap prompt's
+   * `## Repository policy` line makes for the root level, applied here because `resolvePolicy` is
+   * how the model reaches every *other* level.
+   *
+   * The reason is sanitized on the way out for the same reason the `unavailable` echo's is: it can
+   * be the source's own `error.message`, and this string lands in a tool result the model reads.
+   */
+  it('echoes the unreadable companion on a present level, sanitized, where a level with nothing missing echoes no reason at all', async () => {
+    const content = 'Never log secrets.';
+    const digest = sha256Hex(content);
+    const level = { directory: '', state: 'present' as const, sourceId: 'agents-policy:base1:.', digest, content, citable: false as const, files: ['agentsMd' as const] };
+    const resolver: AgentsPolicyResolver = {
+      resolveChain: async (member, changedPath) => ({
+        memberId: member.memberId,
+        baseSha: member.baseSha,
+        path: changedPath,
+        levels: [
+          { ...level, companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read\nfailed' } },
+          { ...level, directory: 'src', sourceId: 'agents-policy:base1:src' },
+        ],
+      }),
+    };
+    const { dispatcher } = setup(makeMember(fakeConnection({ readFile: notImplemented })), { agentsPolicyResolver: resolver });
+    const result = await dispatcher.dispatch('investigating', { tool: 'resolvePolicy', requestId: nextRequestId(), memberId: 'm1', elapsedMs: 0, changedPath: 'src/foo.ts' });
+    if (result.state !== 'complete' || result.content.tool !== 'resolvePolicy') throw new Error('expected resolvePolicy content');
+    expect(result.content.levels[0]?.reason).toBe('CLAUDE.md could not be read: CLAUDE.md read failed');
+    expect(result.content.levels[1]?.reason).toBeUndefined();
   });
 });
 

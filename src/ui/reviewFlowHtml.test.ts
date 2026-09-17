@@ -938,9 +938,17 @@ describe('the running screen renders from the shared projection alone (task 14.1
   it('bounds a long activity list — newest work stays visible and the rest is a count, not a wall of rows (task: long lists must not break the layout)', () => {
     const activity: FlowViewState['runActivity'] = Array.from({ length: 65 }, (_unused, index) => ({
       runId: 'run-1', lineageId: 'lineage-1', attempt: 1, sequence: index + 1,
-      occurredAt: `2026-08-28T09:${String(index).padStart(2, '0')}:00.000Z`, phase: 'investigating' as const, elapsedMs: index * 1_000,
+      // The index advances the seconds, carrying into the minutes, so all 65 stay real instants a
+      // second apart — in step with `elapsedMs`. Spelling the index straight into the minute field
+      // produced `09:60` through `09:64`, which `Date.parse` reads as NaN: no attempt could hand
+      // this renderer such an event, because `harnessActivityLog.ts`'s `validEventFields` refuses
+      // it on append and `harnessRunStore.ts`'s `parseActivityEvent` refuses it on read-back.
+      occurredAt: `2026-08-28T09:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`, phase: 'investigating' as const, elapsedMs: index * 1_000,
       kind: 'toolCompleted' as const, tool: 'readDiff', target: `src/file${index}.ts`, summary: '1 unit(s) returned.',
     }));
+    // Named offenders rather than a boolean: a fixture this renderer never parses can drift back to
+    // unparseable timestamps unnoticed, and the next rendering path that does format them inherits it.
+    expect(activity.filter((event) => Number.isNaN(Date.parse(event.occurredAt)))).toEqual([]);
     const html = running({ runActivity: activity });
     // The oldest entries are elided, named only by count...
     expect(html).not.toContain('src/file0.ts');

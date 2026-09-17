@@ -57,6 +57,9 @@ if (gitVersion === undefined) {
     binaryFilePath: repo.paths.binary,
     noMatchQuery: 'ZZZ_NO_MATCH_ZZZ',
     matchQuery: 'RATE',
+    // The head commit's edit to `paths.modified` adds `export const BURST = 10;`; the base commit
+    // holds only `export const RATE = 100;`, so `BURST` exists nowhere in the repository at base.
+    headOnlyQuery: 'BURST',
     // This source reads an object store it fetched into, not the platform. A
     // pinned pair missing from it is a pair this source has not got, which is
     // not a statement that the platform no longer holds it — the exact

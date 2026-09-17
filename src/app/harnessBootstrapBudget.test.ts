@@ -140,10 +140,11 @@ describe('fitBootstrapToModel (task 6.6)', () => {
 
   it('drops root-policy text (down to identity plus a stated reason) as the last shrink tactic, after every other tactic', async () => {
     const countTokens = charBasedCounter();
-    // A small envelope apart from one member's oversized root-policy text: the first three shrink
-    // tactics (capping, section summaries, tool descriptions) cannot help here at all, so this
-    // proves the *fourth* tactic is what actually gets this envelope to fit, not merely present in
-    // the loop.
+    // A small envelope apart from one member's oversized root-policy text: the bulk is the 50 000
+    // characters of policy body, which the first three shrink tactics (capping, section summaries,
+    // tool descriptions) do not touch, so none of them comes anywhere near fitting it. That is what
+    // makes this prove the *fourth* tactic is what actually gets this envelope to fit, rather than
+    // merely present in the loop.
     const withBigPolicy = buildBootstrapEnvelope({
       members: [{ memberId: 'm1', repoId: 'repo-1', baseSha: 'base-1', headSha: 'head-1' }],
       personaLabel: 'Default review',
@@ -157,10 +158,22 @@ describe('fitBootstrapToModel (task 6.6)', () => {
       harnessPolicyVersion: '1',
       memberSections: [{ memberId: 'm1', changeRequestDetails: buildBootstrapSection({ kind: 'changeRequestDetails', sectionId: 'cr:1', detail: detail(50), digest: 'd1', providerState: 'complete', maxInlineChars: 1_000_000 }), issueDetails: [] }],
     });
-    const fullTokens = await charBasedCounter()(JSON.stringify(withBigPolicy));
-    const minimalTokens = await charBasedCounter()(JSON.stringify(withBigPolicy)); // capping/sections/tool descriptions do not shrink this envelope at all
-    const result = await fitBootstrapToModel({ envelope: withBigPolicy, maxInputTokens: Math.floor(minimalTokens / 4), countTokens });
-    expect(fullTokens).toBe(minimalTokens); // confirms the first three tactics really do nothing here
+    const attempts = bootstrapShrinkAttempts(withBigPolicy);
+    // The premise the rest of this test rests on, asserted rather than claimed: the fourth attempt —
+    // everything the first three tactics can do — still carries every one of the 50 000 policy
+    // characters that are 95% of this envelope. A tactic that started shaving the policy body reds
+    // here, which the old spelling (`fullTokens === minimalTokens`, both sides the same unshrunk
+    // object) could not do for any shrink short of one large enough to fit the budget outright.
+    expect(attempts[3]!.authoritative.rootPolicies[0]!.source.text).toHaveLength(50_000);
+    // Both sizes come off the real ladder, never from restringifying the unshrunk envelope: the
+    // first three tactics do shave a little here (a capped commit list, a summarized section), so a
+    // budget derived from the full envelope would measure an envelope the loop never sees.
+    const minimalTokens = Math.ceil(JSON.stringify(attempts[3]!).length / 4); // everything the first three tactics can do
+    const policyTrimmedTokens = Math.ceil(JSON.stringify(attempts[4]!).length / 4); // ...and the policy text dropped as well
+    expect(policyTrimmedTokens).toBeLessThan(minimalTokens); // or a budget between them proves nothing
+    // A budget at the policy-trimmed envelope's own size: every earlier attempt is at least
+    // `minimalTokens`, so nothing short of dropping the policy text can fit under it.
+    const result = await fitBootstrapToModel({ envelope: withBigPolicy, maxInputTokens: policyTrimmedTokens, countTokens });
     expect(result.ok).toBe(true);
     expect(countTokens).toHaveBeenCalledTimes(5);
     const source = result.ok ? result.envelope.authoritative.rootPolicies[0]!.source : undefined;

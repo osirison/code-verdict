@@ -33,6 +33,14 @@ export type ReviewRunTargetKind = 'cr' | 'changeset';
 export type PolicyFileKind = 'agentsMd' | 'claudeMd';
 
 /**
+ * The file name behind each kind. Here rather than in whichever module renders first, because two
+ * surfaces now name these files from host data — the bootstrap prompt's `## Repository policy` line
+ * (`harnessModelSeam.ts`) and the run's own limitations (`harnessRuntime.ts`) — and two copies of
+ * this mapping is how one of them ends up saying `CLAUDE.md` where the other says `claudeMd`.
+ */
+export const POLICY_FILE_NAMES: Readonly<Record<PolicyFileKind, string>> = Object.freeze({ agentsMd: 'AGENTS.md', claudeMd: 'CLAUDE.md' });
+
+/**
  * An `AGENTS.md`/`CLAUDE.md` chain always starts at a member's own base-revision root.
  *
  * `present: true` now carries the composed root-policy `text` (not just its identity) — the change
@@ -48,6 +56,13 @@ export type PolicyFileKind = 'agentsMd' | 'claudeMd';
  * `unavailableReason` undoes that fold for the honest case: present when the host could not
  * determine presence either way (no source, capability withheld, or a read failure), and absent
  * entirely when the host checked both files and genuinely found neither.
+ *
+ * `companionUnavailable` is the same distinction one level down, on the `present` arm. A root where
+ * `AGENTS.md` was read and `CLAUDE.md` failed to read used to be byte-identical to one where
+ * `CLAUDE.md` was confirmed not to exist — same `files: ['agentsMd']`, same everything — so the
+ * rules in the file nobody could read were dropped with nothing said. Set only for that mixed case,
+ * naming the companion file kind (host data, never parsed from the reason text) and the reason,
+ * and absent whenever both files were actually checked.
  *
  * `textOmittedReason` is a second, independent honesty escape hatch, set only by
  * `harnessRunStore.ts`'s `writeSnapshot` at persistence time — never by the resolver, and never seen
@@ -68,6 +83,7 @@ export type ReviewRunAgentsPolicySource =
       readonly files?: readonly PolicyFileKind[];
       readonly identical?: boolean;
       readonly textOmittedReason?: string;
+      readonly companionUnavailable?: { readonly file: PolicyFileKind; readonly reason: string };
     }
   | { readonly present: false; readonly unavailableReason?: string };
 

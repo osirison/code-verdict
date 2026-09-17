@@ -360,4 +360,7 @@ describeInvestigationSourceContract('demo pod sample source', {
   priorRevision: { baseSha: DEFAULT_BASE_SHA, headSha: harnessFixtures.CHANGED_HEAD_SNAPSHOT_SHA },
   noMatchQuery: 'ZZZ_NO_MATCH_ZZZ',
   matchQuery: 'refresh',
+  // `this.pending = this.doRefresh()` is one of the lines TOKEN_TS_DIFF adds, so it appears in the
+  // head reconstruction of `src/auth/token.ts` and in no file's base reconstruction.
+  headOnlyQuery: 'doRefresh',
 });

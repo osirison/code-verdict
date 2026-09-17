@@ -241,7 +241,7 @@ describe('CLAUDE.md fallback and companion at each level (owner-mandated)', () =
     expect(!fold.present && fold.unavailableReason).toEqual(expect.any(String));
   });
 
-  it('one file present, one file unavailable: still present overall — reading one policy is not nothing', async () => {
+  it('one file present, one file unavailable: still present overall — reading one policy is not nothing — and the unread companion is named on the level', async () => {
     const source = fakeInvestigationSource({
       readFile: vi.fn(async (request: FileRangeRequest): Promise<FileRangeResult> => {
         if (request.path === 'AGENTS.md') {
@@ -252,7 +252,34 @@ describe('CLAUDE.md fallback and companion at each level (owner-mandated)', () =
     });
     const resolver = createAgentsPolicyResolver(() => source);
     const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
-    expect(chain.levels[0]).toMatchObject({ state: 'present', content: 'Agents policy.\n', files: ['agentsMd'] });
+    expect(chain.levels[0]).toMatchObject({
+      state: 'present',
+      content: 'Agents policy.\n',
+      files: ['agentsMd'],
+      companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' },
+    });
+    // The whole point of the field: without it this level is byte-identical to the one below, where
+    // the host actually established that CLAUDE.md does not exist. `files: ['agentsMd']` is the same
+    // in both, so "which file contributed" can never be read as "what happened to the other one".
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({
+      present: true,
+      files: ['agentsMd'],
+      companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' },
+    });
+
+    // The control, in the same test because it is what makes the assertions above mean anything: a
+    // companion the host actually checked and found missing carries no reason, so the field marks
+    // the unchecked case only rather than every single-file level.
+    const { source: absentCompanion } = fakeSource({ 'AGENTS.md': 'Agents policy.\n' });
+    const checkedChain = await createAgentsPolicyResolver(() => absentCompanion).resolveChain(MEMBER, 'charge.ts');
+    expect(checkedChain.levels[0] && 'companionUnavailable' in checkedChain.levels[0]).toBe(false);
+    expect(rootAgentsPolicySourceFor(checkedChain)).toEqual({
+      present: true,
+      sourceId: 'agents-policy:policy-base-1:.',
+      digest: expect.any(String),
+      text: 'Agents policy.\n',
+      files: ['agentsMd'],
+    });
   });
 
   it('dedupes an identical unavailable reason from both files rather than repeating it', async () => {
@@ -305,7 +332,15 @@ describe('truncated/paginated policy reads are never digested as present (root-p
     const chain = await resolver.resolveChain(MEMBER, 'charge.ts');
     expect(chain.levels[0]).toMatchObject({ state: 'present', content: 'Agents policy complete.\n', files: ['agentsMd'] });
     expect(JSON.stringify(chain.levels[0])).not.toContain('Claude policy first page only.');
-    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({ present: true, text: 'Agents policy complete.\n', files: ['agentsMd'] });
+    // The cap fold reaches the mixed case too: a partial CLAUDE.md is a companion the host could not
+    // confirm, so it is disclosed here exactly as a thrown read error is — the partial *content*
+    // stays out (asserted above), the fact that it went unread does not.
+    expect(rootAgentsPolicySourceFor(chain)).toMatchObject({
+      present: true,
+      text: 'Agents policy complete.\n',
+      files: ['agentsMd'],
+      companionUnavailable: { file: 'claudeMd', reason: expect.stringContaining('CLAUDE.md exceeds the 200-line read cap') },
+    });
   });
 
   it('both truncated: unavailable, naming both files and the cap, neither reason silently dropping the other', async () => {

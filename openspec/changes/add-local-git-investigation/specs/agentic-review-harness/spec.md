@@ -33,7 +33,7 @@ A resumed attempt SHALL compare the recorded investigation source kind and the r
 
 ### Requirement: A run starts from an immutable snapshot and isolated bootstrap
 
-Before model work begins, the host SHALL snapshot immutable repository identity, base and head revisions, the meaning of the base revision, the selected investigation source and its capability signature, target identity, selected agent instructions and persona, criteria, model, thinking effort, context controls, and host-owned tool contracts. The investigation source SHALL be obtained once per member before any model work and SHALL NOT change during an attempt. There SHALL be exactly one kind of investigation source for a connected pod — a local copy of the repository — and a member whose source cannot be obtained SHALL end its attempt before bootstrap with completeness `none` and a reason naming what was unavailable, never a review served from the platform instead. The bootstrap SHALL include normalized full linked-issue details; normalized full change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships; root `AGENTS.md` policy from the base revision; and references that let large sections be reopened. Full CI logs and the patch SHALL NOT be included in bootstrap.
+Before model work begins, the host SHALL snapshot immutable repository identity, base and head revisions, the meaning of the base revision, the selected investigation source and its capability signature, target identity, selected agent instructions and persona, criteria, model, thinking effort, context controls, and host-owned tool contracts. The investigation source SHALL be obtained once per member before any model work and SHALL NOT change during an attempt. There SHALL be exactly one kind of investigation source for a connected pod — a local copy of the repository — and a member whose source cannot be obtained SHALL end its attempt before bootstrap with completeness `none` and a reason naming what was unavailable, never a review served from the platform instead. The bootstrap SHALL include normalized full linked-issue details; normalized full change-request metadata, title, body, commits, review discussion, labels, check summaries, and relationships; root `AGENTS.md`/`CLAUDE.md` policy identity and its composed text from the base revision (`CLAUDE.md` serves as a fallback when `AGENTS.md` is absent and as a companion when both exist); and references that let large sections be reopened. Full CI logs and the patch SHALL NOT be included in bootstrap. When the composed policy text cannot fit the model's input limit alongside the rest of the envelope, the host SHALL degrade to identity plus a stated reason rather than send a silently truncated policy body.
 
 #### Scenario: Bootstrap is assembled
 
@@ -57,30 +57,25 @@ Before model work begins, the host SHALL snapshot immutable repository identity,
 #### Scenario: Target head changes after snapshot
 
 - **WHEN** the provider reports a different head revision before final completion
-- **THEN** the attempt cannot complete successfully
+- **THEN** the attempt still completes successfully against the pinned snapshot — a review of the pinned revision is valid regardless of what the branch did afterward
+- **AND** the result states that the head moved, naming the pinned and current revisions
 - **AND** evidence from the old head is not relabelled or reused as evidence for the new head
 
-#### Scenario: An investigation source is selected
+#### Scenario: An investigation source is obtained
 
-- **WHEN** the host prepares a member's snapshot and more than one source could answer investigation requests
-- **THEN** it selects the source that can serve the whole change, confirms it can answer before the attempt starts, and records the chosen kind and its capability signature in the snapshot
+- **WHEN** the host prepares a connected pod member's snapshot
+- **THEN** it obtains a local copy of the repository at the pinned revisions before the attempt starts, and records that source kind and its capability signature in the snapshot
 - **AND** every piece of evidence records which source produced it
 
-#### Scenario: No source can serve the change
+#### Scenario: The change cannot be read from a local copy
 
-- **WHEN** neither a local source nor the provider can serve investigation for a member's change
-- **THEN** the attempt does not begin model work
-- **AND** it ends with completeness `none` and a reason naming what could not be obtained
-
-#### Scenario: The preferred source is unavailable
-
-- **WHEN** the preferred investigation source cannot be prepared and another source can serve the change
-- **THEN** the attempt uses the other source and records that its preferred source was unavailable, with the reason
-- **AND** the run's limitations state which source produced its evidence
+- **WHEN** a member's pinned revisions cannot be obtained into a local object store — no git, no object-source descriptor, credentials the remote refused, an unwritable cache, or a fetch that failed
+- **THEN** the attempt does not begin model work, and it ends before bootstrap with completeness `none`
+- **AND** the reason naming what could not be obtained is recorded as a limitation on that terminal result, never a review served from the platform instead
 
 #### Scenario: A pinned revision cannot be obtained and its absence is unproven
 
-- **WHEN** a pinned commit cannot be obtained by one source and no other source establishes whether the platform still holds it
+- **WHEN** a pinned commit cannot be obtained and nothing establishes whether the platform still holds it
 - **THEN** the attempt does not begin model work, and the reason names the revision and that its absence was not established
 - **AND** the checkpoint is not reported incompatible, because a stale snapshot was not proven
 

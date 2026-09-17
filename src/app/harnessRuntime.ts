@@ -84,7 +84,7 @@ import type {
   RunInput,
 } from './reviewRunManager';
 import { buildReviewRunSnapshot, type ReviewRunSnapshotMemberInput } from './reviewRunSnapshotBuilder';
-import type { ReviewRunInvestigationSource } from '../domain/reviewRunSnapshot';
+import { POLICY_FILE_NAMES, type ReviewRunInvestigationSource } from '../domain/reviewRunSnapshot';
 import { refusingInvestigationSource, selectInvestigationSource, type InvestigationSourceSelection } from './investigationSourceSelection';
 import type { ObjectCache } from '../localgit/objectAcquisition';
 import type { CacheLease } from '../localgit/objectCache';
@@ -562,11 +562,26 @@ async function buildCandidateAssembly(
   // genuinely has neither file, and the reviewer must be told the principles were never actually
   // read — not merely shown an identical "no root AGENTS.md or CLAUDE.md" line. Pushed only for the
   // `unavailableReason` fold, never for a confirmed absence.
+  //
+  // The same requirement covers a root that was only *half* checked — one file read, the other not —
+  // under its own code. Two codes rather than one because the two facts differ in what the review
+  // actually ran on: `rootPolicyUnavailable` means no repository rules reached the model at all,
+  // while `rootPolicyCompanionUnavailable` means some did and an unknown number did not. Collapsing
+  // them would make a half-read policy read as no policy, which is the mirror of the bug that made
+  // it read as a complete one.
   for (const [index, policy] of rootPolicies.entries()) {
+    const memberId = revalidatedMembers[index]!.memberId;
     if (!policy.present && policy.unavailableReason !== undefined) {
       selectionLimitations.push({
         code: 'rootPolicyUnavailable',
-        message: `${revalidatedMembers[index]!.memberId}: root policy could not be checked: ${policy.unavailableReason}`,
+        message: `${memberId}: root policy could not be checked: ${policy.unavailableReason}`,
+      });
+    }
+    if (policy.present && policy.companionUnavailable !== undefined) {
+      const read = (policy.files ?? []).map((kind) => POLICY_FILE_NAMES[kind]).join(' and ');
+      selectionLimitations.push({
+        code: 'rootPolicyCompanionUnavailable',
+        message: `${memberId}: root policy was read from ${read} only; ${POLICY_FILE_NAMES[policy.companionUnavailable.file]} could not be read, so any rules it carries were not applied: ${policy.companionUnavailable.reason}`,
       });
     }
   }

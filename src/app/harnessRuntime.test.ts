@@ -338,6 +338,89 @@ describe('createReviewHarnessFactory — the real runtime wiring (task 15.7)', (
     expect(latest.projection.lifecycle).toBe('succeeded');
   });
 
+  /**
+   * Invariant B at the one level the resolver's own carve-out used to exempt. `combineLevel` makes a
+   * level `present` when *either* file is readable, and the `rootPolicyUnavailable` gate below it is
+   * `!policy.present` — so a review that read `AGENTS.md` and could not read `CLAUDE.md` produced
+   * the same snapshot, the same prompt line and the same empty limitation set as one whose
+   * `CLAUDE.md` the host confirmed does not exist. Whatever rules the unreadable file carried were
+   * dropped with nothing said, which is the fact this run has to surface.
+   *
+   * The confirmed-absent control is run for real rather than assumed: a limitation that fires for
+   * both cases discloses nothing, it just moves the indistinguishable pair somewhere else.
+   */
+  it('a root policy read from one file with the companion unreadable reports its own limitation and says so in the model\'s own prompt, where a companion confirmed absent reports none', async () => {
+    const readable = suppliedSource()!;
+    // The rendered prompts, because the model is the reader this disclosure exists for. A limitation
+    // and a stored snapshot are both surfaces a *person* reads afterwards; neither of them proves the
+    // reviewer that actually wrote the findings was ever told a file of repository rules went unread.
+    const prompts: string[] = [];
+    const scripted = scriptedRunTurn();
+    const halfReadable: HarnessRuntimeDeps = {
+      ...deps,
+      runTurn: async (modelId, prompt) => {
+        prompts.push(prompt);
+        return scripted(modelId, prompt);
+      },
+      investigationSource: () =>
+        fakeInvestigationSource(
+          {
+            listChangedFiles: (request) => readable.listChangedFiles(request),
+            readDiff: (request) => readable.readDiff(request),
+            searchRepository: (request) => readable.searchRepository(request),
+            searchDiff: (request) => readable.searchDiff(request),
+            readFile: async (request) => {
+              if (request.path === 'AGENTS.md') {
+                return { snapshot: request.snapshot, state: 'complete', value: { revision: request.revision, path: request.path, startLine: 1, endLine: 1, text: 'Never log secrets.\n' } };
+              }
+              // A thrown read, the case `fetchFile` turns into a per-file `unavailable` — the raw
+              // `error.message` is what reaches the limitation, so the assertion below pins it.
+              if (request.path === 'CLAUDE.md') throw new Error('CLAUDE.md read failed');
+              return readable.readFile(request);
+            },
+          },
+          readable.capabilities,
+        ),
+    };
+
+    const identity = { runId: 'run-policy-half', lineageId: 'lineage-policy-half', attempt: 1 };
+    const result = await createReviewHarnessFactory(halfReadable).create(runInput(), noopRunOptions(identity)).run();
+
+    const codes = result.outcome.limitations.map((limitation) => limitation.code);
+    expect(codes).toContain('rootPolicyCompanionUnavailable');
+    // Never the wholly-unreadable code: one policy really was read, and reporting that as no policy
+    // at all is the mirror of the bug being fixed.
+    expect(codes).not.toContain('rootPolicyUnavailable');
+    const companion = result.outcome.limitations.find((limitation) => limitation.code === 'rootPolicyCompanionUnavailable')!;
+    expect(companion.message).toContain(MEMBER_ID);
+    expect(companion.message).toContain('read from AGENTS.md only');
+    expect(companion.message).toContain('CLAUDE.md could not be read');
+    expect(companion.message).toContain('CLAUDE.md read failed');
+
+    // The leg between the resolved snapshot and the model — `harnessAttempt.ts`'s `rootPoliciesFor`,
+    // which copies the field onto the bootstrap envelope `renderRootPolicy` reads. Dropping it there
+    // leaves the limitation above and the stored snapshot below both correct and the model told
+    // "root AGENTS.md present" with nothing after it, so this assertion is what holds that copy.
+    expect(prompts[0]).toContain('CLAUDE.md could not be read, so any rules it carries are not in this policy: CLAUDE.md read failed');
+
+    // On the durable record too, not only in this run's limitation list: a resumed attempt and the
+    // dashboard both read the snapshot, and neither re-resolves the policy.
+    const stored = harnessRunStore.readSnapshot(identity.lineageId as never, 1 as never)!;
+    expect(stored.members[0]?.rootAgentsPolicy).toMatchObject({
+      present: true,
+      files: ['agentsMd'],
+      companionUnavailable: { file: 'claudeMd', reason: 'CLAUDE.md read failed' },
+    });
+
+    // The control. `e2eConnection`'s `readFile` answers `notFound` for every path, so both policy
+    // files are genuinely confirmed absent — the host checked and there is nothing to disclose.
+    const controlIdentity = { runId: 'run-policy-absent', lineageId: 'lineage-policy-absent', attempt: 1 };
+    const control = await createReviewHarnessFactory(deps).create(runInput(), noopRunOptions(controlIdentity)).run();
+    const controlCodes = control.outcome.limitations.map((limitation) => limitation.code);
+    expect(controlCodes).not.toContain('rootPolicyCompanionUnavailable');
+    expect(controlCodes).not.toContain('rootPolicyUnavailable');
+  });
+
   it('fails truthfully with no fallback when the selected model is no longer available', async () => {
     const missingModelDeps: HarnessRuntimeDeps = { ...deps, discoverModel: async () => undefined };
     const factory = createReviewHarnessFactory(missingModelDeps);

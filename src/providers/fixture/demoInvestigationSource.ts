@@ -24,7 +24,7 @@
  * two independent implementations to hold it honest.
  *
  * Everything below — the scenario registry keyed by head sha, the
- * reconstruction of head-revision text from a unified diff, the oversized /
+ * reconstruction of revision text from a unified diff, the oversized /
  * declined / binary / rename scenarios — moved here verbatim from
  * `fixtureProvider.ts`. Nothing about the sample data changed; only who serves
  * it did.
@@ -46,6 +46,7 @@ import type {
   FileRangeResult,
   InvestigationSource,
   InvestigationSourceCapabilities,
+  PinnedRevision,
   RepositorySearchRequest,
   RepositorySearchResult,
   SearchMatch,
@@ -94,8 +95,16 @@ interface InvestigationFile {
   entry: ChangedFileEntry;
   /** Original unified-diff hunk text, served by `readDiff`. */
   patch?: string;
-  /** Deterministic reconstruction of head-revision text from `patch` (context + added lines), served by `readFile`/search. Absent for binary files. */
+  /** Deterministic reconstruction of head-revision text from `patch` (context + added lines), served by a `revision: 'head'` read or search. Absent for binary files. */
   lines?: readonly string[];
+  /**
+   * The base-revision mirror of `lines` (context + removed lines), served by a `revision: 'base'`
+   * read or search. Absent for binary files, for a file this change added (a purely additive patch
+   * shows no base-revision content at all), and for a renamed file (whose base revision lives under
+   * `entry.oldPath`, so the new path names nothing at base) — in every one of those cases the base
+   * read answers `unavailable` rather than inventing an empty file or serving the head's text.
+   */
+  baseLines?: readonly string[];
 }
 
 interface InvestigationScenario {
@@ -120,18 +129,41 @@ interface InvestigationScenario {
   readonly repoFiles?: readonly harnessFixtures.FixtureRepoFile[];
 }
 
-/** Keeps context and added lines, drops removed lines and hunk headers \u2014 a deterministic head-revision approximation, never invented file content. */
-function linesFromUnifiedDiff(patch: string): string[] {
+/**
+ * Keeps the lines that survive into `revision`, drops the ones that do not and the hunk headers \u2014 a
+ * deterministic approximation of that revision, never invented file content. One function for both
+ * revisions rather than two: they are exact mirrors (head keeps `+` and context, base keeps `-` and
+ * context), and a base reconstruction written separately is one that can silently drift out of being
+ * a mirror. A head-only reconstruction is what let `readFile`/`searchRepository` serve head text for
+ * a base-pinned request, which is the pin the echoed `revision` claims to prove.
+ */
+function linesFromUnifiedDiff(patch: string, revision: PinnedRevision): string[] {
+  const dropped = revision === 'head' ? '-' : '+';
+  const kept = revision === 'head' ? '+' : '-';
   const lines: string[] = [];
   for (const raw of patch.split('\n')) {
-    if (raw.startsWith('@@') || raw.startsWith('Binary files ') || raw.startsWith('-')) continue;
-    lines.push(raw.startsWith('+') || raw.startsWith(' ') ? raw.slice(1) : raw);
+    if (raw.startsWith('@@') || raw.startsWith('Binary files ') || raw.startsWith(dropped)) continue;
+    lines.push(raw.startsWith(kept) || raw.startsWith(' ') ? raw.slice(1) : raw);
   }
   return lines;
 }
 
+/**
+ * Whether `patch` shows any base-revision content at all. Read off the patch's own markers rather
+ * than off the reconstruction: the trailing newline every fixture patch ends with makes
+ * `linesFromUnifiedDiff` return `['']` for a purely additive patch, so "the array came back empty"
+ * is not a test a file this change added would ever fail.
+ */
+function patchShowsBaseRevision(patch: string): boolean {
+  return patch.split('\n').some((raw) => raw.startsWith('-') || raw.startsWith(' '));
+}
+
 function fileFromFileDiff(fd: FileDiff, kind: ChangedFileKind): InvestigationFile {
   const binary = fd.diff.startsWith('Binary files ');
+  // A rename's base revision sits under `oldPath`, and this registry keys every file by its new
+  // path, so the reconstruction below would answer a base read of the new path with content that
+  // path never held.
+  const baseDerivable = !binary && !fd.isRenamed && patchShowsBaseRevision(fd.diff);
   return {
     entry: {
       path: fd.newPath,
@@ -141,7 +173,8 @@ function fileFromFileDiff(fd: FileDiff, kind: ChangedFileKind): InvestigationFil
       byteSize: binary ? 4096 : undefined,
     },
     patch: fd.diff,
-    lines: binary ? undefined : linesFromUnifiedDiff(fd.diff),
+    lines: binary ? undefined : linesFromUnifiedDiff(fd.diff, 'head'),
+    baseLines: baseDerivable ? linesFromUnifiedDiff(fd.diff, 'base') : undefined,
   };
 }
 
@@ -224,12 +257,21 @@ function paginate<T>(
   return { page: items.slice(start, end), nextCursor: end < items.length ? String(end) : undefined };
 }
 
-function searchScenario(scenario: InvestigationScenario, query: string, pathScope?: string): SearchMatch[] {
+/**
+ * `revision` is a parameter rather than an assumption: a repository search is revision-pinned like
+ * every other investigation operation, and searching the head reconstruction for a base-pinned
+ * request reports a line the base revision does not contain. A file with no reconstruction for the
+ * requested revision is skipped rather than searched at the other one — the search then reports
+ * fewer matches, which is a truthful under-report, where substituting head text would be a match at
+ * a line and revision that never held it.
+ */
+function searchScenario(scenario: InvestigationScenario, query: string, revision: PinnedRevision, pathScope?: string): SearchMatch[] {
   const matches: SearchMatch[] = [];
   for (const file of scenario.files) {
-    if (file.entry.binary || !file.lines) continue;
+    const lines = revision === 'base' ? file.baseLines : file.lines;
+    if (file.entry.binary || !lines) continue;
     if (pathScope && !file.entry.path.startsWith(pathScope)) continue;
-    file.lines.forEach((line, index) => {
+    lines.forEach((line, index) => {
       if (line.includes(query)) matches.push({ path: file.entry.path, line: index + 1, excerpt: line.trim() });
     });
   }
@@ -313,7 +355,22 @@ export function createDemoInvestigationSource(simulation: DemoInvestigationSimul
       const repoFile = !file ? scenario.repoFiles?.find((f) => f.path === request.path) : undefined;
       if (!file && !repoFile) return { snapshot: request.snapshot, state: 'notFound', reason: `No such path: ${request.path}` };
       if (file?.entry.binary) return { snapshot: request.snapshot, state: 'binary', byteSize: file.entry.byteSize };
-      const lines = file ? file.lines ?? [] : (repoFile!.content.split(/\r?\n/));
+      // `repoFiles` is repository content outside the diff — sample data with no second revision to
+      // reconstruct, so it answers both pins with the one text it has. A *changed* file has a
+      // reconstruction per revision, and picking the wrong one is exactly what the echoed
+      // `revision` below claims cannot happen.
+      const lines = file ? (request.revision === 'base' ? file.baseLines : file.lines) : repoFile!.content.split(/\r?\n/);
+      // No `?? []` fallback, at either revision: an absent reconstruction means this source cannot
+      // establish that revision of the path (a file the change added, a rename's new path, or a diff
+      // too large to have been reconstructed at all), and an empty text would state that the file
+      // exists there and is empty. `unavailable` is the state that claims nothing either way.
+      if (!lines) {
+        return {
+          snapshot: request.snapshot,
+          state: 'unavailable',
+          reason: `The sample source reconstructs revisions from this change's patch, which carries no ${request.revision}-revision content for ${request.path}.`,
+        };
+      }
       const bound = DEMO_INVESTIGATION_CAPABILITIES.fileReads.pageBound?.maxPageSize ?? DEMO_INVESTIGATION_CAPABILITIES.pagination.maxPageSize;
       const start = Math.max(1, request.startLine);
       if (start > lines.length) return { snapshot: request.snapshot, state: 'notFound', reason: 'startLine beyond file length' };
@@ -331,7 +388,7 @@ export function createDemoInvestigationSource(simulation: DemoInvestigationSimul
       const scenario = INVESTIGATION_SNAPSHOTS.get(request.snapshot.headSha);
       if (!scenario) return { snapshot: request.snapshot, state: 'unavailable', reason: `Unknown revision: ${request.snapshot.headSha}` };
       const bound = DEMO_INVESTIGATION_CAPABILITIES.repositorySearch.pageBound?.maxPageSize ?? DEMO_INVESTIGATION_CAPABILITIES.pagination.maxPageSize;
-      const { page, nextCursor } = paginate(searchScenario(scenario, request.query, request.pathScope), request.cursor, bound);
+      const { page, nextCursor } = paginate(searchScenario(scenario, request.query, request.revision, request.pathScope), request.cursor, bound);
       if (nextCursor) return { snapshot: request.snapshot, state: 'paginated', value: page, cursor: nextCursor };
       return { snapshot: request.snapshot, state: 'complete', value: page };
     },
@@ -352,7 +409,9 @@ export function createDemoInvestigationSource(simulation: DemoInvestigationSimul
           reason: `${declinedInScope.length} file(s) in this comparison were enumerated without diff content and could not be searched`,
         };
       }
-      const matches: DiffSearchMatch[] = searchScenario(scenario, request.query, request.pathScope).map((m) => ({
+      // `'head'` explicitly, not by default: a diff search reports `side: 'new'` positions, so the
+      // revision it searches is the one those positions are line numbers in.
+      const matches: DiffSearchMatch[] = searchScenario(scenario, request.query, 'head', request.pathScope).map((m) => ({
         position: { path: m.path, side: 'new', line: m.line },
         excerpt: m.excerpt,
       }));

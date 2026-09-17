@@ -640,10 +640,13 @@ export interface HarnessAttemptOptions {
   readonly preflightFailure?: Limitation;
   /**
    * Facts about this attempt that the caller established before building it and
-   * that do not stop it from running — today, that the source it would have
-   * preferred for investigation was unavailable, with the reason (design D8,
-   * task 9.1). Appended to the attempt's own limitations, so a run that
-   * succeeded through the second source still reports which one it used.
+   * that do not stop it from running — today, that the one investigation source
+   * could not be prepared as it stood, and why (design D8, task 10.3): a local
+   * object store that failed its ownership check and had to be rebuilt, for
+   * instance. Appended to the attempt's own limitations, so a run that went
+   * ahead anyway still reports what preparing its source cost. There is no
+   * second source to fall back to: a source that could not be obtained at all
+   * arrives as `preflightFailure` above and ends the attempt.
    */
   readonly limitations?: readonly Limitation[];
   /**
@@ -1112,11 +1115,11 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   let toolCallsSinceCheckpoint = 0;
   let smallFlag = false;
   // Seeded with whatever the caller established before this attempt existed —
-  // today, that its preferred investigation source could not be used and why
-  // (`add-local-git-investigation` task 9.1/design D8). They are attempt
+  // today, what preparing its investigation source cost and why
+  // (`add-local-git-investigation` task 10.3/design D8). They are attempt
   // limitations like any other: reported on the terminal result, carried into
   // every checkpoint, and never silently dropped because the attempt went on to
-  // succeed with the other source.
+  // succeed anyway.
   const extraLimitations: Limitation[] = [...(options.limitations ?? [])];
   let latestHeads: readonly MemberHeadCheck[] = [];
   let latestCitations: CitationRevalidationSummary = { revalidated: false, invalidatedCount: 0 };
@@ -3245,10 +3248,21 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       const resolved = snapshotMember(member.memberId).rootAgentsPolicy;
       // Straight passthrough of the snapshot's own already-resolved shape: `resolvePolicy` is not
       // bootstrap-legal (its `allowedPhases` excludes `bootstrap`, `harnessTools.ts`), so this is
-      // never re-fetched here — `text`/`files`/`identical` ride along exactly as the snapshot
-      // carries them, which is what lets root policy content reach the model without a fresh fetch.
+      // never re-fetched here — `text`/`files`/`identical`/`companionUnavailable` ride along exactly
+      // as the snapshot carries them, which is what lets root policy content reach the model without
+      // a fresh fetch. `companionUnavailable` rides along for a different reason than the rest: drop
+      // it here and the render says "root AGENTS.md present" for a member whose `CLAUDE.md` nobody
+      // could read, which is the one thing the snapshot field exists to prevent.
       const source: BootstrapPolicySource = resolved.present
-        ? { present: true, sourceId: resolved.sourceId, digest: resolved.digest, text: resolved.text, files: resolved.files, identical: resolved.identical }
+        ? {
+            present: true,
+            sourceId: resolved.sourceId,
+            digest: resolved.digest,
+            text: resolved.text,
+            files: resolved.files,
+            identical: resolved.identical,
+            companionUnavailable: resolved.companionUnavailable,
+          }
         : { present: false, unavailableReason: resolved.unavailableReason };
       return { memberId: member.memberId, source };
     });

@@ -82,7 +82,8 @@ The harness SHALL let the model create and revise a public plan, classify risk, 
 
 - **WHEN** the host resolves a repository's root policy
 - **THEN** a level where both `AGENTS.md` and `CLAUDE.md` were checked and neither exists is reported as absent
-- **AND** a level the host could not fully check — no readable source, a withheld capability, or a failed read — is reported distinguishably as unavailable, with the reviewer told the principles were not read
+- **AND** a level where neither file could be read — no readable source, a withheld capability, or a failed read — is reported distinguishably as unavailable, with the reviewer told the principles were not read
+- **AND** a level where one file was read and the other could not be is reported as present with the unread file and the reason named, and the run's limitations record that rules it carries were not applied
 
 #### Scenario: Agent instructions request another tool
 

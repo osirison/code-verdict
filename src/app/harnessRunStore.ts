@@ -34,10 +34,24 @@
  * layers already export (`parseRunLifecycle`, `parseResultCompleteness`,
  * `parseRunPhase`, `parsePlanItemState`, `parseEvidenceKind`,
  * `parseEvidenceCompleteness`, `parseRiskLevel`, `parseFileInspectionState`,
- * `parseProtocolProvenance`, `parseCheckpointReason`, `isTerminalLifecycle`)
- * rather than casting. A record that fails to parse — an unknown lifecycle,
- * a malformed evidence kind, anything shaped wrong — is dropped as a whole
- * (`undefined`), never partially trusted or fabricated.
+ * `parseProtocolProvenance`, `parseCheckpointReason`, `isTerminalLifecycle`,
+ * `validSequence`) rather than casting. A record that fails to parse — an
+ * unknown lifecycle, a malformed evidence kind, anything shaped wrong — is
+ * dropped as a whole (`undefined`), never partially trusted or fabricated.
+ *
+ * **Numbers are read back with the write side's own test**, not a weaker one.
+ * A field whose writer *refuses* a bad value is re-checked with the function
+ * that writer applies — `nonNegativeFinite`, `validSequence`
+ * (`harnessActivityLog.ts`), `normalizeEvidenceRange`
+ * (`harnessEvidenceLedger.ts`), `parseOptionalNonNegativeFinite`. Neither half
+ * of that test is optional: `typeof === 'number'` alone accepts an `Infinity`
+ * that strict JSON carries (`1e999`), and a sign or range comparison written
+ * beside it accepts `NaN`, because every comparison against `NaN` is false.
+ * Both are values no writer could have produced, and nothing downstream
+ * re-checks either. The fields still checked by `typeof` alone — byte counts,
+ * attempt numbers, unit totals — are ones their writer *computes* rather than
+ * validates, so there is no write-side rule to mirror and this module does not
+ * invent one.
  *
  * **What this pass deliberately does not build** (11.5-11.8, a later pass):
  * digest/head/model/policy resume-compatibility checks, resuming a new
@@ -55,12 +69,13 @@ import {
   type IntendedTerminal,
   type PersistedCheckpoint,
 } from './harnessCheckpoint';
+import { validSequence } from './harnessActivityLog';
 import { reduceActivity } from './harnessActivityProjection';
 import type { ContradictedFindingRecord } from './harnessAttempt';
 import { parseCheckpointReason } from './harnessAttempt';
 import type { CitedEvidenceRef, FindingRouting, TrackedCandidate, TrackedCandidateState, ValidatedFinding, ValidationReason } from './harnessCandidateValidation';
 import type { EvidenceLocation, EvidenceOrigin, EvidenceProducer, EvidenceTruncation, RetainedEvidenceRecord } from './harnessEvidenceLedger';
-import { EVIDENCE_ORIGINS, EVIDENCE_PRODUCERS } from './harnessEvidenceLedger';
+import { EVIDENCE_ORIGINS, EVIDENCE_PRODUCERS, normalizeEvidenceRange } from './harnessEvidenceLedger';
 import type { KeyValueStore } from './storage';
 import {
   ALL_CATEGORIES,
@@ -199,10 +214,22 @@ function parseLimitations(raw: unknown): readonly Limitation[] | undefined {
   return parseArray(raw, parseLimitation);
 }
 
+/**
+ * The persisted-number test every field in this module whose write side refuses a negative or
+ * non-finite value is read back with. Both halves are load-bearing and neither is enough alone:
+ * `typeof === 'number'` reads a stored `Infinity` back as valid (`JSON.parse('{"x":1e999}')`
+ * produces one from strict, well-formed JSON), and a bare `< 0` comparison never catches `NaN`,
+ * because every comparison against `NaN` is false. A check that declares a sign bound while
+ * silently admitting `NaN` is the shape this module has had to fix more than once.
+ */
+function nonNegativeFinite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 /** Mirrors `harnessActivityLog.ts`'s own `sanitizeOptionalNonNegativeFinite` — present-but-invalid fails the field's own event closed (this module's house style, see file header), `undefined` is a legitimate absence. */
 function parseOptionalNonNegativeFinite(raw: unknown): { ok: false } | { ok: true; value: number | undefined } {
   if (raw === undefined) return { ok: true, value: undefined };
-  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? { ok: true, value: raw } : { ok: false };
+  return nonNegativeFinite(raw) ? { ok: true, value: raw } : { ok: false };
 }
 
 /**
@@ -266,13 +293,12 @@ export function parsePlan(raw: unknown): Plan | undefined {
  * closed the moment any of these five fields is negative, `NaN`, or `Infinity` (its own
  * `nonNegativeFinite` check), never just wrong-typed — a parser that only checked `typeof === 'number'`
  * would happily read a persisted `-1` or `Infinity` back as valid, which the write side would have
- * refused to accept in the first place. `classified`/`inspected` are required, so their check is
- * inline; the three optional fields reuse `parseOptionalNonNegativeFinite`, the same helper
- * `parseCallMetadata` above already uses for its own five optional numeric fields.
+ * refused to accept in the first place. `classified`/`inspected` are required, so they take
+ * `nonNegativeFinite` directly; the three optional fields reuse `parseOptionalNonNegativeFinite`,
+ * the same helper `parseCallMetadata` above already uses for its own five optional numeric fields.
  */
 function parseCoverageProgress(raw: unknown): CoverageProgress | undefined {
   if (!isRecord(raw)) return undefined;
-  const nonNegativeFinite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
   if (!nonNegativeFinite(raw.classified) || !nonNegativeFinite(raw.inspected)) return undefined;
   const total = parseOptionalNonNegativeFinite(raw.total);
   const requiredInspected = parseOptionalNonNegativeFinite(raw.requiredInspected);
@@ -291,11 +317,17 @@ function parseCoverageProgress(raw: unknown): CoverageProgress | undefined {
 export function parseActivityEvent(raw: unknown, expected: { runId: RunId; lineageId: LineageId; attempt: AttemptNumber }): ActivityEvent | undefined {
   if (!isRecord(raw)) return undefined;
   if (raw.runId !== expected.runId || raw.lineageId !== expected.lineageId || raw.attempt !== expected.attempt) return undefined;
-  if (typeof raw.sequence !== 'number') return undefined;
+  // The three common fields are held to the *write* side's own tests, never weaker ones:
+  // `harnessActivityLog.ts`'s `validSequence` (imported, so the two can never drift) and the finite,
+  // non-negative `elapsedMs` its `validEventFields` requires of every appended event. Nothing
+  // downstream re-checks them — `parsePersistedCheckpoint` builds the projection straight off this
+  // array, and `reduceActivity`'s `last?.elapsedMs ?? 0` does not fire for `NaN`, so a non-finite
+  // value read back here becomes the run clock the stopwatch and time line paint.
+  if (!validSequence(raw.sequence)) return undefined;
   if (typeof raw.occurredAt !== 'string' || Number.isNaN(Date.parse(raw.occurredAt))) return undefined;
   const phase = parseRunPhase(raw.phase);
   if (!phase) return undefined;
-  if (typeof raw.elapsedMs !== 'number' || raw.elapsedMs < 0) return undefined;
+  if (!nonNegativeFinite(raw.elapsedMs)) return undefined;
   const base = { runId: expected.runId, lineageId: expected.lineageId, attempt: expected.attempt, sequence: raw.sequence, occurredAt: raw.occurredAt, phase, elapsedMs: raw.elapsedMs };
   const optionalString = (value: unknown): value is string | undefined => value === undefined || typeof value === 'string';
 
@@ -380,7 +412,7 @@ export function parseRunProjection(raw: unknown): RunProjection | undefined {
   if (raw.phase !== undefined && !isRunPhase(raw.phase)) return undefined;
   if (raw.currentAction !== undefined && typeof raw.currentAction !== 'string') return undefined;
   if (raw.currentTarget !== undefined && typeof raw.currentTarget !== 'string') return undefined;
-  if (typeof raw.elapsedMs !== 'number') return undefined;
+  if (!nonNegativeFinite(raw.elapsedMs)) return undefined;
   const progressMode = parseProgressMode(raw.progressMode);
   if (!progressMode) return undefined;
   let progressUnits: { completed: number; total?: number } | undefined;
@@ -432,7 +464,7 @@ function isKnownEvidenceOrigin(value: unknown): value is EvidenceOrigin {
 
 function parseEvidenceRange(raw: unknown): EvidenceRange | undefined {
   if (!isRecord(raw)) return undefined;
-  if (typeof raw.startLine !== 'number' || typeof raw.endLine !== 'number') return undefined;
+  if (!nonNegativeFinite(raw.startLine) || !nonNegativeFinite(raw.endLine)) return undefined;
   if (raw.startLine < 1 || raw.endLine < raw.startLine) return undefined;
   return { startLine: raw.startLine, endLine: raw.endLine };
 }
@@ -534,10 +566,13 @@ function parseReviewItemSpan(raw: unknown): { repoId: string; location: string; 
 function parseReviewItem(raw: unknown): ReviewItem | undefined {
   if (!isRecord(raw)) return undefined;
   if (typeof raw.id !== 'string' || typeof raw.file !== 'string' || typeof raw.anchored !== 'boolean') return undefined;
-  if (typeof raw.line !== 'number') return undefined;
-  if (raw.endLine !== undefined && typeof raw.endLine !== 'number') return undefined;
+  // The write side is `parseCandidateFinding`'s own `normalizeEvidenceRange(raw.line, raw.endLine)`,
+  // reused here rather than approximated: a persisted item's span is held to the same positive
+  // integers, ordered the same way, that were required of it when the model submitted it.
+  const span = normalizeEvidenceRange(raw.line, raw.endLine);
+  if (!span) return undefined;
   if (!isKnownSeverity(raw.severity) || !isKnownCategory(raw.category)) return undefined;
-  if (typeof raw.confidence !== 'number' || raw.confidence < 0 || raw.confidence > 100) return undefined;
+  if (!nonNegativeFinite(raw.confidence) || raw.confidence > 100) return undefined;
   if (typeof raw.title !== 'string' || typeof raw.body !== 'string' || typeof raw.code !== 'string') return undefined;
   if (raw.rule !== undefined && typeof raw.rule !== 'string') return undefined;
   if (raw.reference !== undefined && typeof raw.reference !== 'string') return undefined;
@@ -556,14 +591,14 @@ function parseReviewItem(raw: unknown): ReviewItem | undefined {
     id: raw.id,
     file: raw.file,
     anchored: raw.anchored,
-    line: raw.line,
+    line: span.startLine,
     severity: raw.severity,
     category: raw.category,
     confidence: raw.confidence,
     title: raw.title,
     body: raw.body,
     code: raw.code,
-    ...(raw.endLine !== undefined ? { endLine: raw.endLine as number } : {}),
+    ...(raw.endLine !== undefined ? { endLine: span.endLine } : {}),
     ...(raw.rule !== undefined ? { rule: raw.rule as string } : {}),
     ...(raw.reference !== undefined ? { reference: raw.reference as string } : {}),
     ...(raw.repoId !== undefined ? { repoId: raw.repoId as string } : {}),
@@ -633,7 +668,7 @@ function parseTrackedCandidate(raw: unknown): TrackedCandidate | undefined {
   if (!isRecord(raw)) return undefined;
   const state = isTrackedCandidateState(raw.state) ? raw.state : undefined;
   if (typeof raw.candidateId !== 'string' || !state) return undefined;
-  if (typeof raw.repairs !== 'number' || raw.repairs < 0) return undefined;
+  if (!nonNegativeFinite(raw.repairs)) return undefined;
   const reasons = parseArray(raw.reasons, parseValidationReason);
   if (!reasons) return undefined;
   if (raw.finding === undefined) return { candidateId: raw.candidateId, state, repairs: raw.repairs, reasons };
@@ -652,7 +687,7 @@ function parseBudgetConsumption(raw: unknown): BudgetConsumption | undefined {
   if (!isRecord(raw)) return undefined;
   const fields = ['modelTurnsUsed', 'toolCallsUsed', 'evidenceBytesUsed', 'elapsedMs', 'highRiskReserveUsed', 'verificationReserveUsed'] as const;
   for (const field of fields) {
-    if (typeof raw[field] !== 'number' || raw[field] < 0) return undefined;
+    if (!nonNegativeFinite(raw[field])) return undefined;
   }
   return {
     modelTurnsUsed: raw.modelTurnsUsed as number,
@@ -714,7 +749,7 @@ export function parsePersistedCheckpoint(raw: unknown): PersistedCheckpoint | un
   const reason = parseCheckpointReason(raw.reason);
   if (!phase || !reason) return undefined;
   if (typeof raw.occurredAt !== 'string' || Number.isNaN(Date.parse(raw.occurredAt))) return undefined;
-  if (typeof raw.elapsedMs !== 'number' || typeof raw.snapshotDigest !== 'string') return undefined;
+  if (!nonNegativeFinite(raw.elapsedMs) || typeof raw.snapshotDigest !== 'string') return undefined;
 
   const identity = { runId: raw.runId as RunId, lineageId: raw.lineageId as LineageId, attempt: raw.attempt };
   let plan: Plan | undefined;
@@ -1093,9 +1128,17 @@ const MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES = 64 * 1024;
  * copy `writeSnapshot` is about to write goes through this; the snapshot object a live attempt is
  * already using in memory (its own `rootPoliciesFor`, `harnessAttempt.ts`) is untouched, since this
  * runs on a shallow copy the caller builds separately (see `writeSnapshot`) and reads a value it
- * never mutates. `sourceId`/`digest`/`files`/`identical` always survive uncapped: they are the
- * identity a resumed attempt or a dashboard render still needs, and none of them can grow unbounded
- * the way free-form file content can.
+ * never mutates. `sourceId`/`digest`/`files`/`identical`/`companionUnavailable` always survive
+ * uncapped: they are the identity and the honesty a resumed attempt or a dashboard render still
+ * needs, and none of them can grow unbounded the way free-form file content can.
+ *
+ * Every field on the arm has to be listed here, and that is a standing hazard rather than a style
+ * choice: this rebuild is the only thing that changes between the moment `computeSnapshotDigest`
+ * hashes the in-memory snapshot and the moment `checkCheckpointIntegrity` re-hashes the stored one.
+ * A field dropped here but hashed there makes the two disagree, and every over-cap run is then
+ * refused on resume as "no longer hashes to digest" — which is exactly what `harnessCheckpoint.ts`'s
+ * `digestProjection` exists to prevent for `text`/`textOmittedReason`, the two fields this function
+ * is *supposed* to diverge on.
  *
  * Deliberately cap-only, not deduplicated across members that happen to share the same
  * `repoId`/`baseSha`/`digest` (a monorepo changeset where every member reads the same root policy).
@@ -1118,6 +1161,7 @@ function capPersistedRootPolicyText(source: ReviewRunMemberSnapshot['rootAgentsP
     digest: source.digest,
     ...(source.files !== undefined ? { files: source.files } : {}),
     ...(source.identical !== undefined ? { identical: source.identical } : {}),
+    ...(source.companionUnavailable !== undefined ? { companionUnavailable: source.companionUnavailable } : {}),
     textOmittedReason: `text omitted from snapshot: exceeds ${MAX_PERSISTED_ROOT_POLICY_TEXT_BYTES} bytes (was ${bytes} bytes)`,
   };
 }
