@@ -149,6 +149,40 @@ describe('debug bootstrap against a live emulator', () => {
     expect(sidebarHtml).toContain('#1180');
   });
 
+  it('reuses the selected pod, not whichever duplicate findByInstance finds first', async () => {
+    const podStore = new PodStore(memoryStore());
+    const secrets = memorySecrets();
+    const bypass: DebugAuthBypass = {
+      enabled: true,
+      providerId: 'gitlab',
+      instanceUrl: baseUrl,
+      token: 'glpat-emulator',
+      reason: 'override',
+    };
+
+    // Onboarding assigns random ids and never dedupes by instance, so two
+    // pods at the same provider+instanceUrl is a real state, not a contrived
+    // one. The second is the one the user has selected.
+    const duplicatePod = (id: string): Pod => ({
+      id,
+      name: `Pod ${id}`,
+      providerId: bypass.providerId,
+      instanceUrl: bypass.instanceUrl,
+      sources: [{ kind: 'group', groupId: '4821', repoIds: ['9101'] }],
+      criteria: DEFAULT_CRITERIA,
+      agentId: '',
+    });
+    await podStore.upsert(duplicatePod('first'));
+    await podStore.upsert(duplicatePod('second'));
+    await podStore.setActive('second');
+
+    const pod = await runDebugBootstrap(bypass, podStore, secrets, {});
+
+    expect(pod.id).toBe('second');
+    expect(podStore.activePod?.id).toBe('second');
+    expect(podStore.list()).toHaveLength(2);
+  });
+
   it('drives the whole review loop: demo agent → triage → submit → threads', async () => {
     const podStore = new PodStore(memoryStore());
     const secrets = memorySecrets();

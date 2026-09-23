@@ -21,15 +21,19 @@ import { tokenSecretKey } from './storage';
 const DEFAULT_SOURCES = 'group 4821, 9210';
 const DEBUG_POD_ID = 'pod_debug_emulator';
 
+// Shared by isDebugBootstrapPodActive and runDebugBootstrap's reuse branch:
+// keyed by provider+instance, not by DEBUG_POD_ID — a pod seeded any other
+// way at the same instance still counts, whatever else sits beside it in the
+// pod list.
+function matchesBypass(pod: Pod | undefined, bypass: DebugAuthBypass): boolean {
+  return pod?.providerId === bypass.providerId && pod?.instanceUrl === bypass.instanceUrl;
+}
+
 // Gates the activation-time reconnect (see extension.ts): only fire when the
-// selected pod itself points at the emulator, keyed by provider+instance like
-// `runDebugBootstrap`'s own reuse branch below, not by DEBUG_POD_ID — a pod
-// seeded any other way at the same instance still counts, whatever else sits
-// beside it in the pod list. Plain "Run Extension" with no emulator started
-// must never touch the network on F5.
+// selected pod itself points at the emulator. Plain "Run Extension" with no
+// emulator started must never touch the network on F5.
 export function isDebugBootstrapPodActive(bypass: DebugAuthBypass, podStore: PodStore): boolean {
-  const active = podStore.activePod;
-  return active?.providerId === bypass.providerId && active?.instanceUrl === bypass.instanceUrl;
+  return matchesBypass(podStore.activePod, bypass);
 }
 
 export async function runDebugBootstrap(
@@ -55,7 +59,15 @@ export async function runDebugBootstrap(
     );
   }
 
-  const existing = podStore.findByInstance(bypass.providerId, bypass.instanceUrl);
+  // Onboarding assigns pods random ids and never dedupes by instance, so two
+  // pods can share this provider+instanceUrl. Reuse the one already selected
+  // when it's one of them — findByInstance's first match is otherwise
+  // whichever pod happened to be created first, and switching to it would
+  // hijack the selection exactly like the bug this file already fixes once.
+  const active = podStore.activePod;
+  const existing = matchesBypass(active, bypass)
+    ? active
+    : podStore.findByInstance(bypass.providerId, bypass.instanceUrl);
   if (existing) {
     await podStore.setActive(existing.id);
     return existing;
