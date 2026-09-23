@@ -885,3 +885,68 @@ describe('activation removes the settings this version no longer declares', () =
     expect(agentTraceChannel().lines.join('\n')).toContain('could not remove codeVerdict.pods from user settings');
   });
 });
+
+/**
+ * `isDebugBootstrapPodActive` (`debugBootstrap.test.ts`) has its own thorough coverage; what it
+ * cannot prove is that `activate()` actually consults it. A regression back to the unconditional
+ * `void bootstrapFromDebugBypass()` at the end of `activate()` would pass every other test in this
+ * suite, so this drives the gate through real activation and watches the one thing it controls —
+ * whether a request to the debug instance URL happens at all. `activateWith` already sets
+ * `extensionMode: 2`; the other gate `getDebugAuthBypass` requires is the env block below, which no
+ * other test in this file sets.
+ */
+describe('activation reconnects to the debug instance only when the emulator pod is the active one', () => {
+  const DEBUG_INSTANCE_URL = 'http://127.0.0.1:8973';
+  let originalBypassEnv: string | undefined;
+  let originalInstanceUrlEnv: string | undefined;
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    originalBypassEnv = process.env.VERDICT_DEBUG_AUTH_BYPASS;
+    originalInstanceUrlEnv = process.env.CODE_VERDICT_DEBUG_INSTANCE_URL;
+    process.env.VERDICT_DEBUG_AUTH_BYPASS = '1';
+    process.env.CODE_VERDICT_DEBUG_INSTANCE_URL = DEBUG_INSTANCE_URL;
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    // Restored rather than just reassigned to the captured value, so a test that ran with the
+    // vars already unset (unlikely, but this suite shares process.env across every test in the
+    // file) leaves them unset again rather than writing `"undefined"`.
+    if (originalBypassEnv === undefined) delete process.env.VERDICT_DEBUG_AUTH_BYPASS;
+    else process.env.VERDICT_DEBUG_AUTH_BYPASS = originalBypassEnv;
+    if (originalInstanceUrlEnv === undefined) delete process.env.CODE_VERDICT_DEBUG_INSTANCE_URL;
+    else process.env.CODE_VERDICT_DEBUG_INSTANCE_URL = originalInstanceUrlEnv;
+    globalThis.fetch = originalFetch;
+  });
+
+  it('makes no request to the debug instance when globalState has no pods', async () => {
+    const fetchMock = vi.fn((_url: string, _init?: unknown) => Promise.reject(new Error('unexpected fetch')));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await activateWith(memoryStore());
+    await flushMicrotasks();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(DEBUG_INSTANCE_URL))).toBe(false);
+  });
+
+  it('attempts the connection when the emulator pod is the active one', async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: unknown) => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({ username: 'you' }),
+      text: async () => '',
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const store = memoryStore();
+    await seedPod(store, { providerId: 'gitlab', instanceUrl: DEBUG_INSTANCE_URL });
+    await activateWith(store);
+    await flushMicrotasks();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(DEBUG_INSTANCE_URL))).toBe(true);
+  });
+});

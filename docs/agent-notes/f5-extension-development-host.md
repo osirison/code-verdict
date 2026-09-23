@@ -104,8 +104,12 @@ written again. It builds, loads `dist/extension.js` against a stubbed `vscode`, 
 `dist/extension.js` can be loaded head­lessly against a stubbed `vscode` module to prove
 `activate()` neither throws nor spins. Requiring the bundle with `Module._load` patched to return a
 permissive Proxy for `require('vscode')`, then calling `activate(context)` with
-`extensionMode: 2`, exercises the same debug-bypass branch F5 takes. A healthy run resolves in tens
-of milliseconds; as of the background-review-runs change it registers 29 commands, 36 subscriptions
+`extensionMode: 2`, evaluates the same debug-bypass gate F5 takes — reached only when the env block
+from `.vscode/launch.json` is exported first (`VERDICT_DEBUG_AUTH_BYPASS=1 … node
+scripts/activation-probe.cjs`); a plain `npm run probe` skips it because the bypass itself is off.
+When it is reached, the stub's `globalState` is empty, so there is no active pod and activation
+skips the reconnect rather than dialling the emulator. A healthy run resolves in tens of
+milliseconds; as of the background-review-runs change it registers 29 commands, 36 subscriptions
 and 6 status-bar items. This separates "the extension is broken" from "the window is dying" in
 seconds, without a display.
 

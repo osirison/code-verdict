@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ALL_COMMAND_IDS, COMMANDS, INTERNAL_COMMANDS } from './commands';
 import { AppStore } from './app/appStore';
 import { detectChangesets } from './app/changesets';
-import { runDebugBootstrap } from './app/debugBootstrap';
+import { isDebugBootstrapPodActive, runDebugBootstrap } from './app/debugBootstrap';
 import { ManualChangesetStore } from './app/manualChangesets';
 import { PodStore } from './app/pods';
 import { connectionForPod } from './app/connections';
@@ -1437,10 +1437,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // ahead of `notifier` existing to raise it.
   void interruptedSweep.then((count) => notifier.runsInterrupted(count));
 
-  // F5 with the debug env vars set (see .vscode/launch.json): skip
-  // onboarding entirely and land on a populated dashboard. Fire and
-  // forget — activation must not block on network I/O.
-  if (getDebugAuthBypass(context.extensionMode)) {
+  // F5 with the debug env vars set (see .vscode/launch.json): reconnect only
+  // when the emulator pod is already the selected pod, so a plain "Run
+  // Extension" launch with no emulator started does not toast a connection
+  // failure on every activation. The first session on a fresh profile picks
+  // the pod up through "Verdict: sign in" -> the debug option instead. Fire
+  // and forget — activation must not block on network I/O.
+  const bypass = getDebugAuthBypass(context.extensionMode);
+  if (bypass && isDebugBootstrapPodActive(bypass, podStore)) {
     void bootstrapFromDebugBypass();
   }
 }

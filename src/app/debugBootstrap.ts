@@ -1,8 +1,10 @@
 /**
  * Debug-only bootstrap: when the launch config sets the auth-bypass env
  * vars (see `src/debugAuth.ts`), pre-seed everything onboarding would
- * produce — token in the secret store, a pod pointing at the emulator —
- * so an F5 session lands straight on populated screens.
+ * produce — token in the secret store, a pod pointing at the emulator.
+ * The first F5 on a fresh profile still needs "Verdict: sign in" -> the
+ * debug option once; after that, activation reconnects on its own because
+ * the emulator pod is now the selected pod.
  *
  * This is the app-layer home of the bypass: providers stay config-driven
  * and never read the environment.
@@ -18,6 +20,17 @@ import { tokenSecretKey } from './storage';
 
 const DEFAULT_SOURCES = 'group 4821, 9210';
 const DEBUG_POD_ID = 'pod_debug_emulator';
+
+// Gates the activation-time reconnect (see extension.ts): only fire when the
+// selected pod itself points at the emulator, keyed by provider+instance like
+// `runDebugBootstrap`'s own reuse branch below, not by DEBUG_POD_ID — a pod
+// seeded any other way at the same instance still counts, whatever else sits
+// beside it in the pod list. Plain "Run Extension" with no emulator started
+// must never touch the network on F5.
+export function isDebugBootstrapPodActive(bypass: DebugAuthBypass, podStore: PodStore): boolean {
+  const active = podStore.activePod;
+  return active?.providerId === bypass.providerId && active?.instanceUrl === bypass.instanceUrl;
+}
 
 export async function runDebugBootstrap(
   bypass: DebugAuthBypass,
