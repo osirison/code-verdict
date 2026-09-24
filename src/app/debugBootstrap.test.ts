@@ -16,10 +16,12 @@ import { connectionForPod } from './connections';
 import { fetchPodData, repoIdsOf, repoLabel } from './podQuery';
 import { PodStore } from './pods';
 import type { KeyValueStore, SecretStore } from './storage';
-import { runDebugBootstrap } from './debugBootstrap';
+import { isDebugBootstrapPodActive, runDebugBootstrap } from './debugBootstrap';
 import { DEMO_AGENT_ID, DEMO_AGENT_LABEL, demoFindingsForFile } from './demoAgent';
 import { BUILTIN_AGENT_DESCRIPTOR } from './agents';
-import type { ReviewItem } from '../domain/types';
+import { DEFAULT_CRITERIA } from '../domain/criteria';
+import type { Pod, ReviewItem } from '../domain/types';
+import type { DebugAuthBypass } from '../debugAuth';
 import { composeCommentDrafts, composeSummaryBody, performSubmit } from './submit';
 import { composeSummary } from '../domain/summary';
 import { addedLines } from '../domain/diffHunks';
@@ -145,6 +147,40 @@ describe('debug bootstrap against a live emulator', () => {
     expect(sidebarHtml).toContain('Refactor token refresh');
     expect(sidebarHtml).toContain('Issues · in progress');
     expect(sidebarHtml).toContain('#1180');
+  });
+
+  it('reuses the selected pod, not whichever duplicate findByInstance finds first', async () => {
+    const podStore = new PodStore(memoryStore());
+    const secrets = memorySecrets();
+    const bypass: DebugAuthBypass = {
+      enabled: true,
+      providerId: 'gitlab',
+      instanceUrl: baseUrl,
+      token: 'glpat-emulator',
+      reason: 'override',
+    };
+
+    // Onboarding assigns random ids and never dedupes by instance, so two
+    // pods at the same provider+instanceUrl is a real state, not a contrived
+    // one. The second is the one the user has selected.
+    const duplicatePod = (id: string): Pod => ({
+      id,
+      name: `Pod ${id}`,
+      providerId: bypass.providerId,
+      instanceUrl: bypass.instanceUrl,
+      sources: [{ kind: 'group', groupId: '4821', repoIds: ['9101'] }],
+      criteria: DEFAULT_CRITERIA,
+      agentId: '',
+    });
+    await podStore.upsert(duplicatePod('first'));
+    await podStore.upsert(duplicatePod('second'));
+    await podStore.setActive('second');
+
+    const pod = await runDebugBootstrap(bypass, podStore, secrets, {});
+
+    expect(pod.id).toBe('second');
+    expect(podStore.activePod?.id).toBe('second');
+    expect(podStore.list()).toHaveLength(2);
   });
 
   it('drives the whole review loop: demo agent → triage → submit → threads', async () => {
@@ -325,5 +361,76 @@ describe('debug bootstrap against a live emulator', () => {
     expect(stateAfter.requestLog.slice(summaryPost).some(
       (entry) => entry.startsWith('POST ') && entry.includes('/discussions'),
     )).toBe(false);
+  });
+});
+
+describe('isDebugBootstrapPodActive', () => {
+  const bypass: DebugAuthBypass = {
+    enabled: true,
+    providerId: 'gitlab',
+    instanceUrl: 'http://127.0.0.1:8971',
+    token: 'glpat-emulator',
+    reason: 'development',
+  };
+
+  function pod(id: string, instanceUrl = bypass.instanceUrl): Pod {
+    return {
+      id,
+      name: `Pod ${id}`,
+      providerId: 'gitlab',
+      instanceUrl,
+      sources: [{ kind: 'group', groupId: '4821', repoIds: ['9101'] }],
+      criteria: DEFAULT_CRITERIA,
+      agentId: '',
+    };
+  }
+
+  it('is false against an empty pod store', () => {
+    const podStore = new PodStore(memoryStore());
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(false);
+  });
+
+  it('is false when the emulator pod exists but a different pod is active', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('emulator'));
+    await podStore.upsert(pod('other', 'https://gitlab.com'));
+    await podStore.setActive('other');
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(false);
+  });
+
+  it('is true when the emulator pod is active', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('emulator'));
+    await podStore.setActive('emulator');
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(true);
+  });
+
+  it('is true when the active pointer is missing but the emulator pod is pods[0]', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('emulator'));
+    // No setActive call — activePod falls back to pods[0].
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(true);
+  });
+
+  it('is true when the active pointer is dangling but the emulator pod is pods[0]', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('emulator'));
+    await podStore.setActive('gone');
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(true);
+  });
+
+  it('is false when the only pod is at a different instanceUrl and active', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('other', 'https://gitlab.com'));
+    await podStore.setActive('other');
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(false);
+  });
+
+  it('is true when two pods share the provider+instanceUrl and the second one is active', async () => {
+    const podStore = new PodStore(memoryStore());
+    await podStore.upsert(pod('first'));
+    await podStore.upsert(pod('second'));
+    await podStore.setActive('second');
+    expect(isDebugBootstrapPodActive(bypass, podStore)).toBe(true);
   });
 });
