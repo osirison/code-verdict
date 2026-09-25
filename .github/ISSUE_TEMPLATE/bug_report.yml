@@ -1,0 +1,50 @@
+name: Bug report
+description: Report something that isn't working as expected.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code version
+      placeholder: 1.96.0
+    validations:
+      required: true
+  - type: input
+    id: extension-version
+    attributes:
+      label: Code Verdict version
+      placeholder: 0.0.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other (remote / Codespaces / WSL)
+    validations:
+      required: true
+  - type: input
+    id: agent-provider
+    attributes:
+      label: Review agent, model, and SCM provider
+      description: The agent selected on the Run AI Review screen (or "default"), the Copilot model, and GitLab or GitHub.
+      placeholder: "Security Reviewer, gpt-5, GitLab"
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true

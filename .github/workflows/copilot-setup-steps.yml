@@ -23,10 +23,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install OpenSpec CLI
-        run: npm install -g @fission-ai/openspec
+        # This environment has push rights, so the version is pinned deliberately rather than
+        # floating on latest; it gets bumped as part of the dependency-update work. Confirmed
+        # clean of preinstall/install/postinstall scripts in its full dependency tree, so
+        # --ignore-scripts is safe here.
+        run: npm install -g @fission-ai/openspec@1.13.1 --ignore-scripts
 
       - name: Verify OpenSpec CLI
         run: openspec --version
