@@ -564,13 +564,13 @@
     "emulator": "esbuild emulator/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/emulator.cjs --log-level=warning && node dist/emulator.cjs"
   },
   "devDependencies": {
-    "@types/jsdom": "^30.0.0",
+    "@types/jsdom": "^28.0.3",
     "@types/node": "^22.10.0",
     "@types/vscode": "~1.96.0",
     "ajv": "^8.20.0",
     "esbuild": "^0.25.0",
     "eslint": "^9.17.0",
-    "jsdom": "^30.0.1",
+    "jsdom": "^29.1.1",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.19.0",
     "vitest": "^3.0.0"
