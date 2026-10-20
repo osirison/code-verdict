@@ -21,9 +21,9 @@
  * classification, logical-unit investigation, checkpoint, synthesis,
  * verification/contradiction/deduplication, host validation, persistence) is
  * sub-structure *within* those six, not a seventh phase:
- * - risk classification runs as the first step of `investigating` (the
- *   committed protocol, task 10.1, carries no model risk-proposal message —
- *   see the note on `classifyFile` below);
+ * - risk classification runs as the first step of `investigating`, and the
+ *   model's own `riskProposal` message (planning or investigating) is applied
+ *   on top of it — see `applyRiskProposals`;
  * - synthesis and verification/contradiction/deduplication both run inside
  *   `verifying`, before the turn loop that lets the model request
  *   completion;
@@ -47,16 +47,16 @@
  * module for a caller to construct.
  *
  * **Interpretations documented, not silently narrowed:**
- * - *No model risk-proposal channel.* Design.md D10 says "the model proposes
- *   risk and logical units [and] the host applies mandatory risk floors...
- *   Model proposal never lowers a host floor," but the committed protocol
- *   (task 10.1, `harnessProtocol.ts`) has no message kind carrying a risk
- *   proposal. `classifyFile` below accepts an optional proposed risk (so the
- *   floor-overrides-a-low-proposal rule is real, testable code) and this
- *   module always calls it with `undefined` today — the floor alone decides.
- *   Extending the protocol with a risk-proposal message is out of this
- *   pass's scope (task 10.1 is committed) and is reported as a gap, not
- *   invented here.
+ * - *The model proposes risk; it can only raise it.* Design.md D10: "the model
+ *   proposes risk and logical units [and] the host applies mandatory risk
+ *   floors... Model proposal never lowers a host floor." The `riskProposal`
+ *   message (`harnessProtocol.ts`) carries that proposal, and
+ *   `applyRiskProposals` applies it through `classifyFile`, so the floor still
+ *   decides whenever it is the higher of the two. Every file is classified at
+ *   the top of `investigating` from the floor alone, so in practice a proposal
+ *   arrives as a raise on an already-classified file; nothing it says can lower
+ *   a recorded risk, add a file to the inventory, or re-open a file already
+ *   read.
  * - *`unresolvedFetches` is always 0.* Every tool dispatch in this module is
  *   `await`ed to a definite result before the turn loop continues; there is
  *   no pending/queued fetch state for `UnresolvedWork.unresolvedFetches` to
@@ -186,6 +186,7 @@ import {
   DEFAULT_RISK_COVERAGE_RULES,
   DEFAULT_RISK_FLOOR_RULES,
   isReserveEligible,
+  maxRisk,
   type RiskCoverageRules,
   type RiskFloorRules,
 } from './harnessRiskFloors';
@@ -220,7 +221,7 @@ import type { BudgetConsumption, FileInspectionState, MemberCoverage, RiskLevel,
 import { effortPrompt } from '../domain/effort';
 import { isTerminalLifecycle, type RunLifecycle } from '../domain/harnessLifecycle';
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from '../domain/harnessPolicy';
-import type { ParsedToolCall, ProtocolMessage } from '../domain/harnessProtocol';
+import type { ParsedToolCall, ProtocolMessage, RiskProposalEntry } from '../domain/harnessProtocol';
 import type { ReviewRunSnapshot } from '../domain/reviewRunSnapshot';
 import type { Connection, MemberCapabilities } from '../platform/provider';
 import type {
@@ -747,10 +748,9 @@ function attachmentSourceKey(memberId: string, attachmentId: string): string {
 }
 
 /**
- * The host-side classification step (D10). `proposed` is always `undefined`
- * from this module today (see the file header's documented protocol gap),
- * but the parameter exists so the floor-overrides-a-low-proposal rule is
- * real, callable code rather than only asserted in `harnessRiskFloors.test.ts`.
+ * The host-side classification step (D10). `proposed` is the model's
+ * `riskProposal` for the file, when it sent one; the applied risk is never
+ * below the host floor (`applyRiskFloor`), whatever was proposed.
  */
 export function classifyFile(
   entry: ChangedFileEntry,
@@ -808,7 +808,7 @@ function toHostToolRequest(
   }
 }
 
-/** Whether a turn's batch contains any work the host should act on beyond bookkeeping — the stall signal that ends a phase's loop (advisor-reviewed addition: a turn with none of this is the model saying "done here"). This catches a model that *stops*; it cannot catch one that runs in place, which is `turnAdvancedTheReview`'s job below. */
+/** Whether a turn's batch contains any work the host should act on beyond bookkeeping — the stall signal that ends a phase's loop (advisor-reviewed addition: a turn with none of this is the model saying "done here"). This catches a model that *stops*; it cannot catch one that runs in place, which is `turnAdvancedTheReview`'s job below. A `riskProposal` is deliberately not on the list: it changes what has to be read but is not itself a read, so a turn of nothing else is a stop that may have left work behind, and is answered like one. */
 function turnHasActionableWork(messages: readonly ProtocolMessage[]): boolean {
   return messages.some((message) => message.kind === 'toolRequest' || message.kind === 'candidateSubmission' || message.kind === 'planCreated' || message.kind === 'planRevised' || message.kind === 'completionRequest');
 }
@@ -1174,6 +1174,9 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   // every checkpoint, and never silently dropped because the attempt went on to
   // succeed anyway.
   const extraLimitations: Limitation[] = [...(options.limitations ?? [])];
+  /** Whether `runInvestigating` has made its one-shot coverage-versus-budget forecast, and the limitation it stated if any. Read by `applyRiskProposals`, which re-states it after a later raise. */
+  let shortfallForecastRan = false;
+  let shortfallLimitation: Limitation | undefined;
   let latestHeads: readonly MemberHeadCheck[] = [];
   let latestCitations: CitationRevalidationSummary = { revalidated: false, invalidatedCount: 0 };
   let latestPasses: VerificationPasses = { contradictionPassComplete: false, deduplicationComplete: false, finalVerificationComplete: false };
@@ -1989,10 +1992,8 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     if (coverageChanged) appendActivity(coverageChangedFact(inventory, riskCoverageRules.requireInspection), currentPhase);
   }
 
-  /** `unvisited -> classified`, using only the deterministic host floor (D10; see the file header's documented protocol gap). */
-  function ensureClassified(memberId: string, file: InventoryFileRecord): void {
-    if (file.state !== 'unvisited') return;
-    const entry: ChangedFileEntry = {
+  function manifestEntryOf(file: InventoryFileRecord): ChangedFileEntry {
+    return {
       path: file.path,
       oldPath: file.oldPath,
       kind: file.kind,
@@ -2002,8 +2003,121 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       removedLines: file.removedLines,
       byteSize: file.byteSize,
     };
-    const classified = classifyFile(entry, undefined, riskFloorRules);
+  }
+
+  /** `forecastCoverageShortfall` over the budget as it stands now. */
+  function forecastShortfall(): ReturnType<typeof forecastCoverageShortfall> {
+    const budgetState = budget.state();
+    return forecastCoverageShortfall({
+      inventory,
+      coverageRules: riskCoverageRules,
+      toolCalls: {
+        ordinaryRemaining: budgetState.pools.toolCalls.lanes.ordinary.remaining,
+        highRiskReserveRemaining: budgetState.pools.toolCalls.lanes.highRiskReserve.remaining,
+      },
+      modelTurns: {
+        ordinaryRemaining: budgetState.pools.modelTurns.lanes.ordinary.remaining,
+        highRiskReserveRemaining: budgetState.pools.modelTurns.lanes.highRiskReserve.remaining,
+      },
+      maxToolRequestsPerTurn: policy.maxToolRequestsPerTurn,
+    });
+  }
+
+  /**
+   * Re-states the coverage-versus-budget forecast after a raise made once it had already run.
+   *
+   * The statement it replaces is replaced **by reference**, in place, for the reason
+   * `retireContradictionLimitation`'s own comment gives: `extraLimitations` mixes unrelated
+   * limitation kinds, so nothing but identity says which entry this was, and removing and
+   * re-appending would move it off the front of the list. A forecast that now finds the lanes
+   * sufficient leaves the earlier statement standing — the lanes it counted only shrink as the run
+   * goes on, so a shortfall once proven is not un-proven by a later, smaller one — and an identical
+   * restatement is not published twice.
+   */
+  function restateShortfall(phase: RunPhase): void {
+    const shortfall = forecastShortfall();
+    if (shortfall === undefined || shortfall.limitation.message === shortfallLimitation?.message) return;
+    const index = shortfallLimitation === undefined ? -1 : extraLimitations.indexOf(shortfallLimitation);
+    if (index === -1) extraLimitations.push(shortfall.limitation);
+    else extraLimitations[index] = shortfall.limitation;
+    shortfallLimitation = shortfall.limitation;
+    appendActivity({ kind: 'partialResult', limitations: [...extraLimitations] }, phase);
+  }
+
+  /** `unvisited -> classified`, from the deterministic host floor alone (D10); the model's own `riskProposal` is applied on top of this by `applyRiskProposals`. */
+  function ensureClassified(memberId: string, file: InventoryFileRecord): void {
+    if (file.state !== 'unvisited') return;
+    const classified = classifyFile(manifestEntryOf(file), undefined, riskFloorRules);
     inventory.classify(memberId, file.path, { risk: classified.risk });
+  }
+
+  /**
+   * Applies the model's `riskProposal` (D10: "the model proposes risk and logical units; the host
+   * applies mandatory risk floors"). The host decides every entry on its own terms:
+   *
+   * - **A path the inventory does not hold is refused**, not repaired. The model has said something
+   *   the host can check and found false, which is information, not a malformed message: it is
+   *   recorded as a failed `riskProposal` activity entry and, for a member the run does have,
+   *   remembered the way an invented `readDiff` path is (`recordOffManifestPath`) so the next
+   *   prompt can say so. The inventory never grows from a model's say-so.
+   * - **An unvisited or classified-but-unread file takes the highest of the proposal, the floor and
+   *   the risk already recorded.** A proposal can raise a file and can never lower one.
+   * - **An inspected or terminal file is left alone.** Its risk has already done its work; raising it
+   *   now would add an obligation the run can no longer discharge by reading.
+   *
+   * Any change to a file's state or risk is a coverage change, and reaches the activity channel the
+   * way every other one does. A raise made after the coverage-versus-budget forecast has run also
+   * re-states that forecast (`restateShortfall`): the forecast is a one-shot announcement of what the
+   * budget can fund, and a raise is exactly the event that changes what has to be funded.
+   *
+   * Raising a file to `high` also lets turns that touch it draw the high-risk reserve
+   * (`choosePurpose`). That is the intended side of the same coin as the obligation it adds: the
+   * model only ever spends reserve on files the host now requires it to read.
+   */
+  function applyRiskProposals(phase: RunPhase, proposals: readonly RiskProposalEntry[]): void {
+    let coverageChanged = false;
+    let raisedAfterForecast = false;
+    const raised: string[] = [];
+    for (const proposal of proposals) {
+      const path = normalizeEvidencePath(proposal.path);
+      const file = path === undefined ? undefined : inventory.file(proposal.memberId, path);
+      if (path === undefined || file === undefined) {
+        // A member the run does not have is not remembered: `offManifestByMember` is keyed by
+        // member id, and a model-minted key would grow it without bound.
+        if (path !== undefined && inventory.member(proposal.memberId) !== undefined) recordOffManifestPath(proposal.memberId, path);
+        const subject = path === undefined ? 'a path the host could not use' : inventory.member(proposal.memberId) === undefined ? `member ${proposal.memberId}` : path;
+        appendActivity(
+          {
+            kind: 'toolFailed',
+            tool: 'riskProposal',
+            ...(path !== undefined ? { target: path } : {}),
+            reason: `Risk proposal refused: ${subject} is not part of this change's inventory, which a proposal cannot add to.`,
+          },
+          phase,
+        );
+        continue;
+      }
+      if (file.state !== 'unvisited' && file.state !== 'classified') continue;
+      const proposed = classifyFile(manifestEntryOf(file), proposal.risk, riskFloorRules).risk;
+      const risk = file.risk === undefined ? proposed : maxRisk(proposed, file.risk);
+      const riskChanged = file.state === 'unvisited' || risk !== file.risk;
+      if (!riskChanged && proposal.logicalUnit === undefined) continue;
+      const classified = inventory.classify(proposal.memberId, path, {
+        risk,
+        ...(proposal.logicalUnit !== undefined ? { logicalUnit: proposal.logicalUnit } : {}),
+      });
+      if (!classified.ok || !riskChanged) continue;
+      coverageChanged = true;
+      if (file.risk !== undefined) {
+        raised.push(`${path} (${file.risk} to ${risk}${proposal.reason !== undefined ? `: ${proposal.reason}` : ''})`);
+        if (shortfallForecastRan) raisedAfterForecast = true;
+      }
+    }
+    if (raised.length > 0) {
+      appendActivity({ kind: 'actionStarted', action: `Raised the risk of ${raised.length} file(s) on the model's proposal: ${raised.slice(0, 3).join('; ')}${raised.length > 3 ? '; ...' : ''}` }, phase);
+    }
+    if (coverageChanged) appendActivity(coverageChangedFact(inventory, riskCoverageRules.requireInspection), phase);
+    if (raisedAfterForecast) restateShortfall(phase);
   }
 
   function classifyAllUnvisited(): void {
@@ -2950,6 +3064,9 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         case 'checkpointSuggestion':
           await fireCheckpoint(phase, 'modelSuggested');
           break;
+        case 'riskProposal':
+          applyRiskProposals(phase, message.proposals);
+          break;
         case 'completionRequest': {
           if (phase === 'verifying' && passesStale) await runSynthesisVerification();
           const request: HostToolRequest = {
@@ -3740,21 +3857,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // *live* projection before any terminal result exists. The run still proceeds: partial
     // coverage of a too-large change is worth having, it just must never present as the full
     // review. See `forecastCoverageShortfall` for the floors that keep this claim honest.
-    const budgetState = budget.state();
-    const shortfall = forecastCoverageShortfall({
-      inventory,
-      coverageRules: riskCoverageRules,
-      toolCalls: {
-        ordinaryRemaining: budgetState.pools.toolCalls.lanes.ordinary.remaining,
-        highRiskReserveRemaining: budgetState.pools.toolCalls.lanes.highRiskReserve.remaining,
-      },
-      modelTurns: {
-        ordinaryRemaining: budgetState.pools.modelTurns.lanes.ordinary.remaining,
-        highRiskReserveRemaining: budgetState.pools.modelTurns.lanes.highRiskReserve.remaining,
-      },
-      maxToolRequestsPerTurn: policy.maxToolRequestsPerTurn,
-    });
+    shortfallForecastRan = true;
+    const shortfall = forecastShortfall();
     if (shortfall !== undefined) {
+      shortfallLimitation = shortfall.limitation;
       extraLimitations.push(shortfall.limitation);
       appendActivity({ kind: 'partialResult', limitations: [...extraLimitations] }, 'investigating');
     }

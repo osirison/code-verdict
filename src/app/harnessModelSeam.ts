@@ -64,7 +64,7 @@ import type {
   BootstrapToolSchema,
 } from '../domain/harnessBootstrap';
 import { POLICY_FILE_NAMES } from '../domain/reviewRunSnapshot';
-import type { RiskLevel } from '../domain/harnessCoverage';
+import { RISK_LEVELS, type RiskLevel } from '../domain/harnessCoverage';
 import { HOST_TOOL_NAMES, type HostToolName } from '../domain/harnessTools';
 import { SEVERITY_ORDER } from '../domain/criteria';
 import type { Severity } from '../domain/types';
@@ -139,6 +139,9 @@ the phase's few repair attempts.
   Alone in its turn; suggests the host record a checkpoint now.
 - completionRequest: { "kind": "completionRequest", "memberId"?, "rationale"? }
   Alone in its turn; advisory — the host decides. A refusal names what remains.
+- riskProposal: { "kind": "riskProposal", "proposals": [ { "memberId", "path", "risk": ${RISK_LEVELS.map((level) => `"${level}"`).join('|')}, "logicalUnit"?, "reason"? } ] }
+  Raises a file's risk above the host's own, never lowers it. Medium and high
+  files must be read.
 
 BATCH_RULES_PLACEHOLDER
 

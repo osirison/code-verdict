@@ -31,12 +31,14 @@
 import { MAX_PUBLIC_TEXT_LENGTH } from '../app/harnessActivitySanitizer';
 import { SEVERITY_ORDER } from './criteria';
 import { ALL_CATEGORIES } from './types';
+import { RISK_LEVELS } from './harnessCoverage';
 import { PLAN_ITEM_STATES } from './harnessActivity';
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from './harnessPolicy';
 import {
   DETAIL_SECTION_MEMBERS,
   MAX_ID_LENGTH,
   MAX_PROTOCOL_MESSAGES_PER_TURN,
+  MAX_RISK_PROPOSALS_PER_MESSAGE,
   MAX_PROTOCOL_STRING_LENGTH,
   PROTOCOL_MESSAGE_KINDS,
   PROTOCOL_VERSION,
@@ -216,6 +218,7 @@ export function buildHarnessTurnSchema(policy: HarnessPolicy = DEFAULT_HARNESS_P
           { contains: kindIs('publicRationale'), minContains: 0, maxContains: 1 },
           { contains: kindIs('checkpointSuggestion'), minContains: 0, maxContains: 1 },
           { contains: kindIs('completionRequest'), minContains: 0, maxContains: 1 },
+          { contains: kindIs('riskProposal'), minContains: 0, maxContains: 1 },
           { contains: kindIs('toolRequest'), minContains: 0, maxContains: policy.maxToolRequestsPerTurn },
           {
             contains: { type: 'object', required: ['kind'], properties: { kind: { enum: ['planCreated', 'planRevised'] } } },
@@ -229,6 +232,7 @@ export function buildHarnessTurnSchema(policy: HarnessPolicy = DEFAULT_HARNESS_P
                 { not: { contains: kindIs('toolRequest') } },
                 { not: { contains: kindIs('candidateSubmission') } },
                 { not: { contains: kindIs('checkpointSuggestion') } },
+                { not: { contains: kindIs('riskProposal') } },
                 { not: { contains: { type: 'object', required: ['kind'], properties: { kind: { enum: ['planCreated', 'planRevised'] } } } } },
               ],
             },
@@ -255,6 +259,7 @@ export function buildHarnessTurnSchema(policy: HarnessPolicy = DEFAULT_HARNESS_P
           { if: { properties: { kind: { const: 'publicRationale' } } }, then: { $ref: '#/$defs/publicRationale' } },
           { if: { properties: { kind: { const: 'toolRequest' } } }, then: { $ref: '#/$defs/toolRequest' } },
           { if: { properties: { kind: { const: 'candidateSubmission' } } }, then: { $ref: '#/$defs/candidateSubmission' } },
+          { if: { properties: { kind: { const: 'riskProposal' } } }, then: { $ref: '#/$defs/riskProposal' } },
         ],
       },
       pinnedRevision: {
@@ -278,6 +283,28 @@ export function buildHarnessTurnSchema(policy: HarnessPolicy = DEFAULT_HARNESS_P
         properties: { rationale: s(MAX_PUBLIC_TEXT_LENGTH) },
       },
       toolRequest,
+      riskProposal: {
+        type: 'object',
+        required: ['proposals'],
+        properties: {
+          proposals: {
+            type: 'array',
+            minItems: 1,
+            maxItems: MAX_RISK_PROPOSALS_PER_MESSAGE,
+            items: {
+              type: 'object',
+              required: ['memberId', 'path', 'risk'],
+              properties: {
+                memberId: s(MAX_ID_LENGTH),
+                path: s(MAX_PROTOCOL_STRING_LENGTH),
+                risk: { enum: [...RISK_LEVELS] },
+                logicalUnit: optional(s(MAX_PUBLIC_TEXT_LENGTH)),
+                reason: optional(s(MAX_PUBLIC_TEXT_LENGTH)),
+              },
+            },
+          },
+        },
+      },
       candidateSubmission: {
         type: 'object',
         required: ['candidate'],

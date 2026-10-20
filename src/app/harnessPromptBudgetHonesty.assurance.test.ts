@@ -453,7 +453,10 @@ describe('a turn that submits eight findings alongside a read', () => {
     // exactly the room eight submission results and eight map lines take. Anything smaller would
     // pass whatever the accounting did.
     const FILES = ['src/alpha.ts', 'src/beta.ts', 'src/gamma.ts'];
-    const sizeOf = (path: string): number => (path === FILES[0] ? 107_000 : 4_000);
+    // 107_000 -> 106_700: the contract grew by the `riskProposal` kind (~270 bytes per turn), and this
+    // size is tuned against the cap. Measured after the change: 106_900 no longer fits and the run
+    // ends with no result; 106_700 and 106_500 both pass.
+    const sizeOf = (path: string): number => (path === FILES[0] ? 106_700 : 4_000);
     const connection = fakeConnection({
       getChangeRequestDetails: detailsHandler(),
       listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: FILES.map((path) => manifestEntry(path, sizeOf(path))) }),

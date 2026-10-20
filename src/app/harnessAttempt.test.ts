@@ -22,6 +22,7 @@ import type { Attachment } from './reviewContext';
 import { DEFAULT_RISK_FLOOR_RULES } from './harnessRiskFloors';
 import type { DispatcherRetryResumingInfo, DispatcherRetryWaitInfo, HostToolResult } from './harnessToolDispatcher';
 import { createHarnessRunStore } from './harnessRunStore';
+import { buildResumePayload } from './harnessResume';
 import { computeSnapshotDigest, type CheckpointBuildInput } from './harnessCheckpoint';
 import type { KeyValueStore } from './storage';
 import { normalizeHarnessPolicy, HARNESS_POLICY_VERSION, type HarnessPolicy } from '../domain/harnessPolicy';
@@ -4342,5 +4343,263 @@ describe('HarnessAttempt.run (an unchecked finding ends the run partial, and eve
     expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1', 'cand-2']);
     expect(result.outcome.limitations.some((l) => l.code === 'contradictionCheckExhausted')).toBe(false);
     expect(result.outcome.limitations.some((l) => l.code === 'contradictionPending')).toBe(false);
+  });
+});
+
+// ---- add-model-risk-proposal: the model can raise a file's risk, and only raise it ----
+
+describe('HarnessAttempt.run (the model proposes risk; the host floor and the inventory decide)', () => {
+  function riskProposalMessage(...entries: ReadonlyArray<{ path: string; risk: string; memberId?: string; logicalUnit?: string; reason?: string }>): unknown {
+    return { kind: 'riskProposal', proposals: entries.map((entry) => ({ memberId: 'm1', ...entry })) };
+  }
+  function investigatingCalls(seam: { readonly calls: readonly RecordedCall[] }): readonly RecordedCall[] {
+    return seam.calls.filter((call) => call.phase === 'investigating');
+  }
+  function riskIn(call: RecordedCall | undefined, path: string): string | undefined {
+    return call?.investigation?.[0]?.files.find((file) => file.path === path)?.risk;
+  }
+  function run(files: readonly string[], script: Parameters<typeof scriptedModelSeam>[0], policy: HarnessPolicy = testPolicy()) {
+    const seam = scriptedModelSeam(script);
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(reviewConnection({ files }))],
+      modelSeam: seam,
+      policy,
+    });
+    return { seam, result: attempt.run() };
+  }
+  /** `docs/notes.md` has no floor (low); `src/a.ts` is source code (medium); `src/auth/session.ts` is floored high. */
+  const LOW = 'docs/notes.md';
+  const MEDIUM = 'src/a.ts';
+
+  it('a raise above the floor applies: the model sees the new risk, the file now has to be read, and the coverage fact says so', async () => {
+    const { seam, result: pending } = run([LOW, MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(riskProposalMessage({ path: LOW, risk: 'high', reason: 'Describes the rollout order.' }), readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    const calls = investigatingCalls(seam);
+    expect(riskIn(calls[0], LOW)).toBe('low');
+    expect(riskIn(calls[1], LOW)).toBe('high');
+    expect(riskIn(calls[1], MEDIUM)).toBe('medium');
+    expect(calls.every((call) => call.repairInstruction === undefined)).toBe(true);
+    // The file was never read, and a high-risk file must be: the obligation exists because of the proposal.
+    expect(result.outcome.kind).not.toBe('completeClean');
+    expect(result.outcome.limitations.some((limitation) => limitation.code === 'insufficientRiskCoverage')).toBe(true);
+    // The change reached the activity channel as a coverage fact whose required total grew by one.
+    const totals = result.activityLog.events.flatMap((event) => (event.kind === 'coverageChanged' && event.coverage.requiredTotal !== undefined ? [event.coverage.requiredTotal] : []));
+    expect(totals).toContain(2);
+  });
+
+  it('the same run without the proposal completes clean, so the obligation above is the proposal\'s doing', async () => {
+    const { result: pending } = run([LOW, MEDIUM], { planning: [PLAN_TURN], investigating: [messages(readDiffMessage(MEDIUM)), STOP_TURN], verifying: [COMPLETION_TURN] });
+    const result = await pending;
+    expect(result.outcome.kind).toBe('completeClean');
+  });
+
+  it('a proposal in planning classifies a file the investigating sweep has not reached yet, at the higher of the proposal and the floor', async () => {
+    const { seam, result: pending } = run([LOW, MEDIUM], {
+      planning: [messages({ kind: 'planCreated', items: [{ id: 'p1', description: 'Review the change.' }] }, riskProposalMessage({ path: LOW, risk: 'high', logicalUnit: 'rollout docs' }, { path: MEDIUM, risk: 'low' }))],
+      investigating: [STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    await pending;
+
+    const first = investigatingCalls(seam)[0];
+    expect(riskIn(first, LOW)).toBe('high');
+    expect(riskIn(first, MEDIUM)).toBe('medium'); // proposed low, floor medium: the floor wins
+  });
+
+  it('never lowers: a proposal under the floor changes nothing and raises no refusal', async () => {
+    const { seam, result: pending } = run([MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(riskProposalMessage({ path: MEDIUM, risk: 'low' }), readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    expect(riskIn(investigatingCalls(seam)[1], MEDIUM)).toBe('medium');
+    expect(result.activityLog.events.some((event) => event.kind === 'toolFailed' && event.tool === 'riskProposal')).toBe(false);
+    expect(result.outcome.kind).toBe('completeClean');
+  });
+
+  it('a path outside the change is refused with a recorded failure, no repair, and the inventory does not grow', async () => {
+    const { seam, result: pending } = run([MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(riskProposalMessage({ path: 'src/invented.ts', risk: 'high' }), readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    const last = investigatingCalls(seam).at(-1);
+    expect(last?.investigation?.[0]?.files.map((file) => file.path)).toEqual([MEDIUM]);
+    expect(last?.investigation?.[0]?.offManifestPaths).toEqual(['src/invented.ts']);
+    expect(seam.calls.every((call) => call.repairInstruction === undefined)).toBe(true);
+    const failure = result.activityLog.events.find((event) => event.kind === 'toolFailed' && event.tool === 'riskProposal');
+    expect(failure).toMatchObject({ target: 'src/invented.ts' });
+    expect(result.outcome.kind).toBe('completeClean');
+  });
+
+  it('a member the run does not have is refused without being remembered as an off-manifest guess', async () => {
+    const { seam, result: pending } = run([MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(riskProposalMessage({ memberId: 'ghost', path: MEDIUM, risk: 'high' }), readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    expect(investigatingCalls(seam).at(-1)?.investigation?.[0]?.offManifestPaths).toBeUndefined();
+    expect(result.activityLog.events.some((event) => event.kind === 'toolFailed' && event.tool === 'riskProposal')).toBe(true);
+    expect(riskIn(investigatingCalls(seam).at(-1), MEDIUM)).toBe('medium');
+  });
+
+  it('a file already inspected is a no-op: the raise neither re-opens it nor adds an obligation', async () => {
+    const { seam, result: pending } = run([MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(MEDIUM)), messages(riskProposalMessage({ path: MEDIUM, risk: 'high' }), readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    expect(riskIn(investigatingCalls(seam).at(-1), MEDIUM)).toBe('medium');
+    expect(result.outcome.kind).toBe('completeClean');
+  });
+
+  it('a proposal-only turn is not actionable work: it ends the phase exactly where a bare stop does', async () => {
+    const stopScript = { planning: [PLAN_TURN], investigating: [messages(readDiffMessage(MEDIUM)), STOP_TURN], verifying: [COMPLETION_TURN] };
+    const proposalScript = {
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(MEDIUM)), messages(riskProposalMessage({ path: MEDIUM, risk: 'high' }))],
+      verifying: [COMPLETION_TURN],
+    };
+    const stopped = run([MEDIUM], stopScript);
+    const proposed = run([MEDIUM], proposalScript);
+    await stopped.result;
+    const proposedResult = await proposed.result;
+
+    expect(investigatingCalls(proposed.seam)).toHaveLength(investigatingCalls(stopped.seam).length);
+    // It is not mistaken for tool requests that "added nothing new" either.
+    expect(proposedResult.activityLog.events.some((event) => event.kind === 'actionStarted' && event.action.includes('added nothing new'))).toBe(false);
+  });
+
+  it('a proposal-only turn that opens an obligation is answered like a stop that left work behind: the model is asked to continue', async () => {
+    const { result: pending } = run([LOW, MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(MEDIUM)), messages(riskProposalMessage({ path: LOW, risk: 'high' })), messages(readDiffMessage(LOW)), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const result = await pending;
+
+    expect(result.activityLog.events.some((event) => event.kind === 'actionStarted' && event.action.includes('The model stopped without finishing; asking it to continue'))).toBe(true);
+    expect(result.outcome.kind).toBe('completeClean'); // it did read the file it raised
+  });
+
+  it('a proposal sent in verifying is a contract failure answered through the bounded repair path, and changes nothing', async () => {
+    const { seam, result: pending } = run([LOW, MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(MEDIUM)), STOP_TURN],
+      verifying: [(call) => (call.repairInstruction === undefined ? messages(riskProposalMessage({ path: LOW, risk: 'high' })) : COMPLETION_TURN)],
+    });
+    const result = await pending;
+
+    const repairs = seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction !== undefined);
+    expect(repairs.length).toBeGreaterThan(0);
+    expect(repairs[0]?.repairInstruction).toContain('riskProposal is not permitted during the verifying phase');
+    expect(result.outcome.kind).toBe('completeClean');
+  });
+
+  it('a malformed proposal is repaired once like any other malformed message', async () => {
+    const { seam, result: pending } = run([MEDIUM], {
+      planning: [PLAN_TURN],
+      investigating: [
+        (call) => (call.repairInstruction === undefined ? messages({ kind: 'riskProposal', proposals: [{ memberId: 'm1', path: MEDIUM, risk: 'critical' }] }) : messages(readDiffMessage(MEDIUM))),
+        STOP_TURN,
+      ],
+      verifying: [COMPLETION_TURN],
+    });
+    await pending;
+
+    const repair = seam.calls.find((call) => call.phase === 'investigating' && call.repairInstruction !== undefined);
+    expect(repair?.repairInstruction).toContain('riskProposal.proposals[0].risk must be one of');
+  });
+
+  describe('after the forecast has run', () => {
+    // Same arithmetic as the coverage-versus-budget forecast block: ten tool calls partition to
+    // ordinary 7 / high 2 / verification 1, bootstrap spends two, so five ordinary reads remain.
+    const POLICY = { maxToolRequestsPerAttempt: 10 } as const;
+    const stopAfter = (turns: readonly string[]) => ({ planning: [PLAN_TURN], investigating: [...turns, STOP_TURN], verifying: [STOP_TURN] });
+
+    it('a late raise that makes the required reads unfundable states the shortfall it caused', async () => {
+      const source = Array.from({ length: 4 }, (_, index) => `src/f${index}.ts`);
+      const { result: pending } = run([...source, 'docs/a.md', 'docs/b.md'], stopAfter([messages(riskProposalMessage({ path: 'docs/a.md', risk: 'medium' }, { path: 'docs/b.md', risk: 'medium' }))]), testPolicy(POLICY));
+      const result = await pending;
+
+      const shortfalls = result.outcome.limitations.filter((limitation) => limitation.code === 'coverageExceedsBudget');
+      expect(shortfalls).toHaveLength(1);
+      expect(shortfalls[0]?.message).toContain('6 file(s) require inspection but the investigation budget can fund at most 5 more file read(s)');
+      // Announced live, in the one event kind a projection reads before any terminal result.
+      const partial = result.activityLog.events.filter((event) => event.kind === 'partialResult');
+      expect(partial.at(-1)).toMatchObject({ phase: 'investigating', limitations: [expect.objectContaining({ code: 'coverageExceedsBudget' })] });
+    });
+
+    it('replaces the shortfall it already stated instead of stacking a second one, with the new counts', async () => {
+      const files = Array.from({ length: 12 }, (_, index) => `src/f${index}.ts`);
+      const { result: pending } = run([...files, 'docs/a.md'], stopAfter([messages(riskProposalMessage({ path: 'docs/a.md', risk: 'medium' }))]), testPolicy(POLICY));
+      const result = await pending;
+
+      const shortfalls = result.outcome.limitations.filter((limitation) => limitation.code === 'coverageExceedsBudget');
+      expect(shortfalls).toHaveLength(1);
+      expect(shortfalls[0]?.message).toContain('13 file(s) require inspection');
+      expect(result.outcome.limitations.indexOf(shortfalls[0]!)).toBe(0); // still the leading limitation
+    });
+
+    it('a raise that leaves every required read fundable states nothing', async () => {
+      const { result: pending } = run(['src/f0.ts', 'src/f1.ts', 'docs/a.md'], stopAfter([messages(riskProposalMessage({ path: 'docs/a.md', risk: 'high' }))]), testPolicy(POLICY));
+      const result = await pending;
+      expect(result.outcome.limitations.some((limitation) => limitation.code === 'coverageExceedsBudget')).toBe(false);
+    });
+  });
+
+  it('a resumed attempt reproduces the raised risk from the persisted checkpoint, and needs no new proposal to keep it', async () => {
+    const snapshot = testSnapshot();
+    const policy = testPolicy();
+    const harnessRunStore = createHarnessRunStore(memoryStore(), { now: () => 0 });
+    await harnessRunStore.writeSnapshot(snapshot);
+    const first = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot,
+      members: [member(reviewConnection({ files: [LOW, MEDIUM] }))],
+      modelSeam: scriptedModelSeam({
+        planning: [PLAN_TURN],
+        investigating: [messages(riskProposalMessage({ path: LOW, risk: 'high', logicalUnit: 'rollout docs' }), readDiffMessage(MEDIUM)), STOP_TURN],
+        verifying: [STOP_TURN],
+      }),
+      policy,
+      onCheckpoint: wireOnCheckpoint(harnessRunStore, snapshot, policy),
+    });
+    await first.run();
+
+    const checkpoint = harnessRunStore.latestCheckpoint(snapshot.lineageId);
+    expect(checkpoint?.coverage[0]?.files.find((file) => file.path === LOW)).toMatchObject({ risk: 'high', logicalUnit: 'rollout docs', state: 'classified' });
+
+    const resumedSnapshot = testSnapshot({ attempt: 2 });
+    const resumedSeam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [messages(readDiffMessage(LOW)), STOP_TURN], verifying: [COMPLETION_TURN] });
+    const resumed = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: resumedSnapshot,
+      members: [member(reviewConnection({ files: [LOW, MEDIUM] }))],
+      modelSeam: resumedSeam,
+      policy,
+      resumeSeed: { payload: buildResumePayload(checkpoint as NonNullable<typeof checkpoint>), startAction: 'Resuming from the interrupted attempt.' },
+    });
+    const result = await resumed.run();
+
+    // No proposal was sent in the second attempt; the floor alone would have said `low`.
+    expect(riskIn(investigatingCalls(resumedSeam)[0], LOW)).toBe('high');
+    expect(riskIn(investigatingCalls(resumedSeam)[0], MEDIUM)).toBe('medium');
+    expect(result.outcome.kind).toBe('completeClean');
   });
 });
