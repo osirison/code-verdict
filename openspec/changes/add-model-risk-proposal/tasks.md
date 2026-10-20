@@ -9,6 +9,7 @@
 - [x] 2.1 Apply proposals in `processMessages` through `classifyFile`: max of proposal, floor and recorded risk; refuse a path or member outside the inventory without repair; no-op for inspected and terminal files.
 - [x] 2.2 Emit the coverage fact on any change; after the forecast has run, re-state it and replace the earlier limitation by reference.
 - [x] 2.3 Leave a proposal-only turn out of the actionable-work test.
+- [x] 2.3a While no plan exists, a planning turn without one is nudged (bounded by `MAX_EARLY_STOP_NUDGES_PER_PHASE`) instead of ending planning; tests cover a proposal-only turn, a rationale-only turn, and the bound.
 - [x] 2.4 Remove the "documented protocol gap" comments.
 - [x] 2.5 Tests: raise applies, planning classification, below-floor ignored, off-inventory and unknown member refused, inspected no-op, proposal-only turn, late raise shortfall (new and replaced), checkpoint resume.
 

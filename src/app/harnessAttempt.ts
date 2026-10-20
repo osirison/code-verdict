@@ -3378,6 +3378,16 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         // the opposite of what it needs (see `ProcessMessagesOutcome.deferredForPromptBudget`).
         processed.deferredForPromptBudget > 0;
       if (processed.hadActionableWork && (productive || !EARLY_STOP_NUDGE_PHASES.has(phase))) continue;
+      if (phase === 'planning' && plan === undefined && !processed.hadActionableWork && earlyStopNudges < MAX_EARLY_STOP_NUDGES_PER_PHASE) {
+        // A planning turn that shaped no plan (a bare rationale, or a `riskProposal` alone) is not
+        // the model declaring planning done: the phase's own condition, a plan, is still missing,
+        // and ending here would skip investigation altogether (`noPlan`). The next turn's prompt
+        // already asks for the plan, so the host only asks again — bounded by the same cap the
+        // other phases use, after which the ordinary `noPlan` ending applies.
+        earlyStopNudges += 1;
+        appendActivity({ kind: 'actionStarted', action: 'The model sent no plan; asking it to publish one before investigating.' }, phase);
+        continue;
+      }
       if (!EARLY_STOP_NUDGE_PHASES.has(phase)) return 'noActionableWork';
 
       // Mirrors `processMessages`'s own `completionRequest` case: a candidate accepted since the

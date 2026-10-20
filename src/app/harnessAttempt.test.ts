@@ -4603,3 +4603,48 @@ describe('HarnessAttempt.run (the model proposes risk; the host floor and the in
     expect(result.outcome.kind).toBe('completeClean');
   });
 });
+
+describe('HarnessAttempt.run (a planning turn without a plan does not end planning while no plan exists)', () => {
+  const proposalOnly = messages({ kind: 'riskProposal', proposals: [{ memberId: 'm1', path: 'docs/notes.md', risk: 'high' }] });
+
+  function runWith(planning: readonly string[]) {
+    const seam = scriptedModelSeam({ planning, investigating: [messages(readDiffMessage('src/a.ts')), STOP_TURN], verifying: [COMPLETION_TURN] });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(reviewConnection({ files: ['docs/notes.md', 'src/a.ts'] }))],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+    return { seam, run: attempt.run() };
+  }
+
+  it('a riskProposal-only first planning turn is followed by another turn, the plan, investigation, and the raise still applies', async () => {
+    const { seam, run } = runWith([proposalOnly, PLAN_TURN]);
+    const result = await run;
+
+    expect(result.plan).toBeDefined();
+    expect(result.outcome.limitations.some((limitation) => limitation.code === 'noPlan')).toBe(false);
+    expect(seam.calls.some((call) => call.phase === 'investigating')).toBe(true);
+    const first = seam.calls.find((call) => call.phase === 'investigating');
+    expect(first?.investigation?.[0]?.files.find((file) => file.path === 'docs/notes.md')?.risk).toBe('high');
+  });
+
+  it('a rationale-only first planning turn is followed by another turn and the plan', async () => {
+    const { seam, run } = runWith([STOP_TURN, PLAN_TURN]);
+    const result = await run;
+
+    expect(result.plan).toBeDefined();
+    expect(seam.calls.some((call) => call.phase === 'investigating')).toBe(true);
+  });
+
+  it('turns that never carry a plan end planning with noPlan after the bound, not a hang', async () => {
+    const { seam, run } = runWith([proposalOnly]);
+    const result = await run;
+
+    expect(result.plan).toBeUndefined();
+    expect(result.outcome.limitations.some((limitation) => limitation.code === 'noPlan')).toBe(true);
+    expect(seam.calls.filter((call) => call.phase === 'planning')).toHaveLength(4); // the first turn plus three nudged ones
+    expect(seam.calls.some((call) => call.phase === 'investigating')).toBe(false);
+  });
+});

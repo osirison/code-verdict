@@ -64,3 +64,9 @@ The harness SHALL let the model create and revise a public plan, propose risk an
 - **WHEN** an attempt is resumed from a checkpoint written after the model raised a file's risk
 - **THEN** the resumed attempt classifies that file at the raised risk without a new proposal
 - **AND** the file's logical unit, when the model named one, is carried with it
+
+#### Scenario: Planning turn carries no plan
+
+- **WHEN** a planning turn contains no plan, such as a risk proposal or a rationale alone, and no plan exists yet
+- **THEN** the host asks the model again, up to a fixed bound of nudged turns, before investigating
+- **AND** if the bound is exhausted without a plan, the attempt records that no plan was created, as before
