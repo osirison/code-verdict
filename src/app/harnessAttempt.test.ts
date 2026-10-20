@@ -2553,6 +2553,61 @@ describe('HarnessAttempt.run (task 3.6: a run holding declined content cannot be
   });
 });
 
+describe('HarnessAttempt.run (a verifying completionRequest denied as unrepairable ends the phase, whatever the blocker)', () => {
+  it('a pre-existing unrepairable blocker unrelated to retirement (declined content) ends verifying after the first denial, partial, with the finding delivered', async () => {
+    const declinedPath = 'docs/notes.md';
+    const readPath = 'file1.ts';
+    const connection = reviewConnection({ files: [readPath, declinedPath], declinedPaths: [declinedPath] });
+    // The script clamps to its last entry, so a model that is NOT stopped by the first denial would
+    // simply ask again: any verifying turn count above one fails the bound below.
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(readPath)), (call) => messages(candidateSubmissionMessage('cand-1', readPath, sourceRefFrom(call.toolResults[0] as HostToolResult))), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBe(1);
+    expect(result.completionEvaluation?.blockers).toContain('declinedContent');
+    expect(result.completionEvaluation?.repairable).toBe(false);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.completeness).toBe('partial');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1']);
+  });
+
+  it('a verifying denial that IS repairable does not end the phase: the model keeps its turns, repairs, and the run completes', async () => {
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    // file2.ts is never read in investigating, so the first completionRequest is denied as
+    // repairable (an unread file the model can still read); it reads it and asks again.
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), STOP_TURN],
+      verifying: [COMPLETION_TURN, messages(readDiffMessage('file2.ts')), COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBe(3);
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+  });
+});
+
 // ---- 15.1/15.2/15.3: explicit attachments become citable evidence for individual runs -----
 
 function snapshotWithAttachments(declared: readonly { attachmentId: string; label: string; contentDigest: string }[]): ReviewRunSnapshot {

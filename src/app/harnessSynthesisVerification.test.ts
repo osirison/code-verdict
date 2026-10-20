@@ -925,6 +925,21 @@ describe('runContradictionChecks: every model call draws on the attempt budget b
     expect(result.stoppedEarly).toEqual({ reason: 'modelTurns: 1 requested for verification but the allowed lanes cannot supply it.', uncheckedCount: 2 });
   });
 
+  it('a reservation refused as cancelled stops the stage the same way but records no stop: the run is already reported cancelled', async () => {
+    const ledger = makeLedger();
+    const [findingA, findingB] = twoFindings(ledger);
+    const seam = scriptedSeam((repair) => verdictJson(extractCandidateId(repair), false));
+    const reserveModelCall = () => ({ ok: false as const, code: 'cancelled' as const, message: 'The attempt was cancelled; no new budget can be reserved.' });
+
+    const result = await runContradictionChecks([findingA, findingB], context(seam, ledger, { reserveModelCall }));
+
+    expect(seam.calls).toBe(0);
+    expect(result.complete).toBe(false);
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-b1', 'cand-b2']);
+    expect(result.unverified).toEqual([]);
+    expect(result.stoppedEarly).toBeUndefined();
+  });
+
   it('one reservation per finding absorbs its repair asks; the stage stops at the first refusal with the already-answered finding checked', async () => {
     const ledger = makeLedger();
     const [findingA, findingB] = twoFindings(ledger);

@@ -15,7 +15,7 @@
 ## 3. Collaborator
 
 - [x] 3.1 Reserve once per finding before its first ask, after the directive proved askable; absorb repairs under it; re-check the elapsed limit before each repair.
-- [x] 3.2 On refusal or the limit, stop the stage as cancellation does: keep the remainder, emit no `unverified` entries, set `stoppedEarly`.
+- [x] 3.2 On refusal or the limit, stop the stage as cancellation does: keep the remainder, emit no `unverified` entries, set `stoppedEarly` (except for a `cancelled` refusal, which the run's own cancelled limitation already discloses).
 - [x] 3.3 Tests: refusal makes no model call and names the unchecked count; one reservation covers repairs; an unexcerptable citation reserves nothing; a repair past the limit is not sent.
 
 ## 4. Budget tracker

@@ -1075,7 +1075,10 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
     // mislabel the stop `verificationExhausted` and feed it to the retirement bound.
     const reserved = context.reserveModelCall?.() ?? { ok: true as const };
     if (!reserved.ok) {
-      stoppedEarly = { reason: reserved.message, uncheckedCount: ordered.length - index };
+      // A cancelled refusal stops the pass identically but records no stop: the run is already
+      // reported cancelled (`classifyOutcome`'s `cancelled` limitation), exactly as the
+      // `isCancelled` branch at the top of this loop leaves it.
+      if (reserved.code !== 'cancelled') stoppedEarly = { reason: reserved.message, uncheckedCount: ordered.length - index };
     } else {
       let raw = await askOnce(finding, directive.text);
       let verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
