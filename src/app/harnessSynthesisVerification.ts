@@ -87,19 +87,36 @@
  * finding is an ordinary surviving finding whose pass did not conclude — the
  * completion clause and the activity trail are where that belongs.
  *
- * **Bounded, not permanent.** This module reports the same `unverified` reason for the same
- * candidate on every re-run for as long as its citation is unchanged — by design, since neither
- * stage here mutates a candidate's own citation. `harnessAttempt.ts`'s `runSynthesisVerification`
- * is what turns that byte-identical repetition into a bound: after `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`
- * consecutive re-runs report the *same* candidate with the *same* reason, that candidate ships
- * recorded as retired (a run limitation naming it, under one of two truthful labels — see below) and
- * stops being counted against `contradictionPassComplete` — which the host may then report `true`
- * even though this module itself never confirmed that one candidate. Nothing in this module
- * implements or is aware of that bound, or of the second, denial-counting one that closes an idle
- * `requestCompletion` spam shape the same way (`harnessAttempt.ts`'s own doc comment on
- * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` covers both); it exists so a citation this module can
- * never honestly excerpt, or a verdict that never comes back at all, does not hold every future
- * completion request hostage forever.
+ * **Bounded, not permanent — and never a pass.** This module reports the same `unverified` reason
+ * for the same candidate on every re-run for as long as its citation is unchanged — by design, since
+ * neither stage here mutates a candidate's own citation. `harnessAttempt.ts`'s
+ * `runSynthesisVerification` is what turns that byte-identical repetition into a bound: after
+ * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` consecutive re-runs report the *same* candidate with the
+ * *same* reason, that candidate ships recorded as retired (a run limitation naming it, under one of
+ * two truthful labels — see below) and stops being a *live* blocker the model is asked to repair.
+ * It does not stop failing the completion gate: the host discloses every retired survivor to
+ * `evaluateCompletion` (`harnessCompletion.ts`'s `RetiredContradictionDetail`) as an unrepairable
+ * failure of `contradictionPassComplete`, so the run ends partial with the finding delivered and
+ * the limitation naming it — a finding this module never confirmed is never reported as checked.
+ * Nothing in this module implements or is aware of that bound, or of the second, denial-counting
+ * one that closes an idle `requestCompletion` spam shape the same way (`harnessAttempt.ts`'s own
+ * doc comment on `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` covers both); it exists so a citation this
+ * module can never honestly excerpt, or a verdict that never comes back at all, does not hold every
+ * future completion request hostage forever.
+ *
+ * **Every ask is budgeted.** `runContradictionChecks` calls `askModel` directly, outside
+ * `runPhaseLoop`'s own `beginTurn`, so before this fix these were the only model calls in an attempt
+ * that drew on no pool and answered to no elapsed-time limit. `ContradictionCheckContext.reserveModelCall`
+ * (supplied by `harnessAttempt.ts` as a one-turn `budget.reserve` of purpose `verification`) is
+ * consulted once per finding, before its first ask — never for a finding skipped as unexcerptable,
+ * since no call is made for it — and its repair asks are absorbed under that one reservation, the
+ * same convention `runPhaseLoop` applies to a turn's own repairs; the attempt clock
+ * (`ContradictionCheckContext.elapsedMs`) is re-read before each repair so none starts past the
+ * limit. A refusal, or the limit, stops the stage exactly as cancellation does: every finding not
+ * yet answered is kept, none gets an `unverified` entry (those feed the retirement bound, and a
+ * finding the host declined to ask about has not failed its check), the stage is incomplete, and
+ * `ContradictionCheckResult.stoppedEarly` names the reason and the unchecked count for the host to
+ * report as its own limitation.
  *
  * Every `UnverifiedFindingRecord` this module pushes carries a `cause` alongside its `reason`,
  * because the two `unverified` push sites below are not the same failure and must not retire under
@@ -158,7 +175,15 @@
  * conclusion again — harmless, if slightly redundant work.
  */
 import type { AgentCancellationToken, ModelTurnTiming } from './lmAgent';
-import type { HarnessModelSeam, SynthesisVerificationInput, SynthesisVerificationOutput, SynthesisVerificationRunner, UnverifiedFindingRecord } from './harnessAttempt';
+import type {
+  ContradictionPassStop,
+  HarnessModelSeam,
+  ModelCallReservation,
+  SynthesisVerificationInput,
+  SynthesisVerificationOutput,
+  SynthesisVerificationRunner,
+  UnverifiedFindingRecord,
+} from './harnessAttempt';
 import type { CitedEvidenceRef, ValidatedFinding } from './harnessCandidateValidation';
 import { sanitizePublicText } from './harnessActivitySanitizer';
 import { MAX_TURN_RAW_BYTES, findValueEnd, stripCodeFence } from '../domain/harnessProtocol';
@@ -948,6 +973,10 @@ export interface ContradictionCheckContext {
   readonly cancellation?: AgentCancellationToken;
   /** Forwarded straight from `SynthesisVerificationInput`'s own field of the same name — see its comment there. */
   readonly onModelTurnTiming?: (timing: ModelTurnTiming) => void;
+  /** Forwarded from `SynthesisVerificationInput.reserveModelCall`; see this module's header ("Every ask is budgeted"). Absent, nothing is reserved. */
+  readonly reserveModelCall?: () => ModelCallReservation;
+  /** Forwarded from `SynthesisVerificationInput.elapsedMs`; re-read before each repair ask against `policy.maxElapsedMsPerAttempt`. Absent, repairs are bounded by the allowance alone. */
+  readonly elapsedMs?: () => number;
 }
 
 export interface ContradictionCheckResult {
@@ -964,8 +993,10 @@ export interface ContradictionCheckResult {
    * drop an already-validated finding.
    */
   readonly unverified: readonly UnverifiedFindingRecord[];
-  /** False if cancellation, an evidence mismatch, an unshowable excerpt, or an exhausted repair allowance left any finding unconfirmed. */
+  /** False if cancellation, an evidence mismatch, an unshowable excerpt, an exhausted repair allowance, or a refused reservation left any finding unconfirmed. */
   readonly complete: boolean;
+  /** Present when the stage stopped before asking about every finding because the budget refused a call or the elapsed limit was reached — see this module's header. */
+  readonly stoppedEarly?: ContradictionPassStop;
 }
 
 function isCancelled(cancellation: AgentCancellationToken | undefined): boolean {
@@ -988,6 +1019,11 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
   const contradicted: ContradictedFindingRecord[] = [];
   const unverified: UnverifiedFindingRecord[] = [];
   const ordered = [...findings].sort(compareCandidateId);
+  let stoppedEarly: ContradictionPassStop | undefined;
+
+  function elapsedLimitReached(): boolean {
+    return context.elapsedMs !== undefined && context.elapsedMs() >= context.policy.maxElapsedMsPerAttempt;
+  }
 
   async function askOnce(finding: ValidatedFinding, directive: string): Promise<string | undefined> {
     try {
@@ -1031,28 +1067,49 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
       continue;
     }
 
-    let raw = await askOnce(finding, directive.text);
-    let verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
-    while (verdict === undefined && repairsUsed < maxRepairs && !isCancelled(context.cancellation)) {
-      repairsUsed += 1;
-      raw = await askOnce(finding, directive.text);
-      verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
-    }
-
-    if (verdict === undefined) {
-      complete = false;
-      unverified.push({ candidateId: finding.candidateId, reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.', cause: 'verificationExhausted' });
-      survivors.push(finding);
-      continue;
-    }
-    if (verdict.contradicted) {
-      contradicted.push({ candidateId: finding.candidateId, reason: verdict.reason ?? 'The model found the cited evidence does not support this claim.' });
+    // One reservation per finding, taken here — after the directive proved askable, so a skipped
+    // finding costs nothing — and before the first ask. Repairs below are absorbed under it. A
+    // refusal, or the elapsed limit reached before a repair, takes the cancellation-shaped exit at
+    // the bottom of the loop: this finding and every one after it are kept unasked, with no
+    // `unverified` entry (see the header), and never through `askOnce`'s catch, which would
+    // mislabel the stop `verificationExhausted` and feed it to the retirement bound.
+    const reserved = context.reserveModelCall?.() ?? { ok: true as const };
+    if (!reserved.ok) {
+      stoppedEarly = { reason: reserved.message, uncheckedCount: ordered.length - index };
     } else {
-      survivors.push(finding);
+      let raw = await askOnce(finding, directive.text);
+      let verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
+      while (verdict === undefined && repairsUsed < maxRepairs && !isCancelled(context.cancellation)) {
+        if (elapsedLimitReached()) {
+          stoppedEarly = {
+            reason: `Elapsed time reached the attempt limit of ${context.policy.maxElapsedMsPerAttempt}ms before a repair of this verdict could be asked.`,
+            uncheckedCount: ordered.length - index,
+          };
+          break;
+        }
+        repairsUsed += 1;
+        raw = await askOnce(finding, directive.text);
+        verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
+      }
+      if (stoppedEarly === undefined) {
+        if (verdict === undefined) {
+          complete = false;
+          unverified.push({ candidateId: finding.candidateId, reason: 'Contradiction check did not conclude: no usable verdict came back within the shared repair allowance.', cause: 'verificationExhausted' });
+          survivors.push(finding);
+        } else if (verdict.contradicted) {
+          contradicted.push({ candidateId: finding.candidateId, reason: verdict.reason ?? 'The model found the cited evidence does not support this claim.' });
+        } else {
+          survivors.push(finding);
+        }
+        continue;
+      }
     }
+    complete = false;
+    survivors.push(...ordered.slice(index));
+    break;
   }
 
-  return { findings: survivors.sort(compareCandidateId), contradicted, unverified, complete };
+  return { findings: survivors.sort(compareCandidateId), contradicted, unverified, complete, ...(stoppedEarly !== undefined ? { stoppedEarly } : {}) };
 }
 
 // ---- Adapter: the injected `SynthesisVerificationRunner` --------------------------
@@ -1079,6 +1136,8 @@ export function createSynthesisVerification(): SynthesisVerificationRunner {
       policy,
       cancellation: input.cancellation,
       onModelTurnTiming: input.onModelTurnTiming,
+      reserveModelCall: input.reserveModelCall,
+      elapsedMs: input.elapsedMs,
     });
     return Object.freeze({
       findings: contradictionResult.findings,
@@ -1087,6 +1146,7 @@ export function createSynthesisVerification(): SynthesisVerificationRunner {
       deduplicationComplete: true,
       contradictionPassComplete: contradictionResult.complete,
       finalVerificationComplete: contradictionResult.complete,
+      ...(contradictionResult.stoppedEarly !== undefined ? { stoppedEarly: contradictionResult.stoppedEarly } : {}),
     });
   };
 }

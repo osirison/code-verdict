@@ -30,6 +30,9 @@ import type { ResultCompleteness } from '../domain/harnessLifecycle';
 import type { CurrentHeadResult } from '../platform/types';
 import type { ChangedFileInventory, ManifestEnumerationState } from './harnessInventory';
 import { DEFAULT_RISK_COVERAGE_RULES, isReserveEligible, requiresInspection, type RiskCoverageRules } from './harnessRiskFloors';
+// Type-only, so the import is erased: `harnessAttempt.ts` imports this module's values, and a
+// runtime import back would be a cycle.
+import type { UnverifiedContradictionCause } from './harnessAttempt';
 
 export const COMPLETION_CLAUSES = [
   'headVerified',
@@ -90,11 +93,27 @@ export interface VerificationPasses {
  * A candidate that `harnessAttempt.ts`'s no-progress bound has already closed out as
  * unverifiable-as-cited is never in this list — the bound retires it into a run limitation instead,
  * precisely so it stops appearing here as a live blocker (see that module's own doc comment on
- * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`).
+ * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`). It still reaches this gate, through
+ * `RetiredContradictionDetail` below, as a failure nothing can repair.
  */
 export interface UnverifiedContradictionDetail {
   readonly candidateId: string;
   readonly reason: string;
+}
+
+/**
+ * One surviving finding whose contradiction check the host has stopped retrying
+ * (`harnessAttempt.ts`'s `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`): the check never concluded, and
+ * nothing further on this attempt will make it conclude. `evaluateCompletion` discloses each one as
+ * a `contradictionPending` failure of `contradictionPassComplete` that is not repairable — never as
+ * a pass. A run whose only remaining failures are these is not repairable, so the caller finalizes
+ * it partial with the finding delivered under its own limitation; a run with other repairable work
+ * still open stays repairable until that work is done. A retirement the host later retracts (the
+ * candidate verified on a re-run) simply stops appearing here.
+ */
+export interface RetiredContradictionDetail {
+  readonly candidateId: string;
+  readonly cause: UnverifiedContradictionCause;
 }
 
 export interface BudgetExhaustionFacts {
@@ -111,6 +130,8 @@ export interface CompletionEvaluationInput {
   readonly passes: VerificationPasses;
   /** See `UnverifiedContradictionDetail`. Read only when `passes.contradictionPassComplete` is false. */
   readonly unverifiedContradictions?: readonly UnverifiedContradictionDetail[];
+  /** See `RetiredContradictionDetail`. Read regardless of `passes`: a retired survivor fails the clause even when the collaborator's own flag says the pass concluded. */
+  readonly retiredContradictions?: readonly RetiredContradictionDetail[];
   readonly budget?: BudgetExhaustionFacts;
 }
 
@@ -182,6 +203,12 @@ const REPAIRABLE_BLOCKERS: ReadonlySet<CompletionBlocker> = new Set<CompletionBl
   'readFailed',
 ]);
 
+/** The clause of a retired candidate's disclosure that names why, per `UnverifiedContradictionCause`, without repeating the retirement limitation's own longer text. */
+const RETIRED_CAUSE_TEXT: Readonly<Record<UnverifiedContradictionCause, string>> = Object.freeze({
+  citationUnavailable: 'its cited evidence could not be excerpted for the check',
+  verificationExhausted: 'no usable verdict ever came back',
+});
+
 export function evaluateCompletion(input: CompletionEvaluationInput): CompletionEvaluation {
   const rules = input.coverageRules ?? DEFAULT_RISK_COVERAGE_RULES;
   const clauses = {} as Record<CompletionClause, boolean>;
@@ -203,6 +230,22 @@ export function evaluateCompletion(input: CompletionEvaluationInput): Completion
     failures += 1;
     if (!repairable) unrepairableFailures += 1;
     pushBounded(details, perClause, { blocker, clause, message, repairable, ...where });
+  }
+
+  /**
+   * A clause failure the model cannot act on and the host will not retry. It fails the clause and
+   * carries a detail exactly as `fail` does, but counts toward neither `failures` nor
+   * `unrepairableFailures`, so `repairable` below is decided by every OTHER failure alone: with
+   * repairable work still open the request stays repairable (the model may finish that work, and a
+   * later re-run may even retract the disclosure); with nothing else open, `failures === 0` makes
+   * the evaluation unrepairable and the caller finalizes truthfully. Not a `fail(..., false)`:
+   * that would mark the whole evaluation unrepairable the moment one check was given up, cutting
+   * off repairable work the model could still finish.
+   */
+  function disclose(clause: CompletionClause, blocker: CompletionBlocker, message: string): void {
+    clauses[clause] = false;
+    blockers.add(blocker);
+    pushBounded(details, perClause, { blocker, clause, message, repairable: false });
   }
 
   // 1. headVerified — one check per member; an unperformed or unresolved check cannot pass. A
@@ -319,6 +362,15 @@ export function evaluateCompletion(input: CompletionEvaluationInput): Completion
       // exactly which finding to fix and how, instead of one opaque boolean it has no way to act on.
       for (const detail of named) fail('contradictionPassComplete', 'contradictionPending', `Candidate ${detail.candidateId}: ${detail.reason}`);
     }
+  }
+  // A retired survivor fails the clause whether or not the collaborator's own flag passed: the
+  // host stopped retrying its check, so the pass never concluded for it. See `RetiredContradictionDetail`.
+  for (const retired of input.retiredContradictions ?? []) {
+    disclose(
+      'contradictionPassComplete',
+      'contradictionPending',
+      `Candidate ${retired.candidateId}: its contradiction check was given up after repeated attempts (${RETIRED_CAUSE_TEXT[retired.cause]}); the finding is kept, but this attempt cannot report it checked.`,
+    );
   }
   clauses.deduplicationComplete = true;
   if (!input.passes.deduplicationComplete) fail('deduplicationComplete', 'deduplicationPending', 'Deduplication has not completed.');

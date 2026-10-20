@@ -889,3 +889,103 @@ describe('createSynthesisVerification (the injected SynthesisVerificationRunner)
     expect(seam.calls).toBe(0);
   });
 });
+
+describe('runContradictionChecks: every model call draws on the attempt budget before it is made', () => {
+  function context(seam: HarnessModelSeam, ledger: EvidenceLedger, overrides: Partial<ContradictionCheckContext> = {}): ContradictionCheckContext {
+    return { modelSeam: seam, ledger, policy: testPolicy(), ...overrides };
+  }
+
+  function twoFindings(ledger: EvidenceLedger): [ValidatedFinding, ValidatedFinding] {
+    const source = registerDiff(ledger, 'src/b.ts', '@@ -1,1 +1,1 @@\n+doSomething();');
+    return [
+      accept(ledger, candidateRaw({ candidateId: 'cand-b1', title: 'First claim' }, source, 'src/b.ts', 1, 1)),
+      accept(ledger, candidateRaw({ candidateId: 'cand-b2', title: 'Second claim' }, source, 'src/b.ts', 1, 1)),
+    ];
+  }
+
+  it('a refused reservation stops the stage before any ask: no model call, every remaining finding kept, no per-finding unverified entry, and the stop named with the unchecked count', async () => {
+    const ledger = makeLedger();
+    const [findingA, findingB] = twoFindings(ledger);
+    const seam = scriptedSeam((repair) => verdictJson(extractCandidateId(repair), false));
+    let reservations = 0;
+    const reserveModelCall = () => {
+      reservations += 1;
+      return { ok: false as const, code: 'exhausted' as const, message: 'modelTurns: 1 requested for verification but the allowed lanes cannot supply it.' };
+    };
+
+    const result = await runContradictionChecks([findingA, findingB], context(seam, ledger, { reserveModelCall }));
+
+    expect(seam.calls).toBe(0);
+    expect(reservations).toBe(1);
+    expect(result.complete).toBe(false);
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-b1', 'cand-b2']);
+    // Never an `unverified` entry: those feed the no-progress bound's retirement, and a finding
+    // the host declined to ask about is not a finding the check could not conclude on.
+    expect(result.unverified).toEqual([]);
+    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns: 1 requested for verification but the allowed lanes cannot supply it.', uncheckedCount: 2 });
+  });
+
+  it('one reservation per finding absorbs its repair asks; the stage stops at the first refusal with the already-answered finding checked', async () => {
+    const ledger = makeLedger();
+    const [findingA, findingB] = twoFindings(ledger);
+    let asks = 0;
+    const seam = scriptedSeam((repair) => {
+      asks += 1;
+      return asks === 1 ? 'not a verdict' : verdictJson(extractCandidateId(repair), false);
+    });
+    let reservations = 0;
+    const reserveModelCall = () => {
+      reservations += 1;
+      return reservations === 1 ? { ok: true as const } : { ok: false as const, code: 'exhausted' as const, message: 'modelTurns exhausted' };
+    };
+
+    const result = await runContradictionChecks([findingA, findingB], context(seam, ledger, { reserveModelCall }));
+
+    expect(seam.calls).toBe(2); // cand-b1: one ask plus one repair, under one reservation
+    expect(reservations).toBe(2);
+    expect(result.complete).toBe(false);
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-b1', 'cand-b2']);
+    expect(result.unverified).toEqual([]);
+    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns exhausted', uncheckedCount: 1 });
+  });
+
+  it('a citation that cannot be excerpted reserves nothing: the skip costs no budget and is still reported per finding', async () => {
+    const ledger = makeLedger();
+    const source = registerDiff(ledger, 'src/opaque.ts', 'z'.repeat(5_000), 3);
+    const finding = accept(ledger, candidateRaw({ candidateId: 'cand-opaque' }, source, 'src/opaque.ts', 2, 3));
+    const seam = scriptedSeam(() => {
+      throw new Error('never asked');
+    });
+    let reservations = 0;
+    const reserveModelCall = () => {
+      reservations += 1;
+      return { ok: true as const };
+    };
+
+    const result = await runContradictionChecks([finding], context(seam, ledger, { reserveModelCall }));
+
+    expect(reservations).toBe(0);
+    expect(result.unverified.map((u) => u.cause)).toEqual(['citationUnavailable']);
+    expect(result.stoppedEarly).toBeUndefined();
+  });
+
+  it('the elapsed limit is re-checked before each repair ask: a repair that would start past it is not sent, and the finding counts as unchecked rather than exhausted', async () => {
+    const ledger = makeLedger();
+    const [findingA, findingB] = twoFindings(ledger);
+    const policy = testPolicy({ maxElapsedMsPerAttempt: 1_000 });
+    let elapsed = 0;
+    const seam = scriptedSeam(() => {
+      elapsed = 1_000; // the first ask itself ran the clock out
+      return 'not a verdict';
+    });
+
+    const result = await runContradictionChecks([findingA, findingB], context(seam, ledger, { policy, reserveModelCall: () => ({ ok: true }), elapsedMs: () => elapsed }));
+
+    expect(seam.calls).toBe(1);
+    expect(result.complete).toBe(false);
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-b1', 'cand-b2']);
+    expect(result.unverified).toEqual([]);
+    expect(result.stoppedEarly?.uncheckedCount).toBe(2);
+    expect(result.stoppedEarly?.reason).toMatch(/elapsed/i);
+  });
+});
