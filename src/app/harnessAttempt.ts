@@ -3381,9 +3381,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       if (phase === 'planning' && plan === undefined && !processed.hadActionableWork && earlyStopNudges < MAX_EARLY_STOP_NUDGES_PER_PHASE) {
         // A planning turn that shaped no plan (a bare rationale, or a `riskProposal` alone) is not
         // the model declaring planning done: the phase's own condition, a plan, is still missing,
-        // and ending here would skip investigation altogether (`noPlan`). The next turn's prompt
-        // already asks for the plan, so the host only asks again — bounded by the same cap the
-        // other phases use, after which the ordinary `noPlan` ending applies.
+        // and ending here would skip investigation altogether (`noPlan`). The next turn re-sends the
+        // planning prompt, which lists `planCreated` as the kind to send, so the host only asks
+        // again — bounded by the same cap the other phases use, after which the ordinary `noPlan`
+        // ending applies.
         earlyStopNudges += 1;
         appendActivity({ kind: 'actionStarted', action: 'The model sent no plan; asking it to publish one before investigating.' }, phase);
         continue;

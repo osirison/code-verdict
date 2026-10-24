@@ -33,7 +33,8 @@ and the two requirements `harden-harness-verification-completion` modifies.
 - Prompt: about 270 bytes more per model turn. The scoped small-review cost ceiling moves from
   87,000 to 90,000 bytes (measured 86,890 before, 88,787 after); the unscoped one stays at 94,000
   (91,958 before, 93,855 after).
-- A model that raises many files to `high` lets turns draw the high-risk reserve and subjects
-  findings on those files to the contradiction check. That is the same trade the host floor
-  already makes for sensitive paths, now available to the model; it adds obligations rather than
-  removing them.
+- A model that raises many files to `high` lets turns draw the high-risk reserve. A raise can add
+  an obligation to read the file (per the configured inspection threshold); those reads draw on
+  the run's budget and can push a run to partial. That is the same trade the host floor already
+  makes for sensitive paths, now available to the model; it adds obligations rather than removing
+  them.

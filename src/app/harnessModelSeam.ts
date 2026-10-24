@@ -140,8 +140,7 @@ the phase's few repair attempts.
 - completionRequest: { "kind": "completionRequest", "memberId"?, "rationale"? }
   Alone in its turn; advisory — the host decides. A refusal names what remains.
 - riskProposal: { "kind": "riskProposal", "proposals": [ { "memberId", "path", "risk": ${RISK_LEVELS.map((level) => `"${level}"`).join('|')}, "logicalUnit"?, "reason"? } ] }
-  Raises a file's risk above the host's own, never lowers it. Medium and high
-  files must be read.
+  Raises a file's risk above the host's own, never lowers it.
 
 BATCH_RULES_PLACEHOLDER
 
