@@ -42,7 +42,7 @@ A model completion request SHALL be advisory. The host SHALL grant complete stat
 
 ### Requirement: Budgets and retries degrade truthfully
 
-The host SHALL enforce global, per-run, per-turn, per-tool, evidence-size, and elapsed-time budgets. It SHALL reserve budget for unvisited or high-risk files and final verification, apply bounded retries with provider `Retry-After` guidance or backoff for transient failures, and limit protocol-repair attempts. Every model call the host makes during verification, including each contradiction check, SHALL draw one model turn from the run's model-turn budget before it is made and SHALL NOT start once the elapsed-time limit is reached; a verification pass the budget stops SHALL retain the findings it did not reach, record how many it did not check and why, and SHALL NOT count them as checked or as failed. Exact numeric defaults and retention limits SHALL be configurable initial defaults rather than fixed product semantics.
+The host SHALL enforce global, per-run, per-turn, per-tool, evidence-size, and elapsed-time budgets. It SHALL reserve budget for unvisited or high-risk files and final verification, apply bounded retries with provider `Retry-After` guidance or backoff for transient failures, and limit protocol-repair attempts. Each finding the host asks the model to contradiction-check SHALL draw one model turn from the run's model-turn budget before its first ask, with that finding's repair asks absorbed under the same reservation, and no check SHALL start once the elapsed-time limit is reached; a verification pass the budget stops SHALL retain the findings it did not reach, record how many it did not check and why, and SHALL NOT count them as checked or as failed. Exact numeric defaults and retention limits SHALL be configurable initial defaults rather than fixed product semantics.
 
 #### Scenario: Provider asks the run to retry later
 
@@ -67,6 +67,12 @@ The host SHALL enforce global, per-run, per-turn, per-tool, evidence-size, and e
 - **WHEN** the contradiction pass asks the model about a retained finding
 - **THEN** one model turn is reserved from the run's model-turn budget before the ask, with that finding's repair asks absorbed under the same reservation
 - **AND** a refused reservation stops the pass with every unasked finding retained, no model call made for it, and a limitation naming how many findings were not checked
+
+#### Scenario: A re-run stopped by the budget still retracts retirements it answered
+
+- **WHEN** a candidate was retired after repeated failed checks, and a later pass answers it (clean or contradicted) before a refused reservation stops the pass at another finding
+- **THEN** the retired candidate's limitation is withdrawn and it is no longer disclosed as retired
+- **AND** a retired candidate the stopped pass never reached keeps its retirement, and the attempt still ends partial naming the unchecked count
 
 #### Scenario: The time limit is reached during verification
 

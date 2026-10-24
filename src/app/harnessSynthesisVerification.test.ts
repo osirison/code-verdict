@@ -922,7 +922,7 @@ describe('runContradictionChecks: every model call draws on the attempt budget b
     // Never an `unverified` entry: those feed the no-progress bound's retirement, and a finding
     // the host declined to ask about is not a finding the check could not conclude on.
     expect(result.unverified).toEqual([]);
-    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns: 1 requested for verification but the allowed lanes cannot supply it.', uncheckedCount: 2 });
+    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns: 1 requested for verification but the allowed lanes cannot supply it.', uncheckedCount: 2, uncheckedCandidateIds: ['cand-b1', 'cand-b2'] });
   });
 
   it('a reservation refused as cancelled stops the stage the same way but records no stop: the run is already reported cancelled', async () => {
@@ -961,7 +961,7 @@ describe('runContradictionChecks: every model call draws on the attempt budget b
     expect(result.complete).toBe(false);
     expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-b1', 'cand-b2']);
     expect(result.unverified).toEqual([]);
-    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns exhausted', uncheckedCount: 1 });
+    expect(result.stoppedEarly).toEqual({ reason: 'modelTurns exhausted', uncheckedCount: 1, uncheckedCandidateIds: ['cand-b2'] });
   });
 
   it('a citation that cannot be excerpted reserves nothing: the skip costs no budget and is still reported per finding', async () => {

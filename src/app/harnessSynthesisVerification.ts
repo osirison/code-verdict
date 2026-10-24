@@ -1078,7 +1078,7 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
       // A cancelled refusal stops the pass identically but records no stop: the run is already
       // reported cancelled (`classifyOutcome`'s `cancelled` limitation), exactly as the
       // `isCancelled` branch at the top of this loop leaves it.
-      if (reserved.code !== 'cancelled') stoppedEarly = { reason: reserved.message, uncheckedCount: ordered.length - index };
+      if (reserved.code !== 'cancelled') stoppedEarly = { reason: reserved.message, uncheckedCount: ordered.length - index, uncheckedCandidateIds: ordered.slice(index).map((entry) => entry.candidateId) };
     } else {
       let raw = await askOnce(finding, directive.text);
       let verdict = raw !== undefined ? parseContradictionVerdict(raw, finding.candidateId) : undefined;
@@ -1087,6 +1087,7 @@ export async function runContradictionChecks(findings: readonly ValidatedFinding
           stoppedEarly = {
             reason: `Elapsed time reached the attempt limit of ${context.policy.maxElapsedMsPerAttempt}ms before a repair of this verdict could be asked.`,
             uncheckedCount: ordered.length - index,
+            uncheckedCandidateIds: ordered.slice(index).map((entry) => entry.candidateId),
           };
           break;
         }

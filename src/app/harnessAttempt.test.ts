@@ -4127,6 +4127,55 @@ describe('HarnessAttempt.run (an unchecked finding ends the run partial, and eve
     expect(result.outcome.limitations.some((l) => l.code === 'budgetExhausted')).toBe(true);
   });
 
+  it.each([
+    ['clean', false],
+    ['contradicted', true],
+  ] as const)(
+    'a re-run the budget stopped still retracts the retirement of a candidate it answered (%s), while the pass is reported stopped',
+    async (_label, contradicted) => {
+      let file2Ref: { sourceId: string; digest: string } | undefined;
+      const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+      const submitCand1: ScriptEntry = (call) => {
+        const file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+        file2Ref = sourceRefFrom(call.toolResults[1] as HostToolResult);
+        return messages(candidateSubmissionMessage('cand-1', 'file1.ts', file1Ref));
+      };
+      let verifyingTurns = 0;
+      const respondToVerifying: ScriptEntry = (call) => {
+        if (call.repairInstruction !== undefined) {
+          // Unparseable until the completion request: cand-1 retires on the phase-entry pass and
+          // the denials. The re-run it triggers then gets a real verdict for cand-1.
+          if (verifyingTurns < 5) return 'not parseable as a verdict at all';
+          const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+          return JSON.stringify({ candidateId: match?.[1], contradicted, ...(contradicted ? { reason: 'Contradicted by evidence two lines up.' } : {}) });
+        }
+        verifyingTurns += 1;
+        if (verifyingTurns === 4) return messages(candidateSubmissionMessage('cand-2', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+        return COMPLETION_TURN;
+      };
+      const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitCand1, STOP_TURN], verifying: [respondToVerifying] });
+      // Same arithmetic as the test above with one more turn: the re-run's reservation for cand-1
+      // is the 11th and is granted, the one for cand-2 is the 12th and is refused.
+      const attempt = createHarnessAttempt({
+        ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+        snapshot: testSnapshot(),
+        members: [member(connection)],
+        modelSeam: seam,
+        policy: testPolicy({ protocolRepairsPerPhase: 1, maxModelTurnsPerAttempt: 11, highRiskReservePercent: 0, verificationReservePercent: 0 }),
+      });
+
+      const result = await attempt.run();
+
+      expect(result.lifecycle).toBe('failed');
+      expect(result.outcome.kind).toBe('partialFindings');
+      expect(result.outcome.limitations.find((l) => l.code === 'contradictionPassStopped')?.message).toContain('1 finding');
+      // cand-1 was answered this round: its retirement is gone, whichever way the verdict went.
+      expect(result.outcome.limitations.find((l) => l.code === 'contradictionCheckExhausted')).toBeUndefined();
+      expect(result.findings.map((f) => f.candidateId)).toEqual(contradicted ? ['cand-2'] : ['cand-1', 'cand-2']);
+      expect(result.completionEvaluation?.clauses.contradictionPassComplete).toBe(false);
+    },
+  );
+
   it('a pass stopped by the budget never lets the no-progress bound call the passes complete: every still-unverified candidate retired is not "every candidate checked"', async () => {
     let file2Ref: { sourceId: string; digest: string } | undefined;
     // cand-a cites an unlocatable diff (never excerptable, so never asked, so never reserved);

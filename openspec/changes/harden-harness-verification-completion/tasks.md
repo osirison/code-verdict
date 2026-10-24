@@ -9,8 +9,8 @@
 - [x] 2.2 End the `verifying` phase when a completion request is denied as unrepairable (`ProcessMessagesOutcome.completionDeniedUnrepairably`).
 - [x] 2.3 Keep the no-progress bound and both counters; they still clear live blockers and never grant completion on their own. Update their doc comments.
 - [x] 2.4 Supply `reserveModelCall` to the collaborator as a host-initiated one-turn `budget.reserve` of purpose `verification`.
-- [x] 2.5 Record a stopped pass as one `contradictionPassStopped` limitation (replaced on re-run), guard retraction and the bound on `stoppedEarly`.
-- [x] 2.6 Tests: the finding-1 and finding-3 shapes end `partialFindings` within four verifying turns; a retired-then-verified candidate ends complete; the pool running out mid-pass makes no further call and keeps the retirement; a stopped pass never reads as "every candidate retired"; the elapsed limit mid-pass ends partial with a timeout blocker and the unchecked count; every check adds one turn to the attempt's tally.
+- [x] 2.5 Record a stopped pass as one `contradictionPassStopped` limitation (replaced on re-run), guard the bound on `stoppedEarly`; retraction skips only the candidates the stopped pass never reached.
+- [x] 2.6 Tests: the finding-1 and finding-3 shapes end `partialFindings` within four verifying turns; a retired-then-verified candidate ends complete; the pool running out mid-pass makes no further call and keeps the retirement of a candidate it never reached, and retracts one it answered; a stopped pass never reads as "every candidate retired"; the elapsed limit mid-pass ends partial with a timeout blocker and the unchecked count; every check adds one turn to the attempt's tally.
 
 ## 3. Collaborator
 

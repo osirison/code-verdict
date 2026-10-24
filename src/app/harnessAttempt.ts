@@ -370,6 +370,8 @@ export type ModelCallReservation = { readonly ok: true } | { readonly ok: false;
 export interface ContradictionPassStop {
   readonly reason: string;
   readonly uncheckedCount: number;
+  /** The candidates the pass never reached — the complement of the ones it answered this round. */
+  readonly uncheckedCandidateIds: readonly string[];
 }
 
 /** One finding the contradiction pass excluded, with a bounded public reason — task 10.6's collaborator (`./harnessSynthesisVerification.ts`) populates this so a contradicted finding is recorded, never silently dropped; the honest no-op default below and any collaborator that skips the stage simply omit it. */
@@ -2398,7 +2400,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // A pass the budget or the clock stopped (`ContradictionPassStop`): one limitation naming the
     // count and the reason, replacing the previous pass's if it had one. Its findings are kept and
     // reach the reviewer; the gate reports the pass incomplete; the stop is never read as progress
-    // or as retirement — see the two `!stoppedEarly` guards below.
+    // or as retirement — see the `boundReached` guard and the retraction loop below.
     if (stoppedEarlyLimitation !== undefined) {
       const index = extraLimitations.indexOf(stoppedEarlyLimitation);
       if (index !== -1) extraLimitations.splice(index, 1);
@@ -2438,11 +2440,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // straight to `output.findings`, so a capped candidate's absence from `output.unverified` there
     // means "never re-asked this round", not "resolved" — retracting on that would erase a truthful
     // limitation from a result already being reported partial for the cancellation itself. A pass
-    // the budget stopped (`stoppedEarly`) leaves its remainder unasked in exactly the same way, and
-    // gets exactly the same treatment.
-    if (!isCancelled() && stoppedEarly === undefined) {
+    // the budget stopped (`stoppedEarly`) leaves its remainder unasked in exactly the same way, so
+    // only the candidates it never reached keep their retirement; one it did answer this round
+    // (clean or contradicted) was resolved, and is retracted like any other.
+    if (!isCancelled()) {
+      const unreached = new Set(stoppedEarly?.uncheckedCandidateIds ?? []);
       for (const candidateId of [...retiredUnverifiableCandidates.keys()]) {
-        if (!unverifiedIds.has(candidateId)) retractRetirement(candidateId);
+        if (!unverifiedIds.has(candidateId) && !unreached.has(candidateId)) retractRetirement(candidateId);
       }
     }
     const stillPending: UnverifiedFindingRecord[] = [];
