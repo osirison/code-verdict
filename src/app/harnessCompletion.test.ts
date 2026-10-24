@@ -567,3 +567,33 @@ describe('coverage-versus-budget forecast (the 204-file live run)', () => {
     expect(shortfall).toMatchObject({ requiredReads: 24, fundableReads: 16 });
   });
 });
+
+describe('a retired contradiction check is disclosed, never counted as a pass', () => {
+  it('retired candidates alone fail the contradiction clause with nothing left to repair: not eligible, not repairable, no new blocker code', () => {
+    const evaluation = evaluateCompletion(passing({ retiredContradictions: [{ candidateId: 'cand-r1', cause: 'citationUnavailable' }] }));
+    expect(evaluation.eligible).toBe(false);
+    expect(evaluation.clauses.contradictionPassComplete).toBe(false);
+    expect(COMPLETION_CLAUSES.filter((clause) => !evaluation.clauses[clause])).toEqual(['contradictionPassComplete']);
+    expect(evaluation.blockers).toEqual(['contradictionPending']);
+    expect(evaluation.repairable).toBe(false);
+    expect(evaluation.details).toHaveLength(1);
+    expect(evaluation.details[0]).toMatchObject({ blocker: 'contradictionPending', clause: 'contradictionPassComplete', repairable: false });
+    expect(evaluation.details[0]?.message).toContain('cand-r1');
+    // The model-facing request is denied as unrepairable even with budget to spare: no further
+    // turn on this attempt can clear a retirement.
+    expect(respondToCompletionRequest(evaluation, { canContinue: true })).toMatchObject({ granted: false, repairable: false });
+  });
+
+  it('a retirement alongside genuinely repairable work leaves the request repairable: the model may still fix what it can', () => {
+    const evaluation = evaluateCompletion(
+      passing({ retiredContradictions: [{ candidateId: 'cand-r1', cause: 'verificationExhausted' }], unresolved: { unresolvedFetches: 0, unresolvedCandidates: 1 } }),
+    );
+    expect(evaluation.eligible).toBe(false);
+    expect(evaluation.repairable).toBe(true);
+    expect(evaluation.blockers).toEqual(['unresolvedCandidates', 'contradictionPending']);
+  });
+
+  it('an empty retirement list changes nothing', () => {
+    expect(evaluateCompletion(passing({ retiredContradictions: [] })).eligible).toBe(true);
+  });
+});

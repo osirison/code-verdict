@@ -727,8 +727,10 @@ describe('budget-exhausted resume (feature): a fresh budget, not a carried-forwa
     expect(exhaustedCheckpoint.budget.modelTurnsUsed).toBe(tightPolicy.maxModelTurnsPerAttempt);
 
     // Resuming with a cap set to *exactly* the number of turns this resumed script needs to
-    // complete (4, measured empirically against this fixture — a resumed attempt's own investigating
-    // phase ends one turn sooner than a fresh attempt 1's does) is the sharpest version of the check:
+    // complete (4, measured empirically against this fixture: three phase turns — a resumed
+    // attempt's own investigating phase ends one turn sooner than a fresh attempt 1's does — plus
+    // the one model turn the carried-forward finding's contradiction check reserves) is the sharpest
+    // version of the check:
     // with a genuinely fresh budget, all 4 are available and the script completes exactly at the
     // wire. If the pre-fix bug (budget always carried forward) were still present, this attempt's
     // tracker would seed `modelTurnsUsed: 1` from attempt 1 against this same 4-turn cap, leaving

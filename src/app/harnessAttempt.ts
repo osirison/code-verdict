@@ -139,6 +139,7 @@ import {
   resolveReservePercents,
   type BudgetTracker,
   type ReservationPurpose,
+  type ReservationRefusal,
 } from './harnessBudgets';
 import {
   createCandidateTracker,
@@ -158,6 +159,7 @@ import {
   type CompletionOutcome,
   type CompletionRequestResponse,
   type CitationRevalidationSummary,
+  type RetiredContradictionDetail,
   type MemberHeadCheck,
   type UnverifiedContradictionDetail,
   type VerificationPasses,
@@ -340,6 +342,36 @@ export interface SynthesisVerificationInput {
   readonly elapsedMs: () => number;
   /** Same reporting seam `HarnessModelSeam.askModel`'s own `onTiming` field documents — the contradiction-check pass (`./harnessSynthesisVerification.ts`'s `runContradictionChecks`) calls `askModel` directly, outside `runPhaseLoop`'s own turn loop, so without this its model-wait time would silently disappear from the diagnostics report's totals instead of landing in `verifying`. */
   readonly onModelTurnTiming?: (timing: ModelTurnTiming) => void;
+  /**
+   * Draws one model turn from the attempt's budget. The same structural gap as `onModelTurnTiming`
+   * above, on the budget side: the contradiction pass's direct `askModel` calls were the only model
+   * calls in an attempt that drew on no pool and answered to no elapsed-time limit — a pass over
+   * many findings could run on past both. `runSynthesisVerification` supplies this as a one-turn
+   * `budget.reserve` of purpose `verification` (the reserve lane, then ordinary — the same shared
+   * `modelTurns` pool every turn draws, so nothing persisted changes shape), host-initiated and
+   * never `beginTurn`, which would reset the per-turn tool counter in the middle of the turn whose
+   * `completionRequest` triggered a re-run. The collaborator calls it once per finding before that
+   * finding's first ask (`harnessSynthesisVerification.ts`'s header, "Every ask is budgeted") and
+   * stops the pass on a refusal; see `SynthesisVerificationOutput.stoppedEarly`.
+   */
+  readonly reserveModelCall?: () => ModelCallReservation;
+}
+
+/** The answer `SynthesisVerificationInput.reserveModelCall` gives: one model turn granted, or refused with the budget tracker's own code and message. */
+export type ModelCallReservation = { readonly ok: true } | { readonly ok: false; readonly code: ReservationRefusal; readonly message: string };
+
+/**
+ * Why a contradiction pass stopped before asking about every finding — a refused
+ * `reserveModelCall`, or the elapsed limit reached before a repair ask — and how many findings it
+ * never reached. The host turns it into one `contradictionPassStopped` limitation and refuses to
+ * let the no-progress bound read the stopped pass as "every candidate retired"; see
+ * `runSynthesisVerification`.
+ */
+export interface ContradictionPassStop {
+  readonly reason: string;
+  readonly uncheckedCount: number;
+  /** The candidates the pass never reached — the complement of the ones it answered this round. */
+  readonly uncheckedCandidateIds: readonly string[];
 }
 
 /** One finding the contradiction pass excluded, with a bounded public reason — task 10.6's collaborator (`./harnessSynthesisVerification.ts`) populates this so a contradicted finding is recorded, never silently dropped; the honest no-op default below and any collaborator that skips the stage simply omit it. */
@@ -387,6 +419,8 @@ export interface SynthesisVerificationOutput {
   readonly contradicted?: readonly ContradictedFindingRecord[];
   /** Optional: surviving findings the contradiction pass could not check, each with why (see `UnverifiedFindingRecord`). */
   readonly unverified?: readonly UnverifiedFindingRecord[];
+  /** Optional: the pass stopped before every finding was asked about (see `ContradictionPassStop`). The findings it never reached are in `findings` and in no other list. */
+  readonly stoppedEarly?: ContradictionPassStop;
 }
 
 export type SynthesisVerificationRunner = (input: SynthesisVerificationInput) => Promise<SynthesisVerificationOutput>;
@@ -824,6 +858,16 @@ interface ProcessMessagesOutcome {
    * existing check is for and how this budget converges instead of ping-ponging.
    */
   readonly deferredForPromptBudget: number;
+  /**
+   * A `verifying`-phase `requestCompletion` this turn came back denied with `repairable: false` —
+   * a blocker no further turn on this attempt can clear (a retired contradiction check, a head the
+   * provider cannot resolve, a budget that will not fund another turn). `runPhaseLoop` ends the phase
+   * on it, D11's "otherwise the run finalizes truthfully": letting the model ask again would only
+   * buy identical denials until the budget ran out — the 154-turn shape
+   * `MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s doc comment records, which that bound closed by
+   * retiring the candidate and which would reopen the moment a retirement stopped granting completion.
+   */
+  readonly completionDeniedUnrepairably: boolean;
 }
 
 /**
@@ -863,13 +907,22 @@ const MAX_EARLY_STOP_NUDGES_PER_PHASE = 3;
  * `docs/agent-notes/` for this run's diagnosis.
  *
  * `runSynthesisVerification` (below) tracks each unverified candidate's `(reason)` across re-runs; once
- * one has recurred byte-identically this many times in a row, it stops counting against
- * `contradictionPassComplete` — recorded instead as its own truthfully-named run limitation (a
+ * one has recurred byte-identically this many times in a row, it stops being a *live* blocker the
+ * model is asked to repair — recorded instead as its own truthfully-named run limitation (a
  * reviewer-visible "this could not be checked", named per `UnverifiedContradictionCause`) — rather
- * than holding every future completion request hostage. The streak resets the moment the reason
- * changes (a narrower resubmission changes the reported character count) or the candidate leaves
- * the unverified set entirely (resolved, contradicted, or excluded), so genuine progress is never
- * mistaken for a stall.
+ * than holding every future completion request hostage. It does not stop blocking completion: a
+ * retired candidate is a finding nobody checked, and `currentCompletionEvaluation` hands every
+ * retired survivor to the gate as `retiredContradictions`, which fails `contradictionPassComplete`
+ * unrepairably (`harnessCompletion.ts`'s `RetiredContradictionDetail`). Once retirements are all
+ * that is left, the next `requestCompletion` is denied unrepairably, `runPhaseLoop` ends the phase
+ * (`ProcessMessagesOutcome.completionDeniedUnrepairably`), and the run finalizes partial with the
+ * finding delivered under its limitation — the same outcome, and the same failure card, as a run
+ * that ran out of budget. Before this, the bound made the passes read complete and the run
+ * `succeeded`, replacing the retained review with findings it had never checked. The streak resets
+ * the moment the reason changes (a narrower resubmission changes the reported character count) or
+ * the candidate leaves the unverified set entirely (resolved, contradicted, or excluded), so
+ * genuine progress is never mistaken for a stall — and a retirement a later re-run does resolve is
+ * retracted (`retractRetirement`), so a complete outcome stays reachable.
  *
  * **Two counters share this one bound, for two structurally different ways to idle.** The streak
  * above — `unverifiedContradictionStreak` — only ever advances when `runSynthesisVerification`
@@ -1129,6 +1182,13 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
   let passesStale = false;
   /** The contradiction pass's exclusions (task 10.6's collaborator's `output.contradicted`), captured here so `fireCheckpoint`/`runPersisting` can hand them to the checkpoint collaborator and `HarnessAttemptOutcome` instead of dropping them at this closure's boundary. */
   let latestContradicted: readonly ContradictedFindingRecord[] = [];
+  /**
+   * The one `contradictionPassStopped` limitation the latest pass pushed, kept by reference (the
+   * same device `retiredUnverifiableCandidates` uses) so a re-run that stops early again replaces
+   * it with its own count and reason instead of stacking a second one, and a re-run that finishes
+   * removes it.
+   */
+  let stoppedEarlyLimitation: Limitation | undefined;
   /**
    * Candidates still genuinely blocking `contradictionPassComplete` after the no-progress bound has
    * excluded any that recurred identically `MAX_UNVERIFIABLE_CONTRADICTION_STREAK` times — see that
@@ -1440,6 +1500,22 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     return elapsedBudgetExhausted() || budget.state().pools.modelTurns.remaining === 0 || isCancelled();
   }
 
+  /**
+   * Every candidate either no-progress counter has retired (`retiredUnverifiableCandidates`) that
+   * is still among the findings this attempt would deliver — the same selection `runPersisting`
+   * makes — as the gate's `retiredContradictions` input. Filtered to survivors because a retirement
+   * follows the candidate, not the result: one retired and later contradicted or dropped is no longer
+   * anything the result claims to have checked. Sorted so the bounded detail list is stable.
+   */
+  function retiredSurvivors(): readonly RetiredContradictionDetail[] {
+    if (retiredUnverifiableCandidates.size === 0) return [];
+    const delivered = new Set((!verificationRan || passesStale ? candidateTracker.triageFindings() : survivingFindings).map((finding) => finding.candidateId));
+    return [...retiredUnverifiableCandidates.entries()]
+      .filter(([candidateId]) => delivered.has(candidateId))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([candidateId, retired]) => ({ candidateId, cause: retired.cause }));
+  }
+
   function currentCompletionEvaluation(): CompletionEvaluation {
     const input: CompletionEvaluationInput = {
       heads: latestHeads,
@@ -1465,6 +1541,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       // reconciling call was skipped — without this file needing to track every future skip site.
       passes: passesStale ? { contradictionPassComplete: false, deduplicationComplete: false, finalVerificationComplete: false } : latestPasses,
       unverifiedContradictions: latestUnverifiedContradictions,
+      retiredContradictions: retiredSurvivors(),
       // `timedOut` is the OR of the budget's own (possibly stale) view and a fresh clock read —
       // never the fresh read alone, so a `HarnessAttempt` built with no `clock`/`policy` mismatch
       // (every production and test caller) keeps reporting a timeout it already knew about even if
@@ -2272,8 +2349,10 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     const cappedIds = new Set(newlyCapped.map((entry) => entry.candidateId));
     latestUnverifiedContradictions = latestUnverifiedContradictions.filter((entry) => !cappedIds.has(entry.candidateId));
     // Mirrors `runSynthesisVerification`'s own `boundReached`: once every candidate this attempt was
-    // still waiting on is retired, the pass and final verification are complete for the same reason
-    // a re-run-triggered cap would make them complete — the bound, not a real confirmed verdict.
+    // still waiting on is retired, the passes have concluded as far as this attempt can take them —
+    // no live blocker remains for the model to repair. Never a grant: each retired survivor still
+    // reaches the gate through `retiredSurvivors()` as an unrepairable failure of the contradiction
+    // clause, so the next denial is unrepairable and the phase ends partial.
     if (latestUnverifiedContradictions.length === 0) {
       latestPasses = { ...latestPasses, contradictionPassComplete: true, finalVerificationComplete: true };
     }
@@ -2308,10 +2387,34 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       cancellation,
       elapsedMs: clock,
       onModelTurnTiming: (timing) => recordModelTurnTiming('verifying', timing),
+      // `reserve`, never `beginTurn` — see `SynthesisVerificationInput.reserveModelCall`.
+      reserveModelCall: () => {
+        const reserved = budget.reserve({ requestId: nextRequestId(), purpose: 'verification', modelTurns: 1, toolCalls: 0, evidenceBytes: 0, hostInitiated: true, elapsedMs: clock() });
+        return reserved.ok ? { ok: true } : { ok: false, code: reserved.code, message: reserved.message };
+      },
     });
     const revalidation = revalidateFindings(output.findings, { ledger, now: now() });
     survivingFindings = revalidation.valid;
     latestCitations = { revalidated: true, invalidatedCount: revalidation.invalidated.length };
+
+    // A pass the budget or the clock stopped (`ContradictionPassStop`): one limitation naming the
+    // count and the reason, replacing the previous pass's if it had one. Its findings are kept and
+    // reach the reviewer; the gate reports the pass incomplete; the stop is never read as progress
+    // or as retirement — see the `boundReached` guard and the retraction loop below.
+    if (stoppedEarlyLimitation !== undefined) {
+      const index = extraLimitations.indexOf(stoppedEarlyLimitation);
+      if (index !== -1) extraLimitations.splice(index, 1);
+      stoppedEarlyLimitation = undefined;
+    }
+    const stoppedEarly = output.stoppedEarly;
+    if (stoppedEarly !== undefined) {
+      stoppedEarlyLimitation = Object.freeze({
+        code: 'contradictionPassStopped',
+        message: `The contradiction pass stopped before checking ${stoppedEarly.uncheckedCount} finding(s), which are kept but were not checked: ${stoppedEarly.reason}`,
+      });
+      extraLimitations.push(stoppedEarlyLimitation);
+      appendActivity({ kind: 'toolFailed', tool: 'contradictionCheck', reason: stoppedEarlyLimitation.message }, 'verifying');
+    }
 
     // No-progress bound (`MAX_UNVERIFIABLE_CONTRADICTION_STREAK`'s own doc comment): advance each
     // still-unverified candidate's streak, byte-identical reason against byte-identical reason, and
@@ -2336,10 +2439,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // `runContradictionChecks` stops early on cancellation and pushes its untouched remainder
     // straight to `output.findings`, so a capped candidate's absence from `output.unverified` there
     // means "never re-asked this round", not "resolved" — retracting on that would erase a truthful
-    // limitation from a result already being reported partial for the cancellation itself.
+    // limitation from a result already being reported partial for the cancellation itself. A pass
+    // the budget stopped (`stoppedEarly`) leaves its remainder unasked in exactly the same way, so
+    // only the candidates it never reached keep their retirement; one it did answer this round
+    // (clean or contradicted) was resolved, and is retracted like any other.
     if (!isCancelled()) {
+      const unreached = new Set(stoppedEarly?.uncheckedCandidateIds ?? []);
       for (const candidateId of [...retiredUnverifiableCandidates.keys()]) {
-        if (!unverifiedIds.has(candidateId)) retractRetirement(candidateId);
+        if (!unverifiedIds.has(candidateId) && !unreached.has(candidateId)) retractRetirement(candidateId);
       }
     }
     const stillPending: UnverifiedFindingRecord[] = [];
@@ -2368,8 +2475,14 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
     // its own, separate incompleteness (D2's cancelled semantics; never masked by a candidate-level
     // bound), and a pass already complete has no unverified candidate to cap in the first place —
     // `unverifiedNow.length > 0` keeps a vacuous "every one of zero candidates is capped" from ever
-    // firing.
-    const boundReached = !isCancelled() && unverifiedNow.length > 0 && stillPending.length === 0;
+    // firing, and a pass the budget stopped is its own incompleteness too: the candidates it never
+    // reached are in no list at all, so "every unverified candidate is capped" would be true of a
+    // pass that checked nothing.
+    //
+    // What `boundReached` grants is narrow: the collaborator's flags read complete, so the gate stops
+    // naming a live, repairable `contradictionPending` for candidates the model cannot fix. It never
+    // grants completion — every retired survivor still fails the clause through `retiredSurvivors()`.
+    const boundReached = !isCancelled() && stoppedEarly === undefined && unverifiedNow.length > 0 && stillPending.length === 0;
     latestPasses = {
       contradictionPassComplete: output.contradictionPassComplete || boundReached,
       deduplicationComplete: output.deduplicationComplete,
@@ -2758,6 +2871,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
 
   async function processMessages(phase: RunPhase, messages: readonly ProtocolMessage[], sink: HostToolResult[]): Promise<ProcessMessagesOutcome> {
     let completionGranted = false;
+    let completionDeniedUnrepairably = false;
     // Opened lazily, on the turn's first tool request: a turn that only submits findings or shapes
     // the plan pays nothing to measure a prompt whose results it is not adding to.
     let contentBudget: TurnContentBudget | undefined;
@@ -2861,6 +2975,11 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
             // and already bounded and sanitized at parse, so nothing untrusted reaches the record.
             if (message.rationale !== undefined && message.rationale.trim() !== '') conclusion = message.rationale.trim();
           } else if (phase === 'verifying') {
+            // See `ProcessMessagesOutcome.completionDeniedUnrepairably`. Read off the dispatcher's
+            // own answer, the one the model was just shown — never a second evaluation here.
+            if (result.state === 'complete' && result.content.tool === 'requestCompletion' && !result.content.response.granted && !result.content.response.repairable) {
+              completionDeniedUnrepairably = true;
+            }
             // Finding 1's fix: a denial reaches here whether or not the line above's `passesStale`
             // check just re-ran verification — a model that submits once and then spams
             // `requestCompletion` with nothing further never sets `passesStale` again, so without
@@ -2877,7 +2996,7 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
         }
       }
     }
-    return { hadActionableWork: turnHasActionableWork(messages), completionGranted, deferredForPromptBudget: contentBudget?.deferrals ?? 0 };
+    return { hadActionableWork: turnHasActionableWork(messages), completionGranted, completionDeniedUnrepairably, deferredForPromptBudget: contentBudget?.deferrals ?? 0 };
   }
 
   /**
@@ -3121,6 +3240,11 @@ export function createHarnessAttempt(options: HarnessAttemptOptions): HarnessAtt
       const processed = await processMessages(phase, outcome.messages, sink);
       lastTurnResults = sink;
       if (phase === 'verifying' && processed.completionGranted) return 'condition';
+      // D11, "otherwise the run finalizes truthfully" — the same exit the early-stop path below takes
+      // (`if (!response.repairable) return ...`) for a model that stopped on its own, applied to a
+      // model that asked and was told no further turn can help. See
+      // `ProcessMessagesOutcome.completionDeniedUnrepairably`.
+      if (phase === 'verifying' && processed.completionDeniedUnrepairably) return 'condition';
       // The run-in-place fix (this function's own doc comment): a `continue` must be earned by
       // progress the host can see — new coverage, or content the attempt did not already hold.
       // Digest, never sourceId: the ledger mints a fresh sourceId for every registration, so a

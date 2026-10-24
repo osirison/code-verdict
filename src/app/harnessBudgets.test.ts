@@ -456,3 +456,24 @@ describe('carried-forward consumption on a resumed attempt (task 14.6)', () => {
     expect(state.pools.toolCalls.lanes.ordinary.used).toBe(10); // charged to the shared lane only
   });
 });
+
+describe('a host-initiated model-turn reservation (the contradiction pass draws its calls this way)', () => {
+  it('charges the shared modelTurns pool through the verification lane first and leaves the per-turn tool counter alone — unlike beginTurn, which resets it', () => {
+    const tracker = createBudgetTracker(POLICY);
+    expect(tracker.beginTurn({ requestId: 't1', purpose: 'verification', elapsedMs: 1 }).ok).toBe(true);
+    expect(tracker.reserve({ requestId: 't1-0', purpose: 'verification', toolCalls: 2, elapsedMs: 1 }).ok).toBe(true);
+    expect(tracker.state().toolCallsThisTurn).toBe(2);
+    const before = tracker.state().pools.modelTurns;
+
+    const reserved = tracker.reserve({ requestId: 'check-1', purpose: 'verification', modelTurns: 1, toolCalls: 0, evidenceBytes: 0, hostInitiated: true, elapsedMs: 1 });
+
+    expect(reserved.ok).toBe(true);
+    expect(tracker.state().toolCallsThisTurn).toBe(2);
+    expect(tracker.state().pools.modelTurns.used).toBe(before.used + 1);
+    expect(tracker.consumption().modelTurnsUsed).toBe(before.used + 1);
+    if (reserved.ok) expect(reserved.reservation.charges.map((charge) => charge.lane)).toEqual(['verificationReserve']);
+    // A second turn's own `beginTurn` is what resets the counter.
+    expect(tracker.beginTurn({ requestId: 't2', purpose: 'verification', elapsedMs: 2 }).ok).toBe(true);
+    expect(tracker.state().toolCallsThisTurn).toBe(0);
+  });
+});

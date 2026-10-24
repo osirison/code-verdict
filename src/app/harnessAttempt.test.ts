@@ -1720,7 +1720,7 @@ describe('HarnessAttempt.run (the no-progress bound: a citation stuck past the e
 });
 
 describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming model without further submissions cannot idle past it either)', () => {
-  it('finding 1 — a burst of one submission followed only by requestCompletion spam (no further submissions, so passesStale never returns) terminates within the denial bound and is granted with a truthful limitation', async () => {
+  it('finding 1 — a burst of one submission followed only by requestCompletion spam (no further submissions, so passesStale never returns) terminates within the denial bound and ends partial with a truthful limitation, never complete', async () => {
     let file1Ref: { sourceId: string; digest: string } | undefined;
     // `opaqueDiffPageResult`, not `bigDiffPageResult`: this candidate must still be *accepted* with
     // an unverifiable citation, to drive the no-progress bound this test targets — a wide-but-
@@ -1744,7 +1744,9 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
     // counter) is frozen at 1 for the rest of the phase. Only `deniedContradictionStreak` — the
     // denial counter this fix adds — ever advances, and it must still trip the same bound within
     // the same number of denials, never sooner and never later: denied at 1, denied at 2, denied at
-    // 3 (which retires the candidate mid-turn), granted on the 4th ask against the now-retired state.
+    // 3 (which retires the candidate mid-turn), and denied as unrepairable on the 4th ask against the
+    // now-retired state — which ends the phase: a retired candidate is a finding nobody checked, and
+    // the gate discloses it rather than counting it as a pass.
     const seam = scriptedModelSeam({
       planning: [PLAN_TURN],
       investigating: [messages(readDiffMessage('file1.ts')), submitWide, STOP_TURN],
@@ -1760,12 +1762,20 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
 
     const result = await attempt.run();
 
-    // Exactly four `requestCompletion` turns happened — no runaway spam, no early-stop-nudge path
+    // At most four `requestCompletion` turns happened — no runaway spam, no early-stop-nudge path
     // involved (a `completionRequest` message is itself "actionable work", so this never touches
     // `MAX_EARLY_STOP_NUDGES_PER_PHASE` at all; only the denial counter bounds it).
-    expect(result.lifecycle).toBe('succeeded');
-    expect(result.outcome.completeness).toBe('complete');
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBeLessThanOrEqual(4);
+    // Partial, not complete: the finding was never contradiction-checked, so the run cannot claim
+    // it was. It is still delivered, on a failed run, with the limitation naming why.
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.kind).toBe('partialFindings');
+    expect(result.outcome.completeness).toBe('partial');
+    expect(result.outcome.replacesRetainedReview).toBe(false);
     expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-wide']);
+    expect(result.completionEvaluation?.clauses.contradictionPassComplete).toBe(false);
+    expect(result.completionEvaluation?.repairable).toBe(false);
+    expect(result.outcome.limitations.some((l) => l.code === 'contradictionPending')).toBe(true);
     const limitation = result.outcome.limitations.find((l) => l.code === 'unverifiableCitation');
     expect(limitation?.message).toContain('cand-wide');
     expect(limitation?.message).toContain('3 attempts');
@@ -1794,9 +1804,13 @@ describe('HarnessAttempt.run (the no-progress bound, part 2: a denial-spamming m
 
     const result = await attempt.run();
 
-    expect(result.lifecycle).toBe('succeeded');
-    expect(result.outcome.completeness).toBe('complete');
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBeLessThanOrEqual(4);
+    // Same outcome as the sibling test: retired is "not checked", and not checked is partial.
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.kind).toBe('partialFindings');
+    expect(result.outcome.completeness).toBe('partial');
     expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1']);
+    expect(result.completionEvaluation?.repairable).toBe(false);
     // Its own name, never the citation one — narrowing a citation would do nothing for a verdict
     // that never came back at all.
     expect(result.outcome.limitations.some((l) => l.code === 'unverifiableCitation')).toBe(false);
@@ -2536,6 +2550,61 @@ describe('HarnessAttempt.run (task 3.6: a run holding declined content cannot be
     const control = await controlAttempt.run();
     expect(control.outcome.completeness).toBe('complete');
     expect(control.completionEvaluation?.blockers).toEqual([]);
+  });
+});
+
+describe('HarnessAttempt.run (a verifying completionRequest denied as unrepairable ends the phase, whatever the blocker)', () => {
+  it('a pre-existing unrepairable blocker unrelated to retirement (declined content) ends verifying after the first denial, partial, with the finding delivered', async () => {
+    const declinedPath = 'docs/notes.md';
+    const readPath = 'file1.ts';
+    const connection = reviewConnection({ files: [readPath, declinedPath], declinedPaths: [declinedPath] });
+    // The script clamps to its last entry, so a model that is NOT stopped by the first denial would
+    // simply ask again: any verifying turn count above one fails the bound below.
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage(readPath)), (call) => messages(candidateSubmissionMessage('cand-1', readPath, sourceRefFrom(call.toolResults[0] as HostToolResult))), STOP_TURN],
+      verifying: [COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBe(1);
+    expect(result.completionEvaluation?.blockers).toContain('declinedContent');
+    expect(result.completionEvaluation?.repairable).toBe(false);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.completeness).toBe('partial');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1']);
+  });
+
+  it('a verifying denial that IS repairable does not end the phase: the model keeps its turns, repairs, and the run completes', async () => {
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    // file2.ts is never read in investigating, so the first completionRequest is denied as
+    // repairable (an unread file the model can still read); it reads it and asks again.
+    const seam = scriptedModelSeam({
+      planning: [PLAN_TURN],
+      investigating: [messages(readDiffMessage('file1.ts')), STOP_TURN],
+      verifying: [COMPLETION_TURN, messages(readDiffMessage('file2.ts')), COMPLETION_TURN],
+    });
+    const attempt = createHarnessAttempt({
+      ...baseOptions(),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length).toBe(3);
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
   });
 });
 
@@ -3992,5 +4061,286 @@ describe('Fix 1: a model round trip consumes the transient retry budget instead 
       (e) => (e.kind === 'toolCompleted' || e.kind === 'toolFailed') && e.tool === 'modelTurn' && e.retryCount === 1,
     );
     expect(retryFact).toBeDefined();
+  });
+});
+
+describe('HarnessAttempt.run (an unchecked finding ends the run partial, and every contradiction check draws on the run budget)', () => {
+  function verifyingAsks(seam: { readonly calls: RecordedCall[] }): number {
+    return seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction === undefined).length;
+  }
+  function directiveAsks(seam: { readonly calls: RecordedCall[] }): number {
+    return seam.calls.filter((call) => call.phase === 'verifying' && call.repairInstruction !== undefined).length;
+  }
+  const READ_BOTH = messages(readDiffMessage('file1.ts'), readDiffMessage('file2.ts'));
+
+  it('the model-turn pool running out mid-pass stops the pass with no model call beyond the budget, keeps an earlier retirement standing (a candidate never re-asked was not resolved), and ends partial naming the unchecked count', async () => {
+    let file1Ref: { sourceId: string; digest: string } | undefined;
+    let file2Ref: { sourceId: string; digest: string } | undefined;
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    const submitCand1: ScriptEntry = (call) => {
+      file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      file2Ref = sourceRefFrom(call.toolResults[1] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', file1Ref));
+    };
+    let verifyingTurns = 0;
+    const respondToVerifying: ScriptEntry = (call) => {
+      // Every verdict ask is unparseable: cand-1 exhausts the repair allowance on the phase-entry
+      // pass (`protocolRepairsPerPhase: 1` — one ask plus one repair, under ONE model-turn
+      // reservation) and three bare denials then retire it as `contradictionCheckExhausted`.
+      if (call.repairInstruction !== undefined) return 'not parseable as a verdict at all';
+      verifyingTurns += 1;
+      // The 4th turn submits a second candidate; the 5th asks for completion (the protocol forbids
+      // batching the two), so the reconciling re-run happens inside `processMessages` — the one
+      // call site that used to carry no budget gate at all.
+      if (verifyingTurns === 4) return messages(candidateSubmissionMessage('cand-2', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+      return COMPLETION_TURN;
+    };
+    const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitCand1, STOP_TURN], verifying: [respondToVerifying] });
+    // Turn arithmetic, with both reserve lanes at 0% so the pool is one lane: planning 1,
+    // investigating 3 (read, submit, stop), the phase-entry contradiction check 1, verifying turns
+    // 1-5 = 10. The re-run's own reservation for cand-1 is the 11th and is refused.
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy({ protocolRepairsPerPhase: 1, maxModelTurnsPerAttempt: 10, highRiskReservePercent: 0, verificationReservePercent: 0 }),
+    });
+
+    const result = await attempt.run();
+
+    // Only the phase-entry pass ever reached the model: one ask plus one repair. The re-run made
+    // no call at all, because the pool could not fund one.
+    expect(directiveAsks(seam)).toBe(2);
+    expect(verifyingAsks(seam)).toBe(5);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.kind).toBe('partialFindings');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1', 'cand-2']);
+    // The retirement stands: cand-1 was never re-asked, so its absence from the re-run's
+    // `unverified` list says nothing about it being resolved.
+    const retired = result.outcome.limitations.find((l) => l.code === 'contradictionCheckExhausted');
+    expect(retired?.message).toContain('cand-1');
+    const stopped = result.outcome.limitations.find((l) => l.code === 'contradictionPassStopped');
+    expect(stopped?.message).toContain('2 finding');
+    expect(result.completionEvaluation?.clauses.contradictionPassComplete).toBe(false);
+    expect(result.completionEvaluation?.clauses.finalVerificationComplete).toBe(false);
+    expect(result.outcome.limitations.some((l) => l.code === 'budgetExhausted')).toBe(true);
+  });
+
+  it.each([
+    ['clean', false],
+    ['contradicted', true],
+  ] as const)(
+    'a re-run the budget stopped still retracts the retirement of a candidate it answered (%s), while the pass is reported stopped',
+    async (_label, contradicted) => {
+      let file2Ref: { sourceId: string; digest: string } | undefined;
+      const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+      const submitCand1: ScriptEntry = (call) => {
+        const file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+        file2Ref = sourceRefFrom(call.toolResults[1] as HostToolResult);
+        return messages(candidateSubmissionMessage('cand-1', 'file1.ts', file1Ref));
+      };
+      let verifyingTurns = 0;
+      const respondToVerifying: ScriptEntry = (call) => {
+        if (call.repairInstruction !== undefined) {
+          // Unparseable until the completion request: cand-1 retires on the phase-entry pass and
+          // the denials. The re-run it triggers then gets a real verdict for cand-1.
+          if (verifyingTurns < 5) return 'not parseable as a verdict at all';
+          const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+          return JSON.stringify({ candidateId: match?.[1], contradicted, ...(contradicted ? { reason: 'Contradicted by evidence two lines up.' } : {}) });
+        }
+        verifyingTurns += 1;
+        if (verifyingTurns === 4) return messages(candidateSubmissionMessage('cand-2', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+        return COMPLETION_TURN;
+      };
+      const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitCand1, STOP_TURN], verifying: [respondToVerifying] });
+      // Same arithmetic as the test above with one more turn: the re-run's reservation for cand-1
+      // is the 11th and is granted, the one for cand-2 is the 12th and is refused.
+      const attempt = createHarnessAttempt({
+        ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+        snapshot: testSnapshot(),
+        members: [member(connection)],
+        modelSeam: seam,
+        policy: testPolicy({ protocolRepairsPerPhase: 1, maxModelTurnsPerAttempt: 11, highRiskReservePercent: 0, verificationReservePercent: 0 }),
+      });
+
+      const result = await attempt.run();
+
+      expect(result.lifecycle).toBe('failed');
+      expect(result.outcome.kind).toBe('partialFindings');
+      expect(result.outcome.limitations.find((l) => l.code === 'contradictionPassStopped')?.message).toContain('1 finding');
+      // cand-1 was answered this round: its retirement is gone, whichever way the verdict went.
+      expect(result.outcome.limitations.find((l) => l.code === 'contradictionCheckExhausted')).toBeUndefined();
+      expect(result.findings.map((f) => f.candidateId)).toEqual(contradicted ? ['cand-2'] : ['cand-1', 'cand-2']);
+      expect(result.completionEvaluation?.clauses.contradictionPassComplete).toBe(false);
+    },
+  );
+
+  it('a pass stopped by the budget never lets the no-progress bound call the passes complete: every still-unverified candidate retired is not "every candidate checked"', async () => {
+    let file2Ref: { sourceId: string; digest: string } | undefined;
+    // cand-a cites an unlocatable diff (never excerptable, so never asked, so never reserved);
+    // cand-b cites an ordinary one whose check must draw a turn — and cannot.
+    const connection = reviewConnection({
+      files: ['file1.ts', 'file2.ts'],
+      readDiff: async (request) => (request.path === 'file1.ts' ? opaqueDiffPageResult('file1.ts', 5_000) : diffPageResult(request.path)),
+    });
+    const submitCandA: ScriptEntry = (call) => {
+      const file1Ref = sourceRefFrom(call.toolResults[0] as HostToolResult);
+      file2Ref = sourceRefFrom(call.toolResults[1] as HostToolResult);
+      return messages(candidateSubmissionMessageAt('cand-a', 'file1.ts', file1Ref, 1, 3));
+    };
+    let verifyingTurns = 0;
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        return JSON.stringify({ candidateId: match?.[1], contradicted: false });
+      }
+      verifyingTurns += 1;
+      if (verifyingTurns === 4) return messages(candidateSubmissionMessage('cand-b', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+      return COMPLETION_TURN;
+    };
+    const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitCandA, STOP_TURN], verifying: [respondToVerifying] });
+    // planning 1 + investigating 3 + verifying turns 1-5 = 9; the phase-entry pass reserves
+    // nothing (cand-a is skipped before any ask). The 5th turn's completion request re-runs the
+    // pass, and its reservation for cand-b is the 10th.
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy({ maxModelTurnsPerAttempt: 9, highRiskReservePercent: 0, verificationReservePercent: 0 }),
+    });
+
+    const result = await attempt.run();
+
+    expect(directiveAsks(seam)).toBe(0);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.kind).toBe('partialFindings');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-a', 'cand-b']);
+    expect(result.outcome.limitations.find((l) => l.code === 'unverifiableCitation')?.message).toContain('cand-a');
+    expect(result.outcome.limitations.find((l) => l.code === 'contradictionPassStopped')?.message).toContain('1 finding');
+    // Before this fix the re-run would have found "every unverified candidate is retired" and
+    // reported both passes complete — over a finding (cand-b) it never checked.
+    expect(result.completionEvaluation?.clauses.contradictionPassComplete).toBe(false);
+    expect(result.completionEvaluation?.clauses.finalVerificationComplete).toBe(false);
+  });
+
+  it('the elapsed-time limit reached mid-pass stops the pass at the next check: a timeout blocker, a partial outcome, both findings kept, and no further model turn', async () => {
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    const submitBoth: ScriptEntry = (call) =>
+      messages(
+        candidateSubmissionMessage('cand-1', 'file1.ts', sourceRefFrom(call.toolResults[0] as HostToolResult)),
+        candidateSubmissionMessage('cand-2', 'file2.ts', sourceRefFrom(call.toolResults[1] as HostToolResult)),
+      );
+    const policy = testPolicy();
+    let elapsed = 0;
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        // The first verdict comes back with the attempt's clock already at its limit.
+        elapsed = policy.maxElapsedMsPerAttempt;
+        return JSON.stringify({ candidateId: match?.[1], contradicted: false });
+      }
+      return COMPLETION_TURN;
+    };
+    const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitBoth, STOP_TURN], verifying: [respondToVerifying] });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification(), clock: () => elapsed }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy,
+    });
+
+    const result = await attempt.run();
+
+    // cand-1 was asked; cand-2's own reservation was refused for the elapsed limit, so it was
+    // never asked — and no verifying turn could start afterwards either.
+    expect(directiveAsks(seam)).toBe(1);
+    expect(verifyingAsks(seam)).toBe(0);
+    expect(result.lifecycle).toBe('failed');
+    expect(result.outcome.kind).toBe('partialFindings');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1', 'cand-2']);
+    expect(result.outcome.limitations.some((l) => l.code === 'timeout')).toBe(true);
+    const stopped = result.outcome.limitations.find((l) => l.code === 'contradictionPassStopped');
+    expect(stopped?.message).toContain('1 finding');
+    expect(stopped?.message).toMatch(/elapsed/i);
+  });
+
+  it('every contradiction check draws one turn from the same model-turn pool the phase loop draws — a reservation, counted in the attempt\'s own turn tally', async () => {
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    const submitBoth: ScriptEntry = (call) =>
+      messages(
+        candidateSubmissionMessage('cand-1', 'file1.ts', sourceRefFrom(call.toolResults[0] as HostToolResult)),
+        candidateSubmissionMessage('cand-2', 'file2.ts', sourceRefFrom(call.toolResults[1] as HostToolResult)),
+      );
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        return JSON.stringify({ candidateId: match?.[1], contradicted: false });
+      }
+      return COMPLETION_TURN;
+    };
+    const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitBoth, STOP_TURN], verifying: [respondToVerifying] });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1', 'cand-2']);
+    // Every phase turn the seam answered was one `beginTurn`; every finding checked was one
+    // further reservation on the same pool. Before this fix the two checks cost nothing at all.
+    const phaseTurns = seam.calls.filter((call) => call.repairInstruction === undefined).length;
+    expect(directiveAsks(seam)).toBe(2);
+    expect(result.turnsUsed).toBe(phaseTurns + 2);
+    // The per-turn tool counter is a `beginTurn` concern the reservation must leave alone;
+    // `harnessBudgets.test.ts` ("a host-initiated model-turn reservation") holds that property.
+  });
+
+  it('a candidate retired as unverifiable and then genuinely verified by a later re-run still lets the run end complete', async () => {
+    let file2Ref: { sourceId: string; digest: string } | undefined;
+    const connection = reviewConnection({ files: ['file1.ts', 'file2.ts'] });
+    const submitCand1: ScriptEntry = (call) => {
+      file2Ref = sourceRefFrom(call.toolResults[1] as HostToolResult);
+      return messages(candidateSubmissionMessage('cand-1', 'file1.ts', sourceRefFrom(call.toolResults[0] as HostToolResult)));
+    };
+    let directives = 0;
+    let verifyingTurns = 0;
+    const respondToVerifying: ScriptEntry = (call) => {
+      if (call.repairInstruction !== undefined) {
+        directives += 1;
+        // The phase-entry pass (ask + one repair) never gets a verdict; every later ask does.
+        if (directives <= 2) return 'not parseable as a verdict at all';
+        const match = /^candidateId: (.+)$/m.exec(call.repairInstruction);
+        return JSON.stringify({ candidateId: match?.[1], contradicted: false });
+      }
+      verifyingTurns += 1;
+      // Denied at 1, 2, 3 (retiring cand-1); the 4th turn submits a fresh candidate; the 5th asks
+      // again, which re-runs the pass — and this time cand-1's verdict comes back clean.
+      if (verifyingTurns === 4) return messages(candidateSubmissionMessage('cand-2', 'file2.ts', file2Ref as { sourceId: string; digest: string }));
+      return COMPLETION_TURN;
+    };
+    const seam = scriptedModelSeam({ planning: [PLAN_TURN], investigating: [READ_BOTH, submitCand1, STOP_TURN], verifying: [respondToVerifying] });
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot: testSnapshot(),
+      members: [member(connection)],
+      modelSeam: seam,
+      policy: testPolicy({ protocolRepairsPerPhase: 1 }),
+    });
+
+    const result = await attempt.run();
+
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.findings.map((f) => f.candidateId)).toEqual(['cand-1', 'cand-2']);
+    expect(result.outcome.limitations.some((l) => l.code === 'contradictionCheckExhausted')).toBe(false);
+    expect(result.outcome.limitations.some((l) => l.code === 'contradictionPending')).toBe(false);
   });
 });

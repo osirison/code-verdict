@@ -321,6 +321,16 @@ through exactly one path: every completion clause passed and nothing survived. S
 zero findings is `failed`/`none`, never clean — an incomplete review that found nothing is not the
 same fact as a complete review that found nothing, and the two are never allowed to look alike.
 
+A finding the contradiction check could not conclude on is held to the same rule. After three
+identical failures for one candidate the host stops asking the model to repair it (the no-progress
+bound in `harnessAttempt.ts`), but the gate still counts that candidate as unchecked: the clause
+fails as a condition nothing on this attempt can repair, the next completion request is denied as
+unrepairable and ends the phase, and the run finalizes `failed`/`partial` with the finding delivered
+under a limitation naming it. The retained review is left alone and the fresh-attempt offer stays.
+A later pass on the same attempt that does verify the candidate withdraws the limitation, so a
+complete outcome stays reachable. Before this, a retired check made the passes read complete and
+the run replaced the retained review with a finding nobody had checked.
+
 ### Bounded investigation and the host tool dispatcher
 
 The model does not receive a diff. It receives a fixed, versioned tool catalog
@@ -353,6 +363,11 @@ elapsed time, model turns, tool requests, and evidence bytes per attempt, with a
 held back — by default 20% for files the model did not pick but the host judged high-risk, 15% for
 final verification — so early low-risk exploration cannot spend the capacity later work needs. A
 changeset gives every member a minimum turn/tool/evidence allotment before any shared pool opens.
+Every model call draws on the model-turn pool, the contradiction checks of `verifying` included:
+each check reserves one turn (verification lane first, then ordinary) before its first ask, with
+its repair asks absorbed under that reservation and the attempt clock re-read before each one. A
+refused reservation or the elapsed limit stops the pass where it is — the findings it did not reach
+are kept, counted in one limitation, and never reported as checked — and the run ends partial.
 Transient failures retry with the provider's own `Retry-After` guidance first, exponential backoff
 otherwise; a long wait moves the attempt to `waiting`, checkpoints it, and releases its concurrency
 slot, resuming through `resuming` in original queue order once the wait is over.
