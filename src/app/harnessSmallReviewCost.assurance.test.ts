@@ -684,6 +684,13 @@ describe('after a reviewer scopes investigation to changed files — same behavi
     //   turn's results. Bytes per turn are the cheapest thing in this system; a round trip resends
     //   the whole prompt, and that run made 53 of them.
     //
+    // 87_000 -> 90_000: the `riskProposal` message kind (the model proposes risk; the host floor and
+    //   inventory decide) is described in the contract, ~270 bytes/turn. Measured before the change
+    //   86,890 (110 bytes under the old cap) and after it 88,787, over the same 7 model turns; the
+    //   unscoped scenario above went 91,958 -> 93,855 and stays under its 94,000. The text was cut to
+    //   one shape line and one rule sentence first; the message is what lets the model say a file is
+    //   riskier than its path suggests, which the host floor alone cannot, so it is not optional.
+    //
     // What this guard actually protects is unchanged and still strict: turn count, provider calls,
     // and off-MR calls below are exact. Bytes are the loose half deliberately — the regressions
     // worth catching here (unbatched reads, whole-file pages, a ballooning envelope) cost tens of
@@ -691,7 +698,7 @@ describe('after a reviewer scopes investigation to changed files — same behavi
     // wrong place to relax; take it out of the text instead.
     expect(after.modelTurns.length).toBeLessThanOrEqual(8);
     expect(after.offMrCalls).toBeLessThanOrEqual(2); // the two root policy probes (AGENTS.md, CLAUDE.md)
-    expect(after.totalBytesSent).toBeLessThan(87_000);
+    expect(after.totalBytesSent).toBeLessThan(90_000);
   });
 
   /**

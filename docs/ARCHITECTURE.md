@@ -285,7 +285,12 @@ Risk classification is a model proposal maximized against a deterministic host f
 (`harnessRiskFloors.ts`): sensitive paths (auth, authorization, security, secrets, key material, CI
 and infra definitions, payments), binary/deleted/large-changed files, policy-governed paths, and
 cross-member contracts each raise the floor independently, and the model's own proposal can raise a
-file's risk further but never lower it below the floor. A dedicated floor keyed on file extension —
+file's risk further but never lower it below the floor. The proposal is a `riskProposal` protocol
+message, legal in planning and investigating and limited to one per turn. The host applies the higher
+of the proposal, its floor and the risk already recorded; refuses (and records) a path that is not in the
+changed-file inventory, which a proposal can never add to; and leaves a file that was already read alone.
+A raise made after the coverage-versus-budget forecast re-states that forecast and adds the inspection
+obligation the new level carries. A dedicated floor keyed on file extension —
 not path — holds any changed file whose extension names a general-purpose or scripting language at
 `medium` regardless of what the model proposes, with generated/built output explicitly exempted; this
 is what makes it safe for `DEFAULT_RISK_COVERAGE_RULES.requireInspection` (and the reviewer-facing

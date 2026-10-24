@@ -104,11 +104,11 @@
  *    `persisting` are host-only phases with no model turn, so every message
  *    is a contract violation there, never a parse failure). Only inside
  *    those three phases does it apply either this module's own
- *    `NON_TOOL_ALLOWED_PHASES` table (the five kinds with no existing
+ *    `NON_TOOL_ALLOWED_PHASES` table (the six kinds with no existing
  *    catalog entry) or the *reused* `hostToolDefinition(...).allowedPhases`
  *    (for `toolRequest`, keyed by the actual tool name; `candidateSubmission`;
  *    `completionRequest`). `PHASE_ALLOWED_KINDS` is the full six-phase,
- *    eight-kind table derived from both, exported for introspection/tests.
+ *    nine-kind table derived from both, exported for introspection/tests.
  *    A message that parses (well-formed) but fails this phase check is a
  *    `contract` failure; anything that fails to parse at all is a `parse`
  *    failure — the two carry different `failureKind`s on `TurnParseOutcome`.
@@ -137,6 +137,7 @@ import type {
   Unpinned,
 } from '../platform/types';
 import { isPlanItemState, PLAN_ITEM_STATES, isRunPhase, type Plan, type PlanItemState, type RunPhase } from './harnessActivity';
+import { isRiskLevel, RISK_LEVELS, type RiskLevel } from './harnessCoverage';
 import { DEFAULT_HARNESS_POLICY, type HarnessPolicy } from './harnessPolicy';
 import { hostToolDefinition, isHostToolName, type HostToolName } from './harnessTools';
 
@@ -161,6 +162,7 @@ export const PROTOCOL_MESSAGE_KINDS = [
   'candidateSubmission',
   'checkpointSuggestion',
   'completionRequest',
+  'riskProposal',
 ] as const;
 
 export type ProtocolMessageKind = (typeof PROTOCOL_MESSAGE_KINDS)[number];
@@ -239,6 +241,27 @@ export interface CompletionRequestMessage {
   readonly rationale?: string;
 }
 
+/** One file's proposed risk. `memberId` + `path` name a file in the host's own inventory; nothing here can add one. */
+export interface RiskProposalEntry {
+  readonly memberId: string;
+  readonly path: string;
+  readonly risk: RiskLevel;
+  readonly logicalUnit?: string;
+  readonly reason?: string;
+}
+
+/**
+ * The model's side of D10's "the model proposes risk and logical units; the host applies mandatory
+ * risk floors". A proposal is advisory and one-directional: the host applies the higher of the
+ * proposal, its own floor and the risk already recorded, so a proposal can raise a file's risk and
+ * can never lower it (`applyRiskProposals`, `../app/harnessAttempt.ts`). A path outside the
+ * inventory is refused there, not here — this module only checks shape.
+ */
+export interface RiskProposalMessage {
+  readonly kind: 'riskProposal';
+  readonly proposals: readonly RiskProposalEntry[];
+}
+
 export type ProtocolMessage =
   | PlanCreatedMessage
   | PlanRevisedMessage
@@ -247,7 +270,8 @@ export type ProtocolMessage =
   | ToolRequestMessage
   | CandidateSubmissionMessage
   | CheckpointSuggestionMessage
-  | CompletionRequestMessage;
+  | CompletionRequestMessage
+  | RiskProposalMessage;
 
 // ---- Bounds -------------------------------------------------------------------------
 
@@ -278,6 +302,9 @@ export const MAX_PROTOCOL_MESSAGES_PER_TURN = 32;
 
 /** Length bound for protocol-owned free-text/identifier fields (tool paths, queries, member/item ids, checkpoint reasons, completion rationale). Generous versus the dispatcher's own tighter, policy-driven bounds (e.g. the 500-char search query cap, `diffOrFileReadPageLines`) — those stay the dispatcher's job; this only fails closed on a pathological field before dispatch is ever reached. */
 export const MAX_PROTOCOL_STRING_LENGTH = 2000;
+
+/** Entries in one `riskProposal` message. A 207-file change fits in four messages' worth of turns; a turn needing more should split, like tool requests do. */
+export const MAX_RISK_PROPOSALS_PER_MESSAGE = 64;
 
 /** Length bound for protocol-owned short identifiers (member id, plan-item id). */
 export const MAX_ID_LENGTH = 200;
@@ -1133,6 +1160,46 @@ function parseCheckpointSuggestion(raw: unknown): MessageParseResult {
   return { ok: true, message: reasonText.value !== undefined ? { kind: 'checkpointSuggestion', reason: reasonText.value } : { kind: 'checkpointSuggestion' } };
 }
 
+function parseRiskProposalEntry(raw: unknown, index: number): { readonly ok: true; readonly entry: RiskProposalEntry } | { readonly ok: false; readonly message: string } {
+  const where = `riskProposal.proposals[${index}]`;
+  if (!isRecord(raw)) return { ok: false, message: `${where} must be an object.` };
+  const memberId = identifierText(raw.memberId, MAX_ID_LENGTH);
+  if (!memberId.ok) return { ok: false, message: memberId.unprintable ? unprintableIdentifier(`${where}.memberId`) : `${where}.memberId is required.` };
+  const path = boundedString(raw.path);
+  if (path === undefined) return { ok: false, message: `${where}.path is required.` };
+  if (!isRiskLevel(raw.risk)) return { ok: false, message: `${where}.risk must be one of ${listMembers(RISK_LEVELS)}.` };
+  const logicalUnit = parseOwnedShortText(raw.logicalUnit);
+  if (!logicalUnit.ok) return { ok: false, message: `${where}.logicalUnit must be usable text of at most ${MAX_PUBLIC_TEXT_LENGTH} characters.` };
+  const reasonText = parseOwnedShortText(raw.reason);
+  if (!reasonText.ok) return { ok: false, message: `${where}.reason must be usable text of at most ${MAX_PUBLIC_TEXT_LENGTH} characters.` };
+  return {
+    ok: true,
+    entry: {
+      memberId: memberId.value,
+      path,
+      risk: raw.risk,
+      ...(logicalUnit.value !== undefined ? { logicalUnit: logicalUnit.value } : {}),
+      ...(reasonText.value !== undefined ? { reason: reasonText.value } : {}),
+    },
+  };
+}
+
+/** Field by field, never `{...raw}`. A bad entry fails the whole message — there is no half-applied proposal list to reason about. */
+function parseRiskProposal(raw: unknown): MessageParseResult {
+  if (!isRecord(raw)) return msgFail(reason('schema', 'riskProposal must be an object.'));
+  const rawEntries = raw.proposals;
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0 || rawEntries.length > MAX_RISK_PROPOSALS_PER_MESSAGE) {
+    return msgFail(reason('schema', `riskProposal.proposals must be an array of 1 to ${MAX_RISK_PROPOSALS_PER_MESSAGE} {memberId, path, risk, logicalUnit?, reason?} entries.`));
+  }
+  const proposals: RiskProposalEntry[] = [];
+  for (const [index, rawEntry] of rawEntries.entries()) {
+    const parsed = parseRiskProposalEntry(rawEntry, index);
+    if (!parsed.ok) return msgFail(reason('schema', parsed.message));
+    proposals.push(parsed.entry);
+  }
+  return { ok: true, message: { kind: 'riskProposal', proposals } };
+}
+
 function parseCompletionRequest(raw: unknown): MessageParseResult {
   if (raw !== undefined && !isRecord(raw)) return msgFail(reason('schema', 'completionRequest must be an object.'));
   const record = isRecord(raw) ? raw : {};
@@ -1155,13 +1222,14 @@ const MODEL_TURN_PHASES: ReadonlySet<RunPhase> = new Set(['planning', 'investiga
 
 type NonToolKind = Exclude<ProtocolMessageKind, 'toolRequest' | 'candidateSubmission' | 'completionRequest'>;
 
-/** The five kinds with no existing host-tool-catalog entry to reuse a phase list from. */
+/** The six kinds with no existing host-tool-catalog entry to reuse a phase list from. `riskProposal` is not legal in `verifying`: by then the coverage obligations are fixed and the run is closing them, not growing them. */
 const NON_TOOL_ALLOWED_PHASES: Readonly<Record<NonToolKind, ReadonlySet<RunPhase>>> = {
   planCreated: new Set(['planning']),
   planRevised: new Set(['planning', 'investigating', 'verifying']),
   planItemStateChanged: new Set(['planning', 'investigating', 'verifying']),
   publicRationale: new Set(['planning', 'investigating', 'verifying']),
   checkpointSuggestion: new Set(['planning', 'investigating', 'verifying']),
+  riskProposal: new Set(['planning', 'investigating']),
 };
 
 /**
@@ -1189,7 +1257,7 @@ function phaseAllowsCompletionRequest(phase: RunPhase): boolean {
   return MODEL_TURN_PHASES.has(phase) && (hostToolDefinition('requestCompletion')?.allowedPhases.includes(phase) ?? false);
 }
 
-/** Full six-phase, eight-kind table, derived from the checks above — exported for introspection and tests. `bootstrap`/`completing`/`persisting` rows are empty: no model turn happens in those phases. */
+/** Full six-phase, nine-kind table, derived from the checks above — exported for introspection and tests. `bootstrap`/`completing`/`persisting` rows are empty: no model turn happens in those phases. */
 export const PHASE_ALLOWED_KINDS: Readonly<Record<RunPhase, readonly ProtocolMessageKind[]>> = (() => {
   const phases: readonly RunPhase[] = ['bootstrap', 'planning', 'investigating', 'verifying', 'completing', 'persisting'];
   const table = {} as Record<RunPhase, readonly ProtocolMessageKind[]>;
@@ -1219,18 +1287,20 @@ function validateBatchCompatibility(kinds: readonly ProtocolMessageKind[], polic
   const completionCount = count('completionRequest');
   const toolRequestCount = count('toolRequest');
   const candidateCount = count('candidateSubmission');
+  const riskProposalCount = count('riskProposal');
 
   if (planShapingCount > 1) return reason('multiplePlanShaping', 'At most one planCreated or planRevised message is allowed per turn.');
   if (rationaleCount > 1) return reason('multipleRationale', 'At most one publicRationale message is allowed per turn.');
   if (checkpointCount > 1) return reason('multipleCheckpoint', 'At most one checkpointSuggestion message is allowed per turn.');
   if (completionCount > 1) return reason('multipleCompletion', 'At most one completionRequest message is allowed per turn.');
+  if (riskProposalCount > 1) return reason('multipleRiskProposal', 'At most one riskProposal message is allowed per turn; list every file in its "proposals" array.');
   if (toolRequestCount > policy.maxToolRequestsPerTurn) {
     return reason('tooManyToolRequests', `${toolRequestCount} toolRequest messages exceeds the limit of ${policy.maxToolRequestsPerTurn} per turn.`);
   }
-  if (completionCount > 0 && (toolRequestCount > 0 || candidateCount > 0 || checkpointCount > 0 || planShapingCount > 0)) {
+  if (completionCount > 0 && (toolRequestCount > 0 || candidateCount > 0 || checkpointCount > 0 || planShapingCount > 0 || riskProposalCount > 0)) {
     return reason(
       'completionRequestNotFocused',
-      'A completionRequest may not be batched with tool requests, candidate submissions, a checkpoint suggestion, or a plan change in the same turn.',
+      'A completionRequest may not be batched with tool requests, candidate submissions, a checkpoint suggestion, a risk proposal, or a plan change in the same turn.',
     );
   }
   if (checkpointCount > 0 && (toolRequestCount > 0 || planShapingCount > 0)) {
@@ -1257,9 +1327,9 @@ export function describeBatchRules(policy: HarnessPolicy): string {
   const cap = policy.maxToolRequestsPerTurn;
   return [
     'At most one of planCreated/planRevised, one publicRationale, one',
-    'checkpointSuggestion, and one completionRequest may appear in a turn.',
-    'completionRequest and checkpointSuggestion may not be batched with anything',
-    'else. Multiple candidateSubmission messages may share a turn.',
+    'checkpointSuggestion, one riskProposal and one completionRequest may appear',
+    'in a turn. completionRequest and checkpointSuggestion may not be batched with',
+    'anything else. Multiple candidateSubmission messages may share a turn.',
     `Up to ${cap} toolRequest messages may share a turn. A turn carrying more is`,
     'rejected whole and none of its requests run, so when more files remain than',
     `that, send ${cap} and continue in the next turn.`,
@@ -1614,6 +1684,9 @@ function parseMessageShape(raw: unknown, effectivePlanForItemChange: Plan | unde
       break;
     case 'completionRequest':
       result = parseCompletionRequest(raw);
+      break;
+    case 'riskProposal':
+      result = parseRiskProposal(raw);
       break;
   }
   return { kind, ...result };

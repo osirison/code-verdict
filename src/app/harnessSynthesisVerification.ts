@@ -40,12 +40,9 @@
  * **No dedicated protocol message for a contradiction verdict.** The
  * committed model protocol (task 10.1, `../domain/harnessProtocol.ts`) has
  * no message kind for "here is my verdict on candidate X" — it is a fixed,
- * already-shipped union this task does not reopen. `harnessAttempt.ts`
- * documents exactly this kind of gap for the risk-proposal channel ("out of
- * this pass's scope... reported as a gap, not invented here"); the
- * contradiction pass cannot take that path, though, because unlike a risk
- * proposal it is a completion clause (`contradictionPassComplete`) that
- * cannot simply be dropped. So this module defines the one genuinely new,
+ * already-shipped union this task does not reopen. The contradiction pass
+ * cannot simply go without a channel, because it is a completion clause
+ * (`contradictionPassComplete`) that cannot be dropped. So this module defines the one genuinely new,
  * narrow, bounded, fail-closed request/response shape D9 actually needs:
  * - The *request* reuses the existing `HarnessModelSeam.askModel`'s
  *   `repairInstruction` parameter — the one already-threaded per-call free

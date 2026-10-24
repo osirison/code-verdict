@@ -91,6 +91,21 @@ const REALISTIC_TURNS: ReadonlyArray<{ readonly name: string; readonly turn: unk
     turn: { messages: [{ kind: 'toolRequest', tool: 'resolvePolicy', memberId: MEMBER, changedPath: 'src/a.ts' }] },
   },
   {
+    name: 'a risk proposal raising two files, with the optional fields on one of them',
+    turn: {
+      messages: [
+        {
+          kind: 'riskProposal',
+          proposals: [
+            { memberId: MEMBER, path: 'src/auth.ts', risk: 'high', logicalUnit: 'session handling', reason: 'Token expiry logic.' },
+            { memberId: MEMBER, path: 'src/util.ts', risk: 'medium', logicalUnit: null },
+          ],
+        },
+        { kind: 'toolRequest', tool: 'readDiff', memberId: MEMBER, request: { snapshot: SNAPSHOT, path: 'src/auth.ts' } },
+      ],
+    },
+  },
+  {
     name: 'a rationale on its own',
     turn: { messages: [{ kind: 'publicRationale', rationale: 'Investigation is complete.' }] },
   },
@@ -149,6 +164,9 @@ describe('the turn schema agrees with the parser', () => {
       { kind: 'toolRequest', tool: 'getChangeRequestDetails', memberId: MEMBER, request: { snapshot: SNAPSHOT, number: 42, section: 'title' } }, // the section name the prompt used to teach
       { kind: 'planItemStateChanged', itemId: 'p1', state: 'done' }, // not a plan-item state
       { kind: 'notAKind', rationale: 'x' },
+      { kind: 'riskProposal', proposals: [{ memberId: MEMBER, path: 'a.ts', risk: 'critical' }] }, // not a risk level
+      { kind: 'riskProposal', proposals: [] },
+      { kind: 'riskProposal', proposals: [{ memberId: MEMBER, risk: 'high' }] }, // no path
     ];
     for (const message of rejected) {
       expect(schemaAccepts({ messages: [message] }), `schema should reject ${JSON.stringify(message)}`).toBe(false);
@@ -164,6 +182,22 @@ describe('the turn schema agrees with the parser', () => {
     const atCap = { messages: Array.from({ length: DEFAULT_HARNESS_POLICY.maxToolRequestsPerTurn }, () => read) };
     expect(schemaAccepts(atCap)).toBe(true);
     expect(parserAccepts(atCap)).toBe(true);
+  });
+
+  it('enforces the riskProposal limits the parser enforces: one per turn, bounded entries, never with a completion request', () => {
+    const entry = { memberId: MEMBER, path: 'a.ts', risk: 'high' };
+    const one = { kind: 'riskProposal', proposals: [entry] };
+    const cases: ReadonlyArray<readonly [string, unknown, boolean]> = [
+      ['one proposal message', { messages: [one] }, true],
+      ['two proposal messages', { messages: [one, one] }, false],
+      ['64 entries', { messages: [{ kind: 'riskProposal', proposals: Array.from({ length: 64 }, () => entry) }] }, true],
+      ['65 entries', { messages: [{ kind: 'riskProposal', proposals: Array.from({ length: 65 }, () => entry) }] }, false],
+      ['a completion request alongside', { messages: [{ kind: 'completionRequest' }, one] }, false],
+    ];
+    for (const [label, turn, accepted] of cases) {
+      expect(schemaAccepts(turn), `schema: ${label}`).toBe(accepted);
+      expect(parserAccepts(turn), `parser: ${label}`).toBe(accepted);
+    }
   });
 
   it('takes its per-turn tool cap from the policy rather than freezing it', () => {

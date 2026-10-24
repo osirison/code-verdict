@@ -45,7 +45,8 @@
  * call's `toolResults[toolResults.length - 1]` is always that request's own
  * result — the one correlation rule the whole `investigating`-phase state
  * machine relies on; earlier entries in the same batch (e.g. a prior file's
- * `candidateSubmission` acks) are never inspected.
+ * `candidateSubmission` acks, or the one `riskProposal` the first read carries
+ * ahead of it) are never inspected.
  *
  * **Contradiction-check directive detection.** Task 10.6's
  * `./harnessSynthesisVerification.ts` collaborator, when it is the injected
@@ -112,6 +113,14 @@ function toolRequestReadDiff(member: MemberProgress, path: string): unknown {
   };
 }
 
+/** The demo's one risk proposal: raises the first file it reads to `high`, so the demo exercises the same `riskProposal` path a real model does. */
+function riskProposalRaw(memberId: string, path: string): unknown {
+  return {
+    kind: 'riskProposal',
+    proposals: [{ memberId, path, risk: 'high', reason: 'The demo reviewer treats its first file as high risk.' }],
+  };
+}
+
 function candidateSubmissionRaw(memberId: string, item: ReviewItem, sourceId: string, digest: string): unknown {
   return {
     kind: 'candidateSubmission',
@@ -172,6 +181,7 @@ export function createDemoModelSeam(snapshot: ReviewRunSnapshot): HarnessModelSe
   let fileQueue: Array<{ memberId: string; path: string }> = [];
   let pendingRead: { memberId: string; path: string } | undefined;
   let investigatingStopped = false;
+  let riskProposed = false;
   let completionRequested = false;
 
   function investigatingStep(toolResults: readonly HostToolResult[]): string {
@@ -229,6 +239,12 @@ export function createDemoModelSeam(snapshot: ReviewRunSnapshot): HarnessModelSe
     if (next) {
       pendingRead = next;
       const member = memberById.get(next.memberId) ?? fail(`unknown member ${next.memberId} queued for reading.`);
+      // Before the read, never after it: the read stays the batch's LAST message, which is what the
+      // next call's `toolResults[toolResults.length - 1]` correlation relies on (see the header).
+      if (!riskProposed) {
+        riskProposed = true;
+        outMessages.push(riskProposalRaw(next.memberId, next.path));
+      }
       outMessages.push(toolRequestReadDiff(member, next.path));
       return messagesJson(outMessages);
     }

@@ -3,6 +3,7 @@ import { createPlan } from '../app/harnessActivityPlan';
 import { sanitizePublicText } from '../app/harnessActivitySanitizer';
 import {
   buildRepairInstruction,
+  describeBatchRules,
   MAX_PROTOCOL_MESSAGES_PER_TURN,
   MAX_REPAIR_INSTRUCTION_LENGTH,
   parseModelTurn,
@@ -1704,5 +1705,104 @@ describe('parseModelTurn: a request whose fields are all optional is itself opti
       expect(outcome.ok, `request ${JSON.stringify(request)} must not parse`).toBe(false);
       expect(failReasons(outcome)[0]?.message).toBe('listChangedFiles.request must be an object.');
     }
+  });
+});
+
+describe('riskProposal: the model proposes risk, the host decides', () => {
+  const proposal = { memberId: 'm1', path: 'src/auth/session.ts', risk: 'high' };
+
+  it('round-trips a proposal with and without the optional fields', () => {
+    const minimal = okMessages(parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [proposal] }]), { phase: 'investigating' }));
+    expect(minimal[0]).toEqual({ kind: 'riskProposal', proposals: [proposal] });
+    const full = okMessages(
+      parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [{ ...proposal, logicalUnit: 'session handling', reason: 'Touches token expiry.' }] }]), { phase: 'planning' }),
+    );
+    expect(full[0]).toEqual({ kind: 'riskProposal', proposals: [{ ...proposal, logicalUnit: 'session handling', reason: 'Touches token expiry.' }] });
+  });
+
+  it('treats null and "" optional fields as absent', () => {
+    const outcome = parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [{ ...proposal, logicalUnit: null, reason: '' }] }]), { phase: 'investigating' });
+    expect(okMessages(outcome)[0]).toEqual({ kind: 'riskProposal', proposals: [proposal] });
+  });
+
+  it.each([
+    ['no proposals key', { kind: 'riskProposal' }],
+    ['an empty list', { kind: 'riskProposal', proposals: [] }],
+    ['a non-array list', { kind: 'riskProposal', proposals: proposal }],
+    ['an unknown risk', { kind: 'riskProposal', proposals: [{ ...proposal, risk: 'critical' }] }],
+    ['a missing risk', { kind: 'riskProposal', proposals: [{ memberId: 'm1', path: 'a.ts' }] }],
+    ['a missing path', { kind: 'riskProposal', proposals: [{ memberId: 'm1', risk: 'high' }] }],
+    ['a missing member id', { kind: 'riskProposal', proposals: [{ path: 'a.ts', risk: 'high' }] }],
+    ['a non-object entry', { kind: 'riskProposal', proposals: ['a.ts'] }],
+    ['a member id carrying a control character', { kind: 'riskProposal', proposals: [{ ...proposal, memberId: 'm1\u0007' }] }],
+    ['a non-string reason', { kind: 'riskProposal', proposals: [{ ...proposal, reason: 7 }] }],
+  ])('fails closed on %s', (_label, message) => {
+    const outcome = parseModelTurn(turnText([message]), { phase: 'investigating' });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.failureKind).toBe('parse');
+      expect(outcome.reasons.some((r) => r.code === 'schema')).toBe(true);
+    }
+  });
+
+  it('bounds the entry count and every string length', () => {
+    const many = Array.from({ length: 65 }, (_, i) => ({ ...proposal, path: `src/f${i}.ts` }));
+    expect(parseModelTurn(turnText([{ kind: 'riskProposal', proposals: many }]), { phase: 'investigating' }).ok).toBe(false);
+    expect(parseModelTurn(turnText([{ kind: 'riskProposal', proposals: many.slice(0, 64) }]), { phase: 'investigating' }).ok).toBe(true);
+    for (const oversized of [
+      { ...proposal, path: 'p'.repeat(2001) },
+      { ...proposal, memberId: 'm'.repeat(201) },
+      { ...proposal, reason: 'r'.repeat(241) },
+      { ...proposal, logicalUnit: 'u'.repeat(241) },
+    ]) {
+      expect(parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [oversized] }]), { phase: 'investigating' }).ok).toBe(false);
+    }
+  });
+
+  it('is a contract failure in verifying and in the host-only phases', () => {
+    for (const phase of ['verifying', 'bootstrap', 'completing', 'persisting'] as const) {
+      const outcome = parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [proposal] }]), { phase });
+      expect(outcome.ok, phase).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.failureKind).toBe('contract');
+        expect(outcome.reasons.some((r) => r.code === 'phaseNotAllowed')).toBe(true);
+      }
+    }
+  });
+
+  it('is listed for planning and investigating only', () => {
+    expect(PHASE_ALLOWED_KINDS.planning).toContain('riskProposal');
+    expect(PHASE_ALLOWED_KINDS.investigating).toContain('riskProposal');
+    expect(PHASE_ALLOWED_KINDS.verifying).not.toContain('riskProposal');
+    expect(PHASE_ALLOWED_KINDS.bootstrap).not.toContain('riskProposal');
+  });
+
+  it('rejects two in one turn', () => {
+    const outcome = parseModelTurn(turnText([{ kind: 'riskProposal', proposals: [proposal] }, { kind: 'riskProposal', proposals: [proposal] }]), { phase: 'investigating' });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.reasons.some((r) => r.code === 'multipleRiskProposal')).toBe(true);
+  });
+
+  it('may share a turn with tool requests', () => {
+    const outcome = parseModelTurn(
+      turnText([{ kind: 'riskProposal', proposals: [proposal] }, { kind: 'toolRequest', tool: 'readDiff', memberId: 'm1', request: { path: 'a.ts' } }]),
+      { phase: 'investigating' },
+    );
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('may not share a turn with a completion request', () => {
+    // No phase allows both kinds today (`completionRequest` is verifying-only, `riskProposal` is
+    // planning/investigating-only), so the phase check answers first in every phase. The
+    // `completionRequestNotFocused` rule is the backstop should either table widen; the schema test
+    // pins the same exclusion on the JSON-schema side.
+    for (const phase of ['planning', 'investigating', 'verifying'] as const) {
+      const outcome = parseModelTurn(turnText([{ kind: 'completionRequest' }, { kind: 'riskProposal', proposals: [proposal] }]), { phase });
+      expect(outcome.ok, phase).toBe(false);
+    }
+  });
+
+  it('is stated in the batch rules the prompt prints', () => {
+    expect(describeBatchRules(DEFAULT_HARNESS_POLICY)).toContain('riskProposal');
   });
 });

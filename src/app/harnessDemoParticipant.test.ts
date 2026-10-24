@@ -284,6 +284,43 @@ describe('createDemoModelSeam (task 10.7)', () => {
     expect(seam.phasesSeen.filter((p) => p === 'verifying').length).toBeGreaterThanOrEqual(2);
   });
 
+  it('proposes risk once during investigating, never as the last message of a batch, and the host applies it', async () => {
+    const connection = reviewConnection({ files: ['src/a.ts', 'src/b.ts'], patches: { 'src/a.ts': PATCH_WITH_FINDING } });
+    const snapshot = testSnapshot();
+    const inner = createDemoModelSeam(snapshot);
+    const replies: Array<{ phase: string; messages: Array<{ kind: string; proposals?: Array<{ path: string; risk: string }> }> }> = [];
+    const recording: HarnessModelSeam = {
+      modelId: inner.modelId,
+      async askModel(input) {
+        const reply = await inner.askModel(input);
+        if (input.phase !== 'verifying' || input.repairInstruction === undefined) replies.push({ phase: input.phase, messages: (JSON.parse(reply) as { messages: never[] }).messages });
+        return reply;
+      },
+    };
+    const attempt = createHarnessAttempt({
+      ...baseOptions({ synthesisVerification: createSynthesisVerification() }),
+      snapshot,
+      members: [member(connection)],
+      modelSeam: recording,
+      policy: testPolicy(),
+    });
+
+    const result = await attempt.run();
+
+    const proposalMessages = replies.flatMap((reply) => reply.messages.map((message, index) => ({ reply, message, index }))).filter((entry) => entry.message.kind === 'riskProposal');
+    expect(proposalMessages).toHaveLength(1);
+    const [only] = proposalMessages;
+    expect(only?.reply.phase).toBe('investigating');
+    expect(only?.index).toBeLessThan((only?.reply.messages.length ?? 0) - 1); // the correlation rule: a dispatch request stays last
+    expect(only?.message.proposals).toEqual([expect.objectContaining({ memberId: 'm1', path: 'src/a.ts', risk: 'high' })]);
+    // The host took it: the file was raised above its source-code floor of medium, and the run still completes.
+    expect(result.activityLog.events.some((event) => event.kind === 'actionStarted' && event.action.includes('Raised the risk of 1 file(s)') && event.action.includes('src/a.ts (medium to high'))).toBe(true);
+    expect(result.activityLog.events.some((event) => event.kind === 'toolFailed' && event.tool === 'riskProposal')).toBe(false);
+    expect(result.lifecycle).toBe('succeeded');
+    expect(result.outcome.completeness).toBe('complete');
+    expect(result.findings[0]?.item.file).toBe('src/a.ts');
+  });
+
   it('a clean file (no anchors qualify) reaches a complete clean outcome with zero findings', async () => {
     const connection = reviewConnection({ files: ['src/clean.ts'], patches: {} });
     const snapshot = testSnapshot();

@@ -13,6 +13,7 @@
  * not have made, because there was nothing to compare the prompt against.
  */
 import { describe, expect, it } from 'vitest';
+import { RISK_LEVELS } from '../domain/harnessCoverage';
 import { DEFAULT_HARNESS_POLICY, normalizeHarnessPolicy } from '../domain/harnessPolicy';
 import { DETAIL_SECTION_MEMBERS, parseModelTurn, TOOL_REQUEST_SPECS, toolFieldIsOptional, toolRequestObjectIsRequired, type ToolRequestName } from '../domain/harnessProtocol';
 import { HOST_TOOL_DEFINITIONS } from '../domain/harnessTools';
@@ -160,6 +161,16 @@ describe('the prompt describes exactly what the parser accepts', () => {
     // Prose and behaviour, checked against each other rather than separately.
     expect(parseModelTurn(toolRequestTurn(cap), { phase: 'investigating' }).ok, `the contract permits ${cap} but the parser refuses it`).toBe(true);
     expect(parseModelTurn(toolRequestTurn(cap + 1), { phase: 'investigating' }).ok, `the contract caps at ${cap} but the parser allows more`).toBe(false);
+  });
+
+  it('names the riskProposal kind with every risk level the parser accepts, and the shape it prints parses', () => {
+    expect(text).toContain('- riskProposal: ');
+    for (const level of RISK_LEVELS) expect(text, `risk level ${level} missing`).toContain(level);
+    const outcome = parseModelTurn(
+      JSON.stringify({ messages: [{ kind: 'riskProposal', proposals: [{ memberId: MEMBER, path: 'src/a.ts', risk: 'high' }] }] }),
+      { phase: 'investigating' },
+    );
+    expect(outcome.ok).toBe(true);
   });
 
   it('takes the cap from the policy rather than printing a literal', () => {
