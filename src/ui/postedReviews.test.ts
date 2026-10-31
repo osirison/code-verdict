@@ -804,6 +804,9 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     await PostedReviewsPanel.show(deps);
     await flush();
     await click('[data-toggle="thread-1"]');
+    // Whatever the repaint put back (the held draft may or may not have been
+    // shown yet), the field holds exactly the text that is still being sent.
+    field().value = '';
     typeMore(SENT);
     await enter();
     expect(sendBodies()).toEqual([SENT]);
