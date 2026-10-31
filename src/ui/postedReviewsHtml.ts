@@ -518,6 +518,10 @@ const SCRIPT = `
     if (!data || data.type !== 'verdict:replySettled' || !data.ok) return;
     const field = [...document.querySelectorAll('[data-reply]')].find((el) => el.dataset.reply === data.threadId);
     if (!field) return;
+    // The panel's patch (which always arrives first) may already have painted
+    // the draft with the sent text off, e.g. after a click released the typed
+    // hold. Taking the prefix off that again would eat the person's own words.
+    if (field.value === data.remainder) return;
     const lead = field.value.trimStart();
     if (!lead.startsWith(data.text)) return;
     const rest = lead.slice(data.text.length).trimStart();

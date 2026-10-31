@@ -271,7 +271,7 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     expect(posted.regions['pr-detail']).toContain("conceded — they were right");
   });
 
-  it('replying calls replyToThread and issues no other platform call, and clears the draft on success', async () => {
+  it('replying calls replyToThread and issues no other platform call, and the patch it emits carries the draft with the sent text off', async () => {
     const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
     await openPanel(globalState);
 
@@ -313,7 +313,7 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     // No patch, only the note that the send is over (so the page can allow a retry).
     expect(panel.webview.postMessage.mock.calls.map((c) => (c[0] as { type: string }).type)).toEqual(['verdict:replySettled']);
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
-      type: 'verdict:replySettled', threadId: 'thread-1', text: 'Still not convinced.', ok: false,
+      type: 'verdict:replySettled', threadId: 'thread-1', text: 'Still not convinced.', ok: false, remainder: '',
     });
     expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(expect.stringContaining('network down'));
     spy.mockRestore();
@@ -812,9 +812,10 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     await PostedReviewsPanel.show(deps);
     await flush();
     await click('[data-toggle="thread-1"]');
-    // Whatever the repaint put back (the held draft may or may not have been
-    // shown yet), the field holds exactly the text that is still being sent.
-    field().value = '';
+    // The field is empty on return: drafts are held per panel instance, and
+    // this is a new panel, so the text of the send still in flight is not put
+    // back (that is how leaving the screen already worked).
+    expect(field().value).toBe('');
     typeMore(SENT);
     await enter();
     expect(sendBodies()).toEqual([SENT]);
@@ -859,6 +860,23 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     await click('.rev-row[data-number="7"]');
     await click('[data-toggle="thread-1"]');
     expect(field().value).toBe('And one more thing');
+    spy.mockRestore();
+  });
+
+  it('a click that releases the typed hold before the send ends does not make the sent text come off twice', async () => {
+    // "ok", Enter, then " ok then": the field is "ok ok then". The click (in the
+    // field itself) flushes the draft, the panel strips it and its patch paints
+    // "ok then" into the unheld field, and only then does the settled note
+    // arrive; it must not take a second "ok" off the person's own words.
+    const { spy, field, typeMore, enter, settle, sendBodies } = await wired();
+    typeMore('ok');
+    await enter();
+    typeMore(' ok then');
+    expect(field().value).toBe('ok ok then');
+    field().click();
+    await settle(0, 'resolve');
+    expect(field().value).toBe('ok then');
+    expect(sendBodies()).toEqual(['ok']);
     spy.mockRestore();
   });
 

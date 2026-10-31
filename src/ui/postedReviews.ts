@@ -231,6 +231,7 @@ export class PostedReviewsPanel {
           if (PostedReviewsPanel.sendingReplies.has(draftKey)) return;
           PostedReviewsPanel.sendingReplies.add(draftKey);
           let ok = false;
+          let remainder = '';
           try {
             const connection = await connectionForPod(pod, this.deps.secrets);
             await connection.replyToThread(
@@ -250,6 +251,10 @@ export class PostedReviewsPanel {
               if (rest) this.replyDrafts[draftKey] = rest;
               else delete this.replyDrafts[draftKey];
             }
+            // What the draft is now. The patch below paints it, and it reaches
+            // the page before the settled note, so the note carries it: a field
+            // that already equals it has had the sent text taken off.
+            remainder = this.replyDrafts[draftKey] ?? '';
             this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
               replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
             );
@@ -258,7 +263,7 @@ export class PostedReviewsPanel {
             // Whatever happened, the send is over: release the thread and tell
             // the page (it takes the sent text off the field on success).
             PostedReviewsPanel.sendingReplies.delete(draftKey);
-            this.replySettled(m.threadId, m.text, ok);
+            this.replySettled(m.threadId, m.text, ok, remainder);
           }
           return;
         }
@@ -300,10 +305,10 @@ export class PostedReviewsPanel {
    * field for the thread ignores it). A webview that is itself gone throws,
    * and a failed delivery must not take the message handler down with it.
    */
-  private replySettled(threadId: string, text: string, ok: boolean): void {
+  private replySettled(threadId: string, text: string, ok: boolean, remainder: string): void {
     try {
       void Promise.resolve(
-        this.route.panel.webview.postMessage({ type: 'verdict:replySettled', threadId, text, ok }),
+        this.route.panel.webview.postMessage({ type: 'verdict:replySettled', threadId, text, ok, remainder }),
       ).catch(() => undefined);
     } catch {
       // The webview is disposed; nothing is left to tell.

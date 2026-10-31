@@ -209,10 +209,11 @@ describe('the reply field survives a patch (issue #46 tasks 7.4a, 9.3)', () => {
     const submitReply = html.slice(html.indexOf('function submitReply'), html.indexOf('function submitReply') + html.slice(html.indexOf('function submitReply')).indexOf('}\n'));
     expect(submitReply).toContain("post({ type: 'replyDraft', threadId: input.dataset.reply, text })");
     expect(submitReply).toContain('clearTimeout(replyDraftTimers.get(input.dataset.reply))');
-    // Committed before the send: Enter releases REGIONS_SCRIPT's typed hold on
-    // the field, so from here the field is painted from host state alone, and
-    // a patch of #pr-detail from any OTHER thread's activity arriving before
-    // the round trip resolves would otherwise blank an unsent reply.
+    // Committed before the send: the host must hold a copy for as long as the
+    // round trip is unresolved, because a field REGIONS_SCRIPT is not holding
+    // is painted from host state alone, and a patch of #pr-detail from any
+    // OTHER thread's activity arriving meanwhile would otherwise blank an
+    // unsent reply.
     // ("post({ type: 'reply'" does not match the replyDraft line — the closing
     // quote after `reply` is what separates them.)
     expect(submitReply.indexOf("post({ type: 'replyDraft'")).toBeLessThan(submitReply.indexOf("post({ type: 'reply'"));
