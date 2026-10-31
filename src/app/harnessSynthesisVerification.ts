@@ -151,9 +151,10 @@
  *   once dedup has run, since dedup cannot itself fail once started.
  *
  * **Not risk-gated:** the contradiction pass covers every surviving finding
- * whatever the risk of its file (D9: "for each surviving finding... challenge
- * the claim"). `RiskCoverageRules` carries no contradiction-check rule, and
- * `SynthesisVerificationInput` carries no per-file risk.
+ * whatever the risk of its file (D9: verification challenges each claim
+ * against its cited sources). `RiskCoverageRules` carries no
+ * contradiction-check rule, and `SynthesisVerificationInput` carries no
+ * per-file risk.
  *
  * **Documented interaction with `CandidateTracker`:** a finding this module
  * deduplicates away or contradicts stays `accepted` in the tracker (this

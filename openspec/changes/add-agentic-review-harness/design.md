@@ -236,7 +236,7 @@ unvisited -> classified -> inspected
 
 Classification records risk, logical unit, applicable policy identity, and the reason for any non-inspected terminal classification. Inspection requires model-visible diff evidence or an explicit non-text handling decision. Repository search does not add files to the changed inventory and cannot satisfy changed-file inspection.
 
-The model proposes risk and logical units. The host applies mandatory risk floors from manifest facts and policy, such as sensitive paths, dependency manifests, permission changes, generated files, binary files, and cross-member contracts. Configured coverage rules define which risk levels require full diff inspection and which may draw on the high-risk reserve. The contradiction pass covers every surviving finding regardless of risk.
+The model proposes risk and logical units. The host applies mandatory risk floors from manifest facts and policy, such as sensitive paths, dependency manifests, permission changes, generated files, binary files, and cross-member contracts. Configured coverage rules define which risk levels require full diff inspection and which may draw on the high-risk reserve. The contradiction pass is not gated by risk (D9 covers a finding whose check the host cannot perform).
 
 Progress denominators come only from complete inventories or explicit plan-item counts. Before manifest exhaustion, the UI shows known units and indeterminate inventory progress. After exhaustion, it may show files classified out of total and required files inspected out of required total. Percentages never estimate remaining model time.
 
