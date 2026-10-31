@@ -215,10 +215,17 @@ beforeEach(() => {
  * when a test ends would make the next test's replies be dropped.
  */
 const pendingSends: Array<() => void> = [];
+/**
+ * Pages a test wired to the panel. A page left open keeps its 300ms draft timer,
+ * which would fire into the next test's panel (`handlers.message` is shared).
+ */
+const openPages: JSDOM[] = [];
 
 afterEach(async () => {
   for (const settle of pendingSends.splice(0)) settle();
   await flush();
+  for (const page of openPages.splice(0)) page.window.close();
+  panel.webview.postMessage.mockReset();
   // Dispose the surface so the next test builds a fresh panel and route —
   // `AppSurface`'s and `PostedReviewsPanel`'s statics otherwise survive test
   // boundaries in the same module instance.
@@ -623,6 +630,7 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
         window.scrollTo = (() => undefined) as typeof window.scrollTo;
       },
     });
+    openPages.push(dom);
     panel.webview.postMessage.mockImplementation((m: unknown) => {
       dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
       return Promise.resolve(true);
