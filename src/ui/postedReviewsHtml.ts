@@ -421,24 +421,20 @@ const SCRIPT = `
   });
   // Commits the in-progress text into the panel's held per-thread draft (task
   // 9.3) so a patch from acting on a DIFFERENT thread never overwrites what
-  // this one is mid-typing, and so the panel's own clearing on a successful
-  // send (below) has a real field to blank rather than guessing at one.
+  // this one is mid-typing, and so the panel holds the text a send was made
+  // from (it takes that text off the draft when the send succeeds).
   // Debounced, not committed on every keystroke — 'change' (the previous
   // event) only fires on blur, which is what left mid-typing text nowhere
   // but the DOM; per-thread, not one shared timer, so switching to a
   // different thread mid-debounce cannot cancel a commit this one is still
   // waiting on.
   const replyDraftTimers = new Map();
-  // The last text typed per thread, kept for a field a patch has since removed
-  // (a collapsed thread) so a finished send can still take its text off.
-  const replyValues = new Map();
   document.addEventListener('input', (ev) => {
     const el = ev.target.closest('[data-reply]');
     if (!el) return;
     const threadId = el.dataset.reply;
     clearTimeout(replyDraftTimers.get(threadId));
     const text = el.value;
-    replyValues.set(threadId, text);
     replyDraftTimers.set(threadId, setTimeout(() => {
       replyDraftTimers.delete(threadId);
       post({ type: 'replyDraft', threadId, text });
@@ -451,8 +447,9 @@ const SCRIPT = `
   // thread, toggling archived, selecting a different review — all patch
   // #pr-detail from the panel's held drafts without touching the platform.
   // Inside the 300ms window that patch re-renders the reply field from the
-  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT never
-  // restores the value, so those keystrokes are gone. Capture phase, so this
+  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT only holds
+  // a typed value for the focused field, so those keystrokes are gone for
+  // any other repaint of it. Capture phase, so this
   // runs before the delegated handlers below; blur as well, because a
   // palette command or a click outside the webview never produces one here.
   const flushReplyDrafts = () => {
@@ -473,16 +470,13 @@ const SCRIPT = `
   // The input keeps its text until the send has succeeded (spec: ui-responsiveness,
   // "cleared only when it has been sent successfully"), so a failed send leaves
   // everything there for a retry and the person can keep typing meanwhile.
-  // Because the field is still full, a second Enter or a click on Send during
-  // the send would post the same reply again: a thread with a send in flight
-  // ignores them. The host ends the send with 'verdict:replySettled' (below),
-  // which is also what takes the sent text, and only that text, off the field.
-  const sendingReplies = new Set();
+  // This page keeps no send state: a press during a send posts the reply like
+  // any other, and the panel, which owns whether a send is in flight, drops it.
+  // The host ends the send with 'verdict:replySettled' (below), which is also
+  // what takes the sent text, and only that text, off the field.
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
-    if (sendingReplies.has(input.dataset.reply)) return;
-    sendingReplies.add(input.dataset.reply);
     // Commit what is about to be sent as this thread's held draft, THEN cancel
     // the pending debounce so no later timer can re-commit it. Both halves are
     // needed and the order is the fix:
@@ -493,46 +487,49 @@ const SCRIPT = `
     // patch of #pr-detail arriving before the send resolves repaints from that
     // empty state. A resolve or concede on a DIFFERENT thread lands exactly
     // that patch, wiping text that had not been sent yet. Committing first
-    // makes the draft the copy that outlives the tick: a success deletes it
-    // (task 7.4b) so the box still ends empty, and a failure leaves it as the
-    // retry. Committing the trimmed text — what is actually being sent —
+    // makes the draft the copy that outlives the tick: a success takes the
+    // sent text off it (task 7.4b), and a failure leaves it as the retry.
+    // Committing the trimmed text — what is actually being sent —
     // rather than the raw value costs only trailing whitespace on a repaint.
     //
     // Cancelling still matters after committing: a timer left armed would
-    // re-commit the same text AFTER the host cleared the draft on success, and
-    // the next unrelated patch would replay it as though it were never sent.
+    // re-commit the same text AFTER the host took it off the draft on success,
+    // and the next unrelated patch would replay it as though it were never sent.
     post({ type: 'replyDraft', threadId: input.dataset.reply, text });
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
     replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
   }
-  // The send ended. On success the field loses the text that was sent and
-  // nothing else: what was typed after it stays, and is not posted. It is
-  // taken off by prefix, so a field the person has since edited into
-  // something else is left alone. This has to happen here, not through the
-  // host's patch: REGIONS_SCRIPT holds a focused field's typed value across a
-  // patch, so a patch alone would keep the sent text and let Enter post it
-  // again. Either way the field's value is then committed as the draft, so the
-  // host holds what the field shows whether or not the debounce had fired.
+  // A send succeeded. The panel has already taken the sent text off its held
+  // draft; this takes it off the field, if the field is on screen, and nothing
+  // else: what was typed after it stays, and is not posted. It is taken off by
+  // prefix, so a field the person has since edited into something else is left
+  // alone, and the caret stays on the person's own text. This has to happen
+  // here, not through the host's patch: REGIONS_SCRIPT holds a focused field's
+  // typed value across a patch, so a patch alone would keep the sent text and
+  // let Enter post it again. A field that is not on screen needs nothing from
+  // this page (the panel's draft is already right), and a failed send changes
+  // nothing. What remains in the field goes to the panel through the ordinary
+  // input path: the field is on screen, so its review is the selected one, and
+  // the pending-draft flush on click and blur covers a move to another review.
+  // Not handled: an input-method composition in progress in this field.
   window.addEventListener('message', (ev) => {
     const data = ev.data;
-    if (!data || data.type !== 'verdict:replySettled') return;
-    const threadId = data.threadId;
-    sendingReplies.delete(threadId);
-    const field = [...document.querySelectorAll('[data-reply]')].find((el) => el.dataset.reply === threadId);
-    let value = field ? field.value : (replyValues.get(threadId) ?? '');
-    if (data.ok) {
-      const lead = value.trimStart();
-      if (lead.startsWith(data.text)) value = lead.slice(data.text.length).trimStart();
+    if (!data || data.type !== 'verdict:replySettled' || !data.ok) return;
+    const field = [...document.querySelectorAll('[data-reply]')].find((el) => el.dataset.reply === data.threadId);
+    if (!field) return;
+    const lead = field.value.trimStart();
+    if (!lead.startsWith(data.text)) return;
+    const rest = lead.slice(data.text.length).trimStart();
+    const removed = field.value.length - rest.length;
+    const start = field.selectionStart;
+    const end = field.selectionEnd;
+    field.value = rest;
+    if (document.activeElement === field && start !== null && end !== null) {
+      field.setSelectionRange(Math.max(0, Math.min(rest.length, start - removed)), Math.max(0, Math.min(rest.length, end - removed)), field.selectionDirection ?? undefined);
     }
-    if (field && field.value !== value) {
-      field.value = value;
-      window.verdictForgetTypedId(field.id);
-    }
-    replyValues.set(threadId, value);
-    clearTimeout(replyDraftTimers.get(threadId));
-    replyDraftTimers.delete(threadId);
-    post({ type: 'replyDraft', threadId, text: value });
+    if (rest) field.dispatchEvent(new Event('input', { bubbles: true }));
+    else window.verdictForgetTypedId(field.id);
   });
   document.addEventListener('keydown', (ev) => {
     const el = ev.target.closest('[data-reply]');

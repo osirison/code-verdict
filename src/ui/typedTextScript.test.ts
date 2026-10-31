@@ -283,7 +283,7 @@ describe('a patch between keystrokes (tasks 9.3, 9.7)', () => {
     expect((document.getElementById('reply-input') as HTMLInputElement).value).toBe('');
   });
 
-  it('Enter sends the reply and leaves the field focused — the sent text must not hold against the host\'s cleared draft', () => {
+  it('Enter sends the reply and leaves the field focused — the sent text comes off once the host reports the send settled, and is not held against it', () => {
     // The sibling of the test above, but through the DESIGNED primary path
     // (postedReviewsHtml.ts: "a single-line input has no reason to require
     // the chord (#33)"), not a direct patch. Enter fires no click and no
@@ -569,11 +569,6 @@ describe('a reply still in flight is held by the host, not by the field it was t
 
     const after = document.getElementById('reply-input') as HTMLInputElement;
     expect(after.value).toBe(sent);
-    // The host says the send is over (it failed), which is what lets the
-    // thread send again.
-    dom.window.dispatchEvent(new dom.window.MessageEvent('message', {
-      data: { type: 'verdict:replySettled', threadId: 'thread-2', text: sent, ok: false },
-    }));
     // Recovered means usable, not merely displayed: the retry goes back out
     // through the same Enter path, carrying the same text, with no retyping.
     after.focus();

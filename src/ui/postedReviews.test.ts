@@ -209,7 +209,16 @@ beforeEach(() => {
   panel.webview.postMessage.mockClear();
 });
 
-afterEach(() => {
+/**
+ * Settlers for every `replyToThread` a test left pending. The panel's one-send-
+ * per-thread guard is static (it must outlive a panel), so a send still pending
+ * when a test ends would make the next test's replies be dropped.
+ */
+const pendingSends: Array<() => void> = [];
+
+afterEach(async () => {
+  for (const settle of pendingSends.splice(0)) settle();
+  await flush();
   // Dispose the surface so the next test builds a fresh panel and route —
   // `AppSurface`'s and `PostedReviewsPanel`'s statics otherwise survive test
   // boundaries in the same module instance.
@@ -351,7 +360,10 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
         resolveThread: () => Promise.resolve(undefined),
         replyToThread: (_ref: unknown, _id: string, body: string) => {
           calls.push(body);
-          return new Promise<void>((resolve, reject) => { settle = { resolve, reject }; });
+          return new Promise<void>((resolve, reject) => {
+            settle = { resolve, reject };
+            pendingSends.push(resolve);
+          });
         },
       } as never);
       handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
@@ -572,12 +584,18 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
 
   async function wired() {
     const entry = { ...submittedReview(), threads: { item1: 'thread-1', item2: 'thread-2' } };
+    // A second review (#8) with its own thread, so "click another review" is real.
+    const other = { ...submittedReview(), crNumber: '8', submittedAt: '2026-08-19T10:00:00.000Z', threads: { item1: 'thread-9' } };
+    const otherRef = { repoId: REF.repoId, number: '8' };
+    world.crs = [changeRequest(), { ...changeRequest(), ref: otherRef }];
     world.threads = [
       reviewThread({ id: 'thread-1' }),
       reviewThread({ id: 'thread-2', notes: [{ id: 'n3', author: { username: 'you' }, body: 'Second finding.', createdAt: '2026-08-20T10:06:00.000Z' }] }),
+      reviewThread({ id: 'thread-9', crRef: otherRef }),
     ];
     const { PostedReviewsPanel } = await import('./postedReviews.js');
-    await PostedReviewsPanel.show(makeDeps(memoryStore({ 'codeVerdict.submittedReviews': [entry] })));
+    const deps = makeDeps(memoryStore({ 'codeVerdict.submittedReviews': [entry, other] }));
+    await PostedReviewsPanel.show(deps);
     await flush();
 
     const sends: Send[] = [];
@@ -587,10 +605,13 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
       listThreads: () => Promise.resolve(world.threads),
       resolveThread: () => Promise.resolve(undefined),
       replyToThread: (_ref: unknown, _id: string, body: string) =>
-        new Promise<void>((resolve, reject) => { sends.push({ body, resolve, reject }); }),
+        new Promise<void>((resolve, reject) => {
+          sends.push({ body, resolve, reject });
+          pendingSends.push(resolve);
+        }),
     } as never);
 
-    // What the page sends the panel, kept so a test can see the page's own guard.
+    // What the page sends the panel.
     const toPanel: Array<{ type: string }> = [];
     const dom = new JSDOM(panel.webview.html, {
       runScripts: 'dangerously',
@@ -626,7 +647,6 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
       await flush();
     };
     const sendBodies = (): string[] => sends.map((s) => s.body);
-    const replyMessages = (): number => toPanel.filter((m) => m.type === 'reply').length;
     const settle = async (index: number, how: 'resolve' | 'reject'): Promise<void> => {
       if (how === 'resolve') sends[index]!.resolve(); else sends[index]!.reject(new Error('network down'));
       await flush();
@@ -634,7 +654,7 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     await click('[data-toggle="thread-1"]');
-    return { spy, dom, document, click, field, typeMore, enter, sendBodies, replyMessages, settle, wait };
+    return { spy, dom, document, click, field, typeMore, enter, sendBodies, settle, wait, deps, toPanel, PostedReviewsPanel };
   }
 
   it('keeps the text in the field for the whole send, and clears it once the send succeeds', async () => {
@@ -648,19 +668,18 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     spy.mockRestore();
   });
 
-  it('a press during a send posts nothing and the field keeps its text, with the page ignoring it before the panel does', async () => {
-    const { spy, field, typeMore, enter, click, sendBodies, replyMessages, settle } = await wired();
+  it('a press during a send reaches the platform once, and the field keeps its text', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle } = await wired();
     typeMore(SENT);
     await enter();
     await enter();
     await click('[data-reply-send]');
-    expect(replyMessages()).toBe(1);
     expect(sendBodies()).toEqual([SENT]);
     expect(field().value).toBe(SENT);
     // New text and another Enter while A is pending: not posted, not hidden.
     typeMore(MORE);
     await enter();
-    expect(replyMessages()).toBe(1);
+    expect(sendBodies()).toEqual([SENT]);
     expect(field().value).toBe(SENT + MORE);
     await settle(0, 'resolve');
     // Only what was sent left the field; the rest waits for an explicit Enter.
@@ -772,6 +791,122 @@ describe('a reply sent while its send is in flight (panel and page wired togethe
     expect(field().value).toBe('');
     await click('[data-toggle="thread-1"]');
     expect(field().value).toBe('');
+    expect(sendBodies()).toHaveLength(2);
+    spy.mockRestore();
+  });
+
+  it('leaving the screen mid-send and coming back: the send is still guarded, and the settled note still reaches the page', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle, deps, PostedReviewsPanel } = await wired();
+    typeMore(SENT);
+    await enter();
+    // The panel is disposed on leaving; the call is not.
+    AppSurface.show('elsewhere', 'Verdict: Elsewhere');
+    await PostedReviewsPanel.show(deps);
+    await flush();
+    await click('[data-toggle="thread-1"]');
+    typeMore(SENT);
+    await enter();
+    expect(sendBodies()).toEqual([SENT]);
+    await settle(0, 'resolve');
+    // The old panel is gone, yet the page was told: the sent text comes off.
+    expect(field().value).toBe('');
+    typeMore('A new reply');
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'A new reply']);
+    spy.mockRestore();
+  });
+
+  it('text typed after the send is not filed under another review when the reviewer moves away and back before the send ends', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await wait(350);
+    await click('.rev-row[data-number="8"]');
+    await settle(0, 'resolve');
+    await click('.rev-row[data-number="7"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    expect(sendBodies()).toEqual([SENT]);
+    spy.mockRestore();
+  });
+
+  it('a success whose settled note never reaches the page still leaves the panel holding only the new text', async () => {
+    const { spy, dom, field, typeMore, enter, click, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await wait(350);
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      if ((m as { type: string }).type !== 'verdict:replySettled') {
+        dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      }
+      return Promise.resolve(true);
+    });
+    await settle(0, 'resolve');
+    await click('.rev-row[data-number="8"]');
+    await click('.rev-row[data-number="7"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    spy.mockRestore();
+  });
+
+  it('keeps the caret on the person\'s own text when the sent text comes off in front of it', async () => {
+    const { spy, field, typeMore, enter, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    const at = (SENT + MORE).indexOf('one more');
+    field().setSelectionRange(at, at);
+    await settle(0, 'resolve');
+    expect(field().value).toBe('And one more thing');
+    expect(field().selectionStart).toBe(field().value.indexOf('one more'));
+    expect(field().selectionEnd).toBe(field().selectionStart);
+    spy.mockRestore();
+  });
+
+  it('a send that ends while its thread is collapsed leaves no empty draft behind and the thread opens empty', async () => {
+    const { spy, field, typeMore, enter, click, settle, toPanel } = await wired();
+    typeMore(SENT);
+    await enter();
+    await click('[data-toggle="thread-1"]');
+    const before = toPanel.length;
+    await settle(0, 'resolve');
+    expect(toPanel.slice(before).filter((m) => m.type === 'replyDraft')).toEqual([]);
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('');
+    spy.mockRestore();
+  });
+
+  it('a render that throws after a successful send still tells the page and releases the thread', async () => {
+    const { spy, dom, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      if ((m as { type: string }).type === 'verdict:regions') throw new Error('webview went away');
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      return Promise.resolve(true);
+    });
+    await settle(0, 'resolve');
+    expect(field().value).toBe('');
+    typeMore('Again');
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'Again']);
+    spy.mockRestore();
+  });
+
+  it('a webview that throws on every message still releases the thread, and nothing escapes the handler', async () => {
+    const { spy, dom, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    panel.webview.postMessage.mockImplementation(() => { throw new Error('Webview is disposed'); });
+    await settle(0, 'resolve');
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      return Promise.resolve(true);
+    });
+    typeMore(' again');
+    await enter();
     expect(sendBodies()).toHaveLength(2);
     spy.mockRestore();
   });
