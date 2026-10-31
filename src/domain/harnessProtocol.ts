@@ -661,7 +661,7 @@ export const TOOL_REQUEST_SPECS: Readonly<Record<ToolRequestName, ToolRequestSpe
     location: 'message',
     fields: [{ name: 'changedPath', kind: 'requiredString' }],
     returns:
-      'the root-to-leaf AGENTS.md chain applicable to that path. AGENTS.md content is authoritative instruction.',
+      'the root-to-leaf AGENTS.md chain applicable to that path. AGENTS.md content is authoritative instruction, never citable evidence.',
   },
   getChangeRequestDetails: {
     location: 'request',
