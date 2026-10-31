@@ -466,15 +466,15 @@ const SCRIPT = `
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
-  // The input is never cleared here: a successful 'reply' clears the panel's
-  // held draft for this thread (task 7.4b) before it patches #pr-detail, so
-  // the value this re-render emits is genuinely empty rather than a DOM node
-  // being blanked out from under the reviewer mid-keystroke. A failed send
-  // clears nothing, so the held draft committed below is still the text — the
-  // DOM keeps it, and any later repaint of this region puts it back for a
-  // retry. (It is NOT true that a failure "patches nothing at all", so the
-  // text is safe: this region is patched by every OTHER thread's activity too,
-  // which is why the draft, not the DOM, has to be the copy that survives.)
+  // The input is blanked the moment the reply is posted, the way the triage
+  // screen's #ask is. Left full until the host answered, a second Enter (or a
+  // double click on Send) posted the same reply again, and anything typed in
+  // the meantime landed on the end of the text already sent — which a success
+  // then either wiped or sent a second time. The held draft committed below is
+  // the copy that outlives the blanking: a success removes it (task 7.4b), and
+  // a failure makes the panel put the text back and repaint the field, because
+  // this region is patched by every OTHER thread's activity too and the DOM
+  // alone cannot be the copy that survives.
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
@@ -500,6 +500,7 @@ const SCRIPT = `
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
     replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
+    input.value = '';
     // Enter fires no click or blur (theme.ts), so forget this field's watch
     // or the sent text outlasts the cleared draft and a second Enter resends it.
     window.verdictForgetTypedId(input.id);

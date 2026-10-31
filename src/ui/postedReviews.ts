@@ -95,6 +95,8 @@ export class PostedReviewsPanel {
    * removes a thread, so it has no basis for deciding one has disappeared.
    */
   private replyDrafts: Record<string, string> = {};
+  /** `replyDraftKey(...)` of every reply whose platform call has not answered yet. */
+  private readonly sendingReplies = new Set<string>();
 
   private constructor(
     private readonly route: AppRoute,
@@ -216,17 +218,38 @@ export class PostedReviewsPanel {
         }
         case 'reply': {
           if (!view) return;
-          const connection = await connectionForPod(pod, this.deps.secrets);
-          await connection.replyToThread(
-            { repoId: view.repoId, number: view.crNumber },
-            m.threadId,
-            m.text,
-          );
+          const draftKey = replyDraftKey(view.repoId, view.crNumber, m.threadId);
+          // One send per thread at a time: a second 'reply' while the first is
+          // unanswered is the same text posted to the platform twice.
+          if (this.sendingReplies.has(draftKey)) return;
+          this.sendingReplies.add(draftKey);
+          try {
+            const connection = await connectionForPod(pod, this.deps.secrets);
+            await connection.replyToThread(
+              { repoId: view.repoId, number: view.crNumber },
+              m.threadId,
+              m.text,
+            );
+          } catch (e) {
+            // The page blanked the field when it posted, so a failure has to
+            // hand the text back: held draft first, and anything typed since
+            // (it replaced the held draft) after it. Nothing is lost and
+            // nothing is sent; the reviewer retries from the field.
+            const held = this.replyDrafts[draftKey];
+            if (!held) this.replyDrafts[draftKey] = m.text;
+            else if (held !== m.text) this.replyDrafts[draftKey] = `${m.text}\n${held}`;
+            this.render();
+            throw e;
+          } finally {
+            this.sendingReplies.delete(draftKey);
+          }
           // A send that reached the platform is what makes the held draft
           // stale (task 7.4b) — clear it explicitly, before the patch below
           // reads it, or the field this re-render emits would show text that
-          // was already sent as though it never went anywhere.
-          delete this.replyDrafts[replyDraftKey(view.repoId, view.crNumber, m.threadId)];
+          // was already sent as though it never went anywhere. Only that text:
+          // a draft that differs was typed while the send was in flight, and
+          // is the reviewer's next reply.
+          if (this.replyDrafts[draftKey] === m.text) delete this.replyDrafts[draftKey];
           this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
             replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
           );

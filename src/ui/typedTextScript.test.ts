@@ -510,7 +510,9 @@ describe('a reply still in flight is held by the host, not by the field it was t
       posted.findIndex((message) => (message as { type: string }).type === wanted);
     expect(indexOfType('replyDraft')).toBeLessThan(indexOfType('reply'));
 
-    field.setSelectionRange(6, 6);
+    // The page blanked the field when it posted (the host's draft is the copy
+    // now), so there is no caret in the sent text to keep across the patch.
+    expect(field.value).toBe('');
     // thread-1 resolves while the reply is still unresolved — the shape every
     // resolve/concede/second-opinion on another thread produces: the same
     // region, re-rendered from host state, which now includes the draft the
@@ -530,8 +532,6 @@ describe('a reply still in flight is held by the host, not by the field it was t
     const after = document.getElementById('reply-input') as HTMLInputElement;
     expect(after.value).toBe(sent);
     expect(document.activeElement?.id).toBe('reply-input');
-    expect(after.selectionStart).toBe(6);
-    expect(after.selectionEnd).toBe(6);
   });
 
   it('a send that FAILS leaves the text re-sendable, not just visible: the held draft refills the box on the next repaint and a second Enter posts the same reply again', () => {
