@@ -95,6 +95,12 @@ export class PostedReviewsPanel {
    * removes a thread, so it has no basis for deciding one has disappeared.
    */
   private replyDrafts: Record<string, string> = {};
+  /**
+   * `replyDraftKey(...)` of every reply whose platform call has not answered
+   * yet. Static, because the call outlives the panel that made it: leaving the
+   * screen disposes the panel, and the one made on return must still know.
+   */
+  private static readonly sendingReplies = new Set<string>();
 
   private constructor(
     private readonly route: AppRoute,
@@ -216,21 +222,49 @@ export class PostedReviewsPanel {
         }
         case 'reply': {
           if (!view) return;
-          const connection = await connectionForPod(pod, this.deps.secrets);
-          await connection.replyToThread(
-            { repoId: view.repoId, number: view.crNumber },
-            m.threadId,
-            m.text,
-          );
-          // A send that reached the platform is what makes the held draft
-          // stale (task 7.4b) — clear it explicitly, before the patch below
-          // reads it, or the field this re-render emits would show text that
-          // was already sent as though it never went anywhere.
-          delete this.replyDrafts[replyDraftKey(view.repoId, view.crNumber, m.threadId)];
-          this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
-            replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
-          );
-          this.render();
+          const draftKey = replyDraftKey(view.repoId, view.crNumber, m.threadId);
+          // One send per thread at a time: a second 'reply' while the first is
+          // unanswered is the same text posted to the platform twice. The page
+          // keeps no send state, so this is the only guard, and it is static:
+          // leaving the screen disposes the panel but not the call in flight,
+          // and a fresh panel must still see it.
+          if (PostedReviewsPanel.sendingReplies.has(draftKey)) return;
+          PostedReviewsPanel.sendingReplies.add(draftKey);
+          let ok = false;
+          let remainder = '';
+          try {
+            const connection = await connectionForPod(pod, this.deps.secrets);
+            await connection.replyToThread(
+              { repoId: view.repoId, number: view.crNumber },
+              m.threadId,
+              m.text,
+            );
+            ok = true;
+            // A send that reached the platform is what makes the sent text on
+            // the held draft stale (task 7.4b). Taken off under the key
+            // captured at send, not the current selection, and by prefix with
+            // the page's own trim rule: text typed since stays, and a draft
+            // that no longer starts with the sent text is left alone.
+            const held = this.replyDrafts[draftKey]?.trimStart();
+            if (held?.startsWith(m.text)) {
+              const rest = held.slice(m.text.length).trimStart();
+              if (rest) this.replyDrafts[draftKey] = rest;
+              else delete this.replyDrafts[draftKey];
+            }
+            // What the draft is now. The patch below paints it, and it reaches
+            // the page before the settled note, so the note carries it: a field
+            // that already equals it has had the sent text taken off.
+            remainder = this.replyDrafts[draftKey] ?? '';
+            this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
+              replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
+            );
+            this.render();
+          } finally {
+            // Whatever happened, the send is over: release the thread and tell
+            // the page (it takes the sent text off the field on success).
+            PostedReviewsPanel.sendingReplies.delete(draftKey);
+            this.replySettled(m.threadId, m.text, ok, remainder);
+          }
           return;
         }
         case 'replyDraft':
@@ -259,6 +293,25 @@ export class PostedReviewsPanel {
       void vscode.window.showErrorMessage(
         `Verdict: ${e instanceof Error ? e.message : String(e)}`,
       );
+    }
+  }
+
+  /**
+   * Tells the page a reply's platform call has ended, and with what text. The
+   * page owns the field: a patch cannot take the sent text off a focused field
+   * it is watching, so this is the one way it learns the send is over.
+   * Sent even after this panel was disposed: leaving the screen does not end
+   * the call, and the shared webview is still there to hear it (a page with no
+   * field for the thread ignores it). A webview that is itself gone throws,
+   * and a failed delivery must not take the message handler down with it.
+   */
+  private replySettled(threadId: string, text: string, ok: boolean, remainder: string): void {
+    try {
+      void Promise.resolve(
+        this.route.panel.webview.postMessage({ type: 'verdict:replySettled', threadId, text, ok, remainder }),
+      ).catch(() => undefined);
+    } catch {
+      // The webview is disposed; nothing is left to tell.
     }
   }
 

@@ -2513,3 +2513,62 @@ describe('the triage keyboard map is scoped to the triage screen and to not-typi
     expect(moves(posted)).toHaveLength(1);
   });
 });
+
+// ---- a follow-up question sent while the answer is pending ----------------------
+//
+// Reported from a live run for the reply boxes: a second Enter during one send
+// posts twice, and text typed during the send is dropped. The page clears #ask
+// the moment it posts, so neither can happen here — pinned so it stays so.
+
+describe('the ask box while a question is in flight', () => {
+  const flow = (askDraft?: string): FlowViewState => ({
+    ...state,
+    screen: 'triage',
+    mode: 'split',
+    items: [{ ...state.items[0]!, askDraft }],
+  }) as FlowViewState;
+
+  function askPage() {
+    const posted: Array<{ type?: string }> = [];
+    const dom = new JSDOM(renderReviewFlowHtml(flow(), 'HVE Core / PR Review', 'nonce123'), {
+      runScripts: 'dangerously',
+      virtualConsole: new VirtualConsole(),
+      beforeParse(window) {
+        (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+          postMessage: (message: { type?: string }) => posted.push(message),
+        });
+      },
+    });
+    const field = (): HTMLInputElement => dom.window.document.getElementById('ask') as HTMLInputElement;
+    const type = (value: string): void => {
+      field().value = value;
+      field().dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    };
+    const chord = (init: KeyboardEventInit): void => {
+      field().dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, ...init }));
+    };
+    field().focus();
+    return { dom, posted, field, type, chord };
+  }
+  const asks = (posted: Array<{ type?: string }>): unknown[] => posted.filter((m) => m.type === 'ask');
+
+  it('a second Ctrl+Enter or Cmd+Enter does not ask the question again', () => {
+    const { posted, type, chord } = askPage();
+    type('Why is this safe?');
+    chord({ ctrlKey: true });
+    chord({ ctrlKey: true });
+    chord({ metaKey: true });
+    expect(asks(posted)).toHaveLength(1);
+  });
+
+  it('text typed after the send survives the repaint and is not asked', () => {
+    const { dom, posted, field, type, chord } = askPage();
+    type('Why is this safe?');
+    chord({ ctrlKey: true });
+    type(`${field().value}And the retry path?`);
+    // The host cleared its draft on send, so the repaint carries none.
+    patchFlow(dom, { 'flow-body': renderReviewFlowBody(flow(), 'HVE Core / PR Review') });
+    expect(field().value).toBe('And the retry path?');
+    expect(asks(posted)).toHaveLength(1);
+  });
+});

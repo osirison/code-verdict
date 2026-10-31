@@ -519,11 +519,14 @@ stable across renders (not derived from list position). Expansion state the pane
 and re-renders (the codebase norm — `expandedThreadId`, `agentOpen`, …) needs nothing; the rule is
 for state that lives only in the DOM, where disclosure must be a `<details id="…">`.
 
-Two deliberate limits. `value` is never restored: the host holds every editable's in-progress
-text and re-renders it current (design D8, task 9.3), so a restored value could only ever be a
-stale one clobbering a regenerated summary. And view state is per route: the page keeps a bounded,
-route-keyed snapshot (saved when a navigation patch leaves a route, reapplied on return), so one
-screen's scroll and open sections never land on another's.
+Two deliberate limits. `value` is restored only for a focused field the page itself watched the
+reviewer type into, and only while it still carries that typed value: the host holds every
+editable's in-progress text and re-renders it current (design D8, task 9.3), so any other restored
+value could only be a stale one clobbering a regenerated summary. A value the host changes on
+purpose (a reply that was sent) reaches the page as an explicit message, not as a patch. And view
+state is per route: the page keeps a bounded, route-keyed snapshot (saved when a navigation patch
+leaves a route, reapplied on return), so one screen's scroll and open sections never land on
+another's.
 
 ## The status bar shows only what is Verdict's
 

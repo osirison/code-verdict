@@ -439,8 +439,8 @@ export const REGIONS_SCRIPT = `
   // So a patch's value is held off, but ONLY where this page watched the
   // reviewer produce the live value: an 'input' event whose value the control
   // still carries. A value the page never watched is host-authored — a
-  // regenerated summary, a draft the host cleared on a successful send — and
-  // must still win, which is what stops this becoming "the DOM always wins".
+  // regenerated summary, a draft the host dropped for a thread that is gone —
+  // and must still win, which is what stops this becoming "the DOM always wins".
   const typed = new Map();
   document.addEventListener('input', (ev) => {
     const el = ev.target;
@@ -458,8 +458,9 @@ export const REGIONS_SCRIPT = `
   document.addEventListener('click', forgetTyped, true);
   document.addEventListener('blur', forgetTyped, true);
   window.addEventListener('blur', forgetTyped);
-  // A fourth, page-initiated signal: Enter in a reply box sends with no
-  // click or blur. By id, so one field never drops another's watch.
+  // A fourth, page-initiated signal: a reply box whose sent text the page has
+  // just taken off ends up empty with no click or blur. By id, so one field
+  // never drops another's watch.
   window.verdictForgetTypedId = (id) => typed.delete(id);
 
   // The DOM state a patch would otherwise discard (design D8, task 9.1):

@@ -421,8 +421,8 @@ const SCRIPT = `
   });
   // Commits the in-progress text into the panel's held per-thread draft (task
   // 9.3) so a patch from acting on a DIFFERENT thread never overwrites what
-  // this one is mid-typing, and so the panel's own clearing on a successful
-  // send (below) has a real field to blank rather than guessing at one.
+  // this one is mid-typing, and so the panel holds the text a send was made
+  // from (it takes that text off the draft when the send succeeds).
   // Debounced, not committed on every keystroke — 'change' (the previous
   // event) only fires on blur, which is what left mid-typing text nowhere
   // but the DOM; per-thread, not one shared timer, so switching to a
@@ -447,8 +447,9 @@ const SCRIPT = `
   // thread, toggling archived, selecting a different review — all patch
   // #pr-detail from the panel's held drafts without touching the platform.
   // Inside the 300ms window that patch re-renders the reply field from the
-  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT never
-  // restores the value, so those keystrokes are gone. Capture phase, so this
+  // draft as it was BEFORE the last keystrokes, and REGIONS_SCRIPT only holds
+  // a typed value for the focused field, so those keystrokes are gone for
+  // any other repaint of it. Capture phase, so this
   // runs before the delegated handlers below; blur as well, because a
   // palette command or a click outside the webview never produces one here.
   const flushReplyDrafts = () => {
@@ -466,15 +467,13 @@ const SCRIPT = `
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
-  // The input is never cleared here: a successful 'reply' clears the panel's
-  // held draft for this thread (task 7.4b) before it patches #pr-detail, so
-  // the value this re-render emits is genuinely empty rather than a DOM node
-  // being blanked out from under the reviewer mid-keystroke. A failed send
-  // clears nothing, so the held draft committed below is still the text — the
-  // DOM keeps it, and any later repaint of this region puts it back for a
-  // retry. (It is NOT true that a failure "patches nothing at all", so the
-  // text is safe: this region is patched by every OTHER thread's activity too,
-  // which is why the draft, not the DOM, has to be the copy that survives.)
+  // The input keeps its text until the send has succeeded (spec: ui-responsiveness,
+  // "cleared only when it has been sent successfully"), so a failed send leaves
+  // everything there for a retry and the person can keep typing meanwhile.
+  // This page keeps no send state: a press during a send posts the reply like
+  // any other, and the panel, which owns whether a send is in flight, drops it.
+  // The host ends the send with 'verdict:replySettled' (below), which is also
+  // what takes the sent text, and only that text, off the field.
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
@@ -488,22 +487,54 @@ const SCRIPT = `
     // patch of #pr-detail arriving before the send resolves repaints from that
     // empty state. A resolve or concede on a DIFFERENT thread lands exactly
     // that patch, wiping text that had not been sent yet. Committing first
-    // makes the draft the copy that outlives the tick: a success deletes it
-    // (task 7.4b) so the box still ends empty, and a failure leaves it as the
-    // retry. Committing the trimmed text — what is actually being sent —
+    // makes the draft the copy that outlives the tick: a success takes the
+    // sent text off it (task 7.4b), and a failure leaves it as the retry.
+    // Committing the trimmed text — what is actually being sent —
     // rather than the raw value costs only trailing whitespace on a repaint.
     //
     // Cancelling still matters after committing: a timer left armed would
-    // re-commit the same text AFTER the host cleared the draft on success, and
-    // the next unrelated patch would replay it as though it were never sent.
+    // re-commit the same text AFTER the host took it off the draft on success,
+    // and the next unrelated patch would replay it as though it were never sent.
     post({ type: 'replyDraft', threadId: input.dataset.reply, text });
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
     replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
-    // Enter fires no click or blur (theme.ts), so forget this field's watch
-    // or the sent text outlasts the cleared draft and a second Enter resends it.
-    window.verdictForgetTypedId(input.id);
   }
+  // A send succeeded. The panel has already taken the sent text off its held
+  // draft; this takes it off the field, if the field is on screen, and nothing
+  // else: what was typed after it stays, and is not posted. It is taken off by
+  // prefix, so a field the person has since edited into something else is left
+  // alone, and the caret stays on the person's own text. This has to happen
+  // here, not through the host's patch: REGIONS_SCRIPT holds a focused field's
+  // typed value across a patch, so a patch alone would keep the sent text and
+  // let Enter post it again. A field that is not on screen needs nothing from
+  // this page (the panel's draft is already right), and a failed send changes
+  // nothing. What remains in the field goes to the panel through the ordinary
+  // input path: the field is on screen, so its review is the selected one, and
+  // the pending-draft flush on click and blur covers a move to another review.
+  // Not handled: an input-method composition in progress in this field.
+  window.addEventListener('message', (ev) => {
+    const data = ev.data;
+    if (!data || data.type !== 'verdict:replySettled' || !data.ok) return;
+    const field = [...document.querySelectorAll('[data-reply]')].find((el) => el.dataset.reply === data.threadId);
+    if (!field) return;
+    // The panel's patch (which always arrives first) may already have painted
+    // the draft with the sent text off, e.g. after a click released the typed
+    // hold. Taking the prefix off that again would eat the person's own words.
+    if (field.value === data.remainder) return;
+    const lead = field.value.trimStart();
+    if (!lead.startsWith(data.text)) return;
+    const rest = lead.slice(data.text.length).trimStart();
+    const removed = field.value.length - rest.length;
+    const start = field.selectionStart;
+    const end = field.selectionEnd;
+    field.value = rest;
+    if (document.activeElement === field && start !== null && end !== null) {
+      field.setSelectionRange(Math.max(0, Math.min(rest.length, start - removed)), Math.max(0, Math.min(rest.length, end - removed)), field.selectionDirection ?? undefined);
+    }
+    if (rest) field.dispatchEvent(new Event('input', { bubbles: true }));
+    else window.verdictForgetTypedId(field.id);
+  });
   document.addEventListener('keydown', (ev) => {
     const el = ev.target.closest('[data-reply]');
     if (el && ev.key === 'Enter') submitReply(el);

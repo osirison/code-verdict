@@ -11,6 +11,7 @@
  * thread and assert nothing reaches the platform beyond the action's own
  * call.
  */
+import { JSDOM, VirtualConsole } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { clearProviders } from '../platform/registry';
 import { registerBuiltInProviders } from '../registry';
@@ -179,8 +180,12 @@ async function flush(): Promise<void> {
 
 type RegionsMessage = { type: 'verdict:regions'; regions: Record<string, string> };
 
+/** The last region patch; the page is also sent `verdict:replySettled` after a reply ends. */
 function lastPosted(): RegionsMessage {
-  return panel.webview.postMessage.mock.calls.at(-1)?.[0] as RegionsMessage;
+  return panel.webview.postMessage.mock.calls
+    .map((c) => c[0] as { type: string })
+    .filter((m) => m.type === 'verdict:regions')
+    .at(-1) as RegionsMessage;
 }
 
 async function openPanel(globalState: KeyValueStore) {
@@ -204,7 +209,23 @@ beforeEach(() => {
   panel.webview.postMessage.mockClear();
 });
 
-afterEach(() => {
+/**
+ * Settlers for every `replyToThread` a test left pending. The panel's one-send-
+ * per-thread guard is static (it must outlive a panel), so a send still pending
+ * when a test ends would make the next test's replies be dropped.
+ */
+const pendingSends: Array<() => void> = [];
+/**
+ * Pages a test wired to the panel. A page left open keeps its 300ms draft timer,
+ * which would fire into the next test's panel (`handlers.message` is shared).
+ */
+const openPages: JSDOM[] = [];
+
+afterEach(async () => {
+  for (const settle of pendingSends.splice(0)) settle();
+  await flush();
+  for (const page of openPages.splice(0)) page.window.close();
+  panel.webview.postMessage.mockReset();
   // Dispose the surface so the next test builds a fresh panel and route —
   // `AppSurface`'s and `PostedReviewsPanel`'s statics otherwise survive test
   // boundaries in the same module instance.
@@ -250,7 +271,7 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     expect(posted.regions['pr-detail']).toContain("conceded — they were right");
   });
 
-  it('replying calls replyToThread and issues no other platform call, and clears the draft on success', async () => {
+  it('replying calls replyToThread and issues no other platform call, and the patch it emits carries the draft with the sent text off', async () => {
     const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
     await openPanel(globalState);
 
@@ -289,7 +310,11 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
     await flush();
 
-    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    // No patch, only the note that the send is over (so the page can allow a retry).
+    expect(panel.webview.postMessage.mock.calls.map((c) => (c[0] as { type: string }).type)).toEqual(['verdict:replySettled']);
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: 'verdict:replySettled', threadId: 'thread-1', text: 'Still not convinced.', ok: false, remainder: '',
+    });
     expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(expect.stringContaining('network down'));
     spy.mockRestore();
   });
@@ -323,6 +348,81 @@ describe('posted-review thread actions patch instead of refetching (task 7.4)', 
     const posted = lastPosted();
     expect(posted.regions['pr-detail']).toContain('value="Still not convinced."');
     spy.mockRestore();
+  });
+
+  describe('while a reply is still being sent', () => {
+    /** A `replyToThread` the test answers by hand; `calls` counts what reached the platform. */
+    async function slowSend() {
+      const globalState = memoryStore({ 'codeVerdict.submittedReviews': [submittedReview()] });
+      const { PostedReviewsPanel } = await import('./postedReviews.js');
+      await PostedReviewsPanel.show(makeDeps(globalState));
+      await flush();
+      handlers.message?.({ type: 'verdictReady' });
+      let settle!: { resolve: () => void; reject: (e: Error) => void };
+      const calls: string[] = [];
+      const connections = await import('../app/connections.js');
+      const spy = vi.spyOn(connections, 'connectionForPod').mockResolvedValue({
+        listOpenChangeRequests: () => Promise.resolve(world.crs),
+        listThreads: () => Promise.resolve(world.threads),
+        resolveThread: () => Promise.resolve(undefined),
+        replyToThread: (_ref: unknown, _id: string, body: string) => {
+          calls.push(body);
+          return new Promise<void>((resolve, reject) => {
+            settle = { resolve, reject };
+            pendingSends.push(resolve);
+          });
+        },
+      } as never);
+      handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+      panel.webview.postMessage.mockClear();
+      return { calls, spy, settle: () => settle };
+    }
+
+    it('a second reply for the same thread is dropped, not posted twice', async () => {
+      const { calls, spy, settle } = await slowSend();
+      handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+      await flush();
+      handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+      await flush();
+      settle().resolve();
+      await flush();
+      expect(calls).toEqual(['Still not convinced.']);
+      spy.mockRestore();
+    });
+
+    it('a draft typed during the send survives its success and is not sent', async () => {
+      const { calls, spy, settle } = await slowSend();
+      handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'Still not convinced.' });
+      handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+      await flush();
+      handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'And one more thing' });
+      settle().resolve();
+      await flush();
+      expect(calls).toEqual(['Still not convinced.']);
+      expect(lastPosted().regions['pr-detail']).toContain('value="And one more thing"');
+      spy.mockRestore();
+    });
+
+    it('a failed send leaves the held draft exactly as the page last committed it, and releases the thread for a retry', async () => {
+      const { calls, spy, settle } = await slowSend();
+      handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'Still not convinced.' });
+      handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+      await flush();
+      handlers.message?.({ type: 'replyDraft', threadId: 'thread-1', text: 'Still not convinced. And one more thing' });
+      settle().reject(new Error('network down'));
+      await flush();
+      expect(calls).toEqual(['Still not convinced.']);
+      handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+      handlers.message?.({ type: 'toggleThread', threadId: 'thread-1' });
+      expect(lastPosted().regions['pr-detail']).toContain('value="Still not convinced. And one more thing"');
+      // The failure released the thread: a retry goes out.
+      handlers.message?.({ type: 'reply', threadId: 'thread-1', text: 'Still not convinced.' });
+      await flush();
+      expect(calls).toHaveLength(2);
+      settle().resolve();
+      await flush();
+      spy.mockRestore();
+    });
   });
 
   it('a resolve on one thread does not disturb an unrelated thread\'s in-progress reply draft', async () => {
@@ -469,5 +569,374 @@ describe('posted reviews while the reviewer is looking at another screen', () =>
     await flush();
     expect(world.calls.listThreads).toBe(callsBefore.listThreads + 1);
     expect(lastPosted().regions['pr-detail']).toContain('thread stale');
+  });
+});
+
+// ---- the real panel and the real page script, wired together ----------------------
+//
+// Reported from a live run: two Enter presses during one send post it twice,
+// and text typed while a send is in flight is dropped. The tests above drive
+// the panel with hand-written messages and the page tests drive the script
+// with hand-written patches; neither can see a defect that lives in the
+// hand-off between them (a patch the page holds off, a draft the host replaces).
+// Here the page's postMessage goes to the panel's handler, the panel's
+// postMessage goes to the page's window, `replyToThread` is settled by hand,
+// and the assertions are on what the field shows and what the platform got.
+
+describe('a reply sent while its send is in flight (panel and page wired together)', () => {
+  const SENT = 'Still not convinced.';
+  const MORE = ' And one more thing';
+
+  interface Send { body: string; resolve: () => void; reject: (e: Error) => void }
+
+  async function wired() {
+    const entry = { ...submittedReview(), threads: { item1: 'thread-1', item2: 'thread-2' } };
+    // A second review (#8) with its own thread, so "click another review" is real.
+    const other = { ...submittedReview(), crNumber: '8', submittedAt: '2026-08-19T10:00:00.000Z', threads: { item1: 'thread-9' } };
+    const otherRef = { repoId: REF.repoId, number: '8' };
+    world.crs = [changeRequest(), { ...changeRequest(), ref: otherRef }];
+    world.threads = [
+      reviewThread({ id: 'thread-1' }),
+      reviewThread({ id: 'thread-2', notes: [{ id: 'n3', author: { username: 'you' }, body: 'Second finding.', createdAt: '2026-08-20T10:06:00.000Z' }] }),
+      reviewThread({ id: 'thread-9', crRef: otherRef }),
+    ];
+    const { PostedReviewsPanel } = await import('./postedReviews.js');
+    const deps = makeDeps(memoryStore({ 'codeVerdict.submittedReviews': [entry, other] }));
+    await PostedReviewsPanel.show(deps);
+    await flush();
+
+    const sends: Send[] = [];
+    const connections = await import('../app/connections.js');
+    const spy = vi.spyOn(connections, 'connectionForPod').mockResolvedValue({
+      listOpenChangeRequests: () => Promise.resolve(world.crs),
+      listThreads: () => Promise.resolve(world.threads),
+      resolveThread: () => Promise.resolve(undefined),
+      replyToThread: (_ref: unknown, _id: string, body: string) =>
+        new Promise<void>((resolve, reject) => {
+          sends.push({ body, resolve, reject });
+          pendingSends.push(resolve);
+        }),
+    } as never);
+
+    // What the page sends the panel.
+    const toPanel: Array<{ type: string }> = [];
+    const dom = new JSDOM(panel.webview.html, {
+      runScripts: 'dangerously',
+      virtualConsole: new VirtualConsole(),
+      beforeParse(window) {
+        (window as unknown as { acquireVsCodeApi: () => unknown }).acquireVsCodeApi = () => ({
+          postMessage: (m: { type: string }) => { toPanel.push(m); handlers.message?.(m); },
+        });
+        window.scrollTo = (() => undefined) as typeof window.scrollTo;
+      },
+    });
+    openPages.push(dom);
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      return Promise.resolve(true);
+    });
+    await flush();
+    const document = dom.window.document;
+
+    const click = async (selector: string): Promise<void> => {
+      (document.querySelector(selector) as HTMLElement).click();
+      await flush();
+    };
+    const field = (): HTMLInputElement => document.getElementById('reply-input') as HTMLInputElement;
+    /** Types at the end of the field, as a person at the caret does. */
+    const typeMore = (extra: string): void => {
+      field().focus();
+      field().value += extra;
+      field().dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    };
+    const enter = async (): Promise<void> => {
+      field().focus();
+      field().dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await flush();
+    };
+    const sendBodies = (): string[] => sends.map((s) => s.body);
+    const settle = async (index: number, how: 'resolve' | 'reject'): Promise<void> => {
+      if (how === 'resolve') sends[index]!.resolve(); else sends[index]!.reject(new Error('network down'));
+      await flush();
+    };
+    const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+    await click('[data-toggle="thread-1"]');
+    return { spy, dom, document, click, field, typeMore, enter, sendBodies, settle, wait, deps, toPanel, PostedReviewsPanel };
+  }
+
+  it('keeps the text in the field for the whole send, and clears it once the send succeeds', async () => {
+    const { spy, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    expect(sendBodies()).toEqual([SENT]);
+    expect(field().value).toBe(SENT);
+    await settle(0, 'resolve');
+    expect(field().value).toBe('');
+    spy.mockRestore();
+  });
+
+  it('a press during a send reaches the platform once, and the field keeps its text', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    await enter();
+    await click('[data-reply-send]');
+    expect(sendBodies()).toEqual([SENT]);
+    expect(field().value).toBe(SENT);
+    // New text and another Enter while A is pending: not posted, not hidden.
+    typeMore(MORE);
+    await enter();
+    expect(sendBodies()).toEqual([SENT]);
+    expect(field().value).toBe(SENT + MORE);
+    await settle(0, 'resolve');
+    // Only what was sent left the field; the rest waits for an explicit Enter.
+    expect(field().value).toBe('And one more thing');
+    expect(sendBodies()).toEqual([SENT]);
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'And one more thing']);
+    spy.mockRestore();
+  });
+
+  it('a failed send leaves sent text and later typing in the field, and a retry sends all of it', async () => {
+    const { spy, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await settle(0, 'reject');
+    expect(field().value).toBe(SENT + MORE);
+    await enter();
+    expect(sendBodies()).toEqual([SENT, SENT + MORE]);
+    await settle(1, 'resolve');
+    expect(field().value).toBe('');
+    spy.mockRestore();
+  });
+
+  it('a failed send with no typing since lets the same text be retried', async () => {
+    const { spy, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    await settle(0, 'reject');
+    expect(field().value).toBe(SENT);
+    await enter();
+    expect(sendBodies()).toEqual([SENT, SENT]);
+    spy.mockRestore();
+  });
+
+  it('a field edited so it no longer starts with the sent text is left alone when the send succeeds', async () => {
+    const { spy, dom, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    field().value = 'Something else entirely';
+    field().dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    await settle(0, 'resolve');
+    expect(field().value).toBe('Something else entirely');
+    expect(sendBodies()).toEqual([SENT]);
+    spy.mockRestore();
+  });
+
+  it('typing before the debounce fires: success keeps only the new text, and the late draft commit does not bring the old back', async () => {
+    const { spy, field, typeMore, enter, click, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await settle(0, 'resolve');
+    expect(field().value).toBe('And one more thing');
+    await wait(350);
+    // A repaint from the host's held draft shows what the host believes.
+    await click('[data-toggle="thread-2"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    spy.mockRestore();
+  });
+
+  it('typing after the debounce fired: the same result', async () => {
+    const { spy, field, typeMore, enter, click, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await wait(350);
+    await settle(0, 'resolve');
+    expect(field().value).toBe('And one more thing');
+    await click('[data-toggle="thread-2"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    spy.mockRestore();
+  });
+
+  it('an unrelated thread refilling the box with the sent text mid-send does not leave it postable after success', async () => {
+    const { spy, dom, field, typeMore, enter, click, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    // Another thread is opened and thread-1 reopened: its field is repainted from the held draft.
+    await click('[data-toggle="thread-2"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe(SENT);
+    // The person types a character and deletes it.
+    typeMore('x');
+    field().value = field().value.slice(0, -1);
+    field().dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+    await settle(0, 'resolve');
+    expect(field().value).toBe('');
+    await enter();
+    expect(sendBodies()).toEqual([SENT]);
+    spy.mockRestore();
+  });
+
+  it('two threads sending at once settle independently', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    await click('[data-toggle="thread-2"]');
+    expect(field().value).toBe('');
+    typeMore('Second thread reply');
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'Second thread reply']);
+    // Thread 1 finishes while thread 2 is on screen: thread 2's field is untouched.
+    await settle(0, 'resolve');
+    expect(field().value).toBe('Second thread reply');
+    await settle(1, 'resolve');
+    expect(field().value).toBe('');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('');
+    expect(sendBodies()).toHaveLength(2);
+    spy.mockRestore();
+  });
+
+  it('leaving the screen mid-send and coming back: the send is still guarded, and the settled note still reaches the page', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle, deps, PostedReviewsPanel } = await wired();
+    typeMore(SENT);
+    await enter();
+    // The panel is disposed on leaving; the call is not.
+    AppSurface.show('elsewhere', 'Verdict: Elsewhere');
+    await PostedReviewsPanel.show(deps);
+    await flush();
+    await click('[data-toggle="thread-1"]');
+    // The field is empty on return: drafts are held per panel instance, and
+    // this is a new panel, so the text of the send still in flight is not put
+    // back (that is how leaving the screen already worked).
+    expect(field().value).toBe('');
+    typeMore(SENT);
+    await enter();
+    expect(sendBodies()).toEqual([SENT]);
+    await settle(0, 'resolve');
+    // The old panel is gone, yet the page was told: the sent text comes off.
+    expect(field().value).toBe('');
+    typeMore('A new reply');
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'A new reply']);
+    spy.mockRestore();
+  });
+
+  it('text typed after the send is not filed under another review when the reviewer moves away and back before the send ends', async () => {
+    const { spy, field, typeMore, enter, click, sendBodies, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await wait(350);
+    await click('.rev-row[data-number="8"]');
+    await settle(0, 'resolve');
+    await click('.rev-row[data-number="7"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    expect(sendBodies()).toEqual([SENT]);
+    spy.mockRestore();
+  });
+
+  it('a success whose settled note never reaches the page still leaves the panel holding only the new text', async () => {
+    const { spy, dom, field, typeMore, enter, click, settle, wait } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    await wait(350);
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      if ((m as { type: string }).type !== 'verdict:replySettled') {
+        dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      }
+      return Promise.resolve(true);
+    });
+    await settle(0, 'resolve');
+    await click('.rev-row[data-number="8"]');
+    await click('.rev-row[data-number="7"]');
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('And one more thing');
+    spy.mockRestore();
+  });
+
+  it('a click that releases the typed hold before the send ends does not make the sent text come off twice', async () => {
+    // "ok", Enter, then " ok then": the field is "ok ok then". The click (in the
+    // field itself) flushes the draft, the panel strips it and its patch paints
+    // "ok then" into the unheld field, and only then does the settled note
+    // arrive; it must not take a second "ok" off the person's own words.
+    const { spy, field, typeMore, enter, settle, sendBodies } = await wired();
+    typeMore('ok');
+    await enter();
+    typeMore(' ok then');
+    expect(field().value).toBe('ok ok then');
+    field().click();
+    await settle(0, 'resolve');
+    expect(field().value).toBe('ok then');
+    expect(sendBodies()).toEqual(['ok']);
+    spy.mockRestore();
+  });
+
+  it('keeps the caret on the person\'s own text when the sent text comes off in front of it', async () => {
+    const { spy, field, typeMore, enter, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    typeMore(MORE);
+    const at = (SENT + MORE).indexOf('one more');
+    field().setSelectionRange(at, at);
+    await settle(0, 'resolve');
+    expect(field().value).toBe('And one more thing');
+    expect(field().selectionStart).toBe(field().value.indexOf('one more'));
+    expect(field().selectionEnd).toBe(field().selectionStart);
+    spy.mockRestore();
+  });
+
+  it('a send that ends while its thread is collapsed leaves no empty draft behind and the thread opens empty', async () => {
+    const { spy, field, typeMore, enter, click, settle, toPanel } = await wired();
+    typeMore(SENT);
+    await enter();
+    await click('[data-toggle="thread-1"]');
+    const before = toPanel.length;
+    await settle(0, 'resolve');
+    expect(toPanel.slice(before).filter((m) => m.type === 'replyDraft')).toEqual([]);
+    await click('[data-toggle="thread-1"]');
+    expect(field().value).toBe('');
+    spy.mockRestore();
+  });
+
+  it('a render that throws after a successful send still tells the page and releases the thread', async () => {
+    const { spy, dom, field, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      if ((m as { type: string }).type === 'verdict:regions') throw new Error('webview went away');
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      return Promise.resolve(true);
+    });
+    await settle(0, 'resolve');
+    expect(field().value).toBe('');
+    typeMore('Again');
+    await enter();
+    expect(sendBodies()).toEqual([SENT, 'Again']);
+    spy.mockRestore();
+  });
+
+  it('a webview that throws on every message still releases the thread, and nothing escapes the handler', async () => {
+    const { spy, dom, typeMore, enter, sendBodies, settle } = await wired();
+    typeMore(SENT);
+    await enter();
+    panel.webview.postMessage.mockImplementation(() => { throw new Error('Webview is disposed'); });
+    await settle(0, 'resolve');
+    panel.webview.postMessage.mockImplementation((m: unknown) => {
+      dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: m }));
+      return Promise.resolve(true);
+    });
+    typeMore(' again');
+    await enter();
+    expect(sendBodies()).toHaveLength(2);
+    spy.mockRestore();
   });
 });

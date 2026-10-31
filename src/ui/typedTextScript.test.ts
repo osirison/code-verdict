@@ -269,21 +269,21 @@ describe('a patch between keystrokes (tasks 9.3, 9.7)', () => {
     expect(after.selectionStart).toBe(4);
   });
 
-  it('a reply that sends successfully ends empty: the cleared draft is what the patch paints', () => {
+  it('a reply field the page is not holding is painted from the host\'s draft, which is empty once the sent text is off it', () => {
     const { dom } = loadShell(renderPostedReviewsHtml(postedState(), 'testnonce'), 'posted');
     const document = dom.window.document;
 
     const field = document.getElementById('reply-input') as HTMLInputElement;
     type(dom, field, 'Still not convinced.');
-    // The host cleared the per-thread draft on the successful send (task
-    // 7.4b) and re-rendered the detail region; the emitted field is
-    // genuinely empty, not blanked out from under the reviewer.
+    // The host took the sent text off the per-thread draft on the successful
+    // send (task 7.4b) and re-rendered the detail region; the emitted field
+    // is genuinely empty, not blanked out from under the reviewer.
     patch(dom, { 'pr-detail': renderPostedReviewsRegions(postedState({}))['pr-detail']! });
 
     expect((document.getElementById('reply-input') as HTMLInputElement).value).toBe('');
   });
 
-  it('Enter sends the reply and leaves the field focused — the sent text must not hold against the host\'s cleared draft', () => {
+  it('Enter sends the reply and leaves the field focused — the sent text comes off once the host reports the send settled, and is not held against it', () => {
     // The sibling of the test above, but through the DESIGNED primary path
     // (postedReviewsHtml.ts: "a single-line input has no reason to require
     // the chord (#33)"), not a direct patch. Enter fires no click and no
@@ -302,6 +302,11 @@ describe('a patch between keystrokes (tasks 9.3, 9.7)', () => {
     expect(posted).toContainEqual({ type: 'reply', threadId: 'thread-1', text: sent });
 
     patch(dom, { 'pr-detail': renderPostedReviewsRegions(postedState({}))['pr-detail']! });
+    // The field is focused and watched, so the patch alone keeps the sent
+    // text; the host's 'verdict:replySettled' is what takes it off.
+    dom.window.dispatchEvent(new dom.window.MessageEvent('message', {
+      data: { type: 'verdict:replySettled', threadId: 'thread-1', text: sent, ok: true },
+    }));
 
     const after = document.getElementById('reply-input') as HTMLInputElement;
     expect(after.value).toBe('');
@@ -453,12 +458,13 @@ describe('an update to one thread does not disturb another the reviewer is compo
 
 // ---- a reply that is still in flight -----------------------------------------
 //
-// Enter releases REGIONS_SCRIPT's typed hold on the field (it fires no click
-// and no blur, so nothing else would), which is what stops the sent text from
-// beating the host's cleared draft and being resent. From that moment the
-// field is painted from host state alone — so the host has to HOLD the text
-// for as long as the send is unresolved, or any patch of `#pr-detail` in that
-// window blanks a reply that has not landed yet. Every other thread's
+// Enter fires no click and no blur, so REGIONS_SCRIPT keeps holding the typed
+// value of the focused field; the sent text comes off it when the host's
+// 'verdict:replySettled' arrives, which is what stops it being resent. Any
+// repaint of the field that is not held (another click, a collapsed and
+// reopened thread) is painted from host state alone — so the host has to HOLD
+// the text for as long as the send is unresolved, or any patch of `#pr-detail`
+// in that window blanks a reply that has not landed yet. Every other thread's
 // resolve/concede/second-opinion patches that same region.
 
 /**
