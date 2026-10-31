@@ -142,10 +142,9 @@ describe('the risk-coverage setting — reuses risksAtLeast, cannot express an i
     expect(DEFAULT_REQUIRE_INSPECTION_MIN_RISK).toBe('medium');
   });
 
-  it('never changes reserveEligible or contradictionCheck — only requireInspection is configurable', () => {
+  it('never changes reserveEligible — only requireInspection is configurable', () => {
     const rules = normalizeHarnessCoverageRules('high');
     expect(rules.reserveEligible).toEqual(DEFAULT_RISK_COVERAGE_RULES.reserveEligible);
-    expect(rules.contradictionCheck).toEqual(DEFAULT_RISK_COVERAGE_RULES.contradictionCheck);
   });
 
   it('an explicit reviewer choice narrows which levels require inspection, monotonically', () => {

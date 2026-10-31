@@ -213,7 +213,7 @@ describe('configured coverage rules', () => {
   });
 
   it('honours relaxed injected rules', () => {
-    const rules = { requireInspection: ['medium', 'high'], reserveEligible: ['medium', 'high'], contradictionCheck: ['high'] } as const;
+    const rules = { requireInspection: ['medium', 'high'], reserveEligible: ['medium', 'high'] } as const;
     expect(requiresInspection('low', rules)).toBe(false);
     expect(isReserveEligible('medium', rules)).toBe(true);
   });
