@@ -231,14 +231,10 @@ export class PostedReviewsPanel {
               m.text,
             );
           } catch (e) {
-            // The page blanked the field when it posted, so a failure has to
-            // hand the text back: held draft first, and anything typed since
-            // (it replaced the held draft) after it. Nothing is lost and
-            // nothing is sent; the reviewer retries from the field.
-            const held = this.replyDrafts[draftKey];
-            if (!held) this.replyDrafts[draftKey] = m.text;
-            else if (held !== m.text) this.replyDrafts[draftKey] = `${m.text}\n${held}`;
-            this.render();
+            // The field kept its text through the send, so a failure changes
+            // nothing there and nothing here: the page is only told the send
+            // is over, so a retry (everything in the field) can go out.
+            this.replySettled(m.threadId, m.text, false);
             throw e;
           } finally {
             this.sendingReplies.delete(draftKey);
@@ -247,13 +243,14 @@ export class PostedReviewsPanel {
           // stale (task 7.4b) — clear it explicitly, before the patch below
           // reads it, or the field this re-render emits would show text that
           // was already sent as though it never went anywhere. Only that text:
-          // a draft that differs was typed while the send was in flight, and
-          // is the reviewer's next reply.
+          // a draft that differs has more typed after it, and the page takes
+          // the sent part off it when told below.
           if (this.replyDrafts[draftKey] === m.text) delete this.replyDrafts[draftKey];
           this.rows = patchThreadInRows(this.rows, view.repoId, view.crNumber, m.threadId, (t) =>
             replyThreadView(t, pod.username ?? 'you', m.text, new Date().toISOString()),
           );
           this.render();
+          this.replySettled(m.threadId, m.text, true);
           return;
         }
         case 'replyDraft':
@@ -283,6 +280,16 @@ export class PostedReviewsPanel {
         `Verdict: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+  }
+
+  /**
+   * Tells the page a reply's platform call has ended, and with what text. The
+   * page owns the field: a patch cannot take the sent text off a focused field
+   * it is watching, so this is the one way it learns the send is over.
+   */
+  private replySettled(threadId: string, text: string, ok: boolean): void {
+    if (this.disposed) return;
+    void this.route.panel.webview.postMessage({ type: 'verdict:replySettled', threadId, text, ok });
   }
 
   async refresh(): Promise<void> {

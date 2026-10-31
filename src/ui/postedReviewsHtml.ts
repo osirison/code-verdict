@@ -429,12 +429,16 @@ const SCRIPT = `
   // different thread mid-debounce cannot cancel a commit this one is still
   // waiting on.
   const replyDraftTimers = new Map();
+  // The last text typed per thread, kept for a field a patch has since removed
+  // (a collapsed thread) so a finished send can still take its text off.
+  const replyValues = new Map();
   document.addEventListener('input', (ev) => {
     const el = ev.target.closest('[data-reply]');
     if (!el) return;
     const threadId = el.dataset.reply;
     clearTimeout(replyDraftTimers.get(threadId));
     const text = el.value;
+    replyValues.set(threadId, text);
     replyDraftTimers.set(threadId, setTimeout(() => {
       replyDraftTimers.delete(threadId);
       post({ type: 'replyDraft', threadId, text });
@@ -466,18 +470,19 @@ const SCRIPT = `
   // One submit path for the key and the button — a single-line input has no
   // reason to require the ⌘/Ctrl chord (#33), and a chord is still exactly
   // an Enter keydown, so plain 'Enter' keeps both working with one check.
-  // The input is blanked the moment the reply is posted, the way the triage
-  // screen's #ask is. Left full until the host answered, a second Enter (or a
-  // double click on Send) posted the same reply again, and anything typed in
-  // the meantime landed on the end of the text already sent — which a success
-  // then either wiped or sent a second time. The held draft committed below is
-  // the copy that outlives the blanking: a success removes it (task 7.4b), and
-  // a failure makes the panel put the text back and repaint the field, because
-  // this region is patched by every OTHER thread's activity too and the DOM
-  // alone cannot be the copy that survives.
+  // The input keeps its text until the send has succeeded (spec: ui-responsiveness,
+  // "cleared only when it has been sent successfully"), so a failed send leaves
+  // everything there for a retry and the person can keep typing meanwhile.
+  // Because the field is still full, a second Enter or a click on Send during
+  // the send would post the same reply again: a thread with a send in flight
+  // ignores them. The host ends the send with 'verdict:replySettled' (below),
+  // which is also what takes the sent text, and only that text, off the field.
+  const sendingReplies = new Set();
   function submitReply(input) {
     const text = input.value.trim();
     if (!text) return;
+    if (sendingReplies.has(input.dataset.reply)) return;
+    sendingReplies.add(input.dataset.reply);
     // Commit what is about to be sent as this thread's held draft, THEN cancel
     // the pending debounce so no later timer can re-commit it. Both halves are
     // needed and the order is the fix:
@@ -500,11 +505,35 @@ const SCRIPT = `
     clearTimeout(replyDraftTimers.get(input.dataset.reply));
     replyDraftTimers.delete(input.dataset.reply);
     post({ type: 'reply', threadId: input.dataset.reply, text });
-    input.value = '';
-    // Enter fires no click or blur (theme.ts), so forget this field's watch
-    // or the sent text outlasts the cleared draft and a second Enter resends it.
-    window.verdictForgetTypedId(input.id);
   }
+  // The send ended. On success the field loses the text that was sent and
+  // nothing else: what was typed after it stays, and is not posted. It is
+  // taken off by prefix, so a field the person has since edited into
+  // something else is left alone. This has to happen here, not through the
+  // host's patch: REGIONS_SCRIPT holds a focused field's typed value across a
+  // patch, so a patch alone would keep the sent text and let Enter post it
+  // again. Either way the field's value is then committed as the draft, so the
+  // host holds what the field shows whether or not the debounce had fired.
+  window.addEventListener('message', (ev) => {
+    const data = ev.data;
+    if (!data || data.type !== 'verdict:replySettled') return;
+    const threadId = data.threadId;
+    sendingReplies.delete(threadId);
+    const field = [...document.querySelectorAll('[data-reply]')].find((el) => el.dataset.reply === threadId);
+    let value = field ? field.value : (replyValues.get(threadId) ?? '');
+    if (data.ok) {
+      const lead = value.trimStart();
+      if (lead.startsWith(data.text)) value = lead.slice(data.text.length).trimStart();
+    }
+    if (field && field.value !== value) {
+      field.value = value;
+      window.verdictForgetTypedId(field.id);
+    }
+    replyValues.set(threadId, value);
+    clearTimeout(replyDraftTimers.get(threadId));
+    replyDraftTimers.delete(threadId);
+    post({ type: 'replyDraft', threadId, text: value });
+  });
   document.addEventListener('keydown', (ev) => {
     const el = ev.target.closest('[data-reply]');
     if (el && ev.key === 'Enter') submitReply(el);

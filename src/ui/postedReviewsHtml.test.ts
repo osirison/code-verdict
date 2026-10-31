@@ -119,23 +119,20 @@ describe('reply affordance (#33 — Enter did nothing, no send button)', () => {
     expect(html).toContain(".closest('.reply-row')");
   });
 
-  it('blanks the input once the reply is posted, after the draft copy is committed', () => {
+  it('never clears the input eagerly — a failed send must not lose the typed text', () => {
     const html = renderPostedReviewsHtml(
       state([row([thread()])], { expandedThreadId: 'thread-1' }),
       'nonce123',
     );
 
-    // This used to assert the opposite (never clear, so a failed send keeps
-    // the text). That left the field full for the whole round trip: a second
-    // Enter posted the reply twice, and text typed meanwhile was appended to
-    // the sent text and then wiped or re-sent. The failure case is now the
-    // panel's job: it puts the text back (postedReviews.test.ts). What must
-    // hold here is the order — the held draft is committed first, so there
-    // is always a copy to put back.
+    // Clearing happened unconditionally right after `post(...)` before the
+    // fix — before the extension had even attempted the round trip. The
+    // script must post and stop; the field only takes the sent text off when
+    // the host reports the send succeeded ('verdict:replySettled', exercised
+    // end to end in postedReviews.test.ts), never in the send path itself.
+    expect(html).not.toContain('.value = \'\'');
     const submitReply = html.slice(html.indexOf('function submitReply'), html.indexOf('function submitReply') + html.slice(html.indexOf('function submitReply')).indexOf('}\n'));
-    expect(submitReply).toContain("input.value = '';");
-    expect(submitReply.indexOf("post({ type: 'replyDraft'")).toBeLessThan(submitReply.indexOf("input.value = '';"));
-    expect(submitReply.indexOf("post({ type: 'reply'")).toBeLessThan(submitReply.indexOf("input.value = '';"));
+    expect(submitReply).not.toContain('.value =');
   });
 
   it('omits the reply row entirely once a thread is closed', () => {
