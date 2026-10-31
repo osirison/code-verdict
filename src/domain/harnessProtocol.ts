@@ -661,7 +661,7 @@ export const TOOL_REQUEST_SPECS: Readonly<Record<ToolRequestName, ToolRequestSpe
     location: 'message',
     fields: [{ name: 'changedPath', kind: 'requiredString' }],
     returns:
-      'the root-to-leaf AGENTS.md chain applicable to that path. AGENTS.md content is authoritative instruction, never citable evidence.',
+      'the root-to-leaf AGENTS.md chain applicable to that path. AGENTS.md content is authoritative instruction.',
   },
   getChangeRequestDetails: {
     location: 'request',
@@ -1328,8 +1328,7 @@ export function describeBatchRules(policy: HarnessPolicy): string {
   return [
     'At most one of planCreated/planRevised, one publicRationale, one',
     'checkpointSuggestion, one riskProposal and one completionRequest may appear',
-    'in a turn. completionRequest and checkpointSuggestion may not be batched with',
-    'anything else. Multiple candidateSubmission messages may share a turn.',
+    'in a turn. Multiple candidateSubmission messages may share a turn.',
     `Up to ${cap} toolRequest messages may share a turn. A turn carrying more is`,
     'rejected whole and none of its requests run, so when more files remain than',
     `that, send ${cap} and continue in the next turn.`,

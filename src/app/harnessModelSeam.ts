@@ -157,7 +157,7 @@ BATCH_RULES_PLACEHOLDER
 
 ## Host tools
 
-Every tool below is read-only and revision-pinned.
+Every tool below is read-only.
 
 TOOL_CATALOG_PLACEHOLDER`;
 

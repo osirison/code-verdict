@@ -456,7 +456,9 @@ describe('a turn that submits eight findings alongside a read', () => {
     // 107_000 -> 106_700: the contract grew by the `riskProposal` kind (~270 bytes per turn), and this
     // size is tuned against the cap. Measured after the change: 106_900 no longer fits and the run
     // ends with no result; 106_700 and 106_500 both pass.
-    const sizeOf = (path: string): number => (path === FILES[0] ? 106_700 : 4_000);
+    // 106_700 -> 106_900: one duplicated batching sentence and two repeated clauses were cut
+    // from the contract (~126 bytes per turn). Measured after: 106_900 fits, 107_000 ends with no result.
+    const sizeOf = (path: string): number => (path === FILES[0] ? 106_900 : 4_000);
     const connection = fakeConnection({
       getChangeRequestDetails: detailsHandler(),
       listChangedFiles: async (request) => ({ snapshot: request.snapshot, state: 'complete', value: FILES.map((path) => manifestEntry(path, sizeOf(path))) }),
