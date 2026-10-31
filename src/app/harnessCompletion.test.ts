@@ -114,7 +114,7 @@ describe('deterministic completion gate (task 8.7)', () => {
     expect(evaluation.blockers).toEqual(['insufficientRiskCoverage']);
     expect(COMPLETION_CLAUSES.filter((clause) => !evaluation.clauses[clause])).toEqual(['configuredRiskCoverageSatisfied']);
     // Relaxed rules that do not require inspection at this level make the same inventory pass.
-    const relaxed = evaluateCompletion(passing({ inventory, coverageRules: { requireInspection: ['medium'], reserveEligible: ['high'], contradictionCheck: [] } }));
+    const relaxed = evaluateCompletion(passing({ inventory, coverageRules: { requireInspection: ['medium'], reserveEligible: ['high'] } }));
     expect(relaxed.eligible).toBe(true);
   });
 

@@ -163,17 +163,15 @@ export function normalizeRequireInspectionMinRisk(value: unknown): RiskLevel {
 export const DEFAULT_REQUIRE_INSPECTION_MIN_RISK: RiskLevel = normalizeRequireInspectionMinRisk(undefined);
 
 /**
- * Only `requireInspection` is configurable; `reserveEligible` and
- * `contradictionCheck` stay at their shipped defaults — this change exposes
- * the one field task 17's "decision already taken" names, not the whole
- * `RiskCoverageRules` shape.
+ * Only `requireInspection` is configurable; `reserveEligible` stays at its
+ * shipped default — this change exposes the one field task 17's "decision
+ * already taken" names, not the whole `RiskCoverageRules` shape.
  */
 export function normalizeHarnessCoverageRules(minRiskRaw: unknown): RiskCoverageRules {
   const minRisk = normalizeRequireInspectionMinRisk(minRiskRaw);
   return {
     requireInspection: risksAtLeast(minRisk),
     reserveEligible: DEFAULT_RISK_COVERAGE_RULES.reserveEligible,
-    contradictionCheck: DEFAULT_RISK_COVERAGE_RULES.contradictionCheck,
   };
 }
 

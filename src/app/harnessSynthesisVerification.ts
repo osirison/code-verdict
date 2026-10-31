@@ -150,16 +150,10 @@
  *   its end without being skipped; equal to `contradictionPassComplete`
  *   once dedup has run, since dedup cannot itself fail once started.
  *
- * **Documented gap:** `RiskCoverageRules.contradictionCheck`
- * (`./harnessRiskFloors.ts`) is D10 investigation-coverage configuration —
- * which risk levels of *files* require a contradiction check as part of
- * per-file coverage during investigation — a distinct concept from D9's
- * verification-stage pass over *findings* this module implements. It stays
- * unconsumed here; wiring it would require `SynthesisVerificationInput` to
- * carry per-file risk, which is not part of task 10.6's brief ("for each
- * surviving finding... challenge the claim" — every finding, not a
- * risk-gated subset) and would silently narrow the D9 pass this module is
- * scoped to implement.
+ * **Not risk-gated:** the contradiction pass covers every surviving finding
+ * whatever the risk of its file (D9: "for each surviving finding... challenge
+ * the claim"). `RiskCoverageRules` carries no contradiction-check rule, and
+ * `SynthesisVerificationInput` carries no per-file risk.
  *
  * **Documented interaction with `CandidateTracker`:** a finding this module
  * deduplicates away or contradicts stays `accepted` in the tracker (this

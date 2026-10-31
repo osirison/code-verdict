@@ -99,8 +99,6 @@ export interface RiskCoverageRules {
   readonly requireInspection: readonly RiskLevel[];
   /** Files at these levels may draw on the unvisited/high-risk reserve (D12). */
   readonly reserveEligible: readonly RiskLevel[];
-  /** Findings whose primary target is at these levels get a model contradiction check. */
-  readonly contradictionCheck: readonly RiskLevel[];
 }
 
 /** What the section-6 policy resolution can say about a path without this module parsing `AGENTS.md` prose. */
@@ -207,7 +205,6 @@ export const DEFAULT_RISK_FLOOR_RULES: RiskFloorRules = Object.freeze({
 export const DEFAULT_RISK_COVERAGE_RULES: RiskCoverageRules = Object.freeze({
   requireInspection: Object.freeze(risksAtLeast('medium')),
   reserveEligible: Object.freeze(['high'] as const),
-  contradictionCheck: Object.freeze(['high'] as const),
 });
 
 /** Every level, in ascending order, at or above `minimum`. */
